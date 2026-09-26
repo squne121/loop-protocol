@@ -242,7 +242,13 @@ def _candidate_errors(candidate: Any, repo: str, issue_number: int) -> list[str]
     pr = candidate.get("pr")
     if not isinstance(pr, Mapping) or type(pr.get("number")) is not int or pr["number"] <= 0:
         errors.append("candidate_pr_identity_invalid")
-    if lifecycle == "merged":
+    if lifecycle == "merged" and candidate.get("qualified_irrelevant_sibling") is not True:
+        # research Issue #2761: a candidate qualified as an irrelevant
+        # sibling cross-reference (#2750 carve-out) never has its main
+        # ancestry compared to `main` in the first place (skip-by-
+        # construction in `collect_candidate_inputs()`), so this check must
+        # not apply to it -- otherwise an irrelevant sibling's deliberately-
+        # unfetched ancestry would force the whole evidence set invalid.
         ancestry = candidate.get("main_ancestry")
         if (
             not _valid_sha(candidate.get("merge_oid"))
@@ -592,6 +598,17 @@ def collect_candidate_inputs(
             pr_body=str(pr.get("body") or ""), issue_number=issue_number, live_issue_body=issue_body
         )
         candidate["scope_coverage"] = coverage
+        # research Issue #2761 residual risk: qualification (the #2750
+        # carve-out) must be decided BEFORE any target-specific
+        # freshness/validation transport call is spent on this candidate, so
+        # an irrelevant sibling's own transport failures never have a chance
+        # to reach `materialization_failures`/`contradictory` or the merged
+        # main-ancestry compare below. Only fires for a `verified_cross_
+        # reference` candidate whose own durable marker already reduces to a
+        # lone `scope_coverage_issue_identity_mismatch` at collection time --
+        # `_is_irrelevant_cross_reference()`'s existing boundary (closing
+        # relation, compound errors, markerless) is unchanged.
+        candidate["qualified_irrelevant_sibling"] = _is_irrelevant_cross_reference(candidate)
         if lifecycle in {"open", "draft"} and coverage.get("status") == "missing_marker":
             candidate["current_scope_ownership"] = _allowed_paths_covered(
                 build_scope_manifest(issue_body)["allowed_paths"], pr.get("files")
@@ -600,7 +617,7 @@ def collect_candidate_inputs(
             merge_oid = (pr.get("mergeCommit") or {}).get("oid") if isinstance(pr.get("mergeCommit"), Mapping) else None
             candidate["merge_oid"] = merge_oid
             candidate["main_ancestry"] = {"verified": False, "reachable": False}
-            if _valid_sha(merge_oid):
+            if not candidate["qualified_irrelevant_sibling"] and _valid_sha(merge_oid):
                 rc, out, _ = run(["gh", "api", f"repos/{repo}/compare/{merge_oid}...main", "--jq", ".status"])
                 candidate["main_ancestry"] = {
                     "verified": rc == 0,
@@ -651,6 +668,15 @@ def collect_candidate_inputs(
 
 _FRESHNESS_REBIND_MAX_RETRIES = 1
 
+# research Issue #2761: the decision-time per-candidate live re-fetch used by
+# `_live_freshness_reference()` requests `body`/`closingIssuesReferences` in
+# addition to the pre-existing identity fields, so a candidate previously
+# qualified as an irrelevant sibling cross-reference (#2750 carve-out) can
+# have its qualification independently re-derived from FRESH live data
+# (never trusted from the collection-time snapshot alone -- AC1's "decision-
+# time の live body 再解析").
+_LIVE_CANDIDATE_REFRESH_FIELDS = "headRefOid,mergedAt,mergeCommit,body,closingIssuesReferences"
+
 
 def _collection_time_reference(evidence: Mapping[str, Any]) -> dict[str, Any]:
     """The collection-time snapshot of the values freshness-rebind protects."""
@@ -684,9 +710,24 @@ def _live_freshness_reference(
 ) -> dict[str, Any]:
     """Live re-fetch of the same three value classes, taken right before
     finalizing a disposition. `ok` is False whenever any live fetch fails
-    (transport failure is treated as non-fresh, never as a silent match)."""
+    (transport failure is treated as non-fresh, never as a silent match) --
+    EXCEPT for a candidate already qualified as an irrelevant sibling cross-
+    reference (#2750 carve-out) at collection time (research Issue #2761):
+    its head-identity DRIFT alone must not block the current target's
+    disposition, once its irrelevance has been FRESHLY reconfirmed from this
+    candidate's own successfully-fetched, fully-typed live `body`/
+    `closingIssuesReferences` (AC1's "decision-time の live body 再解析" --
+    never trusted from the collection-time snapshot alone, and never
+    required to byte-match it). A transport/parse failure on THIS
+    candidate's own live re-fetch, or a `body`/`closingIssuesReferences`
+    field that is missing/None/wrong-type, is authority-UNCONFIRMED -- never
+    silently treated as "still irrelevant" -- so it is NOT excluded from the
+    freshness identity requirement and drives `ok=False` /
+    `freshness_rebind_failed` like any other unconfirmed candidate (research
+    Issue #2761 P1-1/P1-2)."""
     rc, out, _ = run_command(["gh", "issue", "view", str(issue_number), "--repo", repo, "--json", "body"])
     issue_body_sha256: str | None = None
+    live_issue_body: str | None = None
     if rc == 0:
         try:
             payload = json.loads(out)
@@ -694,6 +735,7 @@ def _live_freshness_reference(
             payload = None
         body = payload.get("body") if isinstance(payload, Mapping) else None
         if isinstance(body, str):
+            live_issue_body = body
             issue_body_sha256 = _body_digest(body)
 
     main_rc, main_out, _ = run_command(["gh", "api", f"repos/{repo}/commits/main", "--jq", ".sha"])
@@ -702,6 +744,18 @@ def _live_freshness_reference(
         main_head_sha = None
 
     candidate_identity: dict[int, str | None] = {}
+    excluded_candidate_numbers: set[int] = set()
+    candidate_live_updates: dict[int, dict[str, Any]] = {}
+    # research Issue #2761 P1-1/P1-2: a previously-qualified-irrelevant
+    # candidate whose decision-time live authority (this candidate's own
+    # `gh pr view` transport/parse, or its `body`/`closingIssuesReferences`
+    # field shape) could not be fully verified. Tracked SEPARATELY from
+    # `candidate_identity` because a malformed-but-present `body`/
+    # `closingIssuesReferences` payload still carries a perfectly valid
+    # `headRefOid`/`mergeCommit` identity -- relying on `candidate_identity`
+    # alone (as a `None` proxy for "unconfirmed") would silently miss this
+    # case and fail back open.
+    unconfirmed_qualified_irrelevant_numbers: set[int] = set()
     for candidate in candidates:
         if not isinstance(candidate, Mapping):
             continue
@@ -709,43 +763,165 @@ def _live_freshness_reference(
         number = pr.get("number") if isinstance(pr, Mapping) else None
         if not isinstance(number, int):
             continue
+        previously_qualified_irrelevant = candidate.get("qualified_irrelevant_sibling") is True
         c_rc, c_out, _ = run_command(
-            ["gh", "pr", "view", str(number), "--repo", repo, "--json", "headRefOid,mergedAt,mergeCommit"]
+            ["gh", "pr", "view", str(number), "--repo", repo, "--json", _LIVE_CANDIDATE_REFRESH_FIELDS]
         )
         identity: str | None = None
+        c_payload: Mapping[str, Any] | None = None
         if c_rc == 0:
             try:
-                c_payload = json.loads(c_out)
+                parsed = json.loads(c_out)
             except json.JSONDecodeError:
-                c_payload = None
-            if isinstance(c_payload, Mapping) and c_payload.get("mergedAt"):
-                merge_commit = c_payload.get("mergeCommit")
-                identity = merge_commit.get("oid") if isinstance(merge_commit, Mapping) else None
-            elif isinstance(c_payload, Mapping):
-                identity = c_payload.get("headRefOid")
+                parsed = None
+            if isinstance(parsed, Mapping):
+                c_payload = parsed
+                if parsed.get("mergedAt"):
+                    merge_commit = parsed.get("mergeCommit")
+                    identity = merge_commit.get("oid") if isinstance(merge_commit, Mapping) else None
+                else:
+                    identity = parsed.get("headRefOid")
         candidate_identity[number] = identity
+
+        if not previously_qualified_irrelevant:
+            continue
+        # research Issue #2761 P1-1/P1-2: a collection-time-qualified
+        # irrelevant sibling's decision-time re-confirmation is only trusted
+        # from FULLY verified fresh authority -- this candidate's own
+        # `gh pr view` transport/parse succeeding AND yielding a `body`
+        # string AND a `closingIssuesReferences` list. Any of those being
+        # missing/None/wrong-type (or the current target's own live body
+        # itself failing to fetch) means negative qualification cannot be
+        # freshly re-derived: this candidate is UNKNOWN, never silently
+        # re-confirmed as "still irrelevant". Recorded in
+        # `unconfirmed_qualified_irrelevant_numbers`, which independently
+        # forces `ok=False` below -- unlike the previous fail-open behavior,
+        # this does NOT rely on `candidate_identity[number]` happening to be
+        # `None` (a malformed `body`/`closingIssuesReferences` payload can
+        # still carry a perfectly valid `headRefOid`/`mergeCommit`).
+        if c_payload is None:
+            unconfirmed_qualified_irrelevant_numbers.add(number)
+            continue
+        raw_body = c_payload.get("body")
+        raw_refs = c_payload.get("closingIssuesReferences")
+        if not isinstance(raw_body, str) or not isinstance(raw_refs, list):
+            # Field missing/None/wrong-type is authority-UNCONFIRMED, never
+            # equivalent to a verified empty `closingIssuesReferences: []`
+            # (which legitimately means "confirmed: no closing relation").
+            unconfirmed_qualified_irrelevant_numbers.add(number)
+            continue
+        if live_issue_body is None:
+            # The current target's own live body could not be fetched, so
+            # body-coverage cannot be freshly re-derived for anyone.
+            # `issue_body_sha256` is already `None` here, which
+            # independently drives `ok=False` below.
+            unconfirmed_qualified_irrelevant_numbers.add(number)
+            continue
+        live_body = raw_body
+        live_refs = raw_refs
+        live_closing = any(isinstance(ref, Mapping) and ref.get("number") == issue_number for ref in live_refs)
+        live_coverage = coverage_from_pr_body(
+            pr_body=live_body, issue_number=issue_number, live_issue_body=live_issue_body
+        )
+        probe_candidate = {"provenance": candidate.get("provenance") or {}, "scope_coverage": live_coverage}
+        still_irrelevant = (not live_closing) and _is_irrelevant_cross_reference(probe_candidate)
+        candidate_live_updates[number] = {
+            "scope_coverage": live_coverage,
+            "promote_closing_relation": live_closing,
+            "still_irrelevant": still_irrelevant,
+        }
+        if still_irrelevant:
+            excluded_candidate_numbers.add(number)
+        # else: decision-time live data now shows current-target authority
+        # (or a materially different marker state) -- the #2750 carve-out
+        # must NOT apply anymore; this candidate's identity stays required
+        # below, and `_apply_live_candidate_qualification_updates()` will
+        # hand it back to normal (non-carve-out) disposition handling.
 
     ok = (
         issue_body_sha256 is not None
         and main_head_sha is not None
-        and all(value is not None for value in candidate_identity.values())
+        and not unconfirmed_qualified_irrelevant_numbers
+        and all(
+            identity is not None
+            for number, identity in candidate_identity.items()
+            if number not in excluded_candidate_numbers
+        )
     )
     return {
         "ok": ok,
+        "unconfirmed_qualified_irrelevant_numbers": unconfirmed_qualified_irrelevant_numbers,
         "issue_body_sha256": issue_body_sha256,
         "main_head_sha": main_head_sha,
         "candidate_identity": candidate_identity,
+        "excluded_candidate_numbers": excluded_candidate_numbers,
+        "candidate_live_updates": candidate_live_updates,
     }
 
 
-def _freshness_matches(collected: Mapping[str, Any], live: Mapping[str, Any]) -> bool:
+def _freshness_matches(
+    collected: Mapping[str, Any],
+    live: Mapping[str, Any],
+    *,
+    excluded_candidate_numbers: Any = frozenset(),
+) -> bool:
     if not live.get("ok"):
         return False
     if collected.get("issue_body_sha256") != live.get("issue_body_sha256"):
         return False
     if collected.get("main_head_sha") != live.get("main_head_sha"):
         return False
-    return collected.get("candidate_identity") == live.get("candidate_identity")
+    excluded = set(excluded_candidate_numbers or ())
+    collected_identity = {
+        number: value for number, value in (collected.get("candidate_identity") or {}).items() if number not in excluded
+    }
+    live_identity = {
+        number: value for number, value in (live.get("candidate_identity") or {}).items() if number not in excluded
+    }
+    return collected_identity == live_identity
+
+
+def _apply_live_candidate_qualification_updates(
+    evidence: Mapping[str, Any], live_ref: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Apply `_live_freshness_reference()`'s decision-time re-derivation
+    (research Issue #2761) onto `evidence["candidates"]` before
+    `derive_landing_disposition()` runs, so its own `_is_irrelevant_cross_
+    reference()` re-check (candidate-local `scope_coverage` + `provenance`)
+    sees the FRESH decision-time classification rather than a stale
+    collection-time one (AC1). A candidate reconfirmed still-irrelevant gets
+    its `scope_coverage` refreshed (no behavior change). A candidate whose
+    live data now shows current-target authority (closingIssuesReferences
+    now names the current target) has its `provenance` promoted to
+    `closing_relation` so the EXISTING closing-priority disposition logic
+    takes over unchanged -- "existing target-authority handling proceeds
+    normally" rather than a bespoke un-exclusion branch."""
+    updates = live_ref.get("candidate_live_updates")
+    if not updates:
+        return dict(evidence)
+    candidates = evidence.get("candidates")
+    if not isinstance(candidates, list):
+        return dict(evidence)
+    updated_candidates: list[Any] = []
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            updated_candidates.append(candidate)
+            continue
+        pr = candidate.get("pr")
+        number = pr.get("number") if isinstance(pr, Mapping) else None
+        refresh = updates.get(number) if isinstance(number, int) else None
+        if refresh is None:
+            updated_candidates.append(candidate)
+            continue
+        updated = dict(candidate)
+        updated["scope_coverage"] = refresh["scope_coverage"]
+        updated["qualified_irrelevant_sibling"] = bool(refresh.get("still_irrelevant"))
+        if refresh.get("promote_closing_relation"):
+            updated["provenance"] = {"kind": "closing_relation", "verified": True}
+        updated_candidates.append(updated)
+    new_evidence = dict(evidence)
+    new_evidence["candidates"] = updated_candidates
+    return new_evidence
 
 
 def resolve_landing_disposition_with_freshness_rebind(
@@ -778,7 +954,9 @@ def resolve_landing_disposition_with_freshness_rebind(
             candidates=evidence.get("candidates") or [],
             run_command=run_command,
         )
-        if _freshness_matches(collected_ref, live_ref):
+        excluded_candidate_numbers = live_ref.get("excluded_candidate_numbers") or set()
+        if _freshness_matches(collected_ref, live_ref, excluded_candidate_numbers=excluded_candidate_numbers):
+            evidence = _apply_live_candidate_qualification_updates(evidence, live_ref)
             evidence["decision_time_rebind"] = {"status": "fresh"}
             evidence["landing_disposition"] = derive_landing_disposition(
                 evidence, repo=repo, issue_number=issue_number, now=now

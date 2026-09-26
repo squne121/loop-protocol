@@ -12,6 +12,13 @@ ROOT = Path(__file__).resolve().parents[4]
 ROUTE = ROOT / ".claude/skills/impl-review-loop/scripts/route_loop_verdict_v2.py"
 RUNTIME = ROOT / ".claude/skills/impl-review-loop/scripts/verify_implementation_landed_intake_runtime.py"
 
+# research Issue #2761: mirrors `implementation_landed_evidence.py`'s
+# `_LIVE_CANDIDATE_REFRESH_FIELDS` -- the decision-time per-candidate
+# `gh pr view` field list used by `_live_freshness_reference()`, now
+# including `body,closingIssuesReferences` so qualification can be freshly
+# re-derived at decision time (AC1).
+_LIVE_CANDIDATE_REFRESH_FIELDS = "headRefOid,mergedAt,mergeCommit,body,closingIssuesReferences"
+
 
 def _load(path: Path, name: str):
     spec = importlib.util.spec_from_file_location(name, path)
@@ -150,8 +157,20 @@ def test_collect_implementation_landed_evidence_applies_precedence_through_defau
         if argv[:2] == ["gh", "api"] and len(argv) > 2 and "commits/main" in argv[2]:
             return 0, main_sha + "\n", ""
         if argv[:3] == ["gh", "pr", "view"]:
-            if argv[-1] == "headRefOid,mergedAt,mergeCommit":
-                return 0, json.dumps({"headRefOid": "c" * 40, "mergedAt": None, "mergeCommit": None}), ""
+            if argv[-1] == _LIVE_CANDIDATE_REFRESH_FIELDS:
+                return (
+                    0,
+                    json.dumps(
+                        {
+                            "headRefOid": "c" * 40,
+                            "mergedAt": None,
+                            "mergeCommit": None,
+                            "body": "",
+                            "closingIssuesReferences": [{"number": 2119}],
+                        }
+                    ),
+                    "",
+                )
             return 0, pr_view_full, ""
         if argv[:3] == ["gh", "issue", "view"]:
             return 0, json.dumps({"body": "live body"}), ""
@@ -536,14 +555,19 @@ def test_collect_candidate_inputs_production_shaped_2727_sibling_cross_reference
         },
     ]
 
-    # #2750 PR #2758 review: `_LIGHT_PR_FIELDS` distinguishes the freshness-
-    # rebind `gh pr view --json headRefOid,mergedAt,mergeCommit` shape
+    # #2750 PR #2758 review / research Issue #2761: `_LIGHT_PR_FIELDS`
+    # distinguishes the freshness-rebind `gh pr view --json
+    # headRefOid,mergedAt,mergeCommit,body,closingIssuesReferences` shape
     # (`_live_freshness_reference()`) from the discovery-time
     # `gh pr view --json number,url,state,...` shape (`collect_candidate_
     # inputs()`) -- both real production call shapes the same fixture must
     # answer once this test continues through
-    # `resolve_landing_disposition_with_freshness_rebind()`.
-    _LIGHT_PR_FIELDS = "headRefOid,mergedAt,mergeCommit"
+    # `resolve_landing_disposition_with_freshness_rebind()`. #2761: the
+    # light-field response now also carries `body`/`closingIssuesReferences`
+    # so decision-time re-qualification independently reconfirms each
+    # sibling is still irrelevant from FRESH live data (never merely trusted
+    # from collection time).
+    _LIGHT_PR_FIELDS = _LIVE_CANDIDATE_REFRESH_FIELDS
 
     def run(argv):
         if argv[:3] == ["gh", "pr", "list"]:
@@ -565,7 +589,13 @@ def test_collect_candidate_inputs_production_shaped_2727_sibling_cross_reference
             return (
                 0,
                 json.dumps(
-                    {"headRefOid": "a" * 40, "mergedAt": "2026-09-01T00:00:00Z", "mergeCommit": {"oid": "a" * 40}}
+                    {
+                        "headRefOid": "a" * 40,
+                        "mergedAt": "2026-09-01T00:00:00Z",
+                        "mergeCommit": {"oid": "a" * 40},
+                        "body": marker_2735,
+                        "closingIssuesReferences": [{"number": 2725}],
+                    }
                 ),
                 "",
             )
@@ -573,7 +603,13 @@ def test_collect_candidate_inputs_production_shaped_2727_sibling_cross_reference
             return (
                 0,
                 json.dumps(
-                    {"headRefOid": "b" * 40, "mergedAt": "2026-09-02T00:00:00Z", "mergeCommit": {"oid": "b" * 40}}
+                    {
+                        "headRefOid": "b" * 40,
+                        "mergedAt": "2026-09-02T00:00:00Z",
+                        "mergeCommit": {"oid": "b" * 40},
+                        "body": marker_2746,
+                        "closingIssuesReferences": [{"number": 2726}],
+                    }
                 ),
                 "",
             )
@@ -618,19 +654,29 @@ def test_collect_candidate_inputs_production_shaped_2727_sibling_cross_reference
         if argv[:3] == ["gh", "issue", "view"] and argv[3] == str(target_issue):
             return 0, json.dumps({"body": target_issue_body}), ""
         if argv[:2] == ["gh", "api"] and len(argv) > 2 and "compare" in argv[2]:
+            # research Issue #2761: neither sibling's own main-ancestry
+            # compare may be invoked at all once qualified irrelevant
+            # (skip-by-construction) -- this branch existing/succeeding is
+            # not itself proof of correctness; `ancestry_compare_calls`
+            # below asserts it is never actually reached.
+            ancestry_compare_calls.append(argv)
             return 0, "ahead\n", ""
         if argv[:2] == ["gh", "api"] and len(argv) > 2 and "commits/main" in argv[2]:
             return 0, main_sha + "\n", ""
         return 1, "", "unexpected argv: " + " ".join(argv)
 
+    ancestry_compare_calls: list[list[str]] = []
     evidence = landed_evidence.collect_candidate_inputs(
         repo=repo, issue_number=target_issue, current_scope=target_issue_body, run_command=run
     )
+    assert ancestry_compare_calls == []
     assert len(evidence["candidates"]) == 2
     for candidate in evidence["candidates"]:
         assert candidate["provenance"]["kind"] == "verified_cross_reference"
         assert candidate["scope_coverage"]["status"] == "invalid"
         assert candidate["scope_coverage"]["errors"] == ["scope_coverage_issue_identity_mismatch"]
+        assert candidate["qualified_irrelevant_sibling"] is True
+        assert candidate["main_ancestry"] == {"verified": False, "reachable": False}
 
     result = landed_evidence.derive_landing_disposition(evidence, repo=repo, issue_number=target_issue)
     assert result["disposition"] == "ordinary_dispatch_or_explicit_recovery"

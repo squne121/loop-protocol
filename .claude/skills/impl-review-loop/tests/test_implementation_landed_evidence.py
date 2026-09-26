@@ -7,6 +7,7 @@ import json
 import sys
 import types
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[4]
 SCRIPT = ROOT / ".claude/skills/impl-review-loop/scripts/implementation_landed_evidence.py"
@@ -25,6 +26,14 @@ route_spec.loader.exec_module(route_mod)
 REPO = "squne121/loop-protocol"
 ISSUE = 2119
 SHA = "a" * 40
+
+# Sentinels for `_build_pipeline_run()`'s sibling live-field overrides
+# (research Issue #2761 P1-2 regressions): `_UNSET` means "use the default
+# derivation", `_MISSING_FIELD` means "omit the key entirely from the live
+# `gh pr view` JSON payload" (distinct from an explicit `None` value, which
+# callers pass directly as the override).
+_UNSET = object()
+_MISSING_FIELD = object()
 
 
 def _candidate(
@@ -523,7 +532,19 @@ def test_decision_time_freshness_rebind_and_bounded_retry():
         )
 
     def _pr_view_identity_response():
-        return 0, json.dumps({"headRefOid": SHA, "mergedAt": None, "mergeCommit": None}), ""
+        return (
+            0,
+            json.dumps(
+                {
+                    "headRefOid": SHA,
+                    "mergedAt": None,
+                    "mergeCommit": None,
+                    "body": "",
+                    "closingIssuesReferences": [{"number": ISSUE}],
+                }
+            ),
+            "",
+        )
 
     def make_run(main_sha_sequence):
         state = {"main_sha_calls": 0, "pr_list_calls": 0}
@@ -539,7 +560,7 @@ def test_decision_time_freshness_rebind_and_bounded_retry():
                 state["main_sha_calls"] += 1
                 return 0, sha, ""
             if argv[:3] == ["gh", "pr", "view"]:
-                if argv[-1] == "headRefOid,mergedAt,mergeCommit":
+                if argv[-1] == mod._LIVE_CANDIDATE_REFRESH_FIELDS:
                     return _pr_view_identity_response()
                 return _pr_view_full_response()
             if argv[:3] == ["gh", "issue", "view"]:
@@ -1073,3 +1094,643 @@ def test_is_irrelevant_cross_reference_unit_boundaries():
         provenance="verified_cross_reference", scope_coverage=_sibling_identity_mismatch_coverage(other_issue_number=1)
     )
     assert mod._is_irrelevant_cross_reference(single_identity_mismatch) is True
+
+
+# ---------------------------------------------------------------------------
+# research Issue #2761 (follow-up to PR #2758): once an irrelevant sibling
+# candidate is freshly qualified (its own live body/closingIssuesReferences
+# reduce to a lone `scope_coverage_issue_identity_mismatch`, no current-
+# target closing relation), neither `collect_candidate_inputs()`'s
+# materialization/ancestry-compare handling nor `_live_freshness_reference()`
+# 's decision-time re-fetch may propagate that sibling's own transport
+# failures or drift into the CURRENT target's `reconciliation_required`/
+# `freshness_rebind_failed`.
+# ---------------------------------------------------------------------------
+
+_REAL_PR = 3000
+_SIBLING_PR = 3100
+_SIBLING_OTHER_ISSUE = 9001
+_TARGET_ISSUE_BODY = "## Allowed Paths\n- `.claude/a.py`\n"
+
+
+def _sibling_marker_body(
+    *,
+    other_issue_number=_SIBLING_OTHER_ISSUE,
+    other_issue_body="## Allowed Paths\n- `.claude/other.py`\n",
+    pr_head_sha=None,
+):
+    return mod.render_scope_coverage_marker(
+        mod.build_scope_coverage_marker(
+            issue_number=other_issue_number, issue_body=other_issue_body, pr_head_sha=pr_head_sha or ("f" * 40)
+        )
+    )
+
+
+def _real_marker_body(*, target_issue_body=_TARGET_ISSUE_BODY, pr_head_sha):
+    return mod.render_scope_coverage_marker(
+        mod.build_scope_coverage_marker(issue_number=ISSUE, issue_body=target_issue_body, pr_head_sha=pr_head_sha)
+    )
+
+
+_LIFECYCLE_SHAPES = {
+    "merged": {"state": "MERGED", "is_draft": False, "merged_at": "2026-01-02T00:00:00Z"},
+    "open": {"state": "OPEN", "is_draft": False, "merged_at": None},
+    "draft": {"state": "OPEN", "is_draft": True, "merged_at": None},
+    "closed_unmerged": {"state": "CLOSED", "is_draft": False, "merged_at": None},
+}
+
+
+def _build_pipeline_run(
+    *,
+    include_real_candidate: bool = True,
+    target_issue_body: str = _TARGET_ISSUE_BODY,
+    real_head_sha: str = "1" * 40,
+    sibling_lifecycle: str = "merged",
+    sibling_collect_head_sha: str = "2" * 40,
+    sibling_live_head_sha: str | None = None,
+    sibling_collect_body: str | None = None,
+    sibling_live_body: str | None = None,
+    sibling_live_closing: bool = False,
+    sibling_ancestry_call_should_fail: bool = True,
+    sibling_light_fetch_fails: bool = False,
+    sibling_live_body_field_override: Any = _UNSET,
+    sibling_live_refs_field_override: Any = _UNSET,
+    main_sha: str = "9" * 40,
+):
+    """Production-shaped `run_command` mock covering the FULL
+    `collect_candidate_inputs()` -> `_live_freshness_reference()` call graph
+    for one genuine current-target candidate (optional) plus one sibling
+    `verified_cross_reference` candidate discovered only via the GitHub
+    timeline (never `gh pr list`, matching the #2727 incident shape)."""
+    sibling_collect_body = (
+        sibling_collect_body
+        if sibling_collect_body is not None
+        else _sibling_marker_body(pr_head_sha=sibling_collect_head_sha)
+    )
+    sibling_live_body = sibling_live_body if sibling_live_body is not None else sibling_collect_body
+    sibling_live_head_sha = sibling_live_head_sha or sibling_collect_head_sha
+
+    real_body = _real_marker_body(target_issue_body=target_issue_body, pr_head_sha=real_head_sha)
+    real_shape = _LIFECYCLE_SHAPES["merged"]
+    real_merge_commit = {"oid": real_head_sha}
+
+    sibling_shape = _LIFECYCLE_SHAPES[sibling_lifecycle]
+    sibling_merge_commit_collect = {"oid": sibling_collect_head_sha} if sibling_lifecycle == "merged" else None
+    sibling_merge_commit_live = {"oid": sibling_live_head_sha} if sibling_lifecycle == "merged" else None
+
+    calls = {"ancestry_compare": 0}
+
+    def run(argv):
+        if argv[:3] == ["gh", "pr", "list"]:
+            rows = (
+                [{"number": _REAL_PR, "closingIssuesReferences": [{"number": ISSUE}]}] if include_real_candidate else []
+            )
+            return 0, json.dumps(rows), ""
+        if argv[:2] == ["gh", "api"] and len(argv) > 2 and "timeline" in argv[-1]:
+            return (
+                0,
+                json.dumps(
+                    [
+                        {
+                            "event": "cross-referenced",
+                            "source": {
+                                "issue": {
+                                    "number": _SIBLING_PR,
+                                    "pull_request": {"url": f"https://api.github.com/repos/{REPO}/pulls/{_SIBLING_PR}"},
+                                    "repository_url": f"https://api.github.com/repos/{REPO}",
+                                }
+                            },
+                        }
+                    ]
+                ),
+                "",
+            )
+        if argv[:2] == ["gh", "api"] and len(argv) > 2 and "compare" in argv[2]:
+            # Only the REAL candidate's ancestry compare may legitimately be
+            # invoked (skip-by-construction must prevent the sibling's own
+            # compare call from ever happening at all). If the sibling's
+            # merge_oid shows up here, this is exactly the bug under test --
+            # fail loudly rather than silently answering it.
+            if sibling_collect_head_sha in argv[2]:
+                calls["ancestry_compare"] += 1
+                if sibling_ancestry_call_should_fail:
+                    return 1, "", "simulated ancestry compare transport failure"
+                return 0, "ahead\n", ""
+            return 0, "ahead\n", ""
+        if argv[:2] == ["gh", "api"] and len(argv) > 2 and "commits/main" in argv[2]:
+            return 0, main_sha + "\n", ""
+        if argv[:3] == ["gh", "pr", "view"]:
+            number = argv[3]
+            if argv[-1] == mod._LIVE_CANDIDATE_REFRESH_FIELDS:
+                if number == str(_REAL_PR):
+                    return (
+                        0,
+                        json.dumps(
+                            {
+                                "headRefOid": real_head_sha,
+                                "mergedAt": real_shape["merged_at"],
+                                "mergeCommit": real_merge_commit,
+                                "body": real_body,
+                                "closingIssuesReferences": [{"number": ISSUE}],
+                            }
+                        ),
+                        "",
+                    )
+                if number == str(_SIBLING_PR):
+                    if sibling_light_fetch_fails:
+                        return 1, "", "simulated sibling live fetch transport failure"
+                    refs = [{"number": ISSUE}] if sibling_live_closing else [{"number": _SIBLING_OTHER_ISSUE}]
+                    if sibling_live_refs_field_override is not _UNSET:
+                        refs = sibling_live_refs_field_override
+                    body_value = sibling_live_body
+                    if sibling_live_body_field_override is not _UNSET:
+                        body_value = sibling_live_body_field_override
+                    live_payload = {
+                        "headRefOid": sibling_live_head_sha,
+                        "mergedAt": sibling_shape["merged_at"],
+                        "mergeCommit": sibling_merge_commit_live,
+                        "body": body_value,
+                        "closingIssuesReferences": refs,
+                    }
+                    if live_payload["body"] is _MISSING_FIELD:
+                        del live_payload["body"]
+                    if live_payload["closingIssuesReferences"] is _MISSING_FIELD:
+                        del live_payload["closingIssuesReferences"]
+                    return (0, json.dumps(live_payload), "")
+                return 1, "", f"unexpected light-field pr view for {number}"
+            if number == str(_REAL_PR):
+                return (
+                    0,
+                    json.dumps(
+                        {
+                            "number": _REAL_PR,
+                            "url": f"https://github.com/{REPO}/pull/{_REAL_PR}",
+                            "state": real_shape["state"],
+                            "isDraft": real_shape["is_draft"],
+                            "mergedAt": real_shape["merged_at"],
+                            "mergeCommit": real_merge_commit,
+                            "headRefOid": real_head_sha,
+                            "closingIssuesReferences": [{"number": ISSUE}],
+                            "body": real_body,
+                            "files": [],
+                        }
+                    ),
+                    "",
+                )
+            if number == str(_SIBLING_PR):
+                return (
+                    0,
+                    json.dumps(
+                        {
+                            "number": _SIBLING_PR,
+                            "url": f"https://github.com/{REPO}/pull/{_SIBLING_PR}",
+                            "state": sibling_shape["state"],
+                            "isDraft": sibling_shape["is_draft"],
+                            "mergedAt": sibling_shape["merged_at"],
+                            "mergeCommit": sibling_merge_commit_collect,
+                            "headRefOid": sibling_collect_head_sha,
+                            "closingIssuesReferences": [],
+                            "body": sibling_collect_body,
+                            "files": [],
+                        }
+                    ),
+                    "",
+                )
+            return 1, "", f"unexpected pr view for {number}"
+        if argv[:3] == ["gh", "issue", "view"]:
+            return 0, json.dumps({"body": target_issue_body}), ""
+        return 1, "", "unexpected argv: " + " ".join(argv)
+
+    return run, calls
+
+
+def test_freshness_rebind_irrelevant_sibling_across_all_lifecycles_does_not_block_target():
+    """AC1/AC2 (scenarios 1-4): GIVEN a genuine merged closing-relation
+    candidate for the CURRENT target Issue, together with a qualified-
+    irrelevant `verified_cross_reference` sibling candidate whose own marker
+    names a different Issue, in each of the open/draft/merged/closed_unmerged
+    lifecycle shapes, WHEN `resolve_landing_disposition_with_freshness_
+    rebind()` runs THEN the sibling never causes `reconciliation_required`/
+    `freshness_rebind_failed` for the current target -- the genuine
+    candidate's `implementation_already_landed` disposition is reached in
+    every case, and (for the merged sibling) the main-ancestry compare
+    transport call is never even attempted (skip-by-construction)."""
+    for lifecycle in ("open", "draft", "merged", "closed_unmerged"):
+        run, calls = _build_pipeline_run(sibling_lifecycle=lifecycle, sibling_ancestry_call_should_fail=True)
+        result = mod.resolve_landing_disposition_with_freshness_rebind(
+            repo=REPO, issue_number=ISSUE, current_scope=_TARGET_ISSUE_BODY, run_command=run
+        )
+        assert result["decision_time_rebind"]["status"] == "fresh", lifecycle
+        assert result["landing_disposition"]["disposition"] == "implementation_already_landed", lifecycle
+        assert result["landing_disposition"]["reason_codes"] != ["qualified_candidate_conflict"], lifecycle
+        if lifecycle == "merged":
+            assert calls["ancestry_compare"] == 0, "merged sibling ancestry compare must be skipped by construction"
+
+
+def test_collect_candidate_inputs_skips_ancestry_compare_for_qualified_irrelevant_merged_sibling():
+    """AC2 (scenario 5): GIVEN a merged `verified_cross_reference` candidate
+    already qualified as an irrelevant sibling (own marker names a different
+    Issue) WHEN `collect_candidate_inputs()` runs THEN the merged main-
+    ancestry compare transport call is never invoked for it (skip-by-
+    construction) and `_candidate_errors()`/`validate_implementation_landed_
+    evidence()` never raises `merged_candidate_main_ancestry_unverified` for
+    it, so a would-be ancestry-compare transport failure never reaches the
+    current target's disposition."""
+    sibling_body = _sibling_marker_body(pr_head_sha="2" * 40)
+    rows = [{"number": _REAL_PR, "closingIssuesReferences": [{"number": ISSUE}]}]
+    timeline = [
+        {
+            "event": "cross-referenced",
+            "source": {
+                "issue": {
+                    "number": _SIBLING_PR,
+                    "pull_request": {"url": f"https://api.github.com/repos/{REPO}/pulls/{_SIBLING_PR}"},
+                    "repository_url": f"https://api.github.com/repos/{REPO}",
+                }
+            },
+        }
+    ]
+    real_body = _real_marker_body(pr_head_sha="1" * 40)
+    calls = {"ancestry_compare": 0}
+
+    def run(argv):
+        if argv[:3] == ["gh", "pr", "list"]:
+            return 0, json.dumps(rows), ""
+        if argv[:2] == ["gh", "api"] and len(argv) > 2 and "timeline" in argv[-1]:
+            return 0, json.dumps(timeline), ""
+        if argv[:2] == ["gh", "api"] and len(argv) > 2 and "compare" in argv[2]:
+            # Only the sibling's own ancestry compare (identified by its
+            # merge_oid) must never happen (skip-by-construction). The
+            # REAL candidate's own ancestry compare is a separate,
+            # legitimate call that must still succeed.
+            if ("2" * 40) in argv[2]:
+                calls["ancestry_compare"] += 1
+                return 1, "", "simulated ancestry compare transport failure"
+            return 0, "ahead\n", ""
+        if argv[:2] == ["gh", "api"] and len(argv) > 2 and "commits/main" in argv[2]:
+            return 0, "9" * 40 + "\n", ""
+        if argv[:3] == ["gh", "pr", "view"] and argv[3] == str(_REAL_PR):
+            return (
+                0,
+                json.dumps(
+                    {
+                        "number": _REAL_PR,
+                        "url": f"https://github.com/{REPO}/pull/{_REAL_PR}",
+                        "state": "MERGED",
+                        "isDraft": False,
+                        "mergedAt": "2026-01-01T00:00:00Z",
+                        "mergeCommit": {"oid": "1" * 40},
+                        "headRefOid": "1" * 40,
+                        "closingIssuesReferences": [{"number": ISSUE}],
+                        "body": real_body,
+                        "files": [],
+                    }
+                ),
+                "",
+            )
+        if argv[:3] == ["gh", "pr", "view"] and argv[3] == str(_SIBLING_PR):
+            return (
+                0,
+                json.dumps(
+                    {
+                        "number": _SIBLING_PR,
+                        "url": f"https://github.com/{REPO}/pull/{_SIBLING_PR}",
+                        "state": "MERGED",
+                        "isDraft": False,
+                        "mergedAt": "2026-01-02T00:00:00Z",
+                        "mergeCommit": {"oid": "2" * 40},
+                        "headRefOid": "2" * 40,
+                        "closingIssuesReferences": [],
+                        "body": sibling_body,
+                        "files": [],
+                    }
+                ),
+                "",
+            )
+        return 1, "", "unexpected argv: " + " ".join(argv)
+
+    evidence = mod.collect_candidate_inputs(
+        repo=REPO, issue_number=ISSUE, current_scope=_TARGET_ISSUE_BODY, run_command=run
+    )
+    assert calls["ancestry_compare"] == 0
+    sibling_candidate = next(c for c in evidence["candidates"] if c["pr"]["number"] == _SIBLING_PR)
+    assert sibling_candidate["qualified_irrelevant_sibling"] is True
+    assert sibling_candidate["main_ancestry"] == {"verified": False, "reachable": False}
+    validated = mod.validate_implementation_landed_evidence(evidence, repo=REPO, issue_number=ISSUE)
+    assert validated["valid"] is True, validated["errors"]
+    result = mod.derive_landing_disposition(evidence, repo=REPO, issue_number=ISSUE)
+    assert result["disposition"] == "implementation_already_landed"
+
+
+def test_collect_candidate_inputs_sibling_live_body_fetch_failure_stays_fail_closed():
+    """AC3 (scenario 6): GIVEN a discovered sibling candidate whose OWN `gh
+    pr view` detail/body fetch fails during `collect_candidate_inputs()`
+    (qualification itself cannot be attempted without a live body) WHEN
+    evidence is validated THEN it stays fail-closed
+    (`materialization_failures` records it, `contradictory` is True, and
+    `derive_landing_disposition()` returns `reconciliation_required`) exactly
+    as before this fix -- this failure mode is untouched by the #2750/#2761
+    carve-out, which only ever applies to a candidate whose live body WAS
+    successfully fetched."""
+    rows = [{"number": _REAL_PR, "closingIssuesReferences": [{"number": ISSUE}]}]
+    timeline = [
+        {
+            "event": "cross-referenced",
+            "source": {
+                "issue": {
+                    "number": _SIBLING_PR,
+                    "pull_request": {"url": f"https://api.github.com/repos/{REPO}/pulls/{_SIBLING_PR}"},
+                    "repository_url": f"https://api.github.com/repos/{REPO}",
+                }
+            },
+        }
+    ]
+    real_body = _real_marker_body(pr_head_sha="1" * 40)
+
+    def run(argv):
+        if argv[:3] == ["gh", "pr", "list"]:
+            return 0, json.dumps(rows), ""
+        if argv[:2] == ["gh", "api"] and len(argv) > 2 and "timeline" in argv[-1]:
+            return 0, json.dumps(timeline), ""
+        if argv[:2] == ["gh", "api"] and len(argv) > 2 and "commits/main" in argv[2]:
+            return 0, "9" * 40 + "\n", ""
+        if argv[:3] == ["gh", "pr", "view"] and argv[3] == str(_REAL_PR):
+            return (
+                0,
+                json.dumps(
+                    {
+                        "number": _REAL_PR,
+                        "url": f"https://github.com/{REPO}/pull/{_REAL_PR}",
+                        "state": "MERGED",
+                        "isDraft": False,
+                        "mergedAt": "2026-01-01T00:00:00Z",
+                        "mergeCommit": {"oid": "1" * 40},
+                        "headRefOid": "1" * 40,
+                        "closingIssuesReferences": [{"number": ISSUE}],
+                        "body": real_body,
+                        "files": [],
+                    }
+                ),
+                "",
+            )
+        if argv[:3] == ["gh", "pr", "view"] and argv[3] == str(_SIBLING_PR):
+            return 1, "", "simulated sibling detail fetch transport failure"
+        return 1, "", "unexpected argv: " + " ".join(argv)
+
+    evidence = mod.collect_candidate_inputs(
+        repo=REPO, issue_number=ISSUE, current_scope=_TARGET_ISSUE_BODY, run_command=run
+    )
+    assert evidence["materialization_failures"] == [_SIBLING_PR]
+    assert evidence["contradictory"] is True
+    result = mod.derive_landing_disposition(evidence, repo=REPO, issue_number=ISSUE)
+    assert result["disposition"] == "reconciliation_required"
+    assert "evidence_contradictory" in result["reason_codes"]
+
+
+def test_freshness_rebind_reconfirms_irrelevant_sibling_from_changed_decision_time_body():
+    """AC1 (scenario 7): GIVEN a sibling candidate whose PR body differs
+    between collection time and decision time (different wording / a
+    different named sibling Issue number) BUT both independently re-derive
+    to a lone `scope_coverage_issue_identity_mismatch` WHEN `resolve_landing_
+    disposition_with_freshness_rebind()` runs THEN qualification succeeds
+    from the FRESH decision-time re-parse -- never requiring byte-equality
+    to the collection-time body -- and the current target's genuine
+    candidate still reaches `implementation_already_landed`."""
+    collect_body = _sibling_marker_body(other_issue_number=9001, pr_head_sha="2" * 40)
+    live_body = _sibling_marker_body(other_issue_number=9002, pr_head_sha="2" * 40)
+    assert collect_body != live_body
+
+    run, _calls = _build_pipeline_run(
+        sibling_lifecycle="merged",
+        sibling_collect_body=collect_body,
+        sibling_live_body=live_body,
+    )
+    result = mod.resolve_landing_disposition_with_freshness_rebind(
+        repo=REPO, issue_number=ISSUE, current_scope=_TARGET_ISSUE_BODY, run_command=run
+    )
+    assert result["decision_time_rebind"]["status"] == "fresh"
+    assert result["landing_disposition"]["disposition"] == "implementation_already_landed"
+
+
+def test_freshness_rebind_sibling_now_showing_current_target_authority_is_not_excluded():
+    """AC1 (scenario 8): GIVEN a sole sibling candidate that was collection-
+    time-qualified irrelevant, but whose LIVE decision-time
+    `closingIssuesReferences` now names the CURRENT target Issue WHEN
+    `resolve_landing_disposition_with_freshness_rebind()` runs THEN the
+    #2750/#2761 carve-out must NOT apply -- the sibling is promoted back to
+    normal `closing_relation` handling (existing target-authority handling
+    proceeds normally) and, because its own marker still names a different
+    Issue, the EXISTING fail-closed closing-relation-with-mismatched-marker
+    behavior fires (`reconciliation_required`), never a silently-excluded
+    `no_qualified_candidate`."""
+    run, _calls = _build_pipeline_run(
+        include_real_candidate=False,
+        sibling_lifecycle="open",
+        sibling_live_closing=True,
+    )
+    result = mod.resolve_landing_disposition_with_freshness_rebind(
+        repo=REPO, issue_number=ISSUE, current_scope=_TARGET_ISSUE_BODY, run_command=run
+    )
+    assert result["decision_time_rebind"]["status"] == "fresh"
+    assert result["landing_disposition"]["disposition"] == "reconciliation_required"
+    assert result["landing_disposition"]["reason_codes"] == ["scope_coverage_issue_identity_mismatch"]
+    assert result["landing_disposition"]["candidate"]["pr"]["number"] == _SIBLING_PR
+    assert result["landing_disposition"]["candidate"]["provenance"]["kind"] == "closing_relation"
+
+
+def test_freshness_rebind_markerless_legacy_sibling_never_enters_carve_out_path():
+    """AC3/scenario 9: GIVEN a markerless (legacy, #2119/PR #2137-shaped)
+    `verified_cross_reference` sibling candidate coexisting with a genuine
+    current-target candidate WHEN `resolve_landing_disposition_with_
+    freshness_rebind()` runs THEN the markerless candidate is never
+    misclassified as `qualified_irrelevant_sibling` (the carve-out only
+    fires for a marker that parsed with the single identity-mismatch error,
+    never for an absent marker) and legacy markerless compatibility is
+    unaffected."""
+    run, _calls = _build_pipeline_run(sibling_lifecycle="open", sibling_collect_body="", sibling_live_body="")
+    result = mod.resolve_landing_disposition_with_freshness_rebind(
+        repo=REPO, issue_number=ISSUE, current_scope=_TARGET_ISSUE_BODY, run_command=run
+    )
+    sibling_candidate = next(c for c in result["candidates"] if c["pr"]["number"] == _SIBLING_PR)
+    assert sibling_candidate["qualified_irrelevant_sibling"] is False
+    assert result["decision_time_rebind"]["status"] == "fresh"
+    assert result["landing_disposition"]["disposition"] == "implementation_already_landed"
+
+
+def test_collect_candidate_inputs_compound_marker_error_sibling_is_not_qualified_irrelevant():
+    """AC3/scenario 10: GIVEN a sibling `verified_cross_reference` candidate
+    whose own marker error set is identity-mismatch PLUS another marker
+    error (compound failure, e.g. a corrupted `scope_manifest` digest) WHEN
+    `collect_candidate_inputs()` runs THEN it is NOT flagged `qualified_
+    irrelevant_sibling` (stays fail-closed / in conflict counting), and its
+    merged main-ancestry compare is NOT skipped (the skip-by-construction
+    carve-out never applies to it)."""
+    marker = mod.build_scope_coverage_marker(
+        issue_number=_SIBLING_OTHER_ISSUE, issue_body="## Allowed Paths\n- `.claude/other.py`\n", pr_head_sha="2" * 40
+    )
+    marker[mod.COVERAGE_SCHEMA]["normalized_scope_manifest_sha256"] = "sha256:" + "0" * 64  # corrupt digest
+    corrupted_body = mod.render_scope_coverage_marker(marker)
+
+    rows: list[dict] = []
+    timeline = [
+        {
+            "event": "cross-referenced",
+            "source": {
+                "issue": {
+                    "number": _SIBLING_PR,
+                    "pull_request": {"url": f"https://api.github.com/repos/{REPO}/pulls/{_SIBLING_PR}"},
+                    "repository_url": f"https://api.github.com/repos/{REPO}",
+                }
+            },
+        }
+    ]
+    calls = {"ancestry_compare": 0}
+
+    def run(argv):
+        if argv[:3] == ["gh", "pr", "list"]:
+            return 0, json.dumps(rows), ""
+        if argv[:2] == ["gh", "api"] and len(argv) > 2 and "timeline" in argv[-1]:
+            return 0, json.dumps(timeline), ""
+        if argv[:2] == ["gh", "api"] and len(argv) > 2 and "compare" in argv[2]:
+            calls["ancestry_compare"] += 1
+            return 0, "ahead\n", ""
+        if argv[:2] == ["gh", "api"] and len(argv) > 2 and "commits/main" in argv[2]:
+            return 0, "9" * 40 + "\n", ""
+        if argv[:3] == ["gh", "pr", "view"] and argv[3] == str(_SIBLING_PR):
+            return (
+                0,
+                json.dumps(
+                    {
+                        "number": _SIBLING_PR,
+                        "url": f"https://github.com/{REPO}/pull/{_SIBLING_PR}",
+                        "state": "MERGED",
+                        "isDraft": False,
+                        "mergedAt": "2026-01-02T00:00:00Z",
+                        "mergeCommit": {"oid": "2" * 40},
+                        "headRefOid": "2" * 40,
+                        "closingIssuesReferences": [],
+                        "body": corrupted_body,
+                        "files": [],
+                    }
+                ),
+                "",
+            )
+        return 1, "", "unexpected argv: " + " ".join(argv)
+
+    evidence = mod.collect_candidate_inputs(
+        repo=REPO, issue_number=ISSUE, current_scope=_TARGET_ISSUE_BODY, run_command=run
+    )
+    sibling_candidate = evidence["candidates"][0]
+    assert sibling_candidate["pr"]["number"] == _SIBLING_PR
+    assert sibling_candidate["qualified_irrelevant_sibling"] is False
+    assert set(sibling_candidate["scope_coverage"]["errors"]) == {
+        "scope_coverage_issue_identity_mismatch",
+        "scope_coverage_manifest_digest_mismatch",
+    }
+    assert calls["ancestry_compare"] == 1
+    result = mod.derive_landing_disposition(evidence, repo=REPO, issue_number=ISSUE)
+    assert result["disposition"] == "reconciliation_required"
+
+
+def test_freshness_rebind_open_draft_sibling_head_drift_does_not_fail_target_freshness():
+    """AC2/AC6 (scenario 11, extended by research Issue #2761 P2-3): GIVEN
+    an open/draft/closed-unmerged `verified_cross_reference` sibling
+    candidate already qualified irrelevant at collection time, whose live
+    `headRefOid` DRIFTS between collection and decision time (still freshly
+    reconfirmed irrelevant otherwise, from FRESH decision-time body +
+    closing-relation authority) WHEN `resolve_landing_disposition_with_
+    freshness_rebind()` runs THEN this head drift does not cause
+    `freshness_rebind_failed`/`reconciliation_required` for the current
+    target -- the genuine current-target candidate still reaches
+    `implementation_already_landed` -- including for a CLOSED-UNMERGED
+    sibling, not just open/draft."""
+    for lifecycle in ("open", "draft", "closed_unmerged"):
+        run, _calls = _build_pipeline_run(
+            sibling_lifecycle=lifecycle,
+            sibling_collect_head_sha="2" * 40,
+            sibling_live_head_sha="3" * 40,
+        )
+        result = mod.resolve_landing_disposition_with_freshness_rebind(
+            repo=REPO, issue_number=ISSUE, current_scope=_TARGET_ISSUE_BODY, run_command=run
+        )
+        assert result["decision_time_rebind"]["status"] == "fresh", lifecycle
+        assert result["landing_disposition"]["disposition"] == "implementation_already_landed", lifecycle
+
+
+def test_freshness_rebind_qualified_sibling_decision_time_fetch_failure_is_unknown_not_confirmed_irrelevant():
+    """research Issue #2761 P1-1/P2-1 (blocker regression): GIVEN a
+    collection-time-qualified-irrelevant `verified_cross_reference` sibling
+    candidate whose decision-time `gh pr view` (`_LIVE_CANDIDATE_REFRESH_
+    FIELDS`) transport call FAILS WHEN `resolve_landing_disposition_with_
+    freshness_rebind()` runs THEN the candidate is treated as UNKNOWN, never
+    as "still confirmed irrelevant" -- fresh authority (`body`/
+    `closingIssuesReferences`) could not be re-derived, so it is NOT
+    excluded from the freshness identity requirement, and (after the
+    existing bounded retry, which also cannot reconfirm it because the same
+    transport failure persists) the overall result is `reconciliation_
+    required` / `freshness_rebind_failed` -- exactly the same fail-closed
+    outcome as any other decision-time transport failure, never a silent
+    fail-open pass-through for the current target."""
+    run, _calls = _build_pipeline_run(sibling_lifecycle="merged", sibling_light_fetch_fails=True)
+    result = mod.resolve_landing_disposition_with_freshness_rebind(
+        repo=REPO, issue_number=ISSUE, current_scope=_TARGET_ISSUE_BODY, run_command=run
+    )
+    assert result["decision_time_rebind"]["status"] == "stale"
+    assert result["landing_disposition"]["disposition"] == "reconciliation_required"
+    assert result["landing_disposition"]["reason_codes"] == ["freshness_rebind_failed"]
+
+
+def test_freshness_rebind_qualified_sibling_unverified_closing_authority_is_not_confirmed_irrelevant():
+    """research Issue #2761 P1-2/P2-2 (blocker regression, parameterized):
+    GIVEN a collection-time-qualified-irrelevant `verified_cross_reference`
+    sibling candidate whose decision-time `gh pr view` response has a
+    `body` or `closingIssuesReferences` field that is MISSING / `None` /
+    the wrong type WHEN `resolve_landing_disposition_with_freshness_
+    rebind()` runs THEN that field-level ambiguity is never treated as
+    "verified: no closing relation" or "verified: empty body" -- the
+    candidate's fresh negative qualification cannot be re-derived, so it
+    stays UNKNOWN (not excluded from the freshness identity requirement),
+    and the bounded-retried result is `reconciliation_required` /
+    `freshness_rebind_failed` in every boundary case."""
+    boundary_cases = (
+        ("body", _MISSING_FIELD),
+        ("body", None),
+        ("body", 12345),
+        ("closingIssuesReferences", _MISSING_FIELD),
+        ("closingIssuesReferences", None),
+        ("closingIssuesReferences", "not-a-list"),
+    )
+    for field, bad_value in boundary_cases:
+        overrides = {
+            "sibling_live_body_field_override": bad_value if field == "body" else _UNSET,
+            "sibling_live_refs_field_override": bad_value if field == "closingIssuesReferences" else _UNSET,
+        }
+        run, _calls = _build_pipeline_run(sibling_lifecycle="merged", **overrides)
+        result = mod.resolve_landing_disposition_with_freshness_rebind(
+            repo=REPO, issue_number=ISSUE, current_scope=_TARGET_ISSUE_BODY, run_command=run
+        )
+        label = f"{field}={bad_value!r}"
+        assert result["decision_time_rebind"]["status"] == "stale", label
+        assert result["landing_disposition"]["disposition"] == "reconciliation_required", label
+        assert result["landing_disposition"]["reason_codes"] == ["freshness_rebind_failed"], label
+
+
+def test_freshness_rebind_qualified_sibling_verified_empty_closing_refs_still_confirms_irrelevant():
+    """research Issue #2761 P1-2 (positive control): GIVEN a collection-
+    time-qualified-irrelevant sibling candidate whose decision-time
+    `closingIssuesReferences` is a VERIFIED (successfully fetched, correctly
+    typed) empty list `[]` WHEN `resolve_landing_disposition_with_
+    freshness_rebind()` runs THEN this is treated as "confirmed: no closing
+    relation" (not as unconfirmed authority) -- the sibling's fresh negative
+    qualification succeeds normally and the genuine current-target candidate
+    still reaches `implementation_already_landed`, proving `[]` and
+    missing/None/invalid-type are NOT conflated."""
+    run, _calls = _build_pipeline_run(
+        sibling_lifecycle="merged",
+        sibling_live_refs_field_override=[],
+    )
+    result = mod.resolve_landing_disposition_with_freshness_rebind(
+        repo=REPO, issue_number=ISSUE, current_scope=_TARGET_ISSUE_BODY, run_command=run
+    )
+    assert result["decision_time_rebind"]["status"] == "fresh"
+    assert result["landing_disposition"]["disposition"] == "implementation_already_landed"
