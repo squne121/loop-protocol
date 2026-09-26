@@ -129,8 +129,8 @@ RULES: list[dict[str, Any]] = [
     {
         "rule_id": "github_token_classic",
         "source_kind": "github_token",
-        "pattern": re.compile(r"gh[pousr]_[A-Za-z0-9]{36,255}"),
-        "description": "GitHub classic PAT or OAuth token (length range updated for 2026 formats)",
+        "pattern": re.compile(r"(?:gh[pour]_[A-Za-z0-9]{36,255}|ghs_[A-Za-z0-9._-]{36,})"),
+        "description": "GitHub classic PAT/OAuth token or ghs_ App install token (single non-overlapping alternation)",
     },
     {
         "rule_id": "github_fine_grained_pat",
