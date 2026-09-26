@@ -25,4 +25,5 @@ Safety Claim Matrix の Claim が有限の複数 subclaim（例: 複数トーク
 
 - Evidence が **test** の場合のみ、`references/ac-evidence-checks.md` の Enumerated / Exhaustive Claim Evidence Coverage rule（case identity AND relevant executable assertion が PASS していること）を適用する。
 - Evidence が test 以外（source/configuration inspection、policy/config diff、permission declaration、runtime artifact、CI/CheckRun、deterministic validator output 等）の場合は、これらの非-test evidence を「test でない」という理由だけで不当に排除しない。各 subclaim に対応する具体的な evidence の所在と、Claim との対応関係（どの subclaim をどの evidence が support するか）を確認する。
+- 同一 Evidence セル内に test evidence と非-test evidence（例: source inspection + test result）が混在する場合、セル全体を一律に test/non-test へ二分しない。**各 subclaim を support する evidence item が test の場合に**上記 enumerated-test rule を適用し、同じセル内の他の legitimate な非-test evidence item を、隣接する test evidence の有無を理由に排除しない。
 - 単なる例示列挙（「例: A/B」等）は本 rule の対象外。

@@ -55,6 +55,22 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def _slice_section(text: str, heading: str) -> str:
+    """Slice out the body of a single Markdown section, from ``heading`` up to
+    (but excluding) the next level-2 (``## ``) heading, or end-of-text if there
+    is no following level-2 heading.
+
+    Deliberately a plain ``str.index``-based slice, not a generic Markdown
+    parser or AST analyzer -- this repo's convention is to keep contract
+    checks as simple literal text assertions (Issue #2765 fix_delta).
+    """
+    start = text.index(heading)
+    next_heading_index = text.find("\n## ", start + len(heading))
+    if next_heading_index == -1:
+        return text[start:]
+    return text[start:next_heading_index]
+
+
 # ---------------------------------------------------------------------------
 # SKILL.md: Procedure wiring + ordered runtime marker (AC7 precondition)
 # ---------------------------------------------------------------------------
@@ -74,15 +90,23 @@ def test_skill_md_declares_runtime_marker_at_evidence_coverage_step():
         f"SKILL.md must instruct emission of the literal marker {MARKER!r} when the "
         "evidence-coverage Procedure step is reached (Issue #2765 AC7)."
     )
-    # The marker instruction must live in the same paragraph as the coverage rule
-    # itself, not in an unrelated section (guards against a regression where the
-    # marker is moved somewhere disconnected from the actual rule application).
+    # The marker instruction must live strictly *inside* the "### 4.6b)" step --
+    # not merely "before ### 5) verdict" (that older bound would also pass if the
+    # marker were moved into an unrelated later step such as "### 4.7) Clean-Room
+    # Review", which sits between 4.6b and 5). Bound it tightly to
+    # 4.6b_heading < marker < 4.7_heading < verdict_heading (PR #2774 review
+    # finding, fix_delta P1-2).
     marker_index = text.index(MARKER)
-    coverage_heading_index = text.index("Enumerated / Exhaustive Claim Evidence Coverage")
-    verdict_step_index = text.index("### 5) verdict")
-    assert coverage_heading_index < marker_index < verdict_step_index, (
-        "marker instruction must sit within the evidence-coverage step and precede "
-        "the verdict-decision step in Procedure declared order"
+    coverage_heading_index = text.index("### 4.6b)")
+    next_step_heading_index = text.index("### 4.7)", coverage_heading_index)
+    verdict_step_index = text.index("### 5) verdict", next_step_heading_index)
+    assert coverage_heading_index < marker_index < next_step_heading_index, (
+        "marker instruction must sit strictly within the '### 4.6b)' evidence-coverage "
+        "step, before the next Procedure step ('### 4.7)') begins -- moving the "
+        "marker into a later step (e.g. Clean-Room Review) must fail this test"
+    )
+    assert next_step_heading_index < verdict_step_index, (
+        "'### 4.7)' must still precede '### 5) verdict' in declared order"
     )
 
 
@@ -121,11 +145,60 @@ def test_ac_evidence_checks_rejects_aggregate_pass_as_sole_evidence():
 
 
 def test_ac_evidence_checks_requires_case_identity_and_relevant_assertion_and_pass():
+    """Pin the actual AND-semantics and blocker wiring of the enumerated-claim
+    rule, not merely the presence of three unrelated keywords anywhere in the
+    file (PR #2774 review finding, fix_delta P1-1).
+
+    A prior version of this test only asserted that "case identity",
+    "relevant executable assertion", and "coverage の証明にならない" each
+    occurred *somewhere* in the file. That would keep passing even if a future
+    edit silently weakened the rule from AND to OR, dropped the PASS
+    requirement, or dropped the REQUEST_CHANGES blocker consequence -- exactly
+    the kind of semantic regression Issue #2765 exists to prevent. This
+    version scopes all assertions to the actual
+    "## Enumerated / Exhaustive Claim Evidence Coverage" section body and pins
+    the specific phrases that carry the AND / PASS / blocker semantics.
+    """
     text = _read(AC_EVIDENCE_CHECKS_PATH)
-    assert "case identity" in text
-    assert "relevant executable assertion" in text
+    section = _slice_section(
+        text, "## Enumerated / Exhaustive Claim Evidence Coverage"
+    )
+
+    # (a) The two conditions are combined with AND ("両方（AND）"), not OR.
+    # If a future edit downgrades this to "OR" (or drops the AND phrase
+    # entirely), this exact phrase disappears and the assertion fails.
+    assert "両方（AND）" in section, (
+        "the two per-case conditions (case identity, relevant executable "
+        "assertion PASS) must be explicitly combined with AND, not OR"
+    )
+    # Guard against a literal OR-downgraded rewrite of the connecting clause.
+    assert "case identity OR relevant executable assertion" not in section
+    assert re.search(r"case identity\b[^\n]{0,40}\bOR\b[^\n]{0,60}relevant executable assertion", section) is None
+
+    # (b) "relevant executable assertion" must explicitly require PASS -- not
+    # merely be *mentioned* -- so dropping the PASS requirement text breaks
+    # this assertion even though the bare phrase "relevant executable
+    # assertion" might still appear elsewhere.
+    assert "relevant executable assertion が PASS" in section, (
+        "the relevant executable assertion condition must explicitly require "
+        "PASS, not merely existence/mention of the assertion"
+    )
+
     # named node / parameter ID alone must be explicitly insufficient
-    assert "coverage の証明にならない" in text
+    assert "coverage の証明にならない" in section
+
+    # (c) Missing either condition for even one enumerated case must be an
+    # unconditional REQUEST_CHANGES blocker (independent of current-head CI
+    # status). Pin the specific sentence that ties "missing a case" to the
+    # blocker verdict so deleting this consequence breaks the test.
+    assert re.search(
+        r"いずれか一方でも欠落するケースが1つでもあれば[^\n]*REQUEST_CHANGES[^\n]*blocker",
+        section,
+    ), (
+        "missing case identity or relevant-assertion-PASS for any single "
+        "enumerated case must be documented as an unconditional "
+        "REQUEST_CHANGES blocker"
+    )
 
 
 def test_ac_evidence_checks_restricts_skip_and_xfail_as_direct_evidence():
