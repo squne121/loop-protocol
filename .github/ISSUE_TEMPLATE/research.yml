@@ -105,7 +105,7 @@ body:
         **既定: 読み取り専用（リポジトリ変更なし）**。成果物は次 Issue 本文・コメント・link で表現する。
         品質調査などで成果物をリポジトリ資産として書き出す必要がある場合のみ、具体パスを記載する（例: `docs/research/<topic>.md`）。
       value: |
-        - 読み取り専用。リポジトリ変更なし（既定）
+        - (none)
     validations:
       required: true
 

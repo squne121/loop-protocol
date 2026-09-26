@@ -21,6 +21,16 @@ consumer; do not re-implement path classification elsewhere.
 from __future__ import annotations
 
 import re
+import sys
+from pathlib import Path
+
+# Issue #2783: shared no-path marker predicate (`scripts/agent-ops/`). Pure
+# policy library only -- not a grammar library import.
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_AGENT_OPS_DIR = _REPO_ROOT / "scripts" / "agent-ops"
+if str(_AGENT_OPS_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGENT_OPS_DIR))
+from allowed_paths_policy import is_no_path_marker  # noqa: E402
 
 DOCUMENTATION = "documentation"
 CODE_RUNTIME = "code_runtime"
@@ -138,7 +148,9 @@ def extract_allowed_paths(body: str) -> list[str]:
                 m = _BULLET_RE.match(lines[j])
                 if m:
                     token = m.group(1).strip().strip("`").strip()
-                    if token:
+                    # Issue #2783: judge no-path marker BEFORE any further
+                    # normalization -- a marker line contributes 0 entries.
+                    if token and not is_no_path_marker(token):
                         out.append(token)
                 j += 1
             break

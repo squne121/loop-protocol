@@ -29,7 +29,16 @@ import re
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 from typing import Optional
+
+# Issue #2783: shared no-path marker predicate (`scripts/agent-ops/`). Pure
+# policy library only -- not a grammar library import.
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_AGENT_OPS_DIR = _REPO_ROOT / "scripts" / "agent-ops"
+if str(_AGENT_OPS_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGENT_OPS_DIR))
+from allowed_paths_policy import is_no_path_marker  # noqa: E402
 
 
 # Whitelist of path prefixes that are known non-runtime (workflow/docs/scripts only).
@@ -217,6 +226,12 @@ def parse_allowed_paths(lines: list[str]) -> Optional[list[str]]:
     for i in range(start + 1, end):
         line = lines[i].strip()
         if line.startswith("- "):
+            # Issue #2783: judge no-path marker BEFORE stripping the
+            # trailing backtick wrapper -- a marker line contributes 0
+            # paths (missing-section sentinel `None` stays reserved for
+            # "no ## Allowed Paths section at all", handled above).
+            if is_no_path_marker(line):
+                continue
             path = line[2:].strip().strip("`")
             paths.append(path)
     return paths
