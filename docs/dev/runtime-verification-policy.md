@@ -604,6 +604,38 @@ issue-contract-review の deterministic gate に配線する）の責務であ�
 #2290 が完了するまで本セクションの追加をもって「機械的に強制済み」とは
 扱わない。
 
+### profile の assertion binding における完全性の確認（Issue #2771）
+
+`matched_rules[].enforcement == "hard"` のみから到達した各 `verification_profile`
+の `assertions[]` 全件は、Issue の `## Runtime Verification Applicability` に
+`runtime_assertion_bindings`（`profile` / `assertion` / `ac` の3フィールドのみの
+canonical shape）として、どの runtime AC がその assertion を担うかを明示しなければ
+ならない。`enforcement == "advisory"` のみから到達した profile / assertion は
+この required set に一切含まれない（PR #2370 の advisory non-blocking 方針を
+継続する）。
+
+`scripts/agent-guards/extension_surface_policy_matcher.py` の
+`derive_required_runtime_assertions()` / `evaluate_runtime_assertion_binding_
+coverage()` が、composite identity `(verification_profile_id, assertion_id)` を
+基準に required set と宣言された binding set の missing / unknown / duplicate
+（1 key = 1 ac。同一 key の複数回宣言は bind 先 `ac` の異同を問わず duplicate）を
+決定論的に検証し、各 binding の `ac` について実在確認・`applicable_acs` 包含・
+decision レベルの runtime-verification タグ整合・`## Verification Commands` の
+`# AC<N>` canonical reference 存在を確認する。`review-issue`
+（`check_issue_contract.py` の C15）と `issue-contract-review`
+（`contract_readiness_check.py`）は同一のこの shared evaluator を呼ぶため、両者は
+drift しない。
+
+本 gate が保証するのは binding の **structural completeness**（宣言漏れ・未知
+宣言・重複宣言の不在、binding 先 AC の referential integrity）のみであり、binding
+された VC が assertion の意味を実際に証明しているか（**semantic sufficiency**）は
+判定しない。判定しない旨は shared evaluator のコード中にも明示する
+（`structural_completeness_not_semantic_sufficiency`）。policy 自身の欠陥
+（dangling profile reference、同一 profile 内の assertion ID 重複）は Issue の
+`needs_fix` に偽装せず、policy integrity failure として区別する。author 向けの
+記法・生成規則・escape valve は `.claude/skills/create-issue/references/body-
+authoring.md` の「実行時検証プロファイルの assertion binding 記法」を参照する。
+
 ---
 
 ## 関連ドキュメント
