@@ -131,7 +131,9 @@ set -e
 : "${CLAUDE_CODE_PROXY_VERSION:?}"
 : "${CLAUDE_GPT_TEST_CAPTURED_URL_FILE:?}"
 MODELS_JSON="${CLAUDE_GPT_TEST_FIXTURE_MODELS_JSON:-[]}"
-printf '%s' "https://github.com/raine/claude-code-proxy/releases/download/${CLAUDE_CODE_PROXY_VERSION}/claude-code-proxy-linux-amd64.tar.gz" > "$CLAUDE_GPT_TEST_CAPTURED_URL_FILE"
+ASSET_URL="https://github.com/raine/claude-code-proxy/releases/download/${CLAUDE_CODE_PROXY_VERSION}"
+ASSET_URL="${ASSET_URL}/claude-code-proxy-linux-amd64.tar.gz"
+printf '%s' "$ASSET_URL" > "$CLAUDE_GPT_TEST_CAPTURED_URL_FILE"
 mkdir -p "$CLAUDE_CODE_PROXY_INSTALL_DIR"
 cat > "$CLAUDE_CODE_PROXY_INSTALL_DIR/claude-code-proxy" <<PYEOF
 #!/usr/bin/env python3
