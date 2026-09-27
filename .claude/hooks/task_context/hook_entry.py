@@ -89,6 +89,52 @@ _VALID_DECISIONS = ("pass", "block", "ask")
 _PRE_TOOL_USE_MESSAGING_TOOL_NAMES = ("SendMessage", "notify_when_idle")
 
 
+# Issue #2790 AC9: `reason_code`-specific `/task` command-failure messages.
+# Before this fix, every `decision: block` reason_code on `UserPromptExpansion`
+# (including `no_binding_for_session`, which never had anything to do with
+# the *target* the user typed) fell through to the single generic
+# "Provide an explicit target" text -- misleading whenever the user had
+# already supplied a fully-qualified target (see Issue #2790 Background:
+# `/task 2782` / `/task squne121/loop-protocol#2782` both hit exactly this).
+# `on_user_prompt_expansion` (Issue #2790 AC2/AC5) now only ever returns
+# `no_binding_for_session` when the target really is absent too (a target
+# present but Binding absent self-heals via `bootstrap_unbound_session`
+# instead of blocking) -- but this per-reason_code message is kept
+# accurate and explicit regardless, defensively, rather than relying on
+# that invariant holding forever.
+_TASK_COMMAND_FAILURE_DETAILS = {
+    "slash_task_missing_target": (
+        "target が指定されていません。明示的な target を指定してください "
+        "(e.g. `/task owner/repo#123` or `/task <ad-hoc title>`)."
+    ),
+    "no_binding_for_session": (
+        "このセッションには現在の Task Context Binding がなく、target も指定されていません。"
+        "有効な target を指定して `/task <target>` を実行すると、新しい Binding を "
+        "bootstrap してその target に bind します "
+        "(e.g. `/task owner/repo#123` or `/task <ad-hoc title>`)."
+    ),
+    "missing_session_id": (
+        "Claude session id を取得できませんでした。target の再指定では解決しません -- "
+        "Claude Code のセッション状態を確認してください。"
+    ),
+}
+
+
+def _task_command_failure_message(reason_code: str) -> str:
+    """Issue #2790 AC9: never collapse every `/task` `decision: block`
+    reason_code into the same "provide an explicit target" text -- only
+    `slash_task_missing_target` (and, defensively, `no_binding_for_session`
+    when a target is genuinely absent too) actually calls for that
+    instruction; other reason codes get their own accurate detail."""
+    detail = _TASK_COMMAND_FAILURE_DETAILS.get(reason_code)
+    if detail is None:
+        detail = (
+            "Provide an explicit target, e.g. `/task owner/repo#123` or "
+            "`/task <ad-hoc title>`."
+        )
+    return f"[task-context] /task failed: {reason_code}. {detail}"
+
+
 def _read_stdin_json() -> dict:
     raw = sys.stdin.read()
     if not raw.strip():
@@ -178,7 +224,8 @@ def _launch_detached_projection_flush(hook_input: dict) -> None:
 
 def _build_base_payload(event: str, hook_input: dict) -> dict:
     herdr_tab_id = os.environ.get("HERDR_TAB_ID") or None
-    herdr_pane_id = os.environ.get("HERDR_PANE_ID") or herdr_tab_id
+    herdr_pane_id_env = os.environ.get("HERDR_PANE_ID") or None
+    herdr_pane_id = herdr_pane_id_env or herdr_tab_id
     return {
         "event": event,
         "herdr_tab_id": herdr_tab_id,
@@ -186,6 +233,12 @@ def _build_base_payload(event: str, hook_input: dict) -> dict:
         # Pane id (stable across the operator moving Tabs), not the Tab id
         # itself -- see herdr_projection.py module docstring.
         "herdr_locator": herdr_pane_id,
+        # Issue #2790 AC1: forwarded only so a SessionStart debug trace can
+        # report `has_pane_id` distinctly from `has_tab_id` -- whether the
+        # *actual* HERDR_PANE_ID env var was set, not whether `herdr_locator`
+        # above happened to fall back to the Tab id. Never used for
+        # identity/rebind/block decisions (unchanged from AC5/AC7).
+        "has_pane_id": bool(herdr_pane_id_env),
         "claude_session_id": hook_input.get("session_id") or None,
     }
 
@@ -524,11 +577,7 @@ def main(argv: list[str]) -> int:
                 return 2
             if decision == "block":
                 reason_code = data.get("reason_code", "slash_task_missing_target")
-                print(
-                    f"[task-context] /task failed: {reason_code}. Provide an explicit target, "
-                    "e.g. `/task owner/repo#123` or `/task <ad-hoc title>`.",
-                    file=sys.stderr,
-                )
+                print(_task_command_failure_message(reason_code), file=sys.stderr)
                 return 2
         return 0
 
