@@ -436,6 +436,27 @@ def test_redact_patterns_fully_redacts_fine_grained_pat_token() -> None:
     assert "1" * 59 not in result
 
 
+def test_redact_patterns_fully_redacts_minimum_length_pat_token() -> None:
+    """redact: fine-grained personal access token (github_pat_ prefix) は
+    `github_pat_[A-Za-z0-9_]{20,}` という recall-first ポリシーにより
+    body 20文字（下限）でも単一の <GITHUB_TOKEN> に完全置換される
+    (Issue #2736 AC2, PR #2806 OWNER レビュー finding P2)。
+
+    body は実 secret ではない deterministic な synthetic 値であり、
+    matcher の下限境界 (`{20,}`) を固定するための regression test。"""
+    body = ("0" * 9) + "_" + ("1" * 10)
+    assert len(body) == 20, "fixture body must reflect the {20,} lower bound"
+    token = f"github_pat_{body}"
+    text = f"before {token} after"
+
+    result = sat.redact_string(text)
+
+    assert result == "before <GITHUB_TOKEN> after"
+    assert token not in result
+    assert "github_pat_" not in result
+    assert body not in result
+
+
 @pytest.mark.parametrize(
     "prefix",
     ["ghp_", "gho_", "ghs_", "ghu_", "ghr_"],
