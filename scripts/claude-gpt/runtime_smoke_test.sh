@@ -13,7 +13,14 @@
 #     response 相関確認を fail-closed で必須化する）。
 #   - proxy 実行バイナリと本スクリプト自身の sha256 を証跡へ追加した（P1-1 の
 #     identity pinning。exact v0.1.34 source では configured transport がそのまま
-#     HTTP dispatch へ対応することを前提とする）。
+#     HTTP dispatch へ対応することを前提とする）。Issue #2772（2026-09-27）で
+#     ローカル installed v0.1.36 バイナリを対象に、構造化ログのトップレベル
+#     schema（`fields`/`level`/`msg`/`service`/`t` キー、および `request` /
+#     `codex_upstream_request_started` / `request_completed` の各 `fields` 形状）
+#     を bounded local 実行（`/v1/models` 疎通・認証エラー応答経路。実
+#     ChatGPT subscription request は行わない）で再確認し、schema break が
+#     ないことを確認した。この v0.1.34 前提は過去の dated evidence として残し、
+#     遡及的に書き換えない。
 #   - `git_dirty == false` を PASS 条件に追加した（dirty worktree での live smoke は
 #     現行 head の統合状態を証明しない）。
 #   - `proxy_cleanup_ok_launcher_reported`（launcher 自己申告）と、PID/listen socket の

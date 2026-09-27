@@ -6,7 +6,7 @@
 `codex_upstream_request_started` / `request_completed` の 3 イベントを `fields.reqId`
 で相関して transport policy（Issue #2204）の実 upstream 送出結果を判定する。
 
-ログ 1 行のスキーマ（実バイナリの live 出力から確認, 2026-08-16）:
+ログ 1 行のスキーマ（実バイナリの live 出力から確認, 2026-08-16。v0.1.34）:
   {"fields": {...}, "level": "info", "msg": "<event name>", "service": "...", "t": "..."}
   各イベント種別の `fields` 内容:
     - "request"                        : method, path, query, reqId
@@ -17,6 +17,18 @@
   key 共起としてしか確認できず、実際にはファイル全体を対象に 3 つの独立した
   `grep -q` を行っていたため、異なる request 由来の path/status が偶然揃うだけで
   PASS してしまう構造的欠陥があった。）
+
+Issue #2772（2026-09-27）: ローカル installed v0.1.36 バイナリで bounded local
+実行（`/v1/models` 疎通・認証エラー応答経路のみ。実 ChatGPT subscription
+request は行わない）を行い、上記トップレベル schema（`fields`/`level`/`msg`/
+`service`/`t`）および `request`/`codex_upstream_request_started`/
+`request_completed` の 3 イベントの `fields` 形状（本モジュールが参照する
+`reqId`/`transport`/`path`/`status` を含む）が変わっていないことを再確認した。
+v0.1.36 はこの他に `codex_upstream_request_failed` / `request_failed` イベント、
+および `codex_upstream_request_started.fields` への追加キー
+（`hasPreviousResponseId` 等）を新設しているが、本モジュールはこれらを一切
+参照しないため schema break ではない。parser 変更は不要と判断した
+（v0.1.34 時点の上記 dated evidence は遡及的に書き換えない）。
 
 背景（Issue #2204 PR #2205 OWNER REQUEST_CHANGES, iteration 2, P0-2）:
   従来の `runtime_smoke_test.sh` は各 step の最後の `codex_upstream_request_started` 行

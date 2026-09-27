@@ -3,7 +3,8 @@
 #
 # repository-owned claude-gpt launcher。
 #
-# herdr session B（ChatGPT Pro Codex subscription 経由 GPT-5.6 Sol/Terra/Luna）を
+# herdr session B（ChatGPT Pro Codex subscription 経由 GPT-6 Sol/Luna が既定、
+# GPT-6 Astra は明示 on-demand escalation。Issue #2772）を
 # `raine/claude-code-proxy` 経由で起動する。Native Claude（herdr session A）とは
 # config root / credential / working tree を分離する（Issue #2158 / Parent #2154
 # アーキテクチャ決定 A〜E 準拠）。現行 Unix user のまま起動する（Issue #2158
@@ -31,6 +32,10 @@
 #   10  Task Context canonical state-root 解決失敗（python3 未対応 / resolver
 #       error）で、isolated HOME への切替を fail-fast で止めた（Issue #2567
 #       PR #2696 review fix_delta P1-1）
+#   11  明示的に要求された `--model <alias>`（例: gpt-6-astra）が、実際に起動した
+#       proxy の `/v1/models` registry に存在しない（unsupported/unavailable）。
+#       別モデルや Native Claude への silent fallback は行わず、ここで
+#       fail-closed に停止する（Issue #2772 AC2/AC3）。
 
 # --- Herdr Agents session hint: self-reexec (#2332) ---
 # Herdr 内(HERDR_ENV=1)かつ呼び出し側が HERDR_AGENT を設定していない場合だけ、
@@ -943,9 +948,12 @@ while [ "$PORT_ATTEMPTS" -lt "$PORT_MAX_ATTEMPTS" ] && [ "$READY" != "true" ]; d
   # CCP_AUTO_REVIEW_MODEL は repository-owned の CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY
   # （lib.sh 単一 source of truth）を無条件で渡す。未設定時 upstream proxy は
   # non-streaming・tool-free な auto mode classifier request を provider=codex の
-  # 場合無条件で gpt-5.6-luna へ fallback する（Issue #2654 bounded comparison A:
-  # proxy log 実測で 1030/1030 件が gpt-5.6-luna へ固定到達）ため、session model と
-  # 揃えるために明示上書きする。
+  # 場合無条件で gpt-5.6-luna 相当へ fallback する（Issue #2654 bounded comparison A:
+  # proxy log 実測で 1030/1030 件が gpt-5.6-luna へ固定到達）ため、明示上書きする。
+  # Issue #2772 でこの定数値自体を `gpt-6-luna` へ更新した（classifier routing を
+  # Luna へ復帰。session model（既定 gpt-6-sol）とは独立した proxy 子プロセス側の
+  # 注入ポイントであり、claude client 側の CLAUDE_CODE_AUTO_MODE_SERVER=0 export
+  # （claude 起動直前ブロック）とは別経路）。
   env -i \
     "PATH=$PATH" \
     "HOME=$PROXY_HOME_TARGET" \
@@ -1048,6 +1056,45 @@ if [ "$MODEL_ALIAS_OK" != "true" ]; then
   wait "$PROXY_PID" 2>/dev/null
   printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"failed","reason":"model_alias_not_resolved","port":%s}\n' "$PROXY_PORT"
   exit 7
+fi
+
+# --- 明示的モデル escalation の availability 検証（Issue #2772 AC2/AC3）。
+#     `gpt-6-astra` 等の on-demand escalation model は上記 MAIN/OPUS/HAIKU の
+#     一括 preflight に含めない（起動可否を Astra entitlement に依存させない）。
+#     代わりに、caller が `-- --model <alias>` で明示的にモデルを要求した場合
+#     だけ、実際に起動した proxy の /v1/models registry と照合する。存在しない
+#     場合はここで fail-closed に停止し、claude 本体を起動しない -- Claude Code
+#     自身の model-resolution 層（code.claude.com/docs/en/model-config）が行う
+#     可能性のある「継承 model への silent fallback」に判定を委ねない。 ---
+EXPLICIT_MODEL_REQUEST=""
+_prev_arg=""
+for _arg in "$@"; do
+  case "$_arg" in
+    --model=*)
+      EXPLICIT_MODEL_REQUEST="${_arg#--model=}"
+      ;;
+  esac
+  if [ "$_prev_arg" = "--model" ]; then
+    EXPLICIT_MODEL_REQUEST="$_arg"
+  fi
+  _prev_arg="$_arg"
+done
+unset _prev_arg _arg
+
+if [ -n "$EXPLICIT_MODEL_REQUEST" ]; then
+  EXPLICIT_MODEL_BASE=$(claude_gpt_strip_context_hint "$EXPLICIT_MODEL_REQUEST")
+  case "$MODELS_JSON" in
+    *"\"$EXPLICIT_MODEL_BASE\""*)
+      : # registry に存在する。通常どおり claude へそのまま渡す。
+      ;;
+    *)
+      kill "$PROXY_PID" 2>/dev/null
+      wait "$PROXY_PID" 2>/dev/null
+      printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"failed","reason":"explicit_model_escalation_unavailable","requested_model":"%s","message":"requested model is unsupported or unavailable on the selected proxy; no fallback to another model or Native Claude is performed","port":%s}\n' \
+        "$EXPLICIT_MODEL_BASE" "$PROXY_PORT"
+      exit 11
+      ;;
+  esac
 fi
 
 # --- 呼び出し元（runtime_smoke_test.sh 等）が proxy ログ/ポートを追跡できるよう stderr へ
@@ -1282,6 +1329,16 @@ unset GIT_ASKPASS SSH_ASKPASS GIT_CREDENTIAL_HELPER
 unset BUN_OPTIONS
 
 export CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1
+# CLAUDE_CODE_AUTO_MODE_SERVER=0（Issue #2772 Model Policy 3節）: Claude-GPT lane
+# では current Claude Code の gateway/proxy server-side classifier negotiation に
+# 依存せず、client 側の classifier request を決定論的に proxy（CCP_AUTO_REVIEW_MODEL=
+# gpt-6-luna、上記 env -i 起動 env 参照）へ流す。この変数は claude client 自身が
+# 読む `CLAUDE_CODE_` prefix 変数であり、proxy 子プロセスの `env -i` 起動 env に
+# 置いても upstream proxy には無視され claude client にも渡らないため、必ず
+# claude 本体起動直前のこの export ブロックに置く（proxy 子プロセス側の
+# CCP_AUTO_REVIEW_MODEL とは別の注入ポイント。両者を混同しない）。Native Claude
+# profile（`.claude/settings.json` 等）は変更しない。
+export CLAUDE_CODE_AUTO_MODE_SERVER=0
 # `auto` は `[1m]` suffix なし model 名の場合に未知 model として context window を
 # 200k と誤認し早期 compaction/summarization 失敗を招いた（実機再検証, 2026-08-15）。
 # upstream 推奨どおり ChatGPT backend の実 context 上限（272k）に固定する。

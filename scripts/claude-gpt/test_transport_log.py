@@ -7,6 +7,11 @@ fixture のイベント形式は実 `claude-code-proxy` v0.1.34 バイナリの 
 （`<proxy_state_dir>/claude-code-proxy/proxy.log`）から確認した実スキーマ
 （`{"fields": {...}, "msg": "...", ...}`、"request"/"codex_upstream_request_started"/
 "request_completed" の 3 イベントを `fields.reqId` で相関）に合わせている。
+Issue #2772（2026-09-27）でローカル installed v0.1.36 バイナリの bounded local
+実行（実 ChatGPT subscription request は行わない）により、この 3 イベントの
+schema が変わっていないことを再確認済み（transport_log.py 冒頭の追記参照）。
+この fixture の model 名（`gpt-5.6-terra`）は当時の dated evidence の値であり、
+`transport_log.py` は model 名を判定に使わないため、遡及的に書き換えない。
 
 負例（negative fixture）:
   - HTTP + WebSocket 混在 -> FAIL
