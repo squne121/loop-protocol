@@ -9,11 +9,19 @@ Also provides:
   - baseline-expect annotation parser (Issue #889)
   - vc-role annotation parser (Issue #889)
   - parse_verification_commands_section() — unified VC section parser (Issue #993)
+  - vc-regex-intent annotation parser (Issue #589 / moved here in #2788)
+  - detect_compound_command() — shlex-based quote-aware compound shell
+    operator detector (moved here in #2788 AC9; this is the SAME primitive
+    `baseline_vc_preflight.py`'s normal execution already used for its own
+    compound-command classification, now also the authority
+    `parse_verification_commands_section()` below delegates to instead of
+    an independent, non-quote-aware regex).
 """
 
 from __future__ import annotations
 
 import re
+import shlex
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -31,9 +39,6 @@ _AC_MARKER_PATTERN = re.compile(r"^\s*#\s*AC(\d+)\b(.*)$")
 _PRE_FLIGHT_SCOPE_PATTERN = re.compile(r"^\s*#\s*preflight-scope:\s*(.*?)\s*$")
 _BASELINE_EXPECT_PATTERN = re.compile(r"^\s*#\s*baseline-expect:\s*(.*?)\s*$")
 _VC_ROLE_PATTERN = re.compile(r"^\s*#\s*vc-role:\s*(.*?)\s*$")
-
-# Compound shell operators that make a VC command ambiguous / non-runnable as-is.
-_COMPOUND_SHELL_RE = re.compile(r"[;&|]|>+|<+")
 
 # Grouped AC marker: "# AC1, AC2" or "# AC2, AC3, AC4" (comma-separated, no suffix)
 _GROUPED_AC_MARKER_PATTERN = re.compile(
@@ -140,6 +145,124 @@ def parse_vc_role_annotation(line: str) -> tuple[Optional[str], bool]:
         return None, False
     value = match.group(1).strip()
     return value if value else None, bool(value)
+
+
+# Compound-shell operator characters (Issue #2788 fix_delta P1-A).  A shlex
+# token is treated as a compound-shell OPERATOR token when it is composed
+# ENTIRELY of characters from this set -- this generalizes the previous
+# exact-match-against-a-finite-operator-set approach (which only recognized
+# `{"&&", "||", "|", ";", "&", "<<", "<", ">", ">>", "<<<"}` verbatim) so
+# that ANY punctuation-only run built from these characters is caught,
+# including Bash-legal combinations the finite set missed:
+# `>&` (`2>&1`), `&>` (`&>out`), `|&` (`|& tee x`), `>|` (`>| out`),
+# `<>` (`<> file`).
+#
+# A token that MIXES an operator character with a word character (e.g. the
+# quoted-regex-alternation token `foo|bar` shlex produces for
+# `rg -n "foo|bar" PATH` -- Issue #589 / #2788 AC9 regression contract) is
+# NEVER all-operator-chars, so it is correctly left non-compound.
+_COMPOUND_OPERATOR_CHARS = frozenset(";&|<>")
+
+
+def detect_compound_command(command: str) -> bool:
+    """Detect whether ``command`` contains compound shell syntax.
+
+    Moved here from ``baseline_vc_preflight.py`` (Issue #2788 AC9) so it is
+    the SINGLE quote-aware compound-shell detection primitive shared by
+    both normal VC execution classification AND
+    ``parse_verification_commands_section()``'s static ``compound_shell``
+    check below -- no independent regex-based compound detector exists
+    anywhere else in this grammar.
+
+    Uses ``shlex.shlex`` to tokenize precisely and detect shell operators:
+    - ``cmd&&cmd`` (no whitespace) is detected.
+    - A ``|`` inside a quoted string (e.g. ``rg -n "foo|bar" PATH``) is NOT
+      a false positive (quote-aware; Issue #589 / #2788 AC9).
+    - Redirects (``>``, ``<``, ``>>``, etc.) are treated as compound
+      (fail-closed), including the less-common Bash redirect/pipe forms
+      ``2>&1``, ``&>out``, ``|& tee x``, ``>| out``, and ``<> file``
+      (Issue #2788 fix_delta P1-A -- these were previously false negatives
+      because ``shlex``'s ``punctuation_chars=True`` tokenizer merges a
+      contiguous run of punctuation characters into ONE token, e.g. ``>&``,
+      which did not exact-match any entry in the old finite operator set).
+    - A tokenization failure (malformed shell quoting) is treated as
+      compound (fail-closed) -- preserving existing fail-closed semantics
+      for malformed shell tokenization.
+    """
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        tokens = list(lexer)
+    except ValueError:
+        # parse failure = ambiguous/complex command = fail-closed as compound
+        return True
+
+    return any(
+        token and all(ch in _COMPOUND_OPERATOR_CHARS for ch in token)
+        for token in tokens
+    )
+
+
+def extract_vc_regex_intent_annotation(lines: list, target_line_idx: int) -> Optional[str]:
+    """Extract ``# vc-regex-intent: <value>`` annotation from the contiguous
+    annotation/comment block immediately preceding a VC command line
+    (Issue #589; moved here from ``baseline_vc_preflight.py`` in Issue #2788
+    AC1/AC5/AC10 so both normal execution -- via the shared adapter -- and
+    the shared parser's own ``VcCommandEntry.vc_regex_intent`` field source
+    this SAME extraction logic).
+
+    AC3 (Issue #589): backslash-pipe (``\\|``) regex-bearing commands
+    (``rg`` / ``egrep`` etc.) are exempted from ``regex_literal_pipe_suspected``
+    when a ``# vc-regex-intent: literal-pipe-ok`` annotation immediately
+    precedes the command line.
+
+    Format: ``# vc-regex-intent: literal-pipe-ok reason="..."``
+
+    Scope rules (same as ``extract_baseline_expect_annotation`` /
+    ``extract_vc_role_annotation``):
+    - Only the contiguous block of comment/annotation lines directly before
+      ``target_line_idx`` is considered (0-based index within ``lines``).
+    - An empty line or a ``$ command`` line terminates the block.
+    - ``# preflight-scope:`` and ``# AC<N>`` markers are transparent
+      (allowed in the same block).
+
+    Returns:
+        The annotation value (e.g. ``"literal-pipe-ok"``) or ``None``.
+    """
+    found_annotation = None
+    for offset in range(1, target_line_idx + 1):
+        line_idx = target_line_idx - offset
+        if line_idx < 0:
+            break
+        line = lines[line_idx].strip()
+
+        # Empty line: stop scanning (annotation scope ended)
+        if not line:
+            break
+
+        # $ command line: stop scanning (another command intervened)
+        if re.match(r"^\$\s+", line) or re.match(r"^\$\s*$", line):
+            break
+
+        # vc-regex-intent annotation line: record it and continue scanning the block
+        match = re.match(r"^#\s*vc-regex-intent:\s*(\S+)", line)
+        if match:
+            found_annotation = match.group(1)
+            continue
+
+        # preflight-scope marker: transparent (allowed in the same block)
+        marker, _ = parse_preflight_scope_marker_line(line)
+        if marker is not None:
+            continue
+
+        # AC marker line (# AC1 etc): transparent (allowed in the same block)
+        ac_label, is_valid = parse_ac_marker_line(line)
+        if ac_label is not None and is_valid:
+            continue
+
+        # Any other line (regular comment or non-comment non-command): stop scanning
+        break
+
+    return found_annotation
 
 
 def extract_baseline_expect_annotation(
@@ -307,6 +430,34 @@ class VcCommandEntry:
         baseline_expect: Value of `# baseline-expect:` annotation if present,
                          otherwise None.
         vc_role: Value of `# vc-role:` annotation if present, otherwise None.
+        vc_regex_intent: Value of `# vc-regex-intent:` annotation if present
+                         (e.g. "literal-pipe-ok"), otherwise None (Issue #589
+                         / #2788 AC5/AC10 -- losslessly carried so downstream
+                         normal execution can exempt a backslash-pipe
+                         regex-bearing command from
+                         `regex_literal_pipe_suspected`).
+        annotation_source_line: 1-based line number (within the VC section
+                         content) of the `# baseline-expect:` annotation
+                         line this command's `baseline_expect` value was
+                         extracted from, or None (Issue #889 AC11
+                         provenance, #2788 AC5 -- preserved losslessly, not
+                         merely parsed-and-discarded).
+        annotation_source_raw: Raw text of that same annotation line, or
+                         None.
+        block_line_number: 1-based line number of this command WITHIN its
+                         own enclosing ```bash fence (i.e. relative to the
+                         first line after the ```bash opening fence line,
+                         NOT relative to the whole VC section) -- Issue
+                         #2788 fix_delta P2. This is an ADDITIVE provenance
+                         field carried purely so legacy consumers that
+                         expect ``parse_commands_from_block()``'s
+                         block-relative line-number semantics (e.g. the
+                         `results[].line` field in
+                         ``baseline_vc_preflight.py``'s JSON output) can
+                         recover that EXACT SAME coordinate system through
+                         the shared adapter, without changing
+                         `line_number`'s own (section-relative) semantics,
+                         which other existing consumers already depend on.
     """
     ac_refs: set  # set[str]
     command: str
@@ -314,6 +465,10 @@ class VcCommandEntry:
     preflight_scope: Optional[str] = None
     baseline_expect: Optional[str] = None
     vc_role: Optional[str] = None
+    vc_regex_intent: Optional[str] = None
+    annotation_source_line: Optional[int] = None
+    annotation_source_raw: Optional[str] = None
+    block_line_number: Optional[int] = None
 
 
 @dataclass
@@ -598,6 +753,9 @@ def parse_verification_commands_section(vc_section: str) -> "VcParseResult":
             preflight_scope: Optional[str] = None
             baseline_expect_val: Optional[str] = None
             vc_role_val: Optional[str] = None
+            vc_regex_intent_val: Optional[str] = None
+            annotation_source_line_val: Optional[int] = None
+            annotation_source_raw_val: Optional[str] = None
 
             if block_idx > 0:
                 ps_marker, ps_known = parse_preflight_scope_marker_line(
@@ -606,12 +764,22 @@ def parse_verification_commands_section(vc_section: str) -> "VcParseResult":
                 if ps_marker is not None:
                     preflight_scope = ps_marker
 
-                be_v, _, _ = extract_baseline_expect_annotation(
+                be_v, be_line, be_raw = extract_baseline_expect_annotation(
                     [ln.strip() for ln in bash_block_lines], block_idx
                 )
                 baseline_expect_val = be_v
+                annotation_source_line_val = be_line
+                annotation_source_raw_val = be_raw
 
                 vc_role_val = extract_vc_role_annotation(
+                    [ln.strip() for ln in bash_block_lines], block_idx
+                )
+
+                # Issue #2788 AC5/AC10: thread `# vc-regex-intent:` provenance
+                # into the shared entry so normal execution (via the shared
+                # adapter) no longer needs its OWN independent extraction of
+                # this annotation.
+                vc_regex_intent_val = extract_vc_regex_intent_annotation(
                     [ln.strip() for ln in bash_block_lines], block_idx
                 )
 
@@ -622,12 +790,27 @@ def parse_verification_commands_section(vc_section: str) -> "VcParseResult":
                 preflight_scope=preflight_scope,
                 baseline_expect=baseline_expect_val,
                 vc_role=vc_role_val,
+                vc_regex_intent=vc_regex_intent_val,
+                annotation_source_line=annotation_source_line_val,
+                annotation_source_raw=annotation_source_raw_val,
+                # Issue #2788 fix_delta P2: block_idx is the 0-based index of
+                # THIS command line within `bash_block_lines` (the content
+                # of the enclosing ```bash fence, fence markers excluded) --
+                # the SAME coordinate system `extract_fenced_bash_blocks()` +
+                # `parse_commands_from_block()`'s `i` (1-based) legacy
+                # block-relative `line_number` used.
+                block_line_number=block_idx + 1,
             )
             result.commands.append(entry)
             result.canonical_ac_refs.update(resolved_ac)
 
-            # Detect compound shell operators
-            if cmd_str and _COMPOUND_SHELL_RE.search(cmd_str):
+            # Detect compound shell operators (Issue #2788 AC9: delegate to
+            # the shlex-based quote-aware detect_compound_command() instead
+            # of an independent, non-quote-aware regex -- this preserves
+            # `rg -n "foo|bar" PATH` (a quoted regex alternation) as NOT
+            # compound_shell, while still detecting unquoted `|`, `&&`,
+            # `;`, and redirects).
+            if cmd_str and detect_compound_command(cmd_str):
                 result.errors.append(VcParseError(
                     kind="compound_shell",
                     line_number=line_no,

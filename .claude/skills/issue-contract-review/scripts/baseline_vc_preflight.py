@@ -44,7 +44,10 @@ from vc_contract_syntax import (  # noqa: E402
     parse_preflight_scope_marker_line,
     extract_baseline_expect_annotation,
     extract_vc_role_annotation,
+    extract_vc_regex_intent_annotation,
+    detect_compound_command,
     parse_verification_commands_section,
+    VcParseResult,
 )
 import pnpm_gate_registry as pnpm_gate_registry  # noqa: E402
 import vc_runtime_history as _vc_runtime_history  # noqa: E402
@@ -861,61 +864,6 @@ def extract_preflight_scope_marker(lines: List[str], target_line_idx: int) -> Op
     return marker
 
 
-def extract_vc_regex_intent_annotation(lines: List[str], target_line_idx: int) -> Optional[str]:
-    """
-    VC コマンド行（target_line_idx）の直前の連続 annotation/comment ブロックから
-    `# vc-regex-intent: <value>` annotation を抽出。
-
-    AC3 (Issue #589): backslash-pipe (\\|) を含む regex-bearing command（rg / egrep 等）に対して、
-    `literal-pipe-ok` annotation が付与されている場合は regex_literal_pipe_suspected を免除する。
-
-    形式: `# vc-regex-intent: literal-pipe-ok reason="..."`
-    戻り値: annotation value（"literal-pipe-ok" 等）または None
-
-    スコープルール（Blocker 1 修正）:
-    - annotation は VC コマンド行の直前の連続 annotation/comment ブロック内のみ有効。
-    - 途中に空行・$ コマンド行・通常コメントではない行があった時点でブロックを打ち切る。
-    - `# preflight-scope:` は同一ブロック内として透過する（coexistence を許す）。
-    - 空行や $ コマンド行（コマンド行）を跨ぐことはない。
-    """
-    found_annotation = None
-    # Walk backwards from the line immediately before target_line_idx
-    for offset in range(1, target_line_idx + 1):
-        line_idx = target_line_idx - offset
-        if line_idx < 0:
-            break
-        line = lines[line_idx].strip()
-
-        # Empty line: stop scanning (annotation scope ended)
-        if not line:
-            break
-
-        # $ command line: stop scanning (another command intervened)
-        if re.match(r"^\$\s+", line) or re.match(r"^\$\s*$", line):
-            break
-
-        # vc-regex-intent annotation line: record it and continue scanning the block
-        match = re.match(r"^#\s*vc-regex-intent:\s*(\S+)", line)
-        if match:
-            found_annotation = match.group(1)
-            continue
-
-        # preflight-scope marker: transparent (allowed in the same block)
-        marker, _ = parse_preflight_scope_marker_line(line)
-        if marker is not None:
-            continue
-
-        # AC marker line (# AC1 etc): transparent (allowed in the same block)
-        ac_label, is_valid = parse_ac_marker_line(line)
-        if ac_label is not None and is_valid:
-            continue
-
-        # Any other line (regular comment or non-comment non-command): stop scanning
-        break
-
-    return found_annotation
-
-
 def parse_commands_from_block(
     block: str,
 ) -> List[
@@ -1004,6 +952,108 @@ def parse_commands_from_block(
             ))
 
     return commands
+
+
+# Type alias documenting the legacy 9-tuple command shape shared by
+# `parse_commands_from_block()` (kept only for `compute_duplicate_diagnostic_report()`,
+# a diagnostic-only display path -- Issue #2788 Out of Scope) and the shared
+# adapter below (Issue #2788 AC1/AC2/AC7/AC12).
+CommandTuple = Tuple[
+    Optional[str], str, int, Optional[str],
+    Optional[str], Optional[str], Optional[str],
+    Optional[int], Optional[str],
+]
+
+
+def _ac_refs_to_scalar_label(ac_refs: "set") -> Optional[str]:
+    """Deterministically collapse a `VcCommandEntry.ac_refs` set into the
+    scalar `ac_label` normal execution / `_build_result_item()`'s `"ac"`
+    field expect (Issue #2788 AC11).
+
+    - Empty set -> None (matches legacy `parse_commands_from_block()`'s
+      `current_ac = None` when no marker preceded the command).
+    - Single ref -> that ref unchanged (e.g. "AC1").
+    - Multiple refs (grouped marker, e.g. `# AC2, AC3`) -> a comma-joined,
+      NUMERICALLY sorted string (e.g. "AC2,AC3") -- deterministic regardless
+      of the set's iteration order. This is purely a DISPLAY/labelling
+      concatenation: it does not fan out into multiple commands or
+      subprocess launches -- exactly ONE `VcCommandEntry` (hence exactly
+      one entry in the tuple list this function's caller builds) already
+      exists per source `$ command` line, regardless of how many AC labels
+      reference it.
+    """
+    if not ac_refs:
+        return None
+    if len(ac_refs) == 1:
+        return next(iter(ac_refs))
+
+    def _ac_sort_key(label: str) -> int:
+        try:
+            return int(label[2:]) if label.startswith("AC") else 0
+        except ValueError:
+            return 0
+
+    return ",".join(sorted(ac_refs, key=_ac_sort_key))
+
+
+def _command_entries_from_shared_parser(
+    vc_section: str,
+) -> Tuple[List[CommandTuple], VcParseResult]:
+    """Thin shared adapter (Issue #2788 AC1/AC2/AC7/AC12): the SINGLE
+    conversion point from `vc_contract_syntax.parse_verification_commands_section()`'s
+    canonical `VcParseResult.commands` (`list[VcCommandEntry]`) into the
+    SAME legacy 9-tuple shape `parse_commands_from_block()` historically
+    produced -- `(ac_label, command, line_no, preflight_scope,
+    vc_regex_intent, baseline_expect, vc_role, annotation_line_no,
+    annotation_raw)`.
+
+    Normal execution (`_main_impl()`), `compute_canonical_vc_plan()`, and
+    `_distinct_command_texts_from_body()` all call THIS function instead of
+    each independently walking `extract_fenced_bash_blocks()` +
+    `parse_commands_from_block()`'s legacy grammar -- so all three now
+    consume the SAME canonical VC command grammar authority `--static-only`
+    already used, and an explanatory non-`$` line inside a bash fence is
+    NEVER promoted to a runnable subprocess candidate in any of the three
+    paths (it appears only in the returned `VcParseResult.errors` /
+    `.static_errors`, never in `VcParseResult.commands`).
+
+    No new independent VC grammar parser is introduced by this function --
+    it performs pure data reshaping over the shared parser's own output.
+
+    Issue #2788 fix_delta P2: the tuple's `line_no` slot (index 2) is
+    sourced from `entry.block_line_number` (block-relative -- i.e. relative
+    to the first line after the command's own enclosing ```bash opening
+    fence line), NOT `entry.line_number` (section-relative -- i.e. relative
+    to the whole `## Verification Commands` section content). This
+    preserves the EXACT pre-migration `results[].line` coordinate system
+    `parse_commands_from_block()` produced, and keeps it consistent with
+    `annotation_source_line` (already block-relative, since
+    `extract_baseline_expect_annotation()` is invoked against
+    `bash_block_lines` both before and after this migration) -- so a single
+    result item's `line` and `annotation_source.line` always refer to the
+    SAME coordinate system instead of silently drifting between
+    section-relative and block-relative.
+
+    Returns `(command_tuples, parse_result)` so a caller can ALSO inspect
+    `parse_result.static_errors` (e.g. to reject a non-canonical body
+    BEFORE building any subprocess candidate, Issue #2788 AC3) without
+    re-parsing the section a second time.
+    """
+    parse_result = parse_verification_commands_section(vc_section)
+    command_tuples: List[CommandTuple] = []
+    for entry in parse_result.commands:
+        command_tuples.append((
+            _ac_refs_to_scalar_label(entry.ac_refs),
+            entry.command,
+            entry.block_line_number,
+            entry.preflight_scope,
+            entry.vc_regex_intent,
+            entry.baseline_expect,
+            entry.vc_role,
+            entry.annotation_source_line,
+            entry.annotation_source_raw,
+        ))
+    return command_tuples, parse_result
 
 
 def compute_command_hash(command: str) -> str:
@@ -1173,10 +1223,16 @@ def _is_parallel_eligible_command(
 # This function NEVER executes a subprocess and NEVER performs I/O beyond
 # reading the in-memory `body` string it is given. It reuses the SAME
 # normal-execution parsing primitives (`extract_verification_commands_section()`
-# / `extract_fenced_bash_blocks()` / `parse_commands_from_block()` /
-# `_is_parallel_eligible_command()`) the executor loop in `main()` below
-# uses, so the plan cannot silently drift from what the executor actually
-# does (Issue #2207 OWNER finding: "budget/execution parser drift").
+# / `_command_entries_from_shared_parser()` / `_is_parallel_eligible_command()`)
+# the executor loop in `main()` below uses, so the plan cannot silently
+# drift from what the executor actually does (Issue #2207 OWNER finding:
+# "budget/execution parser drift"; Issue #2788 additionally unified BOTH
+# onto the SAME `vc_contract_syntax.parse_verification_commands_section()`
+# canonical grammar authority `--static-only` already used, instead of the
+# legacy `extract_fenced_bash_blocks()` + `parse_commands_from_block()`
+# grammar, closing a SEPARATE authority-drift gap where an explanatory
+# non-`$` line could be promoted to a command/budget candidate here or in
+# normal execution while `--static-only` already rejected it).
 #
 # Counting semantics (OWNER-reviewed redesign, Issue #2207):
 #
@@ -1331,7 +1387,41 @@ def compute_canonical_vc_plan(
     body_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
 
     section = extract_verification_commands_section(body) or ""
-    blocks = extract_fenced_bash_blocks(section)
+    # Issue #2788 AC2: the SAME shared-parser-backed adapter normal execution
+    # uses (`_command_entries_from_shared_parser()`), instead of the legacy
+    # `extract_fenced_bash_blocks()` + `parse_commands_from_block()` grammar
+    # -- so this plan's command occurrence set never drifts from what normal
+    # execution actually runs. Issue #2788 AC3/AC13: an explanatory non-`$`
+    # line inside a bash fence is a `VcParseResult.static_errors` entry, NOT
+    # a `VcCommandEntry` -- it is therefore NEVER present in
+    # `command_tuples` below and never becomes a command occurrence /
+    # subprocess candidate in this plan, without this function needing to
+    # raise any new exception type (fail-closed by omission, not by
+    # exception -- preserving the existing caller-facing contract of
+    # `contract_readiness_check.py` / `run_contract_review_once.py` /
+    # `run_root_review_pipeline.py`, which are outside this Issue's Allowed
+    # Paths).
+    command_tuples, _parse_result = _command_entries_from_shared_parser(section)
+
+    # Issue #2788 fix_delta P1-B: normal execution (`_main_impl()`) rejects
+    # the WHOLE body -- zero subprocess candidates, `results: []`,
+    # `status: blocked` -- the instant ANY `non_dollar_command` static
+    # error is present anywhere in `_parse_result.static_errors`, even when
+    # OTHER, individually well-formed `$ command` lines exist in the SAME
+    # section (see the `_non_canonical_errors` whole-body-rejection branch
+    # in `_main_impl()` below). Before this fix, THIS function ignored
+    # `_parse_result` entirely and still built a command occurrence / timeout
+    # budget candidate from every remaining well-formed `$ command` line --
+    # drifting from what normal execution actually runs (violating AC2/AC3).
+    # Discarding `command_tuples` here (rather than raising) preserves the
+    # existing no-new-exception-type contract for
+    # `contract_readiness_check.py` / `run_contract_review_once.py` /
+    # `run_root_review_pipeline.py` (AC13, outside this Issue's Allowed
+    # Paths) -- this plan simply converges on the SAME "reject by omission"
+    # outcome (zero occurrences) normal execution's whole-body rejection
+    # already produces.
+    if any(se.kind == "non_dollar_command" for se in _parse_result.static_errors):
+        command_tuples = []
 
     command_occurrence_count = 0
     launch_upper_bound = 0
@@ -1342,45 +1432,44 @@ def compute_canonical_vc_plan(
     command_occurrences: List[Dict[str, Any]] = []
     aggregate_timeout_seconds = 0
 
-    for block in blocks:
-        for entry in parse_commands_from_block(block):
-            command = entry[1]
-            command_occurrence_count += 1
+    for entry in command_tuples:
+        command = entry[1]
+        command_occurrence_count += 1
 
-            command_hash = compute_command_hash(command)
-            if command_hash not in budgets_by_hash:
-                budgets_by_hash[command_hash] = compute_command_timeout_budget(
-                    command,
-                    override_seconds=global_override_seconds,
-                    default_seconds=per_command_timeout_seconds,
-                    history_snapshot=history_snapshot,
-                    cwd=cwd,
-                    repo_root=repo_root,
-                )
-            _budget = budgets_by_hash[command_hash]
-            aggregate_timeout_seconds += (
-                _budget["timeout_seconds"] + _budget["cleanup_tail_seconds"]
+        command_hash = compute_command_hash(command)
+        if command_hash not in budgets_by_hash:
+            budgets_by_hash[command_hash] = compute_command_timeout_budget(
+                command,
+                override_seconds=global_override_seconds,
+                default_seconds=per_command_timeout_seconds,
+                history_snapshot=history_snapshot,
+                cwd=cwd,
+                repo_root=repo_root,
             )
+        _budget = budgets_by_hash[command_hash]
+        aggregate_timeout_seconds += (
+            _budget["timeout_seconds"] + _budget["cleanup_tail_seconds"]
+        )
 
-            is_pure = _is_parallel_eligible_command(command, cwd, allowed_paths)
-            command_occurrences.append(
-                {"command_hash": command_hash, "is_pure": is_pure}
-            )
-            if is_pure:
-                bucket = seen_in_epoch.setdefault(state_epoch, set())
-                key = command.strip()
-                if key in bucket:
-                    # Executor dedup-replays this observation: not an
-                    # additional subprocess launch.
-                    continue
-                bucket.add(key)
-                launch_upper_bound += 1
-            else:
-                # Non-pure: never dedup-replayed, and advances the state
-                # barrier so any later repeat of an earlier pure command
-                # belongs to a new epoch (AC4).
-                launch_upper_bound += 1
-                state_epoch += 1
+        is_pure = _is_parallel_eligible_command(command, cwd, allowed_paths)
+        command_occurrences.append(
+            {"command_hash": command_hash, "is_pure": is_pure}
+        )
+        if is_pure:
+            bucket = seen_in_epoch.setdefault(state_epoch, set())
+            key = command.strip()
+            if key in bucket:
+                # Executor dedup-replays this observation: not an
+                # additional subprocess launch.
+                continue
+            bucket.add(key)
+            launch_upper_bound += 1
+        else:
+            # Non-pure: never dedup-replayed, and advances the state
+            # barrier so any later repeat of an earlier pure command
+            # belongs to a new epoch (AC4).
+            launch_upper_bound += 1
+            state_epoch += 1
 
     if aggregate_timeout_seconds > MAX_TOTAL_VERIFICATION_BUDGET_SECONDS:
         raise AggregateTimeoutExceedsPolicyError(
@@ -1549,19 +1638,37 @@ def _distinct_command_texts_from_body(body: str) -> List[str]:
     """Every DISTINCT (first-occurrence-ordered) VC command text in
     `body`'s `## Verification Commands` section -- the same population
     `compute_canonical_vc_plan()` computes one `command_timeout_budget/v1`
-    entry for."""
+    entry for.
+
+    Issue #2788 AC12: sources this population from the SAME shared-parser
+    adapter (`_command_entries_from_shared_parser()`) `compute_canonical_vc_plan()`
+    and normal execution use, instead of independently re-deriving it from
+    the legacy `extract_fenced_bash_blocks()` + `parse_commands_from_block()`
+    grammar -- keeping this docstring's claim actually true.
+
+    Issue #2788 fix_delta P1-B: for a body containing a `non_dollar_command`
+    static error (an explanatory non-`$` line inside a bash fence), normal
+    execution and `compute_canonical_vc_plan()` both reject the WHOLE body
+    (zero commands) -- see `compute_canonical_vc_plan()`'s own P1-B
+    docstring note. This function converges on the SAME empty population
+    for the SAME reason, so its AC12 claim above ("the SAME command
+    population `compute_canonical_vc_plan()` ... use") stays true even for
+    a mixed body that has both a non-`$` line AND an otherwise well-formed
+    `$ command` line.
+    """
     section = extract_verification_commands_section(body) or ""
-    blocks = extract_fenced_bash_blocks(section)
+    command_tuples, _parse_result = _command_entries_from_shared_parser(section)
+    if any(se.kind == "non_dollar_command" for se in _parse_result.static_errors):
+        return []
     seen: set = set()
     ordered: List[str] = []
-    for block in blocks:
-        for entry in parse_commands_from_block(block):
-            command = entry[1]
-            key = command.strip()
-            if key in seen:
-                continue
-            seen.add(key)
-            ordered.append(command)
+    for entry in command_tuples:
+        command = entry[1]
+        key = command.strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(command)
     return ordered
 
 
@@ -1884,27 +1991,12 @@ def compute_duplicate_diagnostic_report(
     }
 
 
-def detect_compound_command(command: str) -> bool:
-    """
-    コマンドが compound shell syntax を含むか検出
-
-    shlex.shlex で正確に tokenize し、shell operator を検出する。
-    これにより:
-    - cmd&&cmd（空白なし）も検出
-    - quoted string 内の | は誤検出しない
-    - redirect ( > < >> ) も compound と見なす (fail-closed)
-    """
-    try:
-        # C6: shlex.shlex with punctuation_chars=True for operator detection
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-        tokens = list(lexer)
-    except ValueError:
-        # parse 失敗 = 複雑なコマンド = fail-closed で compound と見なす
-        return True
-
-    # shell operators
-    operators = {"&&", "||", "|", ";", "&", "<<", "<", ">", ">>", "<<<"}
-    return any(t in operators for t in tokens)
+# `detect_compound_command()` moved to `vc_contract_syntax.py` (Issue #2788
+# AC9): it is now the SINGLE quote-aware compound-shell detection primitive
+# shared by this module's own classification call sites (imported above)
+# AND `vc_contract_syntax.parse_verification_commands_section()`'s static
+# `compound_shell` check -- no independent regex-based compound detector
+# remains anywhere in this grammar.
 
 
 # ---------------------------------------------------------------------------
@@ -5747,14 +5839,80 @@ def _main_impl() -> int:
     # AC2: parse Allowed Paths from Issue body for containment-based broad path detection
     allowed_paths_from_body = extract_allowed_paths(body)
 
-    # B4: bash ブロックからコマンドを抽出 (```bash のみ canonical format)
-    # Note: the normal execution path uses the legacy extract_fenced_bash_blocks() /
-    # parse_commands_from_block() parsers, NOT the unified parse_verification_commands_section().
-    # Only --static-only mode (above) uses the shared parser from vc_contract_syntax.py (#993).
-    blocks = extract_fenced_bash_blocks(vc_section)
-    commands = []
-    for block in blocks:
-        commands.extend(parse_commands_from_block(block))
+    # Issue #2788 AC1/AC6/AC7: normal execution now consumes the SAME
+    # shared-parser-backed adapter `--static-only` mode (above) and
+    # `compute_canonical_vc_plan()` use, instead of the legacy
+    # `extract_fenced_bash_blocks()` + `parse_commands_from_block()` grammar
+    # -- so all three paths share ONE canonical VC command grammar
+    # authority and never drift on what counts as a runnable command.
+    commands, _vc_parse_result = _command_entries_from_shared_parser(vc_section)
+
+    # Issue #2788 AC1/AC3/AC13: reject a body containing an explanatory
+    # non-`$` line inside a ```bash fence BEFORE any subprocess candidate is
+    # built -- consistent with `--static-only` mode's rejection of the SAME
+    # shared-parser `non_dollar_command` error (AC6), instead of silently
+    # ignoring the malformed line while still executing the other commands.
+    #
+    # Only `kind == "non_dollar_command"` is treated as a whole-body
+    # extraction rejection here. Every OTHER `VcParseResult.static_errors`
+    # kind corresponds to a line that IS still added to `.commands` (or, for
+    # `unlabeled_fence`, is handled by the pre-existing
+    # `find_unlabeled_fenced_blocks()` branch below with unchanged messaging)
+    # and is deliberately left to per-command classification instead of a
+    # blanket rejection, preserving existing behavior:
+    #   - `colon_marker` / `suffixed_marker`: the marker itself is invalid,
+    #     but the command line that follows it is still extracted (with its
+    #     `ac_label` simply not updated) -- exactly like legacy
+    #     `parse_commands_from_block()` silently ignored a malformed marker
+    #     without blocking the command it precedes.
+    #   - `compound_shell`: the `$`-prefixed command IS extracted into
+    #     `.commands`; `classify_static_command()` (via `detect_compound_command()`,
+    #     now the SAME shared quote-aware primitive, AC9) already classifies
+    #     THIS SPECIFIC result as `compound_command_disallowed` per-command
+    #     -- rejecting the whole body here would suppress that existing,
+    #     more precise per-command diagnostic.
+    #   - `inline_backtick`: detected OUTSIDE bash fences entirely (stray
+    #     prose elsewhere in the section) and does not correspond to any
+    #     extracted command.
+    #   - `preceding_marker_with_inline_suffix`: the command is still
+    #     extracted; this is an additional advisory-only marker conflict.
+    _non_canonical_errors = [
+        se for se in _vc_parse_result.static_errors if se.kind == "non_dollar_command"
+    ]
+    if _non_canonical_errors:
+        result = {
+            "schema": "baseline_vc_preflight/v1",
+            "issue": args.issue or 0,
+            "repo": args.repo,
+            "generated_at": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+            "source": {
+                "kind": source_kind,
+                "body_sha256": f"sha256:{compute_source_hash(body)}",
+            },
+            "status": "blocked",
+            "summary": {
+                "expected_fail": 0,
+                "unexpected_pass": 0,
+                "blocked": 0,
+                "human_judgment": 0,
+                "extraction_errors": len(_non_canonical_errors),
+            },
+            "results": [],
+            "errors": [
+                {
+                    "kind": "extraction_error",
+                    "rule": f"VC004_{se.kind.upper()}",
+                    "message": se.fix_hint,
+                    "minimal_context": se.raw_line,
+                    "fix_hint": se.fix_hint,
+                }
+                for se in _non_canonical_errors
+            ],
+            "diagnostic_report": not_computed_diagnostic_report(),
+        }
+        emit_json(result, args.evidence_mode, current_evidence)
+        # C2: exit code 2 for extraction errors
+        return 2
 
     # B3: 0 件抽出は blocked として返す
     if not commands:

@@ -89,6 +89,15 @@ def make_body(vc_block: str, allowed_paths: Optional[List[str]] = None) -> str:
 
     allowed_paths: list of path strings for ## Allowed Paths section.
                    Defaults to ["some/path.py"] for backward compatibility.
+
+    `vc_block` is the raw command TEXT (no leading `$ `, single line) --
+    this helper prepends the canonical `$ ` prefix (Issue #2788 AC1/AC3:
+    normal execution now shares `vc_contract_syntax.py`'s canonical
+    `$`-prefixed command grammar with `--static-only`, so a bare non-`$`
+    line is a rejected `non_dollar_command`, not a runnable command; every
+    caller in this file passes a single bare command string, so a single
+    centralized `$ ` prefix here keeps every existing call site's intent
+    unchanged instead of editing each call site individually).
     """
     if allowed_paths is None:
         allowed_paths = ["some/path.py"]
@@ -102,7 +111,7 @@ Test outcome.
 ## Verification Commands
 
 ```bash
-{vc_block}
+$ {vc_block}
 ```
 
 ## Allowed Paths
