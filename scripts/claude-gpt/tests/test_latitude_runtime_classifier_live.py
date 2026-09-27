@@ -62,7 +62,15 @@ def test_gpt_model_variants_with_context_hint_suffix_classify_as_claude_gpt():
     """GIVEN `[1m]` context hint suffix 付きの launcher model 名
     WHEN classify_runtime() を呼ぶ
     THEN suffix を除去した上で claude_gpt と判定される（AC7）
+
+    Issue #2772 で既定 allocation policy が gpt-6-sol/gpt-6-luna へ更新された
+    後も、過去に収集済みの gpt-5.6-* traces（dated evidence）は引き続き
+    claude_gpt と分類できる必要がある（AC6: 読み取り互換性を保持し、dated
+    evidence を遡及的に書き換えない）ため、新旧両方の base id を確認する。
     """
+    assert helpers.classify_runtime(["gpt-6-sol[1m]"]) == "claude_gpt"
+    assert helpers.classify_runtime(["gpt-6-luna[1m]"]) == "claude_gpt"
+    assert helpers.classify_runtime(["gpt-6-astra[1m]"]) == "claude_gpt"
     assert helpers.classify_runtime(["gpt-5.6-terra[1m]"]) == "claude_gpt"
     assert helpers.classify_runtime(["gpt-5.6-sol[1m]"]) == "claude_gpt"
     assert helpers.classify_runtime(["gpt-5.6-luna[1m]"]) == "claude_gpt"

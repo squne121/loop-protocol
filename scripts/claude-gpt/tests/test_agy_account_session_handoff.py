@@ -110,7 +110,7 @@ import json
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-MODELS = ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"]
+MODELS = ["gpt-6-sol", "gpt-6-luna"]
 
 
 def _serve(port: int) -> int:

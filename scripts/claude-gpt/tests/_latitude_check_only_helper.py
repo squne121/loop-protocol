@@ -26,7 +26,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent.parent  # scripts/claude-gpt/
 LAUNCH_SH = SCRIPT_DIR / "launch.sh"
 
-FAKE_PROXY_MODELS = ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"]
+FAKE_PROXY_MODELS = ["gpt-6-sol", "gpt-6-luna"]
 
 FAKE_PROXY_SOURCE = r"""#!/usr/bin/env python3
 import json
@@ -34,7 +34,7 @@ import signal
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-MODELS = ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"]
+MODELS = ["gpt-6-sol", "gpt-6-luna"]
 
 
 def _serve(port: int) -> int:

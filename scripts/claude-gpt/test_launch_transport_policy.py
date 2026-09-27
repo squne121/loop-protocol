@@ -37,7 +37,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 LAUNCH_SH = SCRIPT_DIR / "launch.sh"
 LIB_SH = SCRIPT_DIR / "lib.sh"
 
-MODELS = ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"]
+MODELS = ["gpt-6-sol", "gpt-6-luna"]
 
 FAKE_PROXY_SOURCE = r"""#!/usr/bin/env python3
 import json
@@ -46,7 +46,7 @@ import signal
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-MODELS = ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"]
+MODELS = ["gpt-6-sol", "gpt-6-luna"]
 
 
 def _capture_env():
@@ -245,14 +245,15 @@ def test_build_proxy_env_helper_references_same_transport_policy_constant():
 
 def test_auto_review_model_policy_constant_defined_exactly_once_in_lib_sh():
     """GIVEN lib.sh
-    WHEN CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY="gpt-5.6-terra" の行を数える
-    THEN 無条件定数として一つだけ存在する（Issue #2654 Outcome (a)）
+    WHEN CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY="gpt-6-luna" の行を数える
+    THEN 無条件定数として一つだけ存在する（Issue #2654 で導入、Issue #2772 で
+    Luna へ復帰した classifier routing policy）
     """
     content = LIB_SH.read_text(encoding="utf-8")
     matches = [
         line
         for line in content.splitlines()
-        if line.strip() == 'CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY="gpt-5.6-terra"'
+        if line.strip() == 'CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY="gpt-6-luna"'
     ]
     assert len(matches) == 1
 
@@ -353,24 +354,25 @@ def test_transport_override_applies_even_without_parent_env_set(tmp_path):
     "extra_env",
     [
         pytest.param(None, id="parent_env_unset"),
-        pytest.param({"CCP_AUTO_REVIEW_MODEL": "gpt-5.6-luna"}, id="parent_env_overridden"),
+        pytest.param({"CCP_AUTO_REVIEW_MODEL": "gpt-5.6-terra"}, id="parent_env_overridden"),
     ],
 )
-def test_auto_review_model_override_reaches_child_env_as_terra(tmp_path, extra_env):
+def test_auto_review_model_override_reaches_child_env_as_luna(tmp_path, extra_env):
     """GIVEN 親 env に CCP_AUTO_REVIEW_MODEL が未設定、または他の値
-    （例: gpt-5.6-luna）で設定されている
+    （例: 旧 Issue #2654 世代の gpt-5.6-terra）で設定されている
     WHEN launch.sh --check-only を実行する
     THEN fake proxy が capture した child env の CCP_AUTO_REVIEW_MODEL は
-    どちらのケースでも "gpt-5.6-terra" になる（Issue #2654: launcher-owned な
+    どちらのケースでも "gpt-6-luna" になる（launcher-owned な
     CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY が、親 env の有無・値に関わらず優先
     される実効値を検証する。静的な定義行 grep だけでは、この実効値が
-    意図せず上書きされても検知できない）
+    意図せず上書きされても検知できない。Issue #2772 で classifier routing を
+    Luna へ復帰した後の実効値を確認する）
     """
     result = _run_check_only(tmp_path, extra_env=extra_env)
     assert result.returncode == 0, result.stderr
 
     captured = _read_captured_env(tmp_path)
-    assert captured.get("CCP_AUTO_REVIEW_MODEL") == "gpt-5.6-terra"
+    assert captured.get("CCP_AUTO_REVIEW_MODEL") == "gpt-6-luna"
 
 
 # --- unrelated parent variables の scrub 確認（AC4） -----------------------------
