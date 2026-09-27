@@ -420,10 +420,24 @@ def extract_allowed_path_entries(body: str) -> List[str]:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        # Issue #2783: judge no-path marker BEFORE normalize_path() (fixed
-        # order: wrapper strip -> marker match -> ordinary normalization).
-        # A marker line contributes 0 paths / entries.
-        if is_no_path_marker(stripped):
+        # PR #2791 review fix_delta (Issue #2783): a bare code-fence
+        # delimiter line (an opening ```` ``` ```` / ```` ```text ```` with
+        # an optional info string, or a bare closing ```` ``` ````) is
+        # Markdown *structure* used only for visual wrapping here, never a
+        # path/marker entry on its own -- skip it outright so it never
+        # becomes a spurious candidate path. Lines *inside* the fence are
+        # still processed as ordinary entries below.
+        if stripped.startswith("```"):
+            continue
+        # PR #2791 review fix_delta (Issue #2783): judge no-path marker
+        # BEFORE normalize_path() with the FIXED order: strip the shared
+        # bullet/numbered-list wrapper (`_BULLET_RE`, which also strips
+        # numbered lists like `1.` / `1)` that `allowed_paths_policy`'s own
+        # bullet-only `_strip_wrapper()` deliberately does not) -> marker
+        # exact-match -> ordinary normalization. A marker line contributes
+        # 0 paths / entries.
+        unwrapped = _BULLET_RE.sub("", stripped).strip()
+        if is_no_path_marker(unwrapped):
             continue
         if normalize_path(stripped):
             entries.append(stripped)

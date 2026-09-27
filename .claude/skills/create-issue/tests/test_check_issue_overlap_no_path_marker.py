@@ -107,6 +107,76 @@ def test_no_path_marker_canonical_alone_not_duplicate():
     assert result.verdict != cio.DUPLICATE, result
 
 
+def _allowed_paths_section(inner: str) -> str:
+    return f"""## Outcome
+
+Investigation-only research.
+
+## Allowed Paths
+
+{inner}
+
+## Stop Conditions
+
+- none
+"""
+
+
+def test_code_fence_wrapped_canonical_marker_extracts_zero_paths():
+    # PR #2791 review fix_delta (Issue #2783): a ```text fence-wrapped
+    # `(none)` must not leak the fence delimiter lines themselves
+    # (` ```text` / ` ``` `) as spurious candidate paths via the real
+    # consumer `extract_allowed_path_entries()` / `extract_allowed_paths()`.
+    body = _allowed_paths_section("```text\n(none)\n```")
+    assert cio.extract_allowed_path_entries(body) == []
+    assert cio.extract_allowed_paths(body) == []
+
+
+def test_code_fence_wrapped_legacy_marker_extracts_zero_paths():
+    body = _allowed_paths_section("```text\n読み取り専用。リポジトリ変更なし（既定）\n```")
+    assert cio.extract_allowed_path_entries(body) == []
+    assert cio.extract_allowed_paths(body) == []
+
+
+def test_numbered_list_legacy_marker_extracts_zero_paths():
+    # PR #2791 review fix_delta: numbered-list wrapping (`1.` / `1)`) must
+    # be stripped BEFORE the marker exact-match, mirroring the existing
+    # `_BULLET_RE` numbered-list support `normalize_path()` already has
+    # (the shared `allowed_paths_policy._strip_wrapper()` only strips
+    # bullet markers, not numbered lists -- this consumer must apply its
+    # own numbered-list-aware wrapper strip first).
+    body = _allowed_paths_section("1. 読み取り専用。リポジトリ変更なし（既定）")
+    assert cio.extract_allowed_path_entries(body) == []
+    assert cio.extract_allowed_paths(body) == []
+
+    body_paren_close = _allowed_paths_section("1) 読み取り専用。リポジトリ変更なし（既定）")
+    assert cio.extract_allowed_path_entries(body_paren_close) == []
+    assert cio.extract_allowed_paths(body_paren_close) == []
+
+
+def test_marker_and_real_path_coexist_marker_removed_path_kept():
+    # PR #2791 review fix_delta: when a no-path marker line and a real
+    # path both appear in the SAME Allowed Paths section, only the marker
+    # line is dropped -- the real path must survive extraction unchanged.
+    body = _allowed_paths_section(
+        "- (none)\n- scripts/agent-ops/allowed_paths_policy.py"
+    )
+    entries = cio.extract_allowed_path_entries(body)
+    assert entries == ["- scripts/agent-ops/allowed_paths_policy.py"]
+    assert cio.extract_allowed_paths(body) == ["scripts/agent-ops/allowed_paths_policy.py"]
+
+
+def test_unicode_and_annotated_real_paths_unaffected_by_marker_fix():
+    # PR #2791 review fix_delta: Unicode/punctuation-bearing real paths
+    # (e.g. `docs/日本語.md`) and the existing PR #684 annotation semantics
+    # (`some/path.py（読み取り専用）` -> annotation stripped, bare path kept)
+    # must still work exactly as before this fix.
+    body = _allowed_paths_section(
+        "- docs/日本語.md\n- some/path.py（読み取り専用）"
+    )
+    assert cio.extract_allowed_paths(body) == ["docs/日本語.md", "some/path.py"]
+
+
 def test_no_path_marker_mixed_canonical_and_legacy_not_duplicate():
     """One side declares the canonical marker, the other the legacy marker
     -- still not a duplicate via allowed_paths (both normalize to 0

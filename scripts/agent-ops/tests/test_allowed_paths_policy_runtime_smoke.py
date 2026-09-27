@@ -121,14 +121,19 @@ fi
 """
 
 
-def _subagent_hook_lines(agent_id: str, marker: str) -> str:
+def _subagent_hook_lines(agent_id: str, marker: str, *, transcript_dir: Path) -> str:
     """Correlated SubagentStart/SubagentStop hook lifecycle pair PLUS a real
     Agent tool_use/tool_result envelope PLUS an actual on-disk transcript
     carrying `marker` -- the causal-evidence shape
     `subagent_causal_evidence_verdict()` requires for
-    `causal_evidence_source: hook_id_correlated` (Issue #2183)."""
+    `causal_evidence_source: hook_id_correlated` (Issue #2183).
+
+    PR #2791 review fix_delta: `transcript_path` is test-owned (under the
+    caller's own `tmp_path` fixture directory), never a fixed shared `/tmp/`
+    path -- a fixed path would be shared/clobbered across concurrent pytest
+    runs / other worktrees running this same test file."""
     tool_use_id = "toolu_ac16_agent_invocation"
-    transcript_path = f"/tmp/{agent_id}-ac16-transcript.jsonl"
+    transcript_path = str(transcript_dir / f"{agent_id}-ac16-transcript.jsonl")
 
     def _hook_event(hook_event: str, *, with_transcript: bool) -> str:
         inner: dict[str, str] = {"agent_id": agent_id, "agent_type": "general-purpose"}
@@ -203,7 +208,7 @@ def test_subagent_lifecycle_causal_evidence_unaffected_by_marker_change(tmp_path
 cat > /dev/null
 echo '{"type":"system","subtype":"init"}'
 """
-        + _subagent_hook_lines(agent_id="ac16-child-agent", marker=marker)
+        + _subagent_hook_lines(agent_id="ac16-child-agent", marker=marker, transcript_dir=tmp_path)
         + f"""echo '{{"type":"result","subtype":"success","marker":"{marker}"}}'
 exit 0
 """,

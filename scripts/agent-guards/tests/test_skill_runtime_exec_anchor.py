@@ -673,6 +673,17 @@ def _install_real_contract_update_fixture(repo_root: Path, trusted_gh_bin: Path)
         repo_root / "scripts" / "agent-guards" / "changed_file_matcher.py",
         (source_root / "scripts" / "agent-guards" / "changed_file_matcher.py").read_text(),
     )
+    # Issue #2783 fix_delta: `repair_issue_contract.py` (part of the copied
+    # `issue-refinement-loop` skill tree above) imports the shared
+    # `allowed_paths_policy.is_no_path_marker` helper from
+    # `scripts/agent-ops/` via `sys.path` insertion -- same cross-skill
+    # dependency shape as `changed_file_matcher.py` above. Mirror it into
+    # the isolated fixture repo at the same relative location
+    # (self-contained, no PYTHONPATH escape to the real repo).
+    _write_text(
+        repo_root / "scripts" / "agent-ops" / "allowed_paths_policy.py",
+        (source_root / "scripts" / "agent-ops" / "allowed_paths_policy.py").read_text(),
+    )
     _copy_tree(
         source_root / ".claude" / "skills" / "create-issue" / "scripts",
         repo_root / ".claude" / "skills" / "create-issue" / "scripts",
