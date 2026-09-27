@@ -250,6 +250,50 @@ def test_ac1_consumer_reaches_issue_editor_required_for_freeform_explicit_direct
     assert fetch_calls["count"] >= 1
 
 
+# ---------------------------------------------------------------------------
+# Issue #2812 AC5: the SAME full production routing chain as
+# test_ac1_consumer_reaches_issue_editor_required_for_freeform_explicit_
+# directive() above, but with the directive expressed as a native Markdown
+# ORDERED list (`1. `, `2. `) instead of the unordered `- ` form -- Issue
+# #2805 regression (native Markdown ordered list detection gap in
+# `_BULLET_LINE_RE` / `extract_directive_items()` /
+# `classify_directive_confidence()`, fixed in scope_signal_delta.py).
+# ---------------------------------------------------------------------------
+
+_ORDERED_LIST_ANCHOR_BODY = (
+    "Please restructure the onboarding walkthrough narrative so new "
+    "contributors are not dropped mid-flow.\n\n"
+    "1. Please restructure the onboarding walkthrough narrative to add "
+    "clarifying context for new contributors.\n"
+    "2. Please also add a troubleshooting section for common walkthrough "
+    "errors.\n"
+)
+
+
+def test_ac5_ordered_list_directive_reaches_issue_editor_required_writes_zero():
+    """AC5 (#2812): a freeform human-context comment whose directive is
+    expressed as a native Markdown ORDERED list (`1. `, `2. `) -- not the
+    unordered `-`/`*` form already covered by
+    test_ac1_consumer_reaches_issue_editor_required_for_freeform_explicit_
+    directive() -- reaches the SAME production route via the real
+    production consumer: `rewrite_route.route == issue_editor_required`
+    with `writes == 0` preserved, and the canonical `reviewer_feedback_url`
+    (never the raw anchor body) echoed unchanged."""
+    kwargs = _consumer_kwargs(anchor_body=_ORDERED_LIST_ANCHOR_BODY)
+    fetch_current, fetch_calls = _fetch_current_unchanged(
+        anchor_body=_ORDERED_LIST_ANCHOR_BODY
+    )
+    kwargs["callbacks"] = {"fetch_current": fetch_current}
+    result = preflight.consume_trusted_anchor_contract_patch_plan(**kwargs)
+
+    assert result["writes"] == 0
+    assert result["rewrite_route"]["route"] == "issue_editor_required"
+    assert result["reviewer_feedback_url"] == _ANCHOR_URL
+    assert result["reviewer_feedback_url"] != _ORDERED_LIST_ANCHOR_BODY
+    assert "reviewer_feedback_text" not in result
+    assert fetch_calls["count"] >= 1
+
+
 def test_ac3_untrusted_author_association_never_escalates():
     """AC3: an untrusted author association (NONE) never reaches
     issue_editor_required -- fails closed via the existing

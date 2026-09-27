@@ -803,7 +803,23 @@ _DIRECTIVE_SECTION_MARKERS = (
     "1 issue = 1 pr",
 )
 
-_BULLET_LINE_RE = re.compile(r"^\s*[-*]\s+\S.*$", re.MULTILINE)
+# #2812 fix_delta: originally only matched unordered `-`/`*` bullet
+# markers. Extended to ALSO match Markdown ordered-list markers (`1. `,
+# `2. `, `1)`, `2)` etc. -- `\d+[.)]`) so a structured
+# `human_review_directive` expressed as a native Markdown ordered list
+# (Issue #2805 repro) or a CF_HTML clipboard-paste `<ol><li>` rendition
+# (Issue #2730 repro, canonicalized to plain ordered-list Markdown by
+# `_canonicalize_cf_html_envelope()` before this pattern ever sees it) is
+# detected the same way an unordered bullet already was. This is a minimal
+# regex extension only -- no general Markdown/HTML parser is introduced
+# (#2778 research parent, out-of-scope raw HTML tag detection).
+_BULLET_LINE_RE = re.compile(r"^\s*(?:[-*]|\d+[.)])\s+\S.*$", re.MULTILINE)
+
+# #2812 fix_delta: matches the ordered-list marker prefix of a single
+# (already `.strip()`-ped) line, e.g. "1. " / "2) " -- used by
+# `extract_directive_items()` to extract content symmetrically with the
+# existing unordered `"- "` / `"* "` prefix check below.
+_ORDERED_LIST_ITEM_PREFIX_RE = re.compile(r"^\d+[.)]\s+")
 
 # #2086 AC1 P1 fix_delta: a bullet line's mere PRESENCE is not itself
 # evidence of a scope-expansion directive (an observation note, a TODO
@@ -1133,6 +1149,14 @@ def extract_directive_items(text: "str | None") -> list:
     contamination never reaches the bullet items this function returns (and
     therefore never reaches the downstream contract-patch operations built
     from them).
+
+    #2812 fix_delta: a Markdown ORDERED-list marker line (``1. ``, ``2) ``,
+    etc. -- see ``_ORDERED_LIST_ITEM_PREFIX_RE``) is now extracted
+    symmetrically with the pre-existing unordered ``"- "``/``"* "`` prefix
+    check below, so a structured directive expressed as a native ordered
+    list (Issue #2805) or a CF_HTML clipboard-paste ordered list rendition
+    (Issue #2730, already canonicalized above) is no longer silently
+    dropped.
     """
     canonical = _canonicalize_cf_html_envelope(text)
     if canonical is None:
@@ -1142,6 +1166,12 @@ def extract_directive_items(text: "str | None") -> list:
         stripped = line.strip()
         if stripped.startswith("- ") or stripped.startswith("* "):
             content = stripped[2:].strip()
+            if content:
+                items.append(content)
+            continue
+        ordered_match = _ORDERED_LIST_ITEM_PREFIX_RE.match(stripped)
+        if ordered_match:
+            content = stripped[ordered_match.end():].strip()
             if content:
                 items.append(content)
     return items
