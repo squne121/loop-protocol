@@ -7,6 +7,11 @@ fixture のイベント形式は実 `claude-code-proxy` v0.1.34 バイナリの 
 （`<proxy_state_dir>/claude-code-proxy/proxy.log`）から確認した実スキーマ
 （`{"fields": {...}, "msg": "...", ...}`、"request"/"codex_upstream_request_started"/
 "request_completed" の 3 イベントを `fields.reqId` で相関）に合わせている。
+Issue #2772（2026-09-27）でローカル installed v0.1.36 バイナリの bounded local
+実行（実 ChatGPT subscription request は行わない）により、この 3 イベントの
+schema が変わっていないことを再確認済み（transport_log.py 冒頭の追記参照）。
+この fixture の model 名（`gpt-5.6-terra`）は当時の dated evidence の値であり、
+`transport_log.py` は model 名を判定に使わないため、遡及的に書き換えない。
 
 負例（negative fixture）:
   - HTTP + WebSocket 混在 -> FAIL
@@ -259,6 +264,69 @@ def test_nonexistent_file_fails(tmp_path: Path) -> None:
     verdict = evaluate_transport_log(str(tmp_path / "does-not-exist.log"))
     assert verdict.ok is False
     assert verdict.started_count == 0
+
+
+def test_model_field_prefers_completed_event(tmp_path: Path) -> None:
+    """Issue #2772: `requests[]` の各要素は `model` を持ち、`request_completed` と
+    `codex_upstream_request_started` の両方に model がある場合は `request_completed`
+    側を優先する（両者は同一 reqId なら通常同値だが、優先順位を明示的に固定する）。"""
+    log = _write_jsonl(
+        tmp_path / "proxy.log",
+        [
+            _request("r1"),
+            {
+                "msg": "codex_upstream_request_started",
+                "fields": {"reqId": "r1", "transport": "http", "model": "gpt-6-sol"},
+            },
+            {
+                "msg": "request_completed",
+                "fields": {"reqId": "r1", "status": 200, "model": "gpt-6-luna"},
+            },
+        ],
+    )
+    verdict = evaluate_transport_log(str(log))
+    assert verdict.ok is True
+    assert verdict.requests[0]["model"] == "gpt-6-luna"
+
+
+def test_model_field_falls_back_to_started_event_when_completed_missing_model(
+    tmp_path: Path,
+) -> None:
+    """`request_completed` に `model` が無い場合は `codex_upstream_request_started`
+    側の `model` を使う。"""
+    log = _write_jsonl(
+        tmp_path / "proxy.log",
+        [
+            _request("r1"),
+            {
+                "msg": "codex_upstream_request_started",
+                "fields": {"reqId": "r1", "transport": "http", "model": "gpt-6-luna"},
+            },
+            {"msg": "request_completed", "fields": {"reqId": "r1", "status": 200}},
+        ],
+    )
+    verdict = evaluate_transport_log(str(log))
+    assert verdict.ok is True
+    assert verdict.requests[0]["model"] == "gpt-6-luna"
+
+
+def test_model_field_absent_degrades_to_none_without_raising(tmp_path: Path) -> None:
+    """`model` フィールドが `codex_upstream_request_started` にも `request_completed`
+    にも無い場合、KeyError/例外を送出せず `None` に degrade する。"""
+    log = _write_jsonl(
+        tmp_path / "proxy.log",
+        [
+            _request("r1"),
+            {
+                "msg": "codex_upstream_request_started",
+                "fields": {"reqId": "r1", "transport": "http"},
+            },
+            {"msg": "request_completed", "fields": {"reqId": "r1", "status": 200}},
+        ],
+    )
+    verdict = evaluate_transport_log(str(log))
+    assert verdict.ok is True
+    assert verdict.requests[0]["model"] is None
 
 
 def test_marker_impersonation_without_real_upstream_event_fails(tmp_path: Path) -> None:

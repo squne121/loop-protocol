@@ -310,8 +310,20 @@ claude_gpt_link_native_sessions_dir() {
   return 0
 }
 
-# --- Model alias mapping（Parent #2154 アーキテクチャ決定 E 準拠） ---
-# opus -> gpt-5.6-sol / sonnet -> gpt-5.6-terra（main 推奨） / haiku -> gpt-5.6-luna
+# --- Model alias mapping（Parent #2154 アーキテクチャ決定 E 準拠、Issue #2772 で
+#     GPT-6 Sol/Luna へ更新） ---
+# main / sonnet / opus -> gpt-6-sol（既定 allocation policy） / haiku -> gpt-6-luna
+#
+# Issue #2772 Model Policy 節（OWNER レビュー 2026-09-27 反映）: upstream
+# `raine/claude-code-proxy` v0.1.42 が追加した GPT-6 Sol/Luna
+#（https://github.com/raine/claude-code-proxy/pull/165）へ、この repository-owned
+# default allocation policy を更新する。これは「OpenAI が 5.6 Terra を 6 Sol に
+# 改名した」という主張ではなく、用途ベースの repo policy 決定である（公式発表の
+# 対応は 5.6 Sol→6 Sol、5.6 Luna→6 Luna）。main/sonnet/opus はすべて `gpt-6-sol`
+# に揃え、旧 `gpt-5.6-terra`（Issue #2654 で導入した中間の main 既定）は使わない。
+# `gpt-6-astra` は default opus alias にしない（下記 astra escalation 節参照。
+# 根拠は #2577 の 54 live run 実測で opus は `KEEP_CURRENT` 判定済みであり、GPT-6
+# 互換更新の名目でこの実測結果を上書きしない）。
 #
 # `[1m]` suffix は upstream raine/claude-code-proxy が公式に案内する起動形式
 # （https://claude-code-proxy.raine.dev/using/configure-claude-code/）で、Claude Code
@@ -320,29 +332,49 @@ claude_gpt_link_native_sessions_dir() {
 # model ID は suffix なしの base 名のまま変わらない。suffix を付けずに起動すると
 # Claude Code が未知 model として扱い、実際の context 上限（272k）より小さい既定値
 # （200k）で誤って compaction を早期発動させ、summarization 失敗を引き起こす
-# （Issue #2158/PR #2162 実機再検証, 2026-08-15）。
-CLAUDE_GPT_MODEL_MAIN="gpt-5.6-terra[1m]"
-CLAUDE_GPT_MODEL_OPUS="gpt-5.6-sol[1m]"
-CLAUDE_GPT_MODEL_SONNET="gpt-5.6-terra[1m]"
-CLAUDE_GPT_MODEL_HAIKU="gpt-5.6-luna[1m]"
+# （Issue #2158/PR #2162 実機再検証, 2026-08-15）。この rationale は base model ID の
+# 変更（5.6→6 系）とは独立であり、Issue #2772 でも変更しない。
+CLAUDE_GPT_MODEL_MAIN="gpt-6-sol[1m]"
+CLAUDE_GPT_MODEL_OPUS="gpt-6-sol[1m]"
+CLAUDE_GPT_MODEL_SONNET="gpt-6-sol[1m]"
+CLAUDE_GPT_MODEL_HAIKU="gpt-6-luna[1m]"
 
-# --- auto mode classifier request の routing 先（Issue #2654） ---
+# --- Astra の on-demand escalation（Issue #2772 Model Policy 2節。startup-critical
+#     にしない） ---
 #
-# upstream raine/claude-code-proxy（pinned 0.1.34）は non-streaming・tool-free な
-# auto mode classifier request（`apply_auto_review_model()`）を `CCP_AUTO_REVIEW_MODEL`
-# 未設定時、provider が codex なら無条件で `gpt-5.6-luna` （`CODEX_AUTO_REVIEW_MODEL`
+# `gpt-6-astra` は上記の通常既定（MAIN/OPUS/SONNET/HAIKU）に一切含めない。
+# 明示的な model 選択（`launch.sh -- --model gpt-6-astra[1m]` 等）で到達する
+# on-demand capability としてのみ残す。`launch.sh` の起動 preflight
+# （MAIN/OPUS/HAIKU の `/v1/models` availability 一括確認ループ）は、この定数を
+# 一切参照しない -- Astra entitlement/registration の有無だけで通常 Sol session の
+# launcher 全体が起動不能になることを避けるため（下記 model alias resolution
+# ループ、および明示 escalation 検証ブロック参照）。
+CLAUDE_GPT_MODEL_ASTRA="gpt-6-astra[1m]"
+
+# --- auto mode classifier request の routing 先（Issue #2654 で導入、Issue #2772
+#     で Luna へ復帰） ---
+#
+# upstream raine/claude-code-proxy は non-streaming・tool-free な auto mode
+# classifier request（`apply_auto_review_model()`）を `CCP_AUTO_REVIEW_MODEL`
+# 未設定時、provider が codex なら無条件で `gpt-5.6-luna` 相当（`CODEX_AUTO_REVIEW_MODEL`
 # 定数）へ固定 fallback する。この未設定時デフォルトを避けるため、claude-gpt
-# launcher 側で classifier 専用のモデル選択を明示し、候補として `gpt-5.6-terra`
-# を採用した。native Claude Code の auto mode classifier は `/model` で選択した
-# session model とは独立に既定で Claude Sonnet 5 上で動作する
-# （`code.claude.com/docs/en/permission-modes`）ため、session model と揃えることが
-# native 相当になるという根拠はない。`gpt-5.6-terra` の採用はあくまで launcher が
-# 明示的に選んだ候補という位置づけであり、native classifier（Sonnet 5）との性能
-# 同等性、および `gpt-5.6-luna` 比での過剰拒否率・latency の改善は未検証である。
-# classifier request の到達先が `gpt-5.6-terra` へ変更されたこと自体は Issue #2654
-# の bounded comparison（proxy log 実測で classifier request 1030/1030件が
-# 変更前は gpt-5.6-luna へ固定到達していたことの確認）で確認済みである。
-CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY="gpt-5.6-terra"
+# launcher 側で classifier 専用のモデル選択を明示する。
+#
+# Issue #2654 の bounded comparison（proxy log 実測で classifier request
+# 1030/1030件が変更前は gpt-5.6-luna へ固定到達していたことの確認）を受け、
+# 当時は候補として `gpt-5.6-terra` を採用した。native Claude Code の auto mode
+# classifier は `/model` で選択した session model とは独立に既定で Claude Sonnet 5
+# 上で動作する（`code.claude.com/docs/en/permission-modes`）ため、session model と
+# 揃えることが native 相当になるという根拠はない。`gpt-5.6-terra` の採用は launcher
+# が明示的に選んだ候補という位置づけであり、native classifier（Sonnet 5）との性能
+# 同等性、および `gpt-5.6-luna` 比での過剰拒否率・latency の改善は Issue #2654
+# 時点では未実証のまま残った（#2709 も拒否率改善の因果実証を outcome にしていない）。
+#
+# Issue #2772（ユーザーの明示指示、OWNER レビュー 2026-09-27）により、classifier
+# routing を Luna へ復帰する。「Luna が原因だった／Terra で改善した／問題は完全
+# 解消済み」という主張ではなく、明示的な `CCP_AUTO_REVIEW_MODEL` policy を維持し
+# つつ、対象モデルを世代更新後の base ID（`gpt-6-luna`）へ揃える決定である。
+CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY="gpt-6-luna"
 
 # --- Issue #2801: proxy model catalog compatibility preflight / repair ---------
 #
@@ -426,6 +458,37 @@ claude_gpt_resolve_claude_bin() {
 # 同一の absolute path を使い回す。CLAUDE_GPT_PROXY_BIN が明示されていれば（launch.sh が
 # 一度解決した値を子プロセス preflight.sh へ export する場合など）それを優先し、
 # 再解決による差異（PATH mutation 等）を排除する。
+#
+# --- 互換 proxy の isolated 導入手順（Issue #2772 In Scope、PR #2800 OWNER
+#     REQUEST_CHANGES P1）: ---
+#
+# `command -v claude-code-proxy`（グローバル PATH 上のバイナリ）が GPT-6
+# Sol/Luna/Astra を提供する upstream release（v0.1.42 以上）より古い場合、
+# 通常起動は preflight で `model_alias_not_resolved`（exit 7）になる。この
+# ケースでは、グローバル PATH のインストールを上書きせず、以下の手順で
+# 互換 proxy を隔離した場所へ追加導入し、`CLAUDE_GPT_PROXY_BIN` で明示選択する
+# （upstream 公式 installer の contract をそのまま使い、独自 downloader/package
+# manager は新設しない）。
+#
+#   CLAUDE_CODE_PROXY_VERSION=v0.1.42 \
+#   CLAUDE_CODE_PROXY_INSTALL_DIR=<isolated-dir, 例: ~/.local/share/claude-gpt-compat-proxy> \
+#     bash <(curl -fsSL https://raw.githubusercontent.com/raine/claude-code-proxy/main/scripts/install.sh)
+#
+#   export CLAUDE_GPT_PROXY_BIN=<isolated-dir>/claude-code-proxy
+#
+# 導入後は、選択した isolated バイナリで実際に認証する（Native Claude の
+# credential/config には触れない、proxy 専用の別アカウント認証）。
+#
+#   "$CLAUDE_GPT_PROXY_BIN" codex auth login
+#
+# 最後に、同じ選択バイナリで `scripts/claude-gpt/launch.sh --check-only` を
+# 実行し、`model_alias_ok: true` になることを確認する。`claude-code-proxy
+# models` への表示や local registry 一致は account entitlement の証明では
+# ない（AC7）。実際の ChatGPT subscription request 成功は Issue #2772 の
+# Runtime Verification（AC10）で別途確認する。
+#
+# 稼働中の proxy/session を kill・hot-swap する運用や、`CLAUDE_GPT_PROXY_BIN`
+# を明示している運用者の意図を無断で別バイナリへ差し替える運用はしない。
 claude_gpt_resolve_proxy_bin() {
   if [ -n "${CLAUDE_GPT_PROXY_BIN:-}" ]; then
     printf '%s\n' "$CLAUDE_GPT_PROXY_BIN"

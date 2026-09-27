@@ -29,7 +29,22 @@ SCRIPT_DIR = Path(__file__).resolve().parent.parent  # scripts/claude-gpt/
 LAUNCH_SH = SCRIPT_DIR / "launch.sh"
 
 # Design 7節: launcher-owned GPT model mapping（`[1m]` suffix除去後の base id）。
-GPT_MODEL_BASE_IDS = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
+# Issue #2772 で既定 allocation policy を gpt-6-sol/gpt-6-luna（main/sonnet/opus
+# -> sol、haiku -> luna）へ更新した後も、この classifier は過去に収集済みの
+# gpt-5.6-* traces（dated evidence）を引き続き claude_gpt と正しく分類できる
+# 必要がある（AC6: 過去の GPT-5.6 evidence の読み取り互換性を保持し、
+# dated evidence を遡及的に書き換えない）ため、旧世代 ID を削除せず新世代 ID に
+# 追加する形で保持する。`gpt-6-astra` は明示 on-demand escalation でのみ到達する
+# model だが、実際に到達した trace が観測された場合に unknown 誤分類しないよう
+# 併せて含める。
+GPT_MODEL_BASE_IDS = (
+    "gpt-6-sol",
+    "gpt-6-luna",
+    "gpt-6-astra",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+)
 NATIVE_MODEL_REGEX = re.compile(r"^claude-")
 
 _CONTEXT_HINT_SUFFIX_RE = re.compile(r"\[[^\]]*\]$")
