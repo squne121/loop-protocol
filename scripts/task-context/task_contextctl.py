@@ -8,6 +8,7 @@ typed API/CLI operations within this directory):
 
     task-contextctl hook <event>
     task-contextctl signal apply
+    task-contextctl signal diagnose-origin  # Issue #2790 AC3/AC7: read-only
     task-contextctl query current           # payload: {task_id} or {session_id}
     task-contextctl projection flush
     task-contextctl projection ack
@@ -210,6 +211,15 @@ def _dispatch(operation: str, payload: dict) -> dict:
             )
             return envelope.build_ok_result(result)
 
+        if operation == "signal_diagnose_origin":
+            # Issue #2790 AC3/AC7: read-only diagnostic counterpart of
+            # `signal apply` -- never mutates, never persists an event, and
+            # never changes the frozen public `unbound` disposition/
+            # reason_code contract other callers (e.g. `signal apply`)
+            # still return unchanged.
+            result = workflow_signals.diagnose_origin(conn, os.environ.get("CLAUDE_CODE_SESSION_ID"))
+            return envelope.build_ok_result(result)
+
         if operation == "cleanup_begin":
             required = ("repo", "issue_number", "pr_number", "merge_identity")
             if any(key not in payload for key in required):
@@ -288,6 +298,7 @@ def main(argv: list[str] | None = None) -> int:
     signal_p = sub.add_parser("signal")
     signal_sub = signal_p.add_subparsers(dest="signal_command", required=True)
     signal_sub.add_parser("apply")
+    signal_sub.add_parser("diagnose-origin")
 
     cleanup_p = sub.add_parser("cleanup")
     cleanup_sub = cleanup_p.add_subparsers(dest="cleanup_command", required=True)
@@ -317,6 +328,8 @@ def main(argv: list[str] | None = None) -> int:
         operation = "hook"
     elif args.command == "signal" and args.signal_command == "apply":
         operation = "signal_apply"
+    elif args.command == "signal" and args.signal_command == "diagnose-origin":
+        operation = "signal_diagnose_origin"
     elif args.command == "cleanup" and args.cleanup_command == "begin":
         operation = "cleanup_begin"
     elif args.command == "query" and args.query_command == "current":

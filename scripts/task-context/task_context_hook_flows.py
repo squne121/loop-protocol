@@ -34,7 +34,10 @@ fields -- never a raw prompt string.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import subprocess
 import sys
 from typing import Any
 
@@ -150,6 +153,80 @@ def _projection_fields(result: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# SessionStart debug trace (Issue #2790 AC1/AC11): opt-in, session-scoped,
+# fingerprint-only 1-line diagnostic trace of exactly the fields the Issue's
+# Runtime Verification Applicability artifact_requirements calls for --
+# `source`, Claude Code version, a *fingerprint* (never the raw value) of
+# the session identity / effective Herdr locator, `has_tab_id`/`has_pane_id`,
+# and the lookup-by-current-session / lookup-by-current-location / recovery
+# outcomes. Gated by `TASK_CONTEXT_DEBUG_TRACE` (unset/empty == off, the
+# permanent default) so it never runs -- and never costs a `claude
+# --version` subprocess spawn -- on any production hot path. Never a raw
+# env dump / raw secret (Issue #2790 Stop Condition): `claude_session_id`
+# and the Herdr locator are only ever fingerprinted via `_fingerprint`
+# below, one-way and non-reversible.
+# ---------------------------------------------------------------------------
+
+_DEBUG_TRACE_ENV_VAR = "TASK_CONTEXT_DEBUG_TRACE"
+
+
+def _debug_trace_enabled() -> bool:
+    return bool(os.environ.get(_DEBUG_TRACE_ENV_VAR))
+
+
+def _fingerprint(value: str | None) -> str | None:
+    """One-way, truncated SHA-256 fingerprint of ``value`` -- safe to print
+    to a debug trace line. Never the raw session id / Herdr locator itself."""
+    if not value:
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def _claude_code_version() -> str | None:
+    """Best-effort ``claude --version`` probe. Only ever invoked when the
+    opt-in debug trace is enabled (never on the default-off hot path).
+    Never raises -- any failure (binary not on PATH, timeout, non-zero
+    exit) degrades to ``None`` rather than breaking the hook."""
+    try:
+        result = subprocess.run(
+            ["claude", "--version"], capture_output=True, text=True, timeout=2.0
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _emit_session_start_debug_trace(
+    *,
+    source: str,
+    claude_session_id: str | None,
+    herdr_tab_id: str | None,
+    has_pane_id: bool,
+    herdr_locator: str | None,
+    lookup_by_session_outcome: str,
+    lookup_by_locator_outcome: str,
+    recovery_decision: str,
+) -> None:
+    if not _debug_trace_enabled():
+        return
+    trace = {
+        "task_context_debug_trace": "SessionStart",
+        "source": source,
+        "claude_code_version": _claude_code_version(),
+        "claude_session_id_fingerprint": _fingerprint(claude_session_id),
+        "has_tab_id": bool(herdr_tab_id),
+        "has_pane_id": bool(has_pane_id),
+        "herdr_locator_fingerprint": _fingerprint(herdr_locator),
+        "lookup_by_session_outcome": lookup_by_session_outcome,
+        "lookup_by_locator_outcome": lookup_by_locator_outcome,
+        "recovery_decision": recovery_decision,
+    }
+    print(json.dumps(trace, sort_keys=True), file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # SessionStart (AC1, AC2, AC3, AC14, AC15; Issue #2567 AC1/AC4 runtime-variant
 # awareness)
 # ---------------------------------------------------------------------------
@@ -157,15 +234,75 @@ def _projection_fields(result: dict[str, Any]) -> dict[str, Any]:
 _RECOVERABLE_SOURCES = frozenset({"startup", "resume", "clear"})
 
 
+def _create_new_binding_and_run(
+    conn,
+    *,
+    herdr_locator: str,
+    location_fields: dict[str, Any],
+    claude_session_id: str | None,
+    event_type: str,
+    reason_code: str,
+) -> dict[str, Any]:
+    """Shared "no existing Binding -- create one from scratch" sequence,
+    used by both a brand-new SessionStart Tab (the ``existing_binding is
+    None`` branch of ``on_session_start`` below) and the explicit `/task
+    <target>` unbound-session bootstrap (``bootstrap_unbound_session``,
+    Issue #2790 AC2/AC5). Creates one independent Binding + managed
+    ExecutionRun, relocates it to ``herdr_locator``, and (if a Claude
+    session id is known) attaches it -- this never inherits/steals any
+    other Binding's identity."""
+    run_kind, runtime_profile, resume_profile = config.normalize_operator_profiles_for_new_run(
+        *config.operator_run_kind_and_profiles()
+    )
+    binding = service.create_binding(conn)
+    binding_id = binding["id"]
+    service.relocate_binding(conn, binding_id, herdr_locator, **location_fields)
+    run = service.start_execution_run(
+        conn,
+        run_kind=run_kind,
+        binding_id=binding_id,
+        runtime_profile=runtime_profile,
+        resume_profile=resume_profile,
+    )
+    if claude_session_id:
+        _set_session_on_run(conn, binding_id, run["id"], claude_session_id)
+    service.append_event(
+        conn,
+        event_type=event_type,
+        binding_id=binding_id,
+        execution_run_id=run["id"],
+        metadata=_event_metadata(reason_code, "ok"),
+    )
+    return {"binding_id": binding_id, "execution_run_id": run["id"]}
+
+
 def on_session_start(conn, payload: dict[str, Any]) -> dict[str, Any]:
     source = payload.get("source") or "startup"
     herdr_tab_id = payload.get("herdr_tab_id")
+    has_pane_id = bool(payload.get("has_pane_id"))
     herdr_locator = payload.get("herdr_locator") or herdr_tab_id
     claude_session_id = payload.get("claude_session_id")
+
+    def _trace(*, lookup_by_session_outcome: str, lookup_by_locator_outcome: str, recovery_decision: str) -> None:
+        _emit_session_start_debug_trace(
+            source=source,
+            claude_session_id=claude_session_id,
+            herdr_tab_id=herdr_tab_id,
+            has_pane_id=has_pane_id,
+            herdr_locator=herdr_locator,
+            lookup_by_session_outcome=lookup_by_session_outcome,
+            lookup_by_locator_outcome=lookup_by_locator_outcome,
+            recovery_decision=recovery_decision,
+        )
 
     if not herdr_tab_id:
         # AC11: non-Herdr canonical interactive Claude is observe-only --
         # never autobind/rebind/create a TabBinding for it.
+        _trace(
+            lookup_by_session_outcome="not_attempted",
+            lookup_by_locator_outcome="not_attempted",
+            recovery_decision="observe_only_non_herdr",
+        )
         return {"decision": "pass", "reason_code": "observe_only_non_herdr", "binding_id": None}
 
     if source == "compact":
@@ -173,12 +310,22 @@ def on_session_start(conn, payload: dict[str, Any]) -> dict[str, Any]:
         # identity at all -- context refresh/reinjection only, which is the
         # adapter's responsibility (re-reading current projection), not a
         # DB mutation.
+        _trace(
+            lookup_by_session_outcome="not_attempted",
+            lookup_by_locator_outcome="not_attempted",
+            recovery_decision="compact_no_mutation",
+        )
         return {"decision": "pass", "reason_code": "compact_no_mutation", "binding_id": None}
 
     if source == "fork":
         # AC15: v1 does not inherit the parent operator's TabBinding. Do not
         # even attempt the locator-reuse lookup below (that would silently
         # steal the parent's live Binding for the same Tab).
+        _trace(
+            lookup_by_session_outcome="not_attempted",
+            lookup_by_locator_outcome="not_attempted",
+            recovery_decision="fork_no_inherited_binding",
+        )
         return {"decision": "pass", "reason_code": "fork_no_inherited_binding", "binding_id": None}
 
     # Issue #2569 AC3/AC4 (durable recovery / strong anchor): the current
@@ -194,13 +341,18 @@ def on_session_start(conn, payload: dict[str, Any]) -> dict[str, Any]:
     # resume/`/clear` case the locator lookup already covered) live-location
     # match when no Binding currently claims this exact session id.
     existing_binding = None
+    lookup_by_session_outcome = "not_attempted"
     if claude_session_id:
         try:
             existing_binding = service.get_binding_by_current_session(conn, claude_session_id)
+            lookup_by_session_outcome = "found"
         except errors.NotFoundError:
             existing_binding = None
+            lookup_by_session_outcome = "not_found"
+    lookup_by_locator_outcome = "not_attempted"
     if existing_binding is None and source in _RECOVERABLE_SOURCES:
         existing_binding = service.get_binding_by_current_location(conn, herdr_locator)
+        lookup_by_locator_outcome = "found" if existing_binding is not None else "not_found"
 
     location_fields = _location_fields(payload)
     run_kind, runtime_profile, resume_profile = config.normalize_operator_profiles_for_new_run(
@@ -208,26 +360,21 @@ def on_session_start(conn, payload: dict[str, Any]) -> dict[str, Any]:
     )
 
     if existing_binding is None:
-        binding = service.create_binding(conn)
-        binding_id = binding["id"]
-        service.relocate_binding(conn, binding_id, herdr_locator, **location_fields)
-        run = service.start_execution_run(
+        created = _create_new_binding_and_run(
             conn,
-            run_kind=run_kind,
-            binding_id=binding_id,
-            runtime_profile=runtime_profile,
-            resume_profile=resume_profile,
-        )
-        if claude_session_id:
-            _set_session_on_run(conn, binding_id, run["id"], claude_session_id)
-        service.append_event(
-            conn,
+            herdr_locator=herdr_locator,
+            location_fields=location_fields,
+            claude_session_id=claude_session_id,
             event_type="hook:SessionStart",
-            binding_id=binding_id,
-            execution_run_id=run["id"],
-            metadata=_event_metadata("startup_new_binding", "ok"),
+            reason_code=f"{source}_new_binding",
         )
+        binding_id = created["binding_id"]
         projection = _bump_projection(conn, binding_id)
+        _trace(
+            lookup_by_session_outcome=lookup_by_session_outcome,
+            lookup_by_locator_outcome=lookup_by_locator_outcome,
+            recovery_decision=f"{source}_new_binding",
+        )
         return {
             "decision": "pass",
             "reason_code": f"{source}_new_binding",
@@ -291,6 +438,11 @@ def on_session_start(conn, payload: dict[str, Any]) -> dict[str, Any]:
         metadata=_event_metadata(f"{source}_restored_binding", "ok"),
     )
     projection = _bump_projection(conn, binding_id)
+    _trace(
+        lookup_by_session_outcome=lookup_by_session_outcome,
+        lookup_by_locator_outcome=lookup_by_locator_outcome,
+        recovery_decision=f"{source}_restored_binding",
+    )
     return {
         "decision": "pass",
         "reason_code": f"{source}_restored_binding",
@@ -480,7 +632,47 @@ def on_user_prompt_submit(conn, payload: dict[str, Any]) -> dict[str, Any]:
 # values other than ``"task"`` are not this module's concern (some other
 # Skill/command being expanded) and are always a silent, non-mutating
 # pass-through.
+#
+# Issue #2790 AC2/AC5: `bootstrap_unbound_session` below is the primary
+# design candidate this Issue validated for a Herdr-tracked session whose
+# current Binding is absent (`fork`'s by-design non-inheritance of the
+# parent operator's TabBinding, Issue #2564 AC15, is the case this was
+# written for, but the precondition below never actually inspects
+# `SessionStart`'s `source` -- `UserPromptExpansion` does not even carry
+# it -- so it applies uniformly to *any* confirmed-absent Binding for a
+# Herdr-tracked session with a valid Claude session identity, which also
+# self-heals a hypothetical `startup`/`resume`/`clear` binding-restoration
+# gap the same way). It is built entirely out of the existing typed
+# `task_context_service` primitives already used elsewhere in this module
+# (no new daemon/lease/lock/table) and is only ever invoked once
+# `on_user_prompt_expansion` has itself confirmed every precondition
+# (Herdr-tracked, valid session id, Binding absent, explicit `/task`
+# invocation carrying an already-parsed target) -- never speculatively.
 # ---------------------------------------------------------------------------
+
+
+def bootstrap_unbound_session(
+    conn,
+    *,
+    herdr_locator: str,
+    claude_session_id: str,
+    location_fields: dict[str, Any],
+) -> dict[str, Any]:
+    """Issue #2790 AC2/AC5: create one independent Binding + managed
+    ExecutionRun for a Herdr-tracked session that has no current Binding,
+    so the caller's already-validated explicit `/task <target>` can bind it
+    immediately afterward. Never inherits/steals any other Binding's
+    identity (this only ever creates a brand-new one, exactly like a
+    genuinely new Tab's SessionStart would) -- see
+    `_create_new_binding_and_run` for the shared sequence."""
+    return _create_new_binding_and_run(
+        conn,
+        herdr_locator=herdr_locator,
+        location_fields=location_fields,
+        claude_session_id=claude_session_id,
+        event_type="hook:UserPromptExpansion",
+        reason_code="slash_task_bootstrap_unbound_session",
+    )
 
 
 def on_user_prompt_expansion(conn, payload: dict[str, Any]) -> dict[str, Any]:
@@ -497,7 +689,19 @@ def on_user_prompt_expansion(conn, payload: dict[str, Any]) -> dict[str, Any]:
     `/task` rebind can never be half-applied. Target validation failure,
     persistence failure, and (at the adapter layer) transport failure are
     all surfaced as an explicit `/task` *command* failure (``decision:
-    block``) -- never silently swallowed as if the rebind had succeeded."""
+    block``) -- never silently swallowed as if the rebind had succeeded.
+
+    Issue #2790 AC2/AC5: when the current Binding cannot be resolved for
+    this exact `claude_session_id` (the historical `no_binding_for_session`
+    dead-end -- most notably for a `fork`'d session, Issue #2564 AC15's
+    by-design non-inheritance of the parent operator's TabBinding, though
+    this precondition never actually inspects `source`), an explicit
+    `/task <target>` that already carries a resolvable target (a GitHub ref
+    or an ad-hoc title) now self-heals via `bootstrap_unbound_session`
+    instead of dead-ending -- only when a target is genuinely absent too
+    does this remain the `no_binding_for_session` command failure it always
+    was (see the hook adapter's `_task_command_failure_message` for why
+    that message is now always accurate for this reason_code)."""
     command_name = payload.get("command_name")
     if command_name != "task":
         return {"decision": "pass", "reason_code": "not_task_command"}
@@ -514,18 +718,40 @@ def on_user_prompt_expansion(conn, payload: dict[str, Any]) -> dict[str, Any]:
     if not claude_session_id:
         return {"decision": "block", "reason_code": "missing_session_id"}
 
-    try:
-        binding = service.get_binding_by_current_session(conn, claude_session_id)
-    except errors.NotFoundError:
-        return {"decision": "block", "reason_code": "no_binding_for_session"}
-
-    binding_id = binding["id"]
-    _, _, current_run_id = service.get_current_task_activity_for_binding(conn, binding_id)
-
     target_repo = payload.get("slash_task_target_repo")
     target_ref_kind = payload.get("slash_task_target_ref_kind")
     target_ref_number = payload.get("slash_task_target_ref_number")
     ad_hoc_title = payload.get("slash_task_ad_hoc_title")
+    has_explicit_target = bool(target_repo and target_ref_kind and target_ref_number is not None) or bool(
+        ad_hoc_title
+    )
+
+    try:
+        binding = service.get_binding_by_current_session(conn, claude_session_id)
+    except errors.NotFoundError:
+        binding = None
+
+    bootstrapped = False
+    if binding is None:
+        # AC2/AC5: never bootstrap speculatively -- only once the user's own
+        # `/task` invocation already carries an explicit, already-parsed
+        # target. With no target at all, this is exactly the same command
+        # failure it always was (see the module docstring above).
+        if not has_explicit_target:
+            return {"decision": "block", "reason_code": "no_binding_for_session"}
+        herdr_locator = payload.get("herdr_locator") or herdr_tab_id
+        created = bootstrap_unbound_session(
+            conn,
+            herdr_locator=herdr_locator,
+            claude_session_id=claude_session_id,
+            location_fields=_location_fields(payload),
+        )
+        binding_id = created["binding_id"]
+        current_run_id = created["execution_run_id"]
+        bootstrapped = True
+    else:
+        binding_id = binding["id"]
+        _, _, current_run_id = service.get_current_task_activity_for_binding(conn, binding_id)
 
     if target_repo and target_ref_kind and target_ref_number is not None:
         rebound = service.bind_target_to_binding(
@@ -552,9 +778,10 @@ def on_user_prompt_expansion(conn, payload: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "decision": "pass",
-        "reason_code": "slash_task_rebind",
+        "reason_code": "slash_task_bootstrap_rebind" if bootstrapped else "slash_task_rebind",
         "task_id": rebound["task_id"],
         "activity_id": rebound["activity_id"],
+        "bootstrapped_binding": bootstrapped,
         **_projection_fields(rebound),
     }
 

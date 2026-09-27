@@ -23,6 +23,26 @@ repository identity と Issue number の組で照合する（同番号でも別 
 `unresolved_cleanup_items: []`、`errors: []` の final-success receipt だけが signal を emit できる。receipt/partial/failed/human-review/no-proof
 outcome は `cleanup_completed` を emit せず dispatch も再開しない。adapter outcome は diagnostic であり、完了済み producer operation を rollback しない。
 
+### `unbound` の原因別フォールバック/エスカレーション（Issue #2790 AC8）
+
+`task_context_workflow_signal.py` の呼び出し結果が `{"disposition": "deferred", "reason_code": "unbound"}` を返した場合、この公開 wire contract 自体は Issue #2565 の frozen 契約であり変更しない（Issue #2790 Out of Scope）。ただし `unbound` は Issue #2719 の内部 7 reason-code（`origin_session_missing` / `origin_run_not_found` / `origin_run_ended` / `origin_run_kind_mismatch` / `origin_task_unattached` / `origin_binding_session_mismatch` / `origin_ambiguous`）をすべて一つに畳んだ opaque な値であり、原因を区別しないまま毎回無条件停止すると、恒常的に binding できないセッションで毎回手動 override が必要になる。
+
+原因を区別するには、`scripts/task-context/task_contextctl.py signal diagnose-origin`（`task_context_workflow_signals.diagnose_origin`、Issue #2790 AC3/AC7）を read-only に呼び出す。この診断呼び出しは `events` journal に何も書き込まず、`signal apply` 自身が返す公開 disposition/reason_code には一切影響しない。
+
+診断結果の `reason_code` に応じて、worker/SubAgent は次の原因別経路を選択する（Task を推測して勝手に apply することは一切しない）:
+
+| `diagnose_origin` の `reason_code` | 意味 | 対応 |
+|---|---|---|
+| `origin_session_missing` | 呼び出し元 session id 自体が無い | 既存 recovery（session id 環境変数の確認）へ。signal retry は無意味なので行わない |
+| `origin_run_not_found` | この session id に紐づく ExecutionRun が一件もない | 本当に unbound（binding 未作成）である可能性が高い。明示的な binding recovery（例: `/task <target>` による bootstrap、Issue #2790 AC2/AC5）後に signal を retry する |
+| `origin_run_ended` | ExecutionRun は存在するが既に終了済み | 原因を人間/呼び出し元に表示し、既存の recovery 経路（新しい SessionStart による self-heal）へ委ねる。signal を無条件 retry しない |
+| `origin_run_kind_mismatch` | ExecutionRun は存在するが managed run_kind（`native_operator`/`claude_gpt`）ではない | 原因を表示し、既存 recovery へ。この run から signal を適用しない |
+| `origin_task_unattached` | ExecutionRun に Task が紐づいていない | 原因を表示し、既存 recovery へ。Task を推測して attach しない |
+| `origin_binding_session_mismatch` | Binding の `current_claude_session_id` が一致しない | 原因を表示し、既存 recovery へ。別セッションの Binding を steal しない |
+| `origin_ambiguous` | 複数の candidate が同時に条件を満たす（現在の DB 制約上は到達不能な defense-in-depth 分岐） | Task を推測せず即時停止し、人間判断を求める（`human_review_required: true`） |
+
+`resolved: true`（diagnose_origin が実際に origin を解決できた場合）は、直前の `signal apply` 呼び出しが別の理由（evidence 不整合等）で `unbound` 以外の outcome を返したケースであり、本テーブルの対象外。
+
 ## Delegation / 委譲
 
 main thread は以下の static call shape で SubAgent に委譲する:

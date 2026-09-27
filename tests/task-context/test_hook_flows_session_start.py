@@ -139,3 +139,108 @@ def test_given_fork_when_session_start_then_parent_binding_not_stolen(conn):
     # Parent Binding's location/session must be untouched by the fork.
     parent_binding = service.get_binding(conn, parent_binding_id)
     assert parent_binding["current_claude_session_id"] == "s1"
+
+
+def test_given_fork_session_when_task_expanded_with_target_then_bootstrap_rebind_succeeds_without_stealing_parent(
+    conn,
+):
+    """Issue #2790 AC5: after a `fork` SessionStart deliberately leaves the
+    forked session unbound (Issue #2564 AC15), an explicit `/task <target>`
+    on that exact forked `claude_session_id` bootstraps its own independent
+    Binding (via `bootstrap_unbound_session`) and binds the target -- the
+    parent Binding/session/Task must remain completely untouched."""
+    parent = hook_flows.on_session_start(
+        conn, {"source": "startup", "herdr_tab_id": "tab-6", "claude_session_id": "parent-s1"}
+    )
+    parent_binding_id = parent["binding_id"]
+    parent_prompt = hook_flows.on_user_prompt_submit(
+        conn,
+        {
+            "herdr_tab_id": "tab-6",
+            "claude_session_id": "parent-s1",
+            "classification_kind": "EXPLICIT",
+            "target_repo": "owner/parent-repo",
+            "target_ref_kind": "issue",
+            "target_ref_number": 42,
+        },
+    )
+    parent_task_id = parent_prompt["task_id"]
+
+    fork_result = hook_flows.on_session_start(
+        conn, {"source": "fork", "herdr_tab_id": "tab-6", "claude_session_id": "fork-s1"}
+    )
+    assert fork_result["binding_id"] is None
+
+    rebind = hook_flows.on_user_prompt_expansion(
+        conn,
+        {
+            "command_name": "task",
+            "herdr_tab_id": "tab-6",
+            "claude_session_id": "fork-s1",
+            "slash_task_target_repo": "owner/fork-repo",
+            "slash_task_target_ref_kind": "issue",
+            "slash_task_target_ref_number": 7,
+        },
+    )
+    assert rebind["decision"] == "pass"
+    assert rebind["reason_code"] == "slash_task_bootstrap_rebind"
+    assert rebind["bootstrapped_binding"] is True
+
+    fork_binding = service.get_binding_by_current_session(conn, "fork-s1")
+    assert fork_binding is not None
+    assert fork_binding["id"] != parent_binding_id
+    fork_task_id, _, _ = service.get_current_task_activity_for_binding(conn, fork_binding["id"])
+    assert fork_task_id == rebind["task_id"]
+    assert fork_task_id != parent_task_id
+
+    # Parent Binding/Task must be completely unaffected by the fork bootstrap.
+    parent_binding = service.get_binding(conn, parent_binding_id)
+    assert parent_binding["current_claude_session_id"] == "parent-s1"
+    still_parent_task_id, _, _ = service.get_current_task_activity_for_binding(conn, parent_binding_id)
+    assert still_parent_task_id == parent_task_id
+
+
+def test_given_bound_session_when_compact_then_binding_task_activity_execution_run_identity_unchanged(conn):
+    """Issue #2790 AC6 (compact_binding_survives_identity_unchanged):
+    `compact` must not mutate Task/Activity/Binding/ExecutionRun identity at
+    all (Issue #2564 AC15) -- unlike `fork`, `compact` is not a by-design
+    unbound candidate (Issue #2790 refinement), so this fixes the exact
+    identity tuple in place as a regression guard, distinct from the
+    existing `compact_no_mutation`/no-binding-created assertion above."""
+    started = hook_flows.on_session_start(
+        conn, {"source": "startup", "herdr_tab_id": "tab-7", "claude_session_id": "s1"}
+    )
+    binding_id = started["binding_id"]
+    prompt_result = hook_flows.on_user_prompt_submit(
+        conn,
+        {
+            "herdr_tab_id": "tab-7",
+            "claude_session_id": "s1",
+            "classification_kind": "EXPLICIT",
+            "target_repo": "owner/repo",
+            "target_ref_kind": "issue",
+            "target_ref_number": 55,
+        },
+    )
+    task_id = prompt_result["task_id"]
+    before_task_id, before_activity_id, before_run_id = service.get_current_task_activity_for_binding(
+        conn, binding_id
+    )
+    assert before_task_id == task_id
+
+    compacted = hook_flows.on_session_start(
+        conn, {"source": "compact", "herdr_tab_id": "tab-7", "claude_session_id": "s1"}
+    )
+    assert compacted["decision"] == "pass"
+    assert compacted["reason_code"] == "compact_no_mutation"
+    assert compacted["binding_id"] is None
+
+    binding_after_compact = service.get_binding_by_current_session(conn, "s1")
+    assert binding_after_compact is not None
+    assert binding_after_compact["id"] == binding_id
+    after_task_id, after_activity_id, after_run_id = service.get_current_task_activity_for_binding(
+        conn, binding_id
+    )
+    assert after_task_id == before_task_id
+    assert after_activity_id == before_activity_id
+    assert after_run_id == before_run_id
