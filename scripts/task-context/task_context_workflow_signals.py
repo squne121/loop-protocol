@@ -290,6 +290,43 @@ def _resolve_origin_tx(
     return _classify_origin_candidates(candidates, origin_session_id)
 
 
+def diagnose_origin(conn: sqlite3.Connection, origin_session_id: str | None) -> dict[str, Any]:
+    """Issue #2790 AC3/AC7: read-only diagnostic counterpart of
+    ``_resolve_origin_tx`` that exposes the *specific* one of Issue #2719's
+    seven internal reason-codes for ``origin_session_id`` -- without
+    persisting anything and without changing the frozen public
+    ``apply_workflow_signal``/``begin_cleanup_lifecycle`` wire contract at
+    all (both of those still only ever return
+    ``{"disposition": "deferred", "reason_code": "unbound"}`` via
+    ``_unbound_outcome()`` on any origin-resolution failure -- this function
+    is purely additive, callable separately by a diagnostic-only consumer
+    such as ``post-merge-cleanup``, Issue #2790 AC8).
+
+    This performs no write, opens no transaction, and appends no event -- it
+    is a plain read (``_resolve_origin_tx`` issues one read-only ``SELECT``)
+    and is therefore safe to call at any time, including speculatively
+    before a workflow signal would even be attempted, without the
+    ``origin_resolution_failed`` EventJournal side effect
+    ``_record_origin_resolution_failure_tx`` performs inside
+    ``apply_workflow_signal``'s write transaction.
+
+    Returns ``{"resolved": True, "reason_code": None, ...origin fields}`` on
+    success, or ``{"resolved": False, "reason_code": <one of the 7 codes>,
+    ...available diagnostic fields}`` on failure -- never the frozen public
+    ``"unbound"`` reason_code (that string is reserved for the
+    disposition-only public contract; this function's whole purpose is to
+    expose what that string otherwise hides)."""
+    origin, failure = _resolve_origin_tx(conn, origin_session_id)
+    if origin is not None:
+        return {"resolved": True, "reason_code": None, **origin}
+    assert failure is not None
+    return {
+        "resolved": False,
+        "reason_code": failure["reason_code"],
+        **{key: value for key, value in failure.items() if key not in ("disposition", "reason_code")},
+    }
+
+
 def _unbound_outcome() -> dict[str, Any]:
     """The frozen public disposition for every origin-resolution failure
     (Issue #2565 contract, preserved by Issue #2719). ``_resolve_origin_tx``'s

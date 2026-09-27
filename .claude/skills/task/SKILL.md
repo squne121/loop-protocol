@@ -57,6 +57,40 @@ operator 向けに提供する、ACTIVE Task を人間が意図的に supersede/
 - `/task`（target なし）は明示的な validation failure として扱われ、
   rebind を装わない。
 
+## unbound セッションでの bootstrap（Issue #2790 AC2/AC5）
+
+`/task <target>` を実行した Native Claude session に現在の Task Context
+Binding が存在しない場合（典型例: `fork` は Issue #2564 AC15 により親
+operator の TabBinding を意図的に継承しない by-design non-inheritance
+であり、fork 後のセッションは恒常的に unbound のまま残る）、次の条件を
+すべて満たすときに限り、`/task <target>` 自身が明示的 bootstrap authority
+として動作し、独立した新規 Binding + ExecutionRun を作成してその target に
+bind する（`bootstrap_unbound_session`、
+`scripts/task-context/task_context_hook_flows.py`）:
+
+- Herdr-tracked セッションである（`herdr_tab_id` が存在する）
+- 有効な Claude session identity（`claude_session_id`）が存在する
+- 現在の Binding が存在しない（`get_binding_by_current_session` が
+  `NotFoundError`）
+- ユーザーが明示的に `/task` を実行し、かつ解決済みの target（GitHub
+  ref または ad-hoc title）を伴っている
+
+target が一切指定されていない場合（`/task` のみ）は、bootstrap を
+speculative に行わず、従来通り明示的な validation failure
+（`no_binding_for_session`）として扱う。この bootstrap は既存の
+`create_binding`/`relocate_binding`/`start_execution_run`/
+`bind_target_to_binding`/`bind_ad_hoc_task_to_binding` という既存の
+typed service layer のみで完結し、新規 daemon・lease table・lock
+coordinator は一切追加しない。親 Binding（fork 元）の identity・
+session・location は一切変更されない。
+
+`no_binding_for_session` かつ target 未指定の場合のエラーメッセージ
+（`.claude/hooks/task_context/hook_entry.py` の
+`_task_command_failure_message`）は、target 再入力ではなく Binding
+不在が原因であることと、有効な target を指定すれば bootstrap される
+ことを明示する（Issue #2790 AC9 -- 修正前は target が完全修飾済みでも
+「再入力せよ」と誤誘導していた）。
+
 ## 適用対象外
 
 - ACTIVE Task が `task_refs == 0`（GitHub ref を一切持たない
@@ -81,7 +115,11 @@ operator 向けに提供する、ACTIVE Task を人間が意図的に supersede/
 - hook 登録: `.claude/settings.json`（`UserPromptExpansion`, matcher: `task`）
 - 検証: `tests/task-context/test_hook_flows_user_prompt_expansion.py`
   （service 層）、`tests/task-context/test_hook_entry_subprocess.py`
-  （実 subprocess 経由の adapter 層）
+  （実 subprocess 経由の adapter 層）、
+  `tests/task-context/test_hook_flows_session_start.py`（fork bootstrap /
+  compact identity 不変の regression）、
+  `tests/task-context/test_hook_entry_task_command_messages.py`
+  （エラーメッセージが原因に一致することの regression）
 
 ## Stop Conditions
 

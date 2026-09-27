@@ -8,6 +8,7 @@ typed API/CLI operations within this directory):
 
     task-contextctl hook <event>
     task-contextctl signal apply
+    task-contextctl signal diagnose-origin  # Issue #2790 AC3/AC7: read-only
     task-contextctl query current           # payload: {task_id} or {session_id}
     task-contextctl projection flush
     task-contextctl projection ack
@@ -138,9 +139,45 @@ def _dispatch_query_current_by_session(session_id: str) -> dict:
         conn.close()
 
 
+def _dispatch_signal_diagnose_origin() -> dict:
+    """Issue #2790 AC3/AC7 + PR #2795 review fix_delta P2-B (comment
+    5852749710, finding 4): ``diagnose_origin()`` itself issues no write,
+    but this dispatcher used to route through ``_open_db_and_migrate()``
+    like every mutating operation -- opening a write-capable connection
+    (creating the parent directory/DB file if absent) and running
+    migrations before the read-only diagnostic even ran. "The diagnostic
+    function has no UPDATE" and "the published diagnostic command has no
+    write side effect" are different claims; this makes the second one
+    true too, by branching to ``task_context_db.connect_readonly`` (mirroring
+    ``_dispatch_query_current_by_session`` above) *before* any write-capable
+    initialization, exactly like the existing `query current` session
+    selector.
+
+    A DB that does not exist yet is reported as "no state" (nothing to
+    resolve) without creating it. A DB whose schema is unreadable/
+    incompatible surfaces that as an error (via the generic exception
+    handling in ``_run`` below) rather than migrating it -- diagnosis never
+    mutates schema or business data."""
+    db_file = config.db_path()
+    conn = db.connect_readonly(db_file)
+    if conn is None:
+        return envelope.build_ok_result({"resolved": False, "reason_code": "origin_run_not_found"})
+    try:
+        result = workflow_signals.diagnose_origin(conn, os.environ.get("CLAUDE_CODE_SESSION_ID"))
+        return envelope.build_ok_result(result)
+    finally:
+        conn.close()
+
+
 def _dispatch(operation: str, payload: dict) -> dict:
     if operation == "query_current" and payload.get("session_id") and not payload.get("task_id"):
         return _dispatch_query_current_by_session(payload["session_id"])
+
+    if operation == "signal_diagnose_origin":
+        # PR #2795 review fix_delta P2-B: this branch must be evaluated
+        # strictly before `_open_db_and_migrate()` below -- see
+        # `_dispatch_signal_diagnose_origin`'s docstring.
+        return _dispatch_signal_diagnose_origin()
 
     if (
         operation == "hook"
@@ -288,6 +325,7 @@ def main(argv: list[str] | None = None) -> int:
     signal_p = sub.add_parser("signal")
     signal_sub = signal_p.add_subparsers(dest="signal_command", required=True)
     signal_sub.add_parser("apply")
+    signal_sub.add_parser("diagnose-origin")
 
     cleanup_p = sub.add_parser("cleanup")
     cleanup_sub = cleanup_p.add_subparsers(dest="cleanup_command", required=True)
@@ -317,6 +355,8 @@ def main(argv: list[str] | None = None) -> int:
         operation = "hook"
     elif args.command == "signal" and args.signal_command == "apply":
         operation = "signal_apply"
+    elif args.command == "signal" and args.signal_command == "diagnose-origin":
+        operation = "signal_diagnose_origin"
     elif args.command == "cleanup" and args.cleanup_command == "begin":
         operation = "cleanup_begin"
     elif args.command == "query" and args.query_command == "current":
