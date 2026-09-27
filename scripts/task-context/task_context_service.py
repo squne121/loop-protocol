@@ -206,15 +206,21 @@ def get_activity(conn: sqlite3.Connection, activity_id: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def create_binding(conn: sqlite3.Connection) -> dict[str, Any]:
+def _create_binding_tx(conn: sqlite3.Connection) -> str:
+    """Transaction-internal: INSERT a new Binding, return its id."""
     binding_id = new_id("binding")
     ts = now_iso()
+    conn.execute(
+        "INSERT INTO tab_bindings (id, current_claude_session_id, runtime_health, created_at, updated_at) "
+        "VALUES (?, NULL, 'ACTIVE', ?, ?)",
+        (binding_id, ts, ts),
+    )
+    return binding_id
+
+
+def create_binding(conn: sqlite3.Connection) -> dict[str, Any]:
     with db.write_transaction(conn):
-        conn.execute(
-            "INSERT INTO tab_bindings (id, current_claude_session_id, runtime_health, created_at, updated_at) "
-            "VALUES (?, NULL, 'ACTIVE', ?, ?)",
-            (binding_id, ts, ts),
-        )
+        binding_id = _create_binding_tx(conn)
     return get_binding(conn, binding_id)
 
 
@@ -245,6 +251,7 @@ def _relocate_binding_tx(
     cwd: str | None = None,
     worktree: str | None = None,
     branch: str | None = None,
+    evict_foreign_holder: bool = True,
 ) -> str:
     new_location_id = new_id("loc")
     ts = now_iso()
@@ -265,11 +272,25 @@ def _relocate_binding_tx(
     # location OBSERVATION row here -- this must never terminate/release
     # the other binding's Task/Activity/Binding semantic identity
     # (runtime_health, execution_runs, etc. are untouched).
-    conn.execute(
-        "UPDATE runtime_locations SET released_at = ? "
-        "WHERE herdr_locator = ? AND binding_id != ? AND released_at IS NULL",
-        (ts, herdr_locator, binding_id),
-    )
+    #
+    # PR #2795 review fix_delta P1-B ("同じPaneのforkをbootstrapすると、
+    # 親のRuntimeLocationを解除してしまう"): this eviction is only correct
+    # for a genuine *reassignment* of an existing Binding's own locator
+    # (SessionStart cold-restart recovery, CwdChanged) -- callers that are
+    # instead bootstrapping a brand-new, independent Binding onto a locator
+    # that may still be legitimately held by a live parent/sibling Binding
+    # (e.g. `fork`'s by-design non-inheritance bootstrap) must pass
+    # ``evict_foreign_holder=False`` so creating the new Binding never
+    # mutates the other Binding's location observation. Physical Pane
+    # ownership transfer and independent-Binding creation are deliberately
+    # kept separate operations -- this flag is how a caller opts into the
+    # (destructive to the *other* Binding's location) former.
+    if evict_foreign_holder:
+        conn.execute(
+            "UPDATE runtime_locations SET released_at = ? "
+            "WHERE herdr_locator = ? AND binding_id != ? AND released_at IS NULL",
+            (ts, herdr_locator, binding_id),
+        )
     conn.execute(
         "INSERT INTO runtime_locations "
         "(id, binding_id, herdr_locator, observed_at, released_at, cwd, worktree, branch) "
@@ -288,6 +309,7 @@ def relocate_binding(
     cwd: str | None = None,
     worktree: str | None = None,
     branch: str | None = None,
+    evict_foreign_holder: bool = True,
 ) -> dict[str, Any]:
     """Release the binding's current (unreleased) location observation (if
     any) and record a new one. ``binding_id`` never changes -- only the
@@ -296,10 +318,22 @@ def relocate_binding(
     ``cwd`` / ``worktree`` / ``branch`` (Issue #2564 fix_delta 7) are
     display-only RuntimeLocation observations rendered by the statusLine.
     They are explicitly NOT part of Task/Binding identity and never
-    participate in rebind/block decisions (AC7)."""
+    participate in rebind/block decisions (AC7).
+
+    ``evict_foreign_holder`` (PR #2795 review fix_delta P1-B, default
+    ``True`` to preserve the existing SessionStart/CwdChanged reassignment
+    contract): set ``False`` when relocating a *newly-bootstrapped*,
+    independent Binding so this call never releases a different Binding's
+    still-live location observation on the same locator."""
     with db.write_transaction(conn):
         _relocate_binding_tx(
-            conn, binding_id, herdr_locator, cwd=cwd, worktree=worktree, branch=branch
+            conn,
+            binding_id,
+            herdr_locator,
+            cwd=cwd,
+            worktree=worktree,
+            branch=branch,
+            evict_foreign_holder=evict_foreign_holder,
         )
     return get_current_location(conn, binding_id)  # type: ignore[return-value]
 
@@ -1405,3 +1439,171 @@ def absorb_ref_into_task(
             event_type=event_type,
             reason_code=reason_code,
         )
+
+
+# ---------------------------------------------------------------------------
+# unbound-session bootstrap (Issue #2790 AC2/AC5; PR #2795 review fix_delta
+# P1-A/P1-B, comment
+# https://github.com/squne121/loop-protocol/pull/2795#issuecomment-5852749710)
+# ---------------------------------------------------------------------------
+
+
+def bootstrap_binding_with_run(
+    conn: sqlite3.Connection,
+    *,
+    herdr_locator: str,
+    location_fields: dict[str, Any],
+    claude_session_id: str | None,
+    run_kind: str,
+    runtime_profile: str | None,
+    resume_profile: str | None,
+    event_type: str,
+    reason_code: str,
+    evict_foreign_holder: bool = False,
+) -> dict[str, Any]:
+    """Coarse-grained, single-transaction "no existing Binding -- create one
+    from scratch" operation: create Binding -> relocate -> start
+    ExecutionRun -> (if a Claude session id is known) attach it -> append the
+    lifecycle event, all inside ONE ``BEGIN IMMEDIATE``.
+
+    fix_delta P1-A: this replaces a chain of independently-committing public
+    calls (``create_binding`` / ``relocate_binding`` / ``start_execution_run``
+    / ``set_execution_run_session`` / ``set_binding_session`` /
+    ``append_event``) that could previously leave an orphan half-created
+    Binding/RuntimeLocation/ExecutionRun behind if a later step in the chain
+    raised. A failure anywhere in this function now rolls back everything
+    (the enclosing ``BEGIN IMMEDIATE``), so callers never observe a
+    partially-bootstrapped Binding.
+
+    ``evict_foreign_holder`` (fix_delta P1-B) defaults to ``False`` here --
+    bootstrapping a brand-new, independent Binding must never release a
+    different (e.g. parent/sibling) Binding's still-live location claim on
+    the same locator merely because this new Binding also observes it.
+    Callers that know this locator genuinely belongs to no other live
+    Binding (e.g. a truly new Herdr Tab) may pass ``True``."""
+    with db.write_transaction(conn):
+        binding_id = _create_binding_tx(conn)
+        _relocate_binding_tx(
+            conn,
+            binding_id,
+            herdr_locator,
+            evict_foreign_holder=evict_foreign_holder,
+            **location_fields,
+        )
+        run_id = _start_execution_run_tx(
+            conn,
+            run_kind=run_kind,
+            binding_id=binding_id,
+            runtime_profile=runtime_profile,
+            resume_profile=resume_profile,
+        )
+        if claude_session_id:
+            _set_execution_run_session_tx(conn, run_id, claude_session_id)
+            _set_binding_session_tx(conn, binding_id, claude_session_id, execution_run_id=run_id)
+        _append_event_tx(
+            conn,
+            event_type=event_type,
+            binding_id=binding_id,
+            execution_run_id=run_id,
+            metadata={"reason_code": reason_code, "status": "ok"},
+        )
+    return {"binding_id": binding_id, "execution_run_id": run_id}
+
+
+def bootstrap_binding_and_bind_target(
+    conn: sqlite3.Connection,
+    *,
+    herdr_locator: str,
+    location_fields: dict[str, Any],
+    claude_session_id: str,
+    run_kind: str,
+    runtime_profile: str | None,
+    resume_profile: str | None,
+    bootstrap_event_type: str,
+    bootstrap_reason_code: str,
+    bind_event_type: str,
+    bind_reason_code: str,
+    target_repo: str | None = None,
+    target_ref_kind: str | None = None,
+    target_ref_number: int | None = None,
+    ad_hoc_title: str | None = None,
+    activity_kind: str = "native_operator",
+) -> dict[str, Any]:
+    """Explicit ``/task <target>`` bootstrap of a genuinely unbound Herdr
+    session (Issue #2790 AC2/AC5): create an independent Binding + managed
+    ExecutionRun AND immediately point it at the already-parsed explicit
+    target, all inside one ``BEGIN IMMEDIATE``.
+
+    fix_delta P1-A (PR #2795 review comment 5852749710, finding 1): the
+    previous implementation ran the bootstrap
+    (``bootstrap_unbound_session``) and the target bind
+    (``bind_target_to_binding`` / ``bind_ad_hoc_task_to_binding``) as two
+    separately-committing top-level calls. A failure in the bind step left
+    a real, committed Binding/RuntimeLocation/ExecutionRun/session-claim/
+    event behind with no Task attached -- exactly the
+    ``origin_task_unattached``-shaped half-applied state the review comment
+    identifies. This function makes the whole
+    "create -> relocate -> start run -> attach session -> bootstrap event ->
+    resolve-or-create Task -> ensure ACTIVE Activity -> attach run -> rebind
+    event -> bump projection" sequence a single atomic unit: any failure
+    (including the target-bind half) rolls back the bootstrap half too, so
+    `/task` either fully succeeds or leaves no trace.
+
+    Requires exactly one target shape: a GitHub ref
+    (``target_repo``/``target_ref_kind``/``target_ref_number``) or an
+    ad-hoc title (``ad_hoc_title``) -- the caller (``on_user_prompt_expansion``)
+    has already validated ``has_explicit_target`` before calling this, so
+    this raises ``ValidationError`` rather than silently no-op'ing if
+    neither is given."""
+    has_ref_target = bool(target_repo and target_ref_kind and target_ref_number is not None)
+    if not has_ref_target and not ad_hoc_title:
+        raise errors.ValidationError(
+            "bootstrap_binding_and_bind_target requires either a GitHub ref target "
+            "(target_repo/target_ref_kind/target_ref_number) or ad_hoc_title"
+        )
+    with db.write_transaction(conn):
+        binding_id = _create_binding_tx(conn)
+        # fix_delta P1-B: never evict a foreign Binding's live location claim
+        # just because this brand-new bootstrap Binding also observes the
+        # same locator (e.g. a `fork`'d session sharing its parent's Pane).
+        _relocate_binding_tx(
+            conn,
+            binding_id,
+            herdr_locator,
+            evict_foreign_holder=False,
+            **location_fields,
+        )
+        run_id = _start_execution_run_tx(
+            conn,
+            run_kind=run_kind,
+            binding_id=binding_id,
+            runtime_profile=runtime_profile,
+            resume_profile=resume_profile,
+        )
+        _set_execution_run_session_tx(conn, run_id, claude_session_id)
+        _set_binding_session_tx(conn, binding_id, claude_session_id, execution_run_id=run_id)
+        _append_event_tx(
+            conn,
+            event_type=bootstrap_event_type,
+            binding_id=binding_id,
+            execution_run_id=run_id,
+            metadata={"reason_code": bootstrap_reason_code, "status": "ok"},
+        )
+        if has_ref_target:
+            task_id = _resolve_or_create_task_for_target_tx(
+                conn, target_repo, target_ref_kind, target_ref_number
+            )
+            activity_id = _select_activity_for_binding_tx(conn, task_id, activity_kind)
+        else:
+            task_id = _create_task_tx(conn, ad_hoc_title)
+            activity_id = _ensure_active_activity_tx(conn, task_id, activity_kind)
+        bind_result = _finish_binding_mutation_tx(
+            conn,
+            binding_id=binding_id,
+            task_id=task_id,
+            activity_id=activity_id,
+            execution_run_id=run_id,
+            event_type=bind_event_type,
+            reason_code=bind_reason_code,
+        )
+    return {"binding_id": binding_id, "bootstrap_execution_run_id": run_id, **bind_result}

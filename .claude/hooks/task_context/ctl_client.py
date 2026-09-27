@@ -60,6 +60,16 @@ def call(
         )
     except Exception:
         return None
+    if os.environ.get("TASK_CONTEXT_DEBUG_TRACE") and proc.stderr:
+        # Issue #2790 AC1/AC11: `task_context_hook_flows.on_session_start`'s
+        # opt-in debug trace line is written to *this* subprocess's stderr
+        # (it runs inside the `task_contextctl.py` child, not in
+        # `hook_entry.py` itself) -- `capture_output=True` above would
+        # otherwise silently discard it. Forwarded verbatim only when the
+        # same opt-in gate is set on this process too (never on the default
+        # off hot path, and it is already fingerprint-only content, never a
+        # raw env dump).
+        print(proc.stderr, end="", file=sys.stderr)
     lines = [line for line in proc.stdout.splitlines() if line.strip()]
     if not lines:
         return None

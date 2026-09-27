@@ -193,3 +193,119 @@ def test_given_mismatched_ambient_env_when_adapter_subprocess_runs_then_it_forwa
     result = json.loads(lines[-1])
     assert result["disposition"] == "selected"
     assert result["reason_code"] == "CLEANUP_STARTED"
+
+
+def test_given_ambient_a_and_explicit_b_when_apply_and_diagnose_run_then_both_use_b(
+    state_root, conn, monkeypatch
+):
+    """PR #2795 review fix_delta P2-A (comment 5852749710, finding 3):
+    ambient `CLAUDE_CODE_SESSION_ID` names session A, an explicit
+    `--origin-session-id` names a different, actually-bound session B. Both
+    the failed `signal apply` (via `--phase merged`) and the following
+    `diagnose-origin` call must resolve B, not silently drift onto ambient
+    A. Before this fix_delta, the adapter had no `diagnose_origin()` helper
+    at all, and a caller invoking `task_contextctl.py signal diagnose-origin`
+    directly (without deliberately overriding its own env) would read
+    whatever ambient `CLAUDE_CODE_SESSION_ID` happened to be set -- which
+    could silently be A even though the preceding apply used B."""
+    task = service.create_task(conn, title="p2a-same-origin")
+    activity = service.transition_activity(conn, task["id"], "implementation")
+    binding = service.create_binding(conn)
+    run = service.start_execution_run(
+        conn,
+        run_kind="native_operator",
+        task_id=task["id"],
+        activity_id=activity["id"],
+        binding_id=binding["id"],
+        claude_session_id="origin-b",
+    )
+    service.set_binding_session(conn, binding["id"], "origin-b", execution_run_id=run["id"])
+    conn.close()
+
+    # A is a plausible-looking session id that is never bound to anything --
+    # if the effective origin silently fell back to A, diagnosis would
+    # report `origin_run_not_found` instead of resolving B. This adapter
+    # call reads its OWN ambient CLAUDE_CODE_SESSION_ID as the fallback when
+    # `origin_session_id` is omitted (it is not, here), and always forwards
+    # LOOP_TASK_CONTEXT_STATE_ROOT to the `task_contextctl.py` child
+    # subprocess it spawns.
+    monkeypatch.setenv("LOOP_TASK_CONTEXT_STATE_ROOT", str(state_root))
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "ambient-session-a-never-bound")
+
+    sys.path.insert(0, str(_REPO_ROOT / ".claude" / "skills" / "post-merge-cleanup" / "scripts"))
+    import task_context_workflow_signal as post_merge_signal  # noqa: E402
+
+    diagnosis = post_merge_signal.diagnose_origin(origin_session_id="origin-b")
+    assert diagnosis["resolved"] is True
+    assert diagnosis["reason_code"] is None
+    assert diagnosis["execution_run_id"] == run["id"]
+    assert diagnosis["task_id"] == task["id"]
+
+    # And the raw CLI, invoked the same way the adapter invokes it, agrees.
+    cli_result = _run_ctl(["signal", "diagnose-origin"], {}, state_root=state_root, claude_session_id="origin-b")
+    assert cli_result["data"]["resolved"] is True
+    assert cli_result["data"]["execution_run_id"] == run["id"]
+
+    # Diagnosing the *ambient* A (never bound) resolves to failure -- proving
+    # the two are genuinely different origins, not that everything resolves.
+    cli_result_a = _run_ctl(
+        ["signal", "diagnose-origin"], {}, state_root=state_root, claude_session_id="ambient-session-a-never-bound"
+    )
+    assert cli_result_a["data"]["resolved"] is False
+    assert cli_result_a["data"]["reason_code"] == "origin_run_not_found"
+
+
+def test_given_unmigrated_state_root_when_diagnose_origin_cli_runs_then_no_db_or_directory_is_created(
+    tmp_path,
+):
+    """PR #2795 review fix_delta P2-B (comment 5852749710, finding 4):
+    `signal diagnose-origin` must be genuinely read-only at the CLI level --
+    not just inside `workflow_signals.diagnose_origin()` itself. Before this
+    fix_delta, `task_contextctl._dispatch()` routed every operation
+    (including this one) through `_open_db_and_migrate()` first, which
+    creates the state-root directory, creates the SQLite DB file, and runs
+    migrations as a side effect -- even for a caller that only wanted to
+    know "is anything bound here"."""
+    fresh_root = tmp_path / "never-materialized-state-root"
+    assert not fresh_root.exists()
+
+    result = _run_ctl(
+        ["signal", "diagnose-origin"], {}, state_root=fresh_root, claude_session_id="whoever"
+    )
+    assert result["data"] == {"resolved": False, "reason_code": "origin_run_not_found"}
+    assert not fresh_root.exists(), "diagnose-origin must never create the state-root directory"
+
+
+def test_given_existing_db_when_diagnose_origin_cli_runs_then_schema_and_data_are_unchanged(
+    state_root, conn
+):
+    """Same fix_delta P2-B: an *existing*, already-migrated DB's schema and
+    business data must be byte-for-byte unaffected by a diagnose-origin CLI
+    call -- diagnosis never migrates or writes."""
+    task = service.create_task(conn, title="p2b-readonly")
+    activity = service.transition_activity(conn, task["id"], "implementation")
+    binding = service.create_binding(conn)
+    run = service.start_execution_run(
+        conn,
+        run_kind="native_operator",
+        task_id=task["id"],
+        activity_id=activity["id"],
+        binding_id=binding["id"],
+        claude_session_id="p2b-session",
+    )
+    service.set_binding_session(conn, binding["id"], "p2b-session", execution_run_id=run["id"])
+    conn.close()
+
+    db_file = config.db_path()
+    before_bytes = db_file.read_bytes()
+    before_mtime = db_file.stat().st_mtime_ns
+
+    result = _run_ctl(
+        ["signal", "diagnose-origin"], {}, state_root=state_root, claude_session_id="p2b-session"
+    )
+    assert result["data"]["resolved"] is True
+
+    after_bytes = db_file.read_bytes()
+    after_mtime = db_file.stat().st_mtime_ns
+    assert after_bytes == before_bytes, "diagnose-origin must never mutate the existing DB file's bytes"
+    assert after_mtime == before_mtime, "diagnose-origin must never even touch/rewrite the existing DB file"

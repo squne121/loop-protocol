@@ -23,6 +23,42 @@ repository identity と Issue number の組で照合する（同番号でも別 
 `unresolved_cleanup_items: []`、`errors: []` の final-success receipt だけが signal を emit できる。receipt/partial/failed/human-review/no-proof
 outcome は `cleanup_completed` を emit せず dispatch も再開しない。adapter outcome は diagnostic であり、完了済み producer operation を rollback しない。
 
+### `unbound` の原因別フォールバック/エスカレーション（Issue #2790 AC8、PR #2795 review fix_delta P2-C 改訂）
+
+`task_context_workflow_signal.py` の呼び出し結果が `{"disposition": "deferred", "reason_code": "unbound"}` を返した場合、この公開 wire contract 自体は Issue #2565 の frozen 契約であり変更しない（Issue #2790 Out of Scope）。ただし `unbound` は Issue #2719 の内部 7 reason-code（`origin_session_missing` / `origin_run_not_found` / `origin_run_ended` / `origin_run_kind_mismatch` / `origin_task_unattached` / `origin_binding_session_mismatch` / `origin_ambiguous`）をすべて一つに畳んだ opaque な値であり、原因を区別しないまま毎回無条件停止すると、恒常的に binding できないセッションで毎回手動 override が必要になる。
+
+**責務の所在（P2-C）**: 上記「Task Context の信頼済み merge commit point」節のとおり、`signal apply` が `applied`/`duplicate_noop` 以外（`unbound` を含む）を返した場合、cleanup selection（`cleanup begin`）自体を試行せず、`post-merge-cleanup-worker` SubAgent は **dispatch されない**（同 SubAgent は別の `post-merge-cleanup-executor` procedure のみを読み、本 orchestrator 向け routing instruction を読み込まない設計のため、dispatch 前に止まった worker へ復旧責務を割り当てても実行可能な経路にならない）。したがって、以下の診断・原因別対応・bounded retry は **worker dispatch より前の orchestrator（本 SKILL を呼び出している root/main thread）自身の責務**であり、worker には委譲しない。
+
+診断には `scripts/task-context/task_contextctl.py signal diagnose-origin`（`task_context_workflow_signals.diagnose_origin`、Issue #2790 AC3/AC7）を read-only に呼び出す。この診断呼び出しは `events` journal に何も書き込まず、DB/state-root を作成・migration もせず（`connect_readonly` 経由、PR #2795 review fix_delta P2-B）、`signal apply` 自身が返す公開 disposition/reason_code には一切影響しない。
+
+**同一 effective origin の一貫性（P2-A）**: 診断は、直前に失敗した `signal apply`/`cleanup begin` 呼び出しと **同じ effective origin session** を対象にする。`task_context_workflow_signal.py --origin-session-id` に明示 origin を渡していた場合、直後の診断呼び出しにも `--origin-session-id` として同じ値を渡す（診断が自身の ambient `CLAUDE_CODE_SESSION_ID` だけを読み、直前の apply とは無関係な session を診断してしまう不整合を避ける）。ambient 環境変数だけを頼りに診断すると、直前の apply が使った origin と食い違う場合がある。
+
+canonical flow（概念的な順序。`/task` はユーザーの直接入力 `UserPromptExpansion` を使う設計であり、Claude が単に Skill tool を呼ぶ経路とは異なるため、orchestrator が worker/Skill 呼び出しだけで同じ bootstrap が発火すると仮定しない）:
+
+```text
+merge signal apply が unbound
+→ orchestrator が同一 effective origin を diagnose-origin で診断
+→ 下表の reason-code に対応する既存 recovery、または actionable stop
+→ 本当にユーザーによる明示的 /task <target> が必要な場合は、その必要性と対象を具体的に報告する
+  （それ以外の read-only diagnosis / 既存 recovery / 再評価は不要な承認待ちを追加せず進める）
+→ 復旧を確認できた場合だけ、同じ effective origin で signal を bounded に再適用
+→ cleanup selection が selected の場合だけ、初めて post-merge-cleanup-worker を dispatch
+```
+
+診断結果の `reason_code` に応じて、orchestrator は次の原因別経路を選択する（Task を推測して勝手に apply することは一切しない）:
+
+| `diagnose_origin` の `reason_code` | 意味 | 対応 |
+|---|---|---|
+| `origin_session_missing` | 呼び出し元 session id 自体が無い | 既存 recovery（session id 環境変数の確認）へ。signal retry は無意味なので行わない |
+| `origin_run_not_found` | この session id に紐づく ExecutionRun が一件もない | 本当に unbound（binding 未作成）である可能性が高い。明示的な binding recovery（例: `/task <target>` による bootstrap、Issue #2790 AC2/AC5）後に signal を retry する |
+| `origin_run_ended` | ExecutionRun は存在するが既に終了済み | 原因を人間/呼び出し元に表示し、既存の recovery 経路（新しい SessionStart による self-heal）へ委ねる。signal を無条件 retry しない |
+| `origin_run_kind_mismatch` | ExecutionRun は存在するが managed run_kind（`native_operator`/`claude_gpt`）ではない | 原因を表示し、既存 recovery へ。この run から signal を適用しない |
+| `origin_task_unattached` | ExecutionRun に Task が紐づいていない | 原因を表示し、既存 recovery へ。Task を推測して attach しない |
+| `origin_binding_session_mismatch` | Binding の `current_claude_session_id` が一致しない | 原因を表示し、既存 recovery へ。別セッションの Binding を steal しない |
+| `origin_ambiguous` | 複数の candidate が同時に条件を満たす（現在の DB 制約上は到達不能な defense-in-depth 分岐） | Task を推測せず即時停止し、人間判断を求める（`human_review_required: true`） |
+
+`resolved: true`（diagnose_origin が実際に同一 effective origin を解決できた場合）は、直前の `signal apply` 呼び出しが別の理由（evidence 不整合等）で `unbound` 以外の outcome を返したケース、または診断の間に状態が復旧したケースであり、いずれも本テーブルの原因別対応の対象外 -- 状態が既に復旧している可能性があるため、無条件の再評価・限定的な signal retry へ進めてよい（診断からもう一度状態が変わっていないか再確認したうえで進める）。
+
 ## Delegation / 委譲
 
 main thread は以下の static call shape で SubAgent に委譲する:

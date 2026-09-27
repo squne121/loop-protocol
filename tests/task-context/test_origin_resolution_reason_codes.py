@@ -230,3 +230,126 @@ def test_given_origin_run_not_found_when_signal_applied_then_no_event_is_persist
     assert result == {"disposition": "deferred", "reason_code": "unbound"}
     assert mutation_counts(conn) == before
     assert _events_with_type(conn, "workflow:origin_resolution_failed") == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #2790 AC3/AC7: `diagnose_origin` -- a read-only diagnostic entry
+# point that exposes the same 7 internal reason-codes above without
+# persisting anything, so a consumer such as post-merge-cleanup can select
+# a cause-specific fallback/escalation path (Issue #2790 AC8) instead of
+# only ever seeing the frozen public `unbound` disposition.
+# ---------------------------------------------------------------------------
+
+
+def test_given_no_session_id_when_origin_diagnosed_then_resolved_false_and_reason_is_origin_session_missing(conn):
+    diagnosis = signals.diagnose_origin(conn, None)
+    assert diagnosis["resolved"] is False
+    assert diagnosis["reason_code"] == "origin_session_missing"
+
+
+def test_given_unresolvable_session_when_origin_diagnosed_then_reason_is_origin_run_not_found(conn):
+    diagnosis = signals.diagnose_origin(conn, "no-such-session")
+    assert diagnosis["resolved"] is False
+    assert diagnosis["reason_code"] == "origin_run_not_found"
+
+
+def test_given_ended_run_when_origin_diagnosed_then_reason_is_origin_run_ended_and_non_mutating(conn):
+    task, activity, binding = _task_activity_binding(conn)
+    run = service.start_execution_run(
+        conn,
+        run_kind="native_operator",
+        task_id=task["id"],
+        activity_id=activity["id"],
+        binding_id=binding["id"],
+        claude_session_id="s-diagnose-ended",
+    )
+    service.set_binding_session(conn, binding["id"], "s-diagnose-ended", execution_run_id=run["id"])
+    service.end_execution_run(conn, run["id"])
+    before = mutation_counts(conn)
+
+    diagnosis = signals.diagnose_origin(conn, "s-diagnose-ended")
+
+    assert diagnosis["resolved"] is False
+    assert diagnosis["reason_code"] == "origin_run_ended"
+    assert diagnosis["execution_run_id"] == run["id"]
+    assert diagnosis["task_id"] == task["id"]
+    # AC3/AC7: purely read-only -- no event, no mutation, unlike
+    # `apply_workflow_signal`'s own `_record_origin_resolution_failure_tx`.
+    assert mutation_counts(conn) == before
+    assert _events_with_type(conn, "workflow:origin_resolution_failed") == []
+
+
+def test_given_non_managed_run_kind_when_origin_diagnosed_then_reason_is_origin_run_kind_mismatch(conn):
+    task, activity, binding = _task_activity_binding(conn)
+    service.start_execution_run(
+        conn,
+        run_kind="subagent",
+        task_id=task["id"],
+        activity_id=activity["id"],
+        binding_id=binding["id"],
+        claude_session_id="s-diagnose-kind-mismatch",
+    )
+    diagnosis = signals.diagnose_origin(conn, "s-diagnose-kind-mismatch")
+    assert diagnosis["resolved"] is False
+    assert diagnosis["reason_code"] == "origin_run_kind_mismatch"
+
+
+def test_given_run_with_no_task_when_origin_diagnosed_then_reason_is_origin_task_unattached(conn):
+    binding = service.create_binding(conn)
+    service.start_execution_run(
+        conn, run_kind="native_operator", binding_id=binding["id"], claude_session_id="s-diagnose-unattached"
+    )
+    diagnosis = signals.diagnose_origin(conn, "s-diagnose-unattached")
+    assert diagnosis["resolved"] is False
+    assert diagnosis["reason_code"] == "origin_task_unattached"
+
+
+def test_given_binding_session_mismatch_when_origin_diagnosed_then_reason_is_origin_binding_session_mismatch(conn):
+    task, activity, binding = _task_activity_binding(conn)
+    service.start_execution_run(
+        conn,
+        run_kind="native_operator",
+        task_id=task["id"],
+        activity_id=activity["id"],
+        binding_id=binding["id"],
+        claude_session_id="s-diagnose-binding-mismatch",
+    )
+    diagnosis = signals.diagnose_origin(conn, "s-diagnose-binding-mismatch")
+    assert diagnosis["resolved"] is False
+    assert diagnosis["reason_code"] == "origin_binding_session_mismatch"
+
+
+def test_given_fully_bound_session_when_origin_diagnosed_then_resolved_true_with_no_reason_code(conn):
+    task, activity, binding = _task_activity_binding(conn)
+    run = service.start_execution_run(
+        conn,
+        run_kind="native_operator",
+        task_id=task["id"],
+        activity_id=activity["id"],
+        binding_id=binding["id"],
+        claude_session_id="s-diagnose-bound",
+    )
+    service.set_binding_session(conn, binding["id"], "s-diagnose-bound", execution_run_id=run["id"])
+
+    diagnosis = signals.diagnose_origin(conn, "s-diagnose-bound")
+
+    assert diagnosis == {
+        "resolved": True,
+        "reason_code": None,
+        "execution_run_id": run["id"],
+        "task_id": task["id"],
+        "activity_id": activity["id"],
+        "binding_id": binding["id"],
+    }
+
+
+def test_given_origin_diagnosed_then_public_unbound_disposition_contract_is_unaffected(conn):
+    """AC3/AC7/Out-of-Scope: `diagnose_origin` is purely additive --
+    `apply_workflow_signal` must keep returning the exact frozen
+    `{"disposition": "deferred", "reason_code": "unbound"}` outcome for the
+    same unresolved origin, never the specific internal reason-code."""
+    diagnosis = signals.diagnose_origin(conn, "closed-session")
+    assert diagnosis["reason_code"] == "origin_run_not_found"
+
+    applied = signals.apply_workflow_signal(conn, implementation_payload(), origin_session_id="closed-session")
+    assert applied == {"disposition": "deferred", "reason_code": "unbound"}

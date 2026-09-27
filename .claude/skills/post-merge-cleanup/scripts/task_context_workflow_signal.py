@@ -87,32 +87,32 @@ def _merged_evidence(snapshot: object, issue_number: int, pr_number: int) -> tup
     return {"repo": repo.lower(), "issue_number": issue_number, "pr_number": pr_number, "merge_commit_oid": oid}, "OK"
 
 
-def _run(argv: list[str], body: dict, *, origin_session_id: str | None = None) -> dict:
-    """Invoke ``task_contextctl`` and normalize its result to the typed
-    ``{"disposition": ..., "reason_code": ...}`` shape every other producer
-    adapter (e.g. ``open_pr.emit_implementation_pr_observed``) already
-    returns.
-
-    A subprocess timeout/OSError, an unparsable/empty stdout, or a
-    well-formed ``status: error`` result envelope (whose ``data`` carries
-    ``{message, details}``, not a typed disposition) are all normalized to a
-    diagnosable ``deferred`` outcome instead of an uncaught exception or a
-    bare ``{}``. This is a read normalization only -- it never rolls back or
-    fail-closes any already-completed post-merge cleanup work.
+def _invoke_ctl(argv: list[str], body: dict, *, origin_session_id: str | None = None) -> dict | None:
+    """Invoke ``task_contextctl`` and return its parsed result envelope
+    (``{"status": ..., "data"/"code"/"message": ...}``), or ``None`` if the
+    subprocess itself could not be run or its stdout could not be parsed as
+    one JSON object.
 
     Issue #2719 AC3: ``task_contextctl.py`` reads its origin session id from
     its *own* process environment (``os.environ["CLAUDE_CODE_SESSION_ID"]``,
-    see ``task_contextctl._dispatch``). Previously this subprocess call
-    passed no ``env=`` at all and unconditionally inherited whatever
-    ``CLAUDE_CODE_SESSION_ID`` happened to already be set in *this*
-    adapter's own ambient environment -- an implicit, uncontrolled
-    passthrough. This now mirrors the explicit override pattern
-    ``.claude/hooks/task_context/ctl_client.py``'s ``call()`` already uses
-    for the hook transport: build ``child_env`` from a copy of this
-    process's environment, then explicitly set the caller-supplied
-    ``origin_session_id`` into it before starting the child process, so the
-    origin session provenance is never left to implicit inheritance.
-    """
+    see ``task_contextctl._dispatch``). This subprocess call mirrors the
+    explicit override pattern ``.claude/hooks/task_context/ctl_client.py``'s
+    ``call()`` already uses for the hook transport: build ``child_env`` from
+    a copy of this process's environment, then explicitly set the
+    caller-supplied ``origin_session_id`` into it before starting the child
+    process, so the origin session provenance is never left to implicit
+    inheritance.
+
+    PR #2795 review fix_delta P2-A (comment 5852749710, finding 3): this is
+    the single shared subprocess-invocation primitive both ``_run`` (the
+    ``signal apply``/``cleanup begin`` disposition-oriented callers) and
+    ``diagnose_origin`` (the read-only diagnostic caller) build on, so a
+    caller that passed an explicit ``origin_session_id`` for a failed
+    ``signal apply``/``cleanup begin`` call can pass that exact same value
+    to the following diagnose-origin call -- the two invocations must never
+    silently drift onto different effective origins (one reading this
+    adapter's own ambient ``CLAUDE_CODE_SESSION_ID``, the other honoring the
+    explicit override)."""
     child_env = dict(os.environ)
     if origin_session_id is not None:
         child_env["CLAUDE_CODE_SESSION_ID"] = origin_session_id
@@ -126,14 +126,39 @@ def _run(argv: list[str], body: dict, *, origin_session_id: str | None = None) -
             env=child_env,
         )
     except (subprocess.SubprocessError, OSError):
-        return {"disposition": "deferred", "reason_code": "ADAPTER_UNAVAILABLE"}
+        return None
     if not proc.stdout.splitlines():
-        return {"disposition": "deferred", "reason_code": "ADAPTER_UNAVAILABLE"}
+        return None
     try:
-        envelope = json.loads(proc.stdout.splitlines()[-1])
+        result = json.loads(proc.stdout.splitlines()[-1])
     except json.JSONDecodeError:
-        return {"disposition": "deferred", "reason_code": "ADAPTER_UNAVAILABLE"}
-    if not isinstance(envelope, dict):
+        return None
+    if not isinstance(result, dict):
+        return None
+    return result
+
+
+def _run(argv: list[str], body: dict, *, origin_session_id: str | None = None) -> dict:
+    """Invoke ``task_contextctl`` and normalize its result to the typed
+    ``{"disposition": ..., "reason_code": ...}`` shape every other producer
+    adapter (e.g. ``open_pr.emit_implementation_pr_observed``) already
+    returns.
+
+    A subprocess timeout/OSError, an unparsable/empty stdout, or a
+    well-formed ``status: error`` result envelope (whose ``data`` carries
+    ``{message, details}``, not a typed disposition) are all normalized to a
+    diagnosable ``deferred`` outcome instead of an uncaught exception or a
+    bare ``{}``. This is a read normalization only -- it never rolls back or
+    fail-closes any already-completed post-merge cleanup work.
+
+    fix_delta P2-A: this ``{"disposition": ...}``-shaped normalization only
+    ever fits ``signal apply``/``cleanup begin`` results. ``diagnose_origin``
+    below (which returns a ``{"resolved": ...}``-shaped result with no
+    ``disposition`` key at all) is deliberately NOT routed through this
+    function -- doing so used to silently coerce a genuine ``resolved: true``
+    diagnosis into ``{"disposition": "deferred", "reason_code": "OK"}``."""
+    envelope = _invoke_ctl(argv, body, origin_session_id=origin_session_id)
+    if envelope is None:
         return {"disposition": "deferred", "reason_code": "ADAPTER_UNAVAILABLE"}
     data = envelope.get("data", {})
     if isinstance(data, dict) and "disposition" in data:
@@ -142,6 +167,33 @@ def _run(argv: list[str], body: dict, *, origin_session_id: str | None = None) -
     # disposition) -- surface the envelope's own error code rather than
     # silently returning {message, details} or {}.
     return {"disposition": "deferred", "reason_code": str(envelope.get("code", "ADAPTER_UNAVAILABLE"))}
+
+
+def diagnose_origin(origin_session_id: str | None) -> dict:
+    """PR #2795 review fix_delta P2-A/P2-C (comment 5852749710, findings 3
+    and 5): read-only ``signal diagnose-origin`` counterpart used by the
+    orchestrator (never by the dispatch-time worker -- see
+    ``.claude/skills/post-merge-cleanup/SKILL.md``'s "unbound の原因別
+    フォールバック" section) to diagnose the *same effective origin session*
+    that a preceding failed ``signal apply``/``cleanup begin`` call used --
+    pass the identical ``origin_session_id`` value here that was passed to
+    that preceding call (``None`` falls back to this process's own ambient
+    ``CLAUDE_CODE_SESSION_ID``, exactly like ``_run`` above).
+
+    Returns the diagnostic's own ``{"resolved": bool, "reason_code": ...}``
+    shape verbatim (never coerced through ``_run``'s disposition-oriented
+    normalization -- see that function's docstring) on success, or
+    ``{"resolved": False, "reason_code": "ADAPTER_UNAVAILABLE"}`` if the
+    subprocess itself could not be run/parsed, or
+    ``{"resolved": False, "reason_code": str(<envelope error code>)}`` for a
+    well-formed ``status: error`` envelope."""
+    envelope = _invoke_ctl(["signal", "diagnose-origin"], {}, origin_session_id=origin_session_id)
+    if envelope is None:
+        return {"resolved": False, "reason_code": "ADAPTER_UNAVAILABLE"}
+    data = envelope.get("data", {})
+    if isinstance(data, dict) and "resolved" in data:
+        return data
+    return {"resolved": False, "reason_code": str(envelope.get("code", "ADAPTER_UNAVAILABLE"))}
 
 
 def main(argv: list[str] | None = None) -> int:

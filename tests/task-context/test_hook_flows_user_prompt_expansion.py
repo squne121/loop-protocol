@@ -117,17 +117,53 @@ def test_given_non_herdr_session_when_task_expanded_then_not_applicable_pass(con
     assert result["reason_code"] == "observe_only_non_herdr"
 
 
-def test_given_no_binding_for_session_when_task_expanded_then_explicit_command_failure(conn):
-    """Unlike ordinary UserPromptSubmit's fail-open default, an explicit
-    `/task` command with an unresolvable Binding is surfaced as an explicit
-    command failure -- it must never silently pretend to have succeeded."""
+def test_given_no_binding_for_session_but_explicit_target_when_task_expanded_then_bootstrap_rebind_succeeds(conn):
+    """Issue #2790 AC2/AC5: unlike the pre-#2790 dead-end (an explicit `/task`
+    command with an unresolvable Binding was unconditionally surfaced as a
+    command failure), a `/task <target>` that already carries an explicit,
+    resolvable target self-heals via `bootstrap_unbound_session` instead --
+    this is the primary design candidate validated for `fork`'s by-design
+    non-inheritance of the parent operator's TabBinding (Issue #2564 AC15).
+    It must never silently pretend to have succeeded either: the result
+    reports `bootstrapped_binding: True` and a distinct reason_code."""
     conn_holder["conn"] = conn
     result = _expand(
         "unknown-session", "tab-1", slash_task_target_repo="owner/repo", slash_task_target_ref_kind="issue",
         slash_task_target_ref_number=1,
     )
+    assert result["decision"] == "pass"
+    assert result["reason_code"] == "slash_task_bootstrap_rebind"
+    assert result["bootstrapped_binding"] is True
+    task_id = result["task_id"]
+    assert service.find_live_claim(conn, "owner/repo", "issue", 1)["task_id"] == task_id
+
+    binding = service.get_binding_by_current_session(conn, "unknown-session")
+    assert binding is not None
+    current_task_id, _, _ = service.get_current_task_activity_for_binding(conn, binding["id"])
+    assert current_task_id == task_id
+
+
+def test_given_no_binding_and_no_target_when_task_expanded_then_explicit_command_failure(conn):
+    """Bootstrap is never speculative: with no current Binding AND no
+    explicit target at all, `/task` remains the same explicit command
+    failure it always was -- this is the one remaining case where the hook
+    adapter's `no_binding_for_session` message is shown, and it is now
+    always paired with a genuinely missing target (see
+    `_task_command_failure_message` in `hook_entry.py`)."""
+    conn_holder["conn"] = conn
+    result = _expand("unknown-session", "tab-1")
     assert result["decision"] == "block"
     assert result["reason_code"] == "no_binding_for_session"
+
+
+def test_given_no_binding_and_ad_hoc_title_when_task_expanded_then_bootstrap_rebind_succeeds(conn):
+    """AC2/AC5 counterpart for an ad-hoc title target (no GitHub ref)."""
+    conn_holder["conn"] = conn
+    result = _expand("unknown-session", "tab-1", slash_task_ad_hoc_title="ad-hoc bootstrap work")
+    assert result["decision"] == "pass"
+    assert result["reason_code"] == "slash_task_bootstrap_rebind"
+    assert result["bootstrapped_binding"] is True
+    assert service.count_live_task_ref_claims(conn, result["task_id"]) == 0
 
 
 # ---------------------------------------------------------------------------
