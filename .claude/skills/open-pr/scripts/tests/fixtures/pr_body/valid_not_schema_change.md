@@ -1,6 +1,6 @@
 ## Summary
 
-- PR body validator implementation plan
+- PR body validator implementation plan（実装計画）
 
 ## Checks
 
@@ -9,7 +9,7 @@
 ## Schema Change Applicability
 
 - decision: not_schema_change
-- reason: Python validator and tests only
+- reason: Python validator と test のみを変更するため
 
 ## Schema Consumer Inventory
 
@@ -24,6 +24,7 @@ reason: safety-sensitive path に該当しない
 ## Notes
 
 - Related issue: #330
+- 上記は関連する Issue 番号です
 
 ## 受け入れ条件の達成状況
 

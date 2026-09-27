@@ -1,6 +1,6 @@
 ## Summary
 
-- Valid not schema change fixture
+- Valid not schema change fixture（スキーマ変更を伴わない正常系 fixture）
 
 ## Checks
 
@@ -24,6 +24,7 @@ reason: safety-sensitive path に該当しない
 ## Notes
 
 - Related issue: #244
+- 上記は関連する Issue 番号です
 
 ## 受け入れ条件の達成状況
 
