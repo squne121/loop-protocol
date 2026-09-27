@@ -8,7 +8,7 @@
 - PR / diff / issue に safety 境界ワードを含む
 - issue ラベル/本文に `safety`, `permission`, `runtime verification`, ... が含まれる
 
-## Deterministic Minimum Floor（producer/reviewer 共有、Issue #2808 AC4）
+## Deterministic Minimum Floor（producer と reviewer が共有する最小判定基準、Issue #2808 AC4）
 
 上記の reviewer 判定は本節が定義する floor より広く、reviewer はこの floor 以外の
 semantic concern を引き続き検出してよい。一方、authoring 側の
