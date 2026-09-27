@@ -137,7 +137,7 @@ Issue 起票時に動作検証の適用判定セクションを記載する。`r
 - 自由記述の「後続 Issue で検証する」だけでは不完全。機械的に検出できる半構造化フォーマットで記述すること。
 - 適用判定の詳細基準は `docs/dev/runtime-verification-policy.md` の「Runtime Verification Applicability」を参照する。
 
-### Actual/Canonical Runtime Acceptance と Fixture Semantics の AC 分離（Issue #2807）
+### `actual`/`canonical` ランタイム受け入れと `fixture` 意味論との AC 分離規則（Issue #2807）
 
 AC が **actual / canonical / default runtime selection**（例: current-head production launcher が通常の binary resolution で選択する proxy / 依存プロセスの identity）を要求する場合、fixture proxy を明示注入する hermetic test（fixture-only VC）を、その AC の唯一の evidence にしてはならない。
 

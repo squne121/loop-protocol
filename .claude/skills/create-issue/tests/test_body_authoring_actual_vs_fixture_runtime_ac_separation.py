@@ -31,7 +31,7 @@ def test_actual_runtime_ac_cannot_be_satisfied_by_fixture_only_vc():
 
     # AC2: actual/canonical/default runtime acceptance と fixture
     # semantics を区別する規則そのものが存在すること。
-    assert "Actual/Canonical Runtime Acceptance と Fixture Semantics の AC 分離" in doc_text
+    assert "ランタイム受け入れと `fixture` 意味論との AC 分離規則" in doc_text
     assert (
         "fixture proxy を明示注入する hermetic test（fixture-only VC）を、"
         "その AC の唯一の evidence にしてはならない" in doc_text

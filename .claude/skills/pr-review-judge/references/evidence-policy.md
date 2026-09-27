@@ -63,7 +63,7 @@ skipped 件数を指し、advisory な `TEST_VERDICT_MACHINE` コメントの
   stale/SKIP 状態は、他の authoritative evidence が揃っていれば APPROVE を妨げず、
   他の authoritative evidence が揃っていなければ APPROVE を与えない。
 
-## Canonical Runtime Acceptance vs Fixture-Only Evidence（Issue #2807）
+## `canonical` ランタイム受け入れ evidence と `fixture-only` evidence の区別（Issue #2807）
 
 AC が **actual / canonical / default runtime selection**（例: current-head production launcher の通常 binary resolution で選択される proxy identity）を要求する場合、レビュアーは AC の evidence-source requirement（actual/canonical vs fixture）と、割り当てられた VC / test implementation が実際に生成する evidence source を照合する。両者が一致しない場合（fixture-only VC が actual-runtime AC に割り当てられている場合）は `REQUEST_CHANGES` とする。
 
