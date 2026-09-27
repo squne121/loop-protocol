@@ -723,3 +723,18 @@ def test_secure_atomic_write_candidate_succeeds_for_clean_path(tmp_path):
     # Idempotent overwrite of an existing regular file must also succeed.
     ric.secure_atomic_write_candidate(leaf, "clean content v2", root=artifact_dir)
     assert leaf.read_text(encoding="utf-8") == "clean content v2"
+
+
+def test_extract_allowed_paths_no_path_marker_returns_empty():
+    """AC12 (Issue #2783): canonical marker `(none)` and legacy marker
+    `読み取り専用。リポジトリ変更なし（既定）` as the sole Allowed Paths entry
+    both resolve to [] (previously this module's bullet-token regex had no
+    annotation stripping at all, so BOTH markers leaked as literal
+    non-empty "path" strings)."""
+    ric = _import_ric()
+
+    body_canonical = "## Allowed Paths\n\n- (none)\n"
+    assert ric._extract_allowed_paths_ric(body_canonical) == []
+
+    body_legacy = "## Allowed Paths\n\n- 読み取り専用。リポジトリ変更なし（既定）\n"
+    assert ric._extract_allowed_paths_ric(body_legacy) == []

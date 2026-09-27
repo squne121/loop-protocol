@@ -419,6 +419,18 @@ def _install_fixture(repo_root: Path, trusted_gh_bin: Path) -> None:
     # `contract_readiness_check.py`'s existing-issue-readiness check loads.
     shutil.copytree(REPO_ROOT / "docs" / "dev", repo_root / "docs" / "dev", dirs_exist_ok=True)
 
+    # Issue #2783 fix_delta: `repair_issue_contract.py` imports the shared
+    # `allowed_paths_policy.is_no_path_marker` helper from
+    # `scripts/agent-ops/`. Mirror that dependency into the isolated fixture
+    # repo at the same relative location (self-contained, no PYTHONPATH
+    # escape to the real repo).
+    _write_text(
+        repo_root / "scripts" / "agent-ops" / "allowed_paths_policy.py",
+        (REPO_ROOT / "scripts" / "agent-ops" / "allowed_paths_policy.py").read_text(
+            encoding="utf-8"
+        ),
+    )
+
     _write_text(
         repo_root / "scripts" / "agent-ops" / "worktree_catalog.py",
         """from __future__ import annotations
