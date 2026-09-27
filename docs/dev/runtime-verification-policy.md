@@ -638,7 +638,7 @@ authoring.md` の「実行時検証プロファイルの assertion binding 記�
 
 ---
 
-## 12. live runtime verification における credential profile provenance（Issue #2803）
+## 12. live runtime verification における credential provenance（認証プロファイルの出自判定、Issue #2803）
 
 ### canonical `CLAUDE_GPT_HOME` を検証対象の launcher と同一にする
 
