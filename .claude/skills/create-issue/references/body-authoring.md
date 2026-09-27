@@ -156,7 +156,15 @@ fixture semantics AC の PASS は canonical runtime acceptance AC の代替に�
 - launcher hash
 - selected proxy の absolute path / version / hash
 
-fixture proxy の path/version のみを記載した evidence は、canonical runtime acceptance AC の充足として **明示的に不十分** である。canonical runtime evidence の取得には、新しい harness を作らず既存の `scripts/claude-gpt/launch.sh --check-only` / `scripts/claude-gpt/runtime_smoke_test.sh` のような current-head production 実行資産を参照する。
+上記の必須フィールドと既存 producer `CLAUDE_GPT_SMOKE_RESULT_V1`（`scripts/claude-gpt/runtime_smoke_test.sh`）の実 schema との対応（新しい schema field は追加しない）:
+
+- `run_head_sha` := `CLAUDE_GPT_SMOKE_RESULT_V1.sut.git_head`
+- `git_dirty` := `CLAUDE_GPT_SMOKE_RESULT_V1.sut.git_dirty`
+- launcher hash := `CLAUDE_GPT_SMOKE_RESULT_V1.sut.launch_sh_sha256`
+- selected proxy の absolute path / version / hash := `CLAUDE_GPT_SMOKE_RESULT_V1.proxy.absolute_path` / `.proxy.version` / `.proxy.sha256`
+- 実行 command identity := authoritative evidence に束縛された literal command 文字列とその command SHA256
+
+fixture proxy の path/version のみを記載した evidence は、canonical runtime acceptance AC の充足として **明示的に不十分** である。catalog / proxy-selection AC は fake `CLAUDE_GPT_PROXY_BIN` override なしの current-head production `scripts/claude-gpt/launch.sh --check-only` を canonical acceptance の最低限とし、authenticated request / transport の意味論自体を AC が要求する場合に限り `scripts/claude-gpt/runtime_smoke_test.sh` の full smoke を追加要求する。full smoke の認証不足 SKIP は catalog-only AC を failure 扱いしないが、authenticated request / transport AC 自体を PASS にはしない。canonical runtime evidence の取得には、新しい harness を作らず既存の `scripts/claude-gpt/launch.sh --check-only` / `scripts/claude-gpt/runtime_smoke_test.sh` のような current-head production 実行資産を参照する。
 
 ### 実行時検証プロファイルの assertion binding 記法（`runtime_assertion_bindings`, Issue #2771）
 

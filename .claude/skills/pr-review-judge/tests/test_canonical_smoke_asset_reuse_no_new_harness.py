@@ -49,7 +49,12 @@ def test_evidence_policy_requires_current_head_proxy_identity_binding_and_no_new
     THEN actual selected proxy identity（run_head_sha + git_dirty + 実行
     command identity + launcher hash + selected proxy absolute path/version/
     hash）の記載を要求し、fixture proxy の path/version のみでは不十分と
-    明記し、新しい harness を追加せず既存資産のみを参照する（AC3 / AC8）。
+    明記していることを static に確認する（AC3）。AC8 側で本 test が保証する
+    のは、両ドキュメント本文に禁止マーカー文字列（new permanent daemon 等）
+    が存在しないことのみであり、リポジトリ全体に new harness が追加されて
+    いないことの網羅的証明ではない。「new harness を追加していない」ことの
+    実証は Allowed Paths + actual changed-files（PR body の Safety Claim
+    Matrix、`git diff --name-only main...HEAD`）に委ねる。
     """
     body_authoring_text = _read(BODY_AUTHORING_PATH)
     evidence_policy_text = _read(EVIDENCE_POLICY_PATH)
@@ -98,9 +103,14 @@ def test_evidence_policy_requires_current_head_proxy_identity_binding_and_no_new
 def test_existing_fixture_tests_unchanged_and_ci_not_network_dependent():
     """GIVEN 既存 fixture tests（scripts/claude-gpt/tests/test_proxy_model_compatibility.py）
     WHEN Issue #2807 の変更を適用する
-    THEN 既存 fixture tests は hermetic implementation-semantics coverage
-    としてそのまま維持され、通常 CI は real ChatGPT account/network を
-    必須にしない（AC5）。
+    THEN 本 test が static に保証するのは「hermetic 実装であることを示す既存
+    マーカー文字列がファイル内に残っていること」と「evidence-policy.md が
+    fixture tests 維持と非 network-dependent CI を明記していること」のみ
+    （AC5）。fixture file のバイト単位 unchanged 証明や、CI 実行が実際に
+    network に依存しないことの実行時証明ではない。fixture file が本 PR で
+    変更されていないことの実証は、本 PR の Allowed Paths と
+    `git diff --name-only main...HEAD` の diff evidence（PR body の
+    Safety Claim Matrix）に委ねる。
     """
     # AC5: fixture test ファイル自体が Allowed Paths 外であり、本 Issue の
     # 実装で改変されていないことを確認する（存在確認 + 既存 hermetic
