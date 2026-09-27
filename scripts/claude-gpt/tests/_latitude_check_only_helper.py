@@ -125,7 +125,27 @@ def run_check_only(
     ambient `HOME`), so the canonical default resolves under an isolated root
     rather than the real user's `~/.claude-gpt`. Defaults to `False`, so all
     existing callers keep their prior explicit-override behavior unchanged.
+
+    Raises `ValueError` if `use_default_claude_gpt_home=True` and `extra_env`
+    contains a `HOME` or `CLAUDE_GPT_HOME` key (PR #2804 review P3-2): letting
+    `extra_env` silently clobber either of those would desync the subprocess's
+    actual root from the `settings_path` this function computes and returns
+    (`default_home_root / ".claude-gpt" / "claude" / "settings.local.json"`),
+    since that computation assumes the isolated-`HOME` / popped-`CLAUDE_GPT_HOME`
+    invariant this branch sets up. Callers that need a different `HOME` /
+    `CLAUDE_GPT_HOME` should not combine them with `use_default_claude_gpt_home=True`.
     """
+    if use_default_claude_gpt_home and extra_env:
+        conflicting_keys = {"HOME", "CLAUDE_GPT_HOME"} & set(extra_env)
+        if conflicting_keys:
+            raise ValueError(
+                "run_check_only(use_default_claude_gpt_home=True) requires the "
+                "isolated HOME / popped CLAUDE_GPT_HOME invariant this helper "
+                "sets up; extra_env must not override "
+                f"{sorted(conflicting_keys)} in this mode (it would desync the "
+                "actual subprocess root from the returned settings_path)."
+            )
+
     default_home_root: Path | None = None
     env = dict(os.environ)
 

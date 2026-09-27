@@ -35,11 +35,14 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd -P)
 # shellcheck source=./lib.sh
 . "$SCRIPT_DIR/lib.sh"
 
-# `home_source` provenance（Issue #2803 AC3）: 検査対象の `CLAUDE_GPT_HOME`
-# （source 後の最終的な effective 値）が `lib.sh` の canonical default 式
-# （`${HOME}/.claude-gpt`）と一致するかどうかで判定する。credential の中身
-# （token / auth.json content）は一切含めず、`default` / `env_override` の
-# 2値のみを保持する。
+# `home_source` の lexical/effective-path classification（Issue #2803 AC3）:
+# 検査対象の `CLAUDE_GPT_HOME`（source 後の最終的な effective 値）が `lib.sh`
+# の canonical default 式（`${HOME}/.claude-gpt`）と文字列として lexical に
+# 一致するかどうかだけで判定する。caller が env var を明示指定したかどうか
+# という provenance（出自）を復元するものではない点に注意する（同じ実体を
+# 指す別表記——例えば末尾スラッシュ違い——を明示指定した場合も一致しなければ
+# `env_override` になる）。credential の中身（token / auth.json content）は
+# 一切含めず、`default` / `env_override` の2値のみを保持する。
 #
 # 「source 前に env var の有無を snapshot する」方式（一見自然に見えるが）は
 # 採用しない: `launch.sh` は本 script を invoke する前に自身の `lib.sh` を

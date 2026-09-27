@@ -16,10 +16,19 @@ Issue #2803: `preflight.sh` の既存通常実行結果（`CLAUDE_GPT_PREFLIGHT_
 static/hermetic 検証で完結する。external process 起動を伴う
 `launch.sh --check-only` 経由の伝播検証は AC6 として
 `test_launch_check_only_home_source_smoke.py` に分離している）。
+
+PR #2804 レビュー P3-3 対応: `_run_preflight_env_only()` は PATH 上の実
+`claude-code-proxy` に依存せず、既存の shared hermetic fixture
+（`_latitude_check_only_helper.py` の `FAKE_PROXY_SOURCE` / `write_executable()`）
+で `claude-code-proxy` を fake 化し、`preflight.sh --env-only` の exit code
+契約（0=全 PASS、3=proxy バイナリなし、4=認証利用不能）を明示的に assert する。
+これにより `home_source` フィールドの一致だけで binary/auth check の失敗を
+見逃したまま PASS 扱いにしない。
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -28,19 +37,47 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 PREFLIGHT_SH = SCRIPT_DIR / "preflight.sh"
 
+_HELPER_PATH = Path(__file__).resolve().parent / "_latitude_check_only_helper.py"
+_spec = importlib.util.spec_from_file_location(
+    "claude_gpt_latitude_check_only_helper_2803_preflight_home_source", _HELPER_PATH
+)
+_helper = importlib.util.module_from_spec(_spec)
+assert _spec.loader is not None
+_spec.loader.exec_module(_helper)
 
-def _run_preflight_env_only(tmp_path: Path, *, claude_gpt_home: str | None) -> dict:
+write_executable = _helper.write_executable
+FAKE_PROXY_SOURCE = _helper.FAKE_PROXY_SOURCE
+
+
+def _run_preflight_env_only(
+    tmp_path: Path,
+    *,
+    claude_gpt_home: str | None,
+    expected_returncode: int = 0,
+) -> dict:
     """`preflight.sh --env-only` を isolated HOME で hermetic に実行する。
 
     実 `~/.claude-gpt` を絶対に汚染しないため、`HOME` も isolated tmp 配下へ
     固定する（`claude_gpt_home` が None の場合、canonical default
     `${HOME}/.claude-gpt` は isolated HOME 配下に解決される）。
+
+    PATH 上の実 `claude-code-proxy` には依存せず、既存の shared hermetic
+    fixture（fake proxy）を `CLAUDE_GPT_PROXY_BIN` で注入する
+    （`lib.sh` の `claude_gpt_resolve_proxy_bin()` がこの env var を優先解決
+    に使う）。`--env-only` は外部 `claude` バイナリを呼ばないため
+    `CLAUDE_GPT_CLAUDE_BIN` の fake 化は不要（pop のみ行い、ambient な export
+    があっても影響しないことを保証する）。`expected_returncode` で
+    `preflight.sh --env-only` の exit code 契約を明示的に検証する。
     """
     isolated_home = tmp_path / "isolated-home"
     isolated_home.mkdir(parents=True, exist_ok=True)
 
+    fake_proxy = write_executable(tmp_path / "fake-claude-code-proxy", FAKE_PROXY_SOURCE)
+
     env = dict(os.environ)
     env["HOME"] = str(isolated_home)
+    env["CLAUDE_GPT_PROXY_BIN"] = str(fake_proxy)
+    env.pop("CLAUDE_GPT_CLAUDE_BIN", None)
     if claude_gpt_home is None:
         env.pop("CLAUDE_GPT_HOME", None)
     else:
@@ -55,6 +92,10 @@ def _run_preflight_env_only(tmp_path: Path, *, claude_gpt_home: str | None) -> d
         timeout=30,
     )
     assert result.stdout.strip(), f"preflight.sh produced no stdout: {result.stderr}"
+    assert result.returncode == expected_returncode, (
+        f"preflight.sh --env-only exited {result.returncode} "
+        f"(expected {expected_returncode}); stderr={result.stderr}"
+    )
     return json.loads(result.stdout)
 
 
@@ -115,3 +156,55 @@ def test_home_source_does_not_leak_into_other_preflight_runs_negative_control(tm
 
     second = _run_preflight_env_only(tmp_path, claude_gpt_home=None)
     assert second["home_source"] == "default"
+
+
+def test_home_source_is_default_when_explicit_value_lexically_equals_canonical_default(
+    tmp_path,
+):
+    """GIVEN caller が CLAUDE_GPT_HOME を明示的に、canonical default 式
+         (`${HOME}/.claude-gpt`, isolated HOME 配下) と文字列として完全一致する
+         値に設定する
+    WHEN preflight.sh --env-only を実行する
+    THEN home_source は "default" になる
+
+    P2 (PR #2804 レビュー comment 5856378465): `home_source` は「caller が env
+    var を明示指定したかどうか」の provenance ではなく、effective 値が
+    canonical default 式と lexical に一致するかどうかだけで判定される
+    diagnostic field であることを固定する negative control。ここでは caller
+    が明示的に env var を指定しているにもかかわらず、値が canonical default
+    式と lexical に一致するため `default` になる。
+    """
+    isolated_home = tmp_path / "isolated-home"
+    isolated_home.mkdir(parents=True, exist_ok=True)
+    canonical_default_value = str(isolated_home / ".claude-gpt")
+
+    payload = _run_preflight_env_only(tmp_path, claude_gpt_home=canonical_default_value)
+
+    assert payload["schema"] == "CLAUDE_GPT_PREFLIGHT_RESULT_V1"
+    assert payload["home_source"] == "default"
+
+
+def test_home_source_is_env_override_for_same_directory_different_lexical_form(
+    tmp_path,
+):
+    """GIVEN caller が canonical default と同じ実ディレクトリを意図しているが、
+         末尾スラッシュ等 lexical representation が異なる値を明示指定する
+    WHEN preflight.sh --env-only を実行する
+    THEN home_source は "env_override" になる
+
+    P2 (PR #2804 レビュー comment 5856378465) negative control: `home_source`
+    の判定は文字列としての lexical 一致のみで行い、realpath 等による
+    filesystem canonicalization（同一ディレクトリを指す表記揺れの正規化）は
+    一切行わないことを固定する。
+    """
+    isolated_home = tmp_path / "isolated-home"
+    isolated_home.mkdir(parents=True, exist_ok=True)
+    canonical_default_value = str(isolated_home / ".claude-gpt")
+    lexically_different_same_target = canonical_default_value + "/"
+
+    payload = _run_preflight_env_only(
+        tmp_path, claude_gpt_home=lexically_different_same_target
+    )
+
+    assert payload["schema"] == "CLAUDE_GPT_PREFLIGHT_RESULT_V1"
+    assert payload["home_source"] == "env_override"

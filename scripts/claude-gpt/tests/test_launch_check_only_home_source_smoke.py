@@ -4,7 +4,10 @@ Issue #2803 AC6 (<!-- runtime-verification: true -->): hermetic regression test
 that actually launches `launch.sh --check-only` as an external process (via the
 existing shared hermetic test seam `_latitude_check_only_helper.py::
 run_check_only()`) and observes, at the real launcher process-I/O boundary,
-that the new `preflight.sh` provenance field `home_source` propagates into
+that the new `preflight.sh` field `home_source` -- a lexical/effective-path
+classification of whether the effective `CLAUDE_GPT_HOME` string-equals the
+canonical default expression `${HOME}/.claude-gpt` (not a provenance signal
+of whether the caller explicitly set the env var) -- propagates into
 `CLAUDE_GPT_LAUNCH_RESULT_V1.preflight.home_source` for both cases:
 
   1. `CLAUDE_GPT_HOME` unset/default -- canonical default `${HOME}/.claude-gpt`
@@ -32,6 +35,8 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+
+import pytest
 
 _HELPER_PATH = Path(__file__).resolve().parent / "_latitude_check_only_helper.py"
 _spec = importlib.util.spec_from_file_location(
@@ -102,3 +107,33 @@ def test_home_source_differs_between_default_and_override_same_boundary(tmp_path
         default_payload["preflight"]["home_source"]
         != override_payload["preflight"]["home_source"]
     )
+
+
+def test_run_check_only_rejects_extra_env_home_override_with_default_flag(tmp_path):
+    """GIVEN use_default_claude_gpt_home=True AND extra_env={"CLAUDE_GPT_HOME": ...}
+    WHEN run_check_only() is called
+    THEN it raises ValueError instead of silently letting extra_env desync the
+         actual subprocess root from the settings_path this function computes
+         (PR #2804 review P3-2)
+    """
+    with pytest.raises(ValueError):
+        run_check_only(
+            tmp_path,
+            use_default_claude_gpt_home=True,
+            extra_env={"CLAUDE_GPT_HOME": str(tmp_path / "sneaky-override")},
+        )
+
+
+def test_run_check_only_rejects_extra_env_home_key_override_with_default_flag(tmp_path):
+    """GIVEN use_default_claude_gpt_home=True AND extra_env={"HOME": ...}
+    WHEN run_check_only() is called
+    THEN it raises ValueError instead of silently letting extra_env desync the
+         actual subprocess root from the settings_path this function computes
+         (PR #2804 review P3-2)
+    """
+    with pytest.raises(ValueError):
+        run_check_only(
+            tmp_path,
+            use_default_claude_gpt_home=True,
+            extra_env={"HOME": str(tmp_path / "sneaky-home")},
+        )

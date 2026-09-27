@@ -638,7 +638,7 @@ authoring.md` の「実行時検証プロファイルの assertion binding 記�
 
 ---
 
-## 12. live runtime verification における credential provenance（認証プロファイルの出自判定、Issue #2803）
+## 12. live runtime verification における `home_source` の実効パス文字列一致判定（Issue #2803）
 
 ### canonical `CLAUDE_GPT_HOME` を検証対象の launcher と同一にする
 
@@ -669,10 +669,20 @@ failure（ChatGPT アカウントの再認証が必要という結論）と誤�
 以下の 3 種類の evidence はそれぞれ独立した観測対象であり、いずれか単独を
 「runtime/entitlement PASS」と呼んではならない:
 
-1. **credential/profile provenance**（`scripts/claude-gpt/preflight.sh` が出力する
-   `home_source: default | env_override`。検査対象の `CLAUDE_GPT_HOME` が
-   canonical default か、環境変数による override かを示す。credential の中身
-   （token / auth.json content）は一切含まない）
+1. **`home_source`（`scripts/claude-gpt/preflight.sh` が出力する
+   `home_source: default | env_override`）**: これは caller が env var を明示
+   指定したかどうかの provenance（出自）を復元するものではない。`lib.sh`
+   source 後の effective な `CLAUDE_GPT_HOME` の値が、canonical default 式
+   `${HOME}/.claude-gpt` と **lexical に（文字列として）一致するか**だけを
+   分類する diagnostic field である。POSIX の `${parameter:=word}` 系
+   defaulting は変数が unset/null のときにのみ代入するため、`lib.sh` source
+   後の値だけを見ても、その値が caller による明示指定由来か defaulting 由来か
+   という元の入力 provenance を一般には復元できない（caller が canonical
+   default 式と lexical に完全一致する値を明示指定した場合は `default` に
+   分類され、同じ実体を指す別表記——例えば末尾スラッシュ違い——を明示指定
+   した場合は `env_override` に分類される。realpath 等による filesystem
+   canonicalization は行わない）。credential の中身（token / auth.json
+   content）は一切含まない
 2. **stored-auth availability/status**（既存の `chatgpt_auth.available` /
    `chatgpt_auth.detail`。その `CLAUDE_GPT_HOME` namespace に有効な認証情報が
    存在するかどうか）
