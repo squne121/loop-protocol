@@ -1065,34 +1065,89 @@ fi
 #     だけ、実際に起動した proxy の /v1/models registry と照合する。存在しない
 #     場合はここで fail-closed に停止し、claude 本体を起動しない -- Claude Code
 #     自身の model-resolution 層（code.claude.com/docs/en/model-config）が行う
-#     可能性のある「継承 model への silent fallback」に判定を委ねない。 ---
+#     可能性のある「継承 model への silent fallback」に判定を委ねない。
+#
+#     PR #2800 OWNER REQUEST_CHANGES（Issue #2189 / PR #2191 と同系統の argv
+#     semantics 回帰）: 当初の実装は "$@" を任意位置から無条件に走査しており、
+#     (1) downstream `--`（Claude 自身の positional/prompt 区切り）より後の
+#     literal を誤って model 要求と解釈し、(2) `--append-system-prompt` 等
+#     文字列値を取るオプションの値を `--model` の値と誤認していた。
+#     以下は #2189/#2191 と同じ「先頭から素直に走査し、value position・
+#     downstream `--` に到達したら以降は一切 --model 判定に使わない」という
+#     safe-side 設計を踏襲する。元の "$@" 自体は一切書き換えない。 ---
+CLAUDE_GPT_MODEL_SCAN_VALUE_TAKING_FLAGS="-p --append-system-prompt --system-prompt --output-format --input-format --permission-mode --allowedTools --disallowedTools --add-dir --session-id --resume --fallback-model --mcp-config --settings --agents"
+
 EXPLICIT_MODEL_REQUEST=""
-_prev_arg=""
+_claude_gpt_model_scan_pending_flag=""
+_claude_gpt_model_scan_stopped=false
 for _arg in "$@"; do
+  if [ "$_claude_gpt_model_scan_stopped" = "true" ]; then
+    continue
+  fi
+  # downstream `--`（launcher-level `--` の後にさらに現れる、Claude 自身の
+  # positional/prompt 区切り）に到達したら、以降のトークンは一切 --model 判定に
+  # 使わない。まだ確定していない pending value（例: `-p` の直後）があっても、
+  # ここで走査自体を終了するため無害に破棄される。
+  if [ "$_arg" = "--" ]; then
+    _claude_gpt_model_scan_stopped=true
+    continue
+  fi
+  if [ -n "$_claude_gpt_model_scan_pending_flag" ]; then
+    # このトークンは直前のオプションの値として消費される。`--model` の値の
+    # 場合だけ採用し、それ以外（`--append-system-prompt` 等）の値は
+    # `--model` 判定の対象にしない。
+    if [ "$_claude_gpt_model_scan_pending_flag" = "--model" ]; then
+      EXPLICIT_MODEL_REQUEST="$_arg"
+    fi
+    _claude_gpt_model_scan_pending_flag=""
+    continue
+  fi
   case "$_arg" in
     --model=*)
       EXPLICIT_MODEL_REQUEST="${_arg#--model=}"
+      continue
+      ;;
+    --model)
+      _claude_gpt_model_scan_pending_flag="--model"
+      continue
       ;;
   esac
-  if [ "$_prev_arg" = "--model" ]; then
-    EXPLICIT_MODEL_REQUEST="$_arg"
-  fi
-  _prev_arg="$_arg"
+  for _vf in $CLAUDE_GPT_MODEL_SCAN_VALUE_TAKING_FLAGS; do
+    if [ "$_arg" = "$_vf" ]; then
+      _claude_gpt_model_scan_pending_flag="$_vf"
+      break
+    fi
+  done
 done
-unset _prev_arg _arg
+unset _arg _vf _claude_gpt_model_scan_pending_flag _claude_gpt_model_scan_stopped
 
 if [ -n "$EXPLICIT_MODEL_REQUEST" ]; then
   EXPLICIT_MODEL_BASE=$(claude_gpt_strip_context_hint "$EXPLICIT_MODEL_REQUEST")
-  case "$MODELS_JSON" in
-    *"\"$EXPLICIT_MODEL_BASE\""*)
-      : # registry に存在する。通常どおり claude へそのまま渡す。
-      ;;
+  case "$EXPLICIT_MODEL_BASE" in
+    default|opusplan)
+      # Claude Code 公式仕様（code.claude.com/docs/en/model-config）における
+      # 特殊値: `default` は model override の解除、`opusplan` は plan/execution
+      # で異なる具体的モデルを切り替える特殊モードであり、いずれも proxy へ
+      # そのまま送る具体的な model ID ではない。したがって `/v1/models` に
+      # これらの文字列自体が存在しないことを理由に fail-closed にしない
+      # （実際に使われる具体的な転送先モデルは上記 MODEL_ALIAS_OK の
+      # MAIN/OPUS/HAIKU 一括 preflight で既に検証済み）。argv 上の値自体は
+      # 一切書き換えず、Claude へそのまま渡す。
+      : ;;
     *)
-      kill "$PROXY_PID" 2>/dev/null
-      wait "$PROXY_PID" 2>/dev/null
-      printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"failed","reason":"explicit_model_escalation_unavailable","requested_model":"%s","message":"requested model is unsupported or unavailable on the selected proxy; no fallback to another model or Native Claude is performed","port":%s}\n' \
-        "$EXPLICIT_MODEL_BASE" "$PROXY_PORT"
-      exit 11
+      case "$MODELS_JSON" in
+        *"\"$EXPLICIT_MODEL_BASE\""*)
+          : # registry に存在する。通常どおり claude へそのまま渡す。
+          ;;
+        *)
+          kill "$PROXY_PID" 2>/dev/null
+          wait "$PROXY_PID" 2>/dev/null
+          REQUESTED_MODEL_JSON=$(claude_gpt_json_escape "$EXPLICIT_MODEL_BASE")
+          printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"failed","reason":"explicit_model_escalation_unavailable","requested_model":%s,"message":"requested model is unsupported or unavailable on the selected proxy; no fallback to another model or Native Claude is performed","port":%s}\n' \
+            "$REQUESTED_MODEL_JSON" "$PROXY_PORT"
+          exit 11
+          ;;
+      esac
       ;;
   esac
 fi

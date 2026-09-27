@@ -402,6 +402,37 @@ claude_gpt_resolve_claude_bin() {
 # 同一の absolute path を使い回す。CLAUDE_GPT_PROXY_BIN が明示されていれば（launch.sh が
 # 一度解決した値を子プロセス preflight.sh へ export する場合など）それを優先し、
 # 再解決による差異（PATH mutation 等）を排除する。
+#
+# --- 互換 proxy の isolated 導入手順（Issue #2772 In Scope、PR #2800 OWNER
+#     REQUEST_CHANGES P1）: ---
+#
+# `command -v claude-code-proxy`（グローバル PATH 上のバイナリ）が GPT-6
+# Sol/Luna/Astra を提供する upstream release（v0.1.42 以上）より古い場合、
+# 通常起動は preflight で `model_alias_not_resolved`（exit 7）になる。この
+# ケースでは、グローバル PATH のインストールを上書きせず、以下の手順で
+# 互換 proxy を隔離した場所へ追加導入し、`CLAUDE_GPT_PROXY_BIN` で明示選択する
+# （upstream 公式 installer の contract をそのまま使い、独自 downloader/package
+# manager は新設しない）。
+#
+#   CLAUDE_CODE_PROXY_VERSION=v0.1.42 \
+#   CLAUDE_CODE_PROXY_INSTALL_DIR=<isolated-dir, 例: ~/.local/share/claude-gpt-compat-proxy> \
+#     bash <(curl -fsSL https://raw.githubusercontent.com/raine/claude-code-proxy/main/scripts/install.sh)
+#
+#   export CLAUDE_GPT_PROXY_BIN=<isolated-dir>/claude-code-proxy
+#
+# 導入後は、選択した isolated バイナリで実際に認証する（Native Claude の
+# credential/config には触れない、proxy 専用の別アカウント認証）。
+#
+#   "$CLAUDE_GPT_PROXY_BIN" codex auth login
+#
+# 最後に、同じ選択バイナリで `scripts/claude-gpt/launch.sh --check-only` を
+# 実行し、`model_alias_ok: true` になることを確認する。`claude-code-proxy
+# models` への表示や local registry 一致は account entitlement の証明では
+# ない（AC7）。実際の ChatGPT subscription request 成功は Issue #2772 の
+# Runtime Verification（AC10）で別途確認する。
+#
+# 稼働中の proxy/session を kill・hot-swap する運用や、`CLAUDE_GPT_PROXY_BIN`
+# を明示している運用者の意図を無断で別バイナリへ差し替える運用はしない。
 claude_gpt_resolve_proxy_bin() {
   if [ -n "${CLAUDE_GPT_PROXY_BIN:-}" ]; then
     printf '%s\n' "$CLAUDE_GPT_PROXY_BIN"

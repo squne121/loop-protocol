@@ -574,3 +574,175 @@ def test_explicit_escalation_check_uses_strip_context_hint():
     end = content.index("exit 11", start)
     block = content[start:end]
     assert "claude_gpt_strip_context_hint" in block
+
+
+# --- PR #2800 OWNER REQUEST_CHANGES fix_delta（P2/P3, Issue #2189/#2191 と同系統の
+#     argv semantics 回帰）------------------------------------------------------
+
+
+def test_explicit_model_opusplan_is_not_rejected_as_catalog_miss(tmp_path):
+    """GIVEN fake proxy の registry に文字列 "opusplan" が存在しない（Claude Code
+    公式仕様上 opusplan は具体的な model ID ではなく特殊モードのため、catalog に
+    含まれることはそもそも想定されない）
+    WHEN launch.sh --check-only -- --model opusplan を実行する
+    THEN explicit_model_escalation_unavailable として誤って fail-closed に
+    ならず status=ok になる（PR #2800 P2 fix_delta）。
+    """
+    result = _run_check_only(
+        tmp_path, models=DEFAULT_MODELS, extra_claude_argv=["--model", "opusplan"]
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "ok"
+
+
+def test_explicit_model_default_is_not_rejected_as_catalog_miss(tmp_path):
+    """GIVEN fake proxy の registry に文字列 "default" が存在しない（`default` は
+    model override の解除を意味する特殊値であり、具体的な model ID ではない）
+    WHEN launch.sh --check-only -- --model default を実行する
+    THEN explicit_model_escalation_unavailable として誤って fail-closed に
+    ならず status=ok になる（PR #2800 P2 fix_delta）。
+    """
+    result = _run_check_only(
+        tmp_path, models=DEFAULT_MODELS, extra_claude_argv=["--model", "default"]
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "ok"
+
+
+def test_explicit_model_opus_alias_still_resolves_against_real_catalog(tmp_path):
+    """GIVEN fake proxy の registry に具体的な model ID "opus" が存在する
+    WHEN launch.sh --check-only -- --model opus を実行する
+    THEN opusplan/default とは異なり、通常どおり registry 照合を経て status=ok
+    になる（特殊値 exemption が「あらゆる catalog miss を無条件で許可する」
+    退行になっていないことの回帰確認。PR #2800 OWNER コメント「`--model opus`
+    も上流で拒否される、という指摘はしない」の裏付け）。
+    """
+    result = _run_check_only(
+        tmp_path, models=[*DEFAULT_MODELS, "opus"], extra_claude_argv=["--model", "opus"]
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "ok"
+
+
+def test_explicit_model_unknown_literal_still_fails_closed_after_special_value_exemption(
+    tmp_path,
+):
+    """GIVEN registry に存在しない通常の model literal（opusplan/default の
+    special-case exemption 対象ではない）
+    WHEN launch.sh --check-only -- --model not-a-real-model を実行する
+    THEN 引き続き explicit_model_escalation_unavailable で fail-closed になる
+    （P2 fix_delta が catalog gate 自体を弱めていないことの回帰確認）。
+    """
+    result = _run_check_only(
+        tmp_path, models=DEFAULT_MODELS, extra_claude_argv=["--model", "not-a-real-model"]
+    )
+    assert result.returncode == 11, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["reason"] == "explicit_model_escalation_unavailable"
+    assert payload["requested_model"] == "not-a-real-model"
+
+
+def test_downstream_double_dash_literal_is_not_misread_as_model_request(tmp_path):
+    """GIVEN Claude 自身の downstream `--` より後に現れる `--model=...` 形の
+    positional literal（`-p -- --model=not-a-model` という、PR #2800 OWNER
+    コメントの P2 再現そのもの）
+    WHEN launch.sh --check-only を実行する
+    THEN launcher-level `--` の後にさらに現れる downstream `--` 以降は一切
+    --model 判定の対象にせず、status=ok になる（誤って exit 11 にならない。
+    Issue #2189 と同系統の argv semantics 回帰の修正確認）。
+    """
+    result = _run_check_only(
+        tmp_path,
+        models=DEFAULT_MODELS,
+        extra_claude_argv=["-p", "--", "--model=not-a-model"],
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "ok"
+
+
+def test_value_position_after_append_system_prompt_is_not_misread_as_model_request(
+    tmp_path,
+):
+    """GIVEN `--append-system-prompt` の値としてたまたま `--model=...` という
+    文字列が渡される（PR #2800 OWNER コメントのもう一つの P2 再現）
+    WHEN launch.sh --check-only を実行する
+    THEN その値は `--append-system-prompt` の value position として消費され、
+    独立した `--model` 要求として誤認しない（status=ok）。
+    """
+    result = _run_check_only(
+        tmp_path,
+        models=DEFAULT_MODELS,
+        extra_claude_argv=["--append-system-prompt", "--model=not-a-model", "-p", "hello"],
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "ok"
+
+
+def test_append_system_prompt_equals_variant_still_passed_through_unchanged(tmp_path):
+    """GIVEN `--append-system-prompt=--model=not-a-model`（単一トークン variant）
+    WHEN launch.sh --check-only を実行する
+    THEN 元から `--model=*` prefix match の対象ではなく、この変更後も引き続き
+    誤検知しない（regression なしの確認）。
+    """
+    result = _run_check_only(
+        tmp_path,
+        models=DEFAULT_MODELS,
+        extra_claude_argv=["--append-system-prompt=--model=not-a-model", "-p", "hello"],
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "ok"
+
+
+def test_explicit_model_two_token_form_still_captured_after_value_position_fix(tmp_path):
+    """GIVEN 通常の `--model <value>`（二トークン形式）
+    WHEN registry に存在しない値を指定する
+    THEN value-position スキップ機構を追加した後も、`--model` 自身の値は
+    引き続き正しく捕捉され fail-closed になる（regression なしの確認）。
+    """
+    result = _run_check_only(
+        tmp_path, models=DEFAULT_MODELS, extra_claude_argv=["--model", "not-a-real-model"]
+    )
+    assert result.returncode == 11, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["reason"] == "explicit_model_escalation_unavailable"
+    assert payload["requested_model"] == "not-a-real-model"
+
+
+def test_explicit_model_failure_json_is_valid_with_quote_containing_value(tmp_path):
+    """GIVEN requested model 文字列に二重引用符が含まれる
+    （`scripts/claude-gpt/launch.sh -- --model 'bad"model'`。PR #2800 OWNER
+    コメント P3 の再現）
+    WHEN launch.sh --check-only を実行する
+    THEN 失敗 JSON は `json.loads()` で正しくパースでき、`requested_model` に
+    元の値がそのまま（エスケープ後に復元されて）含まれる（P3 fix_delta）。
+    """
+    result = _run_check_only(
+        tmp_path, models=DEFAULT_MODELS, extra_claude_argv=["--model", 'bad"model']
+    )
+    assert result.returncode == 11, result.stdout
+    payload = json.loads(result.stdout)  # json.loads 自体が壊れていないことの確認
+    assert payload["reason"] == "explicit_model_escalation_unavailable"
+    assert payload["requested_model"] == 'bad"model'
+
+
+def test_explicit_model_failure_json_is_valid_with_backslash_and_newline_value(tmp_path):
+    """GIVEN requested model 文字列にバックスラッシュ・改行が含まれる
+    WHEN launch.sh --check-only を実行する
+    THEN 失敗 JSON は引き続き `json.loads()` で正しくパースできる（P3
+    fix_delta の境界ケース）。
+    """
+    result = _run_check_only(
+        tmp_path,
+        models=DEFAULT_MODELS,
+        extra_claude_argv=["--model", 'bad\\model\nwith-newline'],
+    )
+    assert result.returncode == 11, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["reason"] == "explicit_model_escalation_unavailable"
+    assert payload["requested_model"] == 'bad\\model\nwith-newline'
