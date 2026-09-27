@@ -62,3 +62,37 @@ skipped 件数を指し、advisory な `TEST_VERDICT_MACHINE` コメントの
   一切使わない（diagnostics 表示専用）。TEST_VERDICT コメントの有無・内容・
   stale/SKIP 状態は、他の authoritative evidence が揃っていれば APPROVE を妨げず、
   他の authoritative evidence が揃っていなければ APPROVE を与えない。
+
+## `canonical` ランタイム受け入れ evidence と `fixture-only` evidence の区別（Issue #2807）
+
+AC が **actual / canonical / default runtime selection**（例: current-head production launcher の通常 binary resolution で選択される proxy identity）を要求する場合、レビュアーは AC の evidence-source requirement（actual/canonical vs fixture）と、割り当てられた VC / test implementation が実際に生成する evidence source を照合する。両者が一致しない場合（fixture-only VC が actual-runtime AC に割り当てられている場合）は `REQUEST_CHANGES` とする。
+
+**PR body の `[x]` チェック、Safety Claim、self-report、および fixture-only test の PASS だけでは、actual/canonical runtime を要求する AC を APPROVE する根拠にならない。** fixture PASS + real smoke SKIP / environment_blocked の組み合わせは、actual-runtime AC の充足として不十分である（#2801 / PR #2802 で観測した failure class: actual-runtime AC + fixture-only PASS + real smoke SKIP のまま AC を `[x]` にして APPROVE した旧 iteration 1 相当の判断は、本ポリシー適用後は根拠を持たない）。
+
+**canonical runtime acceptance evidence の必須フィールド**（本ポリシーの evidence 要件。`.claude/skills/create-issue/references/body-authoring.md` の同名ガイダンスと同一）:
+
+- `run_head_sha`
+- `git_dirty`
+- 実行 command identity（実際に起動したコマンド文字列 / invocation）
+- launcher hash
+- selected proxy の absolute path / version / hash
+
+上記の必須フィールドと、既存 producer `CLAUDE_GPT_SMOKE_RESULT_V1`（`scripts/claude-gpt/runtime_smoke_test.sh`）の実 schema との対応は以下のとおりである（新しい schema field は追加しない。既存 field への読み替え mapping のみ）:
+
+- `run_head_sha` := `CLAUDE_GPT_SMOKE_RESULT_V1.sut.git_head`
+- `git_dirty` := `CLAUDE_GPT_SMOKE_RESULT_V1.sut.git_dirty`
+- launcher hash := `CLAUDE_GPT_SMOKE_RESULT_V1.sut.launch_sh_sha256`
+- selected proxy の absolute path / version / hash := `CLAUDE_GPT_SMOKE_RESULT_V1.proxy.absolute_path` / `.proxy.version` / `.proxy.sha256`
+- 実行 command identity := authoritative evidence（独立実行 Issue VC または CI_CHECK_RUN_SCOPED）に束縛された literal command 文字列とその command SHA256
+
+`run_head_sha` という field 名自体は `CLAUDE_GPT_SMOKE_RESULT_V1` には存在しない。上記は既存 `sut.git_head` を evidence 要件の `run_head_sha` として読み替える対応表であり、producer/consumer schema へ新しい field を追加するものではない。
+
+fixture proxy の path/version のみの evidence は、この evidence 要件を **充足しない**（fixture proxy の path/version のみを記載した evidence はこの AC の充足として明示的に不十分と扱う）。
+
+canonical smoke（current-head production launcher を fake proxy override なしで external process 起動した結果。例: `scripts/claude-gpt/launch.sh --check-only`）が `cause: proxy_model_catalog_incompatible` または non-zero exit を返した場合、同一 head の fixture compatibility tests（例: `scripts/claude-gpt/tests/test_proxy_model_compatibility.py`）が全て PASS であっても、actual-runtime AC を PASS / ready-for-merge に **昇格させない**。
+
+**catalog / proxy-selection AC と authenticated request / transport AC の evidence 分離**: fake `CLAUDE_GPT_PROXY_BIN` override なしの current-head production `scripts/claude-gpt/launch.sh --check-only` を、catalog / proxy-selection AC の canonical acceptance の最低限とする。認証を伴う request / transport の意味論自体を AC が要求する場合に限り、`scripts/claude-gpt/runtime_smoke_test.sh` の full smoke を追加要求する。full smoke が認証不足で SKIP（exit 77）/ `environment_blocked` になっても、direct canonical `launch.sh --check-only` が満たした catalog-only AC を不要に failure 扱いしない。逆に authenticated request / transport AC 自体は full smoke の SKIP では PASS にしない。
+
+既存の fixture tests（`scripts/claude-gpt/tests/test_proxy_model_compatibility.py` 等）は hermetic implementation-semantics coverage としてそのまま維持し、廃止・改変しない。通常 CI は real ChatGPT account / network を必須にしない。
+
+canonical runtime evidence の取得には既存の `scripts/claude-gpt/launch.sh --check-only` および `scripts/claude-gpt/runtime_smoke_test.sh` を再利用する。本ポリシーは新しい permanent daemon、generic runtime harness、network-required merge gate の追加を要求しない（既存 runtime verification assets への参照のみ）。
