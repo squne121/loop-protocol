@@ -2605,12 +2605,23 @@ $ test -f /etc/passwd
 
 
 def test_invalid_ac_marker_is_ignored_for_ac_field():
-    """B4: invalid AC marker syntax is not treated as parsed AC label in baseline preflight."""
+    """B4: invalid AC marker syntax is not treated as parsed AC label in baseline preflight.
+
+    Issue #2788: normal execution now shares `vc_contract_syntax.py`'s
+    canonical `$`-prefixed command grammar with `--static-only` (the SAME
+    authority both paths already agreed a bare non-`$` line is
+    `non_dollar_command`, a rejected non-canonical line, not a runnable
+    command -- see `test_baseline_vc_preflight_shared_command_parser.py`
+    AC3/AC6). This fixture therefore uses a canonical `$ true` command line
+    so it exercises ONLY the invalid-AC-marker-is-ignored behavior this test
+    targets, without also depending on the now-corrected non-canonical
+    non-`$` command permissiveness a prior version of this fixture relied on.
+    """
     fixture_content = """## Verification Commands
 
 ```bash
 # AC1: description
-true
+$ true
 ```
 """
     with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
