@@ -494,6 +494,15 @@ claude_gpt_resolve_proxy_bin() {
     printf '%s\n' "$CLAUDE_GPT_PROXY_BIN"
     return 0
   fi
+  # Issue #2801 fix_delta F3: binary precedence 第2候補 -- Claude-GPT-owned
+  # managed install location（`repair_proxy.sh` が compatible proxy を
+  # 導入する先）。これを PATH より先に確認しないと、repair 実行後の通常
+  # 起動が再び PATH 上の古い binary を選び直してしまう。
+  _cgt_home_bin="$(claude_gpt_home_bin_dir)/claude-code-proxy"
+  if [ -x "$_cgt_home_bin" ]; then
+    printf '%s\n' "$_cgt_home_bin"
+    return 0
+  fi
   command -v claude-code-proxy 2>/dev/null
 }
 

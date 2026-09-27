@@ -231,20 +231,35 @@ def test_catalog_incompatible_not_conflated_with_entitlement(tmp_path):
 
 def test_explicit_proxy_bin_precedence_preserved(tmp_path):
     """GIVEN an explicit CLAUDE_GPT_PROXY_BIN pointing at an INCOMPATIBLE
-    proxy, while PATH also exposes a different, COMPATIBLE `claude-code-proxy`
-    binary
+    proxy, while PATH *and* the Claude-GPT-owned managed install location
+    (`$CLAUDE_GPT_HOME/bin`, fix_delta F3's second-precedence candidate) both
+    expose a different, COMPATIBLE `claude-code-proxy` binary
     WHEN launch.sh --check-only runs
-    THEN the launcher does not silently fall back to the PATH binary -- it
-    reports the explicit binary's own path/version and its missing models
-    (binary precedence: explicit CLAUDE_GPT_PROXY_BIN wins, Design section 3).
+    THEN the launcher does not silently fall back to either the managed
+    binary or the PATH binary -- it reports the explicit binary's own
+    path/version and its missing models (binary precedence: explicit
+    CLAUDE_GPT_PROXY_BIN always wins over every other candidate, even an
+    otherwise-compatible one; Design section 3). This also regression-guards
+    fix_delta F3 (home_bin_dir precedence) against silently overriding an
+    explicit operator override -- not just against the PATH candidate.
     """
     required = _required_models()
+
+    claude_gpt_home = tmp_path / "claude-gpt-home"
 
     # PATH candidate: compatible, but must NOT be selected.
     path_bin_dir = tmp_path / "path-bin"
     path_bin_dir.mkdir()
     path_proxy = write_fake_proxy(
         path_bin_dir / "claude-code-proxy", models=required, version="claude-code-proxy 0.1.42"
+    )
+
+    # Managed (`$CLAUDE_GPT_HOME/bin`) candidate: also compatible, also must
+    # NOT be selected (fix_delta F3 regression guard).
+    managed_bin_dir = claude_gpt_home / "bin"
+    managed_bin_dir.mkdir(parents=True)
+    managed_proxy = write_fake_proxy(
+        managed_bin_dir / "claude-code-proxy", models=required, version="claude-code-proxy 0.1.42"
     )
 
     # Explicit candidate: incompatible, must be the one actually used.
@@ -254,7 +269,6 @@ def test_explicit_proxy_bin_precedence_preserved(tmp_path):
         version="claude-code-proxy 0.1.30",
     )
 
-    claude_gpt_home = tmp_path / "claude-gpt-home"
     env = dict(os.environ)
     env["CLAUDE_GPT_HOME"] = str(claude_gpt_home)
     env["CLAUDE_GPT_PROXY_BIN"] = str(explicit_proxy)
@@ -275,6 +289,7 @@ def test_explicit_proxy_bin_precedence_preserved(tmp_path):
     assert receipt is not None
     assert receipt["proxy"]["path"] == str(explicit_proxy)
     assert receipt["proxy"]["path"] != str(path_proxy)
+    assert receipt["proxy"]["path"] != str(managed_proxy)
     assert receipt["proxy"]["version"] == "claude-code-proxy 0.1.30"
     assert receipt["missing_models"]  # non-empty: explicit binary really is incompatible
 
@@ -333,12 +348,27 @@ def test_required_set_reflects_a_sonnet_only_drift(tmp_path):
     shutil.copytree(SCRIPT_DIR, patched_dir, ignore=shutil.ignore_patterns("tests", "__pycache__"))
     patched_lib = patched_dir / "lib.sh"
     original = patched_lib.read_text(encoding="utf-8")
-    assert 'CLAUDE_GPT_MODEL_SONNET="gpt-5.6-terra[1m]"' in original
-    patched = original.replace(
-        'CLAUDE_GPT_MODEL_SONNET="gpt-5.6-terra[1m]"',
-        'CLAUDE_GPT_MODEL_SONNET="gpt-9.9-drift-sentinel[1m]"',
-        1,
+
+    # Extract the *current* `CLAUDE_GPT_MODEL_SONNET="..."` assignment line
+    # itself, rather than hardcoding a specific generation's baseline model
+    # name (that hardcoded literal breaks every time the shared model policy
+    # rotates -- e.g. Issue #2772/#2800 -- even though this test's actual
+    # subject, the one-directional derivation, is untouched by that rotation).
+    # If the assignment line can't be found at all, that is itself a policy
+    # drift this test must not silently swallow -- fail loudly instead of
+    # skipping.
+    sonnet_line_match = re.search(
+        r'^CLAUDE_GPT_MODEL_SONNET="[^"]*"$', original, flags=re.MULTILINE
     )
+    assert sonnet_line_match is not None, (
+        "CLAUDE_GPT_MODEL_SONNET assignment line not found in lib.sh -- "
+        "policy drift the recurrence test must not silently ignore"
+    )
+    original_sonnet_line = sonnet_line_match.group(0)
+    patched_sonnet_line = 'CLAUDE_GPT_MODEL_SONNET="gpt-9.9-drift-sentinel[1m]"'
+    assert patched_sonnet_line != original_sonnet_line
+
+    patched = original.replace(original_sonnet_line, patched_sonnet_line, 1)
     assert patched != original
     patched_lib.write_text(patched, encoding="utf-8")
     patched_lib.chmod(patched_lib.stat().st_mode | stat.S_IEXEC)

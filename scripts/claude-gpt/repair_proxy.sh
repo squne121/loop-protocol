@@ -59,7 +59,21 @@ while [ $# -gt 0 ]; do
 done
 
 INSTALL_DIR="${CLAUDE_CODE_PROXY_INSTALL_DIR:-$(claude_gpt_home_bin_dir)}"
-VERSION_PIN="${CLAUDE_CODE_PROXY_VERSION:-$CLAUDE_GPT_MIN_KNOWN_COMPATIBLE_PROXY_VERSION}"
+# Issue #2801 fix_delta F1: operator が明示的に CLAUDE_CODE_PROXY_VERSION を
+# 設定した場合はその値をそのまま installer に渡す（override intent を維持し、
+# `v` を強制付与しない）。未設定時のフォールバックのみ upstream の GitHub
+# Releases tag 形式（`v<version>`、例: `v0.1.42`）に変換する。upstream
+# installer はこの値をそのまま release download URL に埋め込むため、
+# fallback 側で `v` prefix を付けないと既定の repair 経路が配布物取得段階で
+# 失敗する（tag 名は常に `v` prefix 付き）。
+if [ -n "${CLAUDE_CODE_PROXY_VERSION:-}" ]; then
+  VERSION_PIN="$CLAUDE_CODE_PROXY_VERSION"
+else
+  case "$CLAUDE_GPT_MIN_KNOWN_COMPATIBLE_PROXY_VERSION" in
+    v*) VERSION_PIN="$CLAUDE_GPT_MIN_KNOWN_COMPATIBLE_PROXY_VERSION" ;;
+    *) VERSION_PIN="v${CLAUDE_GPT_MIN_KNOWN_COMPATIBLE_PROXY_VERSION}" ;;
+  esac
+fi
 INSTALLER_URL="${CLAUDE_GPT_REPAIR_INSTALLER_URL:-https://raw.githubusercontent.com/raine/claude-code-proxy/main/scripts/install.sh}"
 
 if [ "$DRY_RUN" = "true" ]; then
@@ -73,6 +87,16 @@ fi
 if ! command -v curl >/dev/null 2>&1; then
   printf '{"schema":"CLAUDE_GPT_REPAIR_PROXY_RESULT_V1","status":"failed","reason":"curl_unavailable"}\n' >&2
   exit 3
+fi
+
+# Issue #2801 fix_delta F2: upstream installer の shebang は
+# `#!/usr/bin/env bash` であり、内部で `[[ ... ]]` / `&>/dev/null` など
+# Bash 専用構文を使う。`sh`（環境によっては dash）で実行すると構文エラーや
+# 判定結果の変化（例: `[[ -w "$install_dir" ]]` の書き込み可否判定）を
+# 起こしうるため、必ず bash で実行する。
+if ! command -v bash >/dev/null 2>&1; then
+  printf '{"schema":"CLAUDE_GPT_REPAIR_PROXY_RESULT_V1","status":"failed","reason":"bash_unavailable"}\n' >&2
+  exit 1
 fi
 
 mkdir -p "$INSTALL_DIR" || {
@@ -99,7 +123,7 @@ fi
 # --- 2. `$CLAUDE_GPT_HOME/bin`（または明示 override）へ version pin 付きで
 #     installer を実行する（AC4）。 ---
 if ! CLAUDE_CODE_PROXY_VERSION="$VERSION_PIN" CLAUDE_CODE_PROXY_INSTALL_DIR="$INSTALL_DIR" \
-    sh "$INSTALLER_SCRIPT_TMP" >>"$INSTALL_LOG" 2>&1; then
+    bash "$INSTALLER_SCRIPT_TMP" >>"$INSTALL_LOG" 2>&1; then
   printf '{"schema":"CLAUDE_GPT_REPAIR_PROXY_RESULT_V1","status":"failed","reason":"installer_execution_failed","version_pin":%s,"install_dir":%s}\n' \
     "$(claude_gpt_json_escape "$VERSION_PIN")" \
     "$(claude_gpt_json_escape "$INSTALL_DIR")" >&2
