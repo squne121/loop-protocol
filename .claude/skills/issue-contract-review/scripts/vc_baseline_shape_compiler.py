@@ -70,6 +70,14 @@ if str(_VC_SYNTAX_DIR) not in sys.path:
 
 from vc_contract_syntax import extract_baseline_expect_annotation  # noqa: E402
 
+# Issue #2783: shared no-path marker predicate (`scripts/agent-ops/`). Pure
+# policy library only -- not a grammar library import.
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_AGENT_OPS_DIR = _REPO_ROOT / "scripts" / "agent-ops"
+if str(_AGENT_OPS_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGENT_OPS_DIR))
+from allowed_paths_policy import is_no_path_marker  # noqa: E402
+
 SCHEMA = "vc_baseline_shape_compiler/v1"
 
 STATUS_CHANGED = "changed"
@@ -123,6 +131,11 @@ def parse_allowed_paths(lines: list[str]) -> list[str]:
     for i in range(start + 1, end):
         line = lines[i].strip()
         if line.startswith("- "):
+            # Issue #2783: judge no-path marker BEFORE stripping the
+            # trailing backtick wrapper -- a marker line contributes 0
+            # paths.
+            if is_no_path_marker(line):
+                continue
             paths.append(line[2:].strip().strip("`"))
     return paths
 

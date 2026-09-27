@@ -658,3 +658,17 @@ def test_ac5_hygiene_autofix_applies_vc_shape_then_no_change():
             probe_dir.rmdir()
         except OSError:
             pass
+
+
+def test_parse_allowed_paths_no_path_marker_returns_empty():
+    """AC12 (Issue #2783): canonical marker `(none)` and legacy marker
+    `読み取り専用。リポジトリ変更なし（既定）` as the sole Allowed Paths entry
+    both resolve to [] (previously this module had no annotation stripping
+    at all, so both markers leaked as literal non-empty "path" strings)."""
+    compiler = _load_compiler()
+
+    lines_canonical = "## Allowed Paths\n\n- (none)\n".split("\n")
+    assert compiler.parse_allowed_paths(lines_canonical) == []
+
+    lines_legacy = "## Allowed Paths\n\n- 読み取り専用。リポジトリ変更なし（既定）\n".split("\n")
+    assert compiler.parse_allowed_paths(lines_legacy) == []

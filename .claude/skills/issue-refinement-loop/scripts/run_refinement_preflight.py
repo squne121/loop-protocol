@@ -9813,11 +9813,46 @@ def _run_git_readonly_bounded(argv: list, cwd: Path, timeout: int = 20):
         return None
 
 
+# Issue #2783: minimal, self-contained equivalent of
+# `scripts/agent-ops/allowed_paths_policy.py::is_no_path_marker()`,
+# deliberately DUPLICATED here (not imported) rather than given a hard
+# import dependency on `scripts/agent-ops/` -- some regression fixtures
+# (`test_command_registry.py`'s
+# `TestAuthorityTransportPrivilegedExecutorRealSubprocessDispatch`,
+# `test_owner_reaction_not_planned_gate_production_shaped.py`) construct an
+# isolated fixture git repo containing only a hand-picked subset of files
+# (this script, `command_registry.py`, `decide_next_loop_action.py`,
+# `schemas/`) WITHOUT `scripts/agent-ops/`, and spawn this script as a REAL
+# subprocess against that fixture repo. A hard `from allowed_paths_policy
+# import ...` here breaks those fixtures at process-start time with
+# `ModuleNotFoundError` (caught during this Issue's own verification --
+# the exact failure mode the module's pre-existing "no import boundary
+# into scripts/agent-ops/" design note already warned about). This
+# duplication's exact two marker strings are covered by
+# `test_extract_allowed_paths_from_issue_body_no_path_marker_returns_empty`
+# in `test_refinement_preflight.py`.
+_NO_PATH_MARKERS_LOCAL = ("(none)", "読み取り専用。リポジトリ変更なし（既定）")
+
+
+def _is_no_path_marker_local(entry: str) -> bool:
+    s = entry.strip()
+    if s[:1] in ("-", "+", "*"):
+        s = s[1:].strip()
+    if len(s) >= 2 and s.startswith("`") and s.endswith("`") and s.count("`") == 2:
+        s = s[1:-1].strip()
+    return s in _NO_PATH_MARKERS_LOCAL
+
+
 def _extract_allowed_paths_from_issue_body(body: str) -> list:
     """Parse the canonical `## Allowed Paths` bullet list the same shape
     `pr_head_replay_publish_exec.py::_allowed_paths()` already parses on the
     implementation-loop side (kept independently here since this module has
-    no import boundary into `scripts/agent-ops/`)."""
+    no import boundary into `scripts/agent-ops/`). Issue #2783: canonical
+    marker `(none)` / legacy marker
+    `読み取り専用。リポジトリ変更なし（既定）` both resolve to 0 paths, via the
+    local `_is_no_path_marker_local()` duplicate above (previously this
+    function had no annotation stripping at all, so both markers leaked as
+    literal non-empty "path" strings)."""
     marker = "## Allowed Paths"
     if marker not in body:
         return []
@@ -9826,6 +9861,10 @@ def _extract_allowed_paths_from_issue_body(body: str) -> list:
     for line in section.splitlines():
         stripped = line.strip()
         if not stripped.startswith("-"):
+            continue
+        # Issue #2783: judge no-path marker BEFORE stripping the trailing
+        # backtick wrapper -- a marker line contributes 0 paths.
+        if _is_no_path_marker_local(stripped):
             continue
         candidate = stripped[1:].strip().strip("`")
         if candidate:

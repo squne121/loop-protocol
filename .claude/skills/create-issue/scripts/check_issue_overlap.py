@@ -48,6 +48,14 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
+# Issue #2783: shared no-path marker predicate (`scripts/agent-ops/`). Pure
+# policy library only -- not a grammar library import.
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_AGENT_OPS_DIR = _REPO_ROOT / "scripts" / "agent-ops"
+if str(_AGENT_OPS_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGENT_OPS_DIR))
+from allowed_paths_policy import is_no_path_marker  # noqa: E402
+
 
 SCHEMA_VERSION = "issue_overlap_preflight/v1"
 
@@ -410,7 +418,28 @@ def extract_allowed_path_entries(body: str) -> List[str]:
     entries: List[str] = []
     for line in match.group(1).splitlines():
         stripped = line.strip()
-        if stripped and not stripped.startswith("#") and normalize_path(stripped):
+        if not stripped or stripped.startswith("#"):
+            continue
+        # PR #2791 review fix_delta (Issue #2783): a bare code-fence
+        # delimiter line (an opening ```` ``` ```` / ```` ```text ```` with
+        # an optional info string, or a bare closing ```` ``` ````) is
+        # Markdown *structure* used only for visual wrapping here, never a
+        # path/marker entry on its own -- skip it outright so it never
+        # becomes a spurious candidate path. Lines *inside* the fence are
+        # still processed as ordinary entries below.
+        if stripped.startswith("```"):
+            continue
+        # PR #2791 review fix_delta (Issue #2783): judge no-path marker
+        # BEFORE normalize_path() with the FIXED order: strip the shared
+        # bullet/numbered-list wrapper (`_BULLET_RE`, which also strips
+        # numbered lists like `1.` / `1)` that `allowed_paths_policy`'s own
+        # bullet-only `_strip_wrapper()` deliberately does not) -> marker
+        # exact-match -> ordinary normalization. A marker line contributes
+        # 0 paths / entries.
+        unwrapped = _BULLET_RE.sub("", stripped).strip()
+        if is_no_path_marker(unwrapped):
+            continue
+        if normalize_path(stripped):
             entries.append(stripped)
     return entries
 

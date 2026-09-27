@@ -28,6 +28,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# Issue #2783: shared no-path marker predicate (`scripts/agent-ops/`). Pure
+# policy library only -- not a grammar library import.
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_AGENT_OPS_DIR = _REPO_ROOT / "scripts" / "agent-ops"
+if str(_AGENT_OPS_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGENT_OPS_DIR))
+from allowed_paths_policy import is_no_path_marker  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # Schema constants
@@ -221,6 +229,11 @@ def _extract_allowed_paths(item: dict[str, Any]) -> frozenset[str]:
             if stripped.startswith("## ") and not stripped.startswith("## Allowed Paths"):
                 break
             if stripped.startswith("- ") or stripped.startswith("* "):
+                # Issue #2783: judge no-path marker BEFORE
+                # _extract_path_from_bullet()'s own normalization -- a
+                # marker line contributes 0 paths.
+                if is_no_path_marker(stripped):
+                    continue
                 path = _extract_path_from_bullet(stripped)
                 if path:
                     paths.append(path)
