@@ -62,3 +62,25 @@ skipped 件数を指し、advisory な `TEST_VERDICT_MACHINE` コメントの
   一切使わない（diagnostics 表示専用）。TEST_VERDICT コメントの有無・内容・
   stale/SKIP 状態は、他の authoritative evidence が揃っていれば APPROVE を妨げず、
   他の authoritative evidence が揃っていなければ APPROVE を与えない。
+
+## Canonical Runtime Acceptance vs Fixture-Only Evidence（Issue #2807）
+
+AC が **actual / canonical / default runtime selection**（例: current-head production launcher の通常 binary resolution で選択される proxy identity）を要求する場合、レビュアーは AC の evidence-source requirement（actual/canonical vs fixture）と、割り当てられた VC / test implementation が実際に生成する evidence source を照合する。両者が一致しない場合（fixture-only VC が actual-runtime AC に割り当てられている場合）は `REQUEST_CHANGES` とする。
+
+**PR body の `[x]` チェック、Safety Claim、self-report、および fixture-only test の PASS だけでは、actual/canonical runtime を要求する AC を APPROVE する根拠にならない。** fixture PASS + real smoke SKIP / environment_blocked の組み合わせは、actual-runtime AC の充足として不十分である（#2801 / PR #2802 で観測した failure class: actual-runtime AC + fixture-only PASS + real smoke SKIP のまま AC を `[x]` にして APPROVE した旧 iteration 1 相当の判断は、本ポリシー適用後は根拠を持たない）。
+
+**canonical runtime acceptance evidence の必須フィールド**（本ポリシーの evidence 要件。`.claude/skills/create-issue/references/body-authoring.md` の同名ガイダンスと同一）:
+
+- `run_head_sha`
+- `git_dirty`
+- 実行 command identity（実際に起動したコマンド文字列 / invocation）
+- launcher hash
+- selected proxy の absolute path / version / hash
+
+fixture proxy の path/version のみの evidence は、この evidence 要件を **充足しない**（fixture proxy の path/version のみを記載した evidence はこの AC の充足として明示的に不十分と扱う）。
+
+canonical smoke（current-head production launcher を fake proxy override なしで external process 起動した結果。例: `scripts/claude-gpt/launch.sh --check-only`）が `cause: proxy_model_catalog_incompatible` または non-zero exit を返した場合、同一 head の fixture compatibility tests（例: `scripts/claude-gpt/tests/test_proxy_model_compatibility.py`）が全て PASS であっても、actual-runtime AC を PASS / ready-for-merge に **昇格させない**。
+
+既存の fixture tests（`scripts/claude-gpt/tests/test_proxy_model_compatibility.py` 等）は hermetic implementation-semantics coverage としてそのまま維持し、廃止・改変しない。通常 CI は real ChatGPT account / network を必須にしない。
+
+canonical runtime evidence の取得には既存の `scripts/claude-gpt/launch.sh --check-only` および `scripts/claude-gpt/runtime_smoke_test.sh` を再利用する。本ポリシーは新しい permanent daemon、generic runtime harness、network-required merge gate の追加を要求しない（既存 runtime verification assets への参照のみ）。

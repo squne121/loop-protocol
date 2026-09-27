@@ -137,6 +137,27 @@ Issue 起票時に動作検証の適用判定セクションを記載する。`r
 - 自由記述の「後続 Issue で検証する」だけでは不完全。機械的に検出できる半構造化フォーマットで記述すること。
 - 適用判定の詳細基準は `docs/dev/runtime-verification-policy.md` の「Runtime Verification Applicability」を参照する。
 
+### Actual/Canonical Runtime Acceptance と Fixture Semantics の AC 分離（Issue #2807）
+
+AC が **actual / canonical / default runtime selection**（例: current-head production launcher が通常の binary resolution で選択する proxy / 依存プロセスの identity）を要求する場合、fixture proxy を明示注入する hermetic test（fixture-only VC）を、その AC の唯一の evidence にしてはならない。
+
+少なくとも次の2種類の AC を区別して起票する。
+
+1. **fixture semantics AC**: catalog mismatch / repair / precedence 等のロジックを hermetic fixture（fake binary injection 等）で検証する AC。
+2. **canonical runtime acceptance AC**: current-head production launcher を通常の binary resolution で external process として起動し、actual selected proxy identity と `--check-only` 相当の結果を観測する AC。
+
+fixture semantics AC の PASS は canonical runtime acceptance AC の代替にならない。**両方が必要な場合は、単一の AC/VC に混在させず、別々の AC と別々の VC に分離して起票する**。1つの AC に fixture-only VC と「real smoke は SKIP でよい」という記述を同居させ、それを canonical runtime acceptance の充足として扱わない。
+
+**canonical runtime acceptance evidence の必須フィールド**（fixture proxy の path/version のみでは不十分）:
+
+- `run_head_sha`
+- `git_dirty`
+- 実行 command identity（実際に起動したコマンド文字列 / invocation）
+- launcher hash
+- selected proxy の absolute path / version / hash
+
+fixture proxy の path/version のみを記載した evidence は、canonical runtime acceptance AC の充足として **明示的に不十分** である。canonical runtime evidence の取得には、新しい harness を作らず既存の `scripts/claude-gpt/launch.sh --check-only` / `scripts/claude-gpt/runtime_smoke_test.sh` のような current-head production 実行資産を参照する。
+
 ### 実行時検証プロファイルの assertion binding 記法（`runtime_assertion_bindings`, Issue #2771）
 
 `docs/dev/extension-surface-runtime-policy.yaml` の risk-trigger rule に **hard** で一致する Allowed Paths を宣言した Issue は、その rule が要求する `verification_profile` の `assertions[]`（証明すべき postcondition）を、どの runtime AC が担うかを `runtime_assertion_bindings` として明示する。`enforcement == advisory` のみで到達した profile / assertion は required set に含まれない（PR #2370 の advisory non-blocking 方針を継続する）。
