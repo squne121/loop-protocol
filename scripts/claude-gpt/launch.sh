@@ -106,7 +106,12 @@ fi
 # （PATH mutation 等による識別ズレを排除する。P2）。
 export CLAUDE_GPT_PROXY_BIN="$PROXY_BIN_TARGET"
 
-echo "launcher=${LAUNCHER_ABS_PATH} git=${CLAUDE_GPT_GIT_HEAD_SHORT} dirty=${CLAUDE_GPT_GIT_DIRTY} proxy=v${PROXY_VERSION_TARGET}" >&2
+# Issue #2801 AC7: `claude_gpt_proxy_version()` は `--version` の生出力
+# （例: "claude-code-proxy 0.1.36"）をそのまま返すため、以前ここに無条件で付与
+# していた `v` prefix は "vclaude-code-proxy 0.1.36" という malformed な表示に
+# なっていた（本文がバージョン番号のみ、という前提が誤りだった）。version の
+# 生表示に prefix を追加しない一意な表示へ修正する。
+echo "launcher=${LAUNCHER_ABS_PATH} git=${CLAUDE_GPT_GIT_HEAD_SHORT} dirty=${CLAUDE_GPT_GIT_DIRTY} proxy=${PROXY_VERSION_TARGET}" >&2
 
 CHECK_ONLY=false
 DRY_RUN=false
@@ -1041,8 +1046,14 @@ fi
 # proxy `/v1/models` は suffix なしの base model 名を返すため、`[1m]` context-window
 # hint suffix を除去した名前で照合する（実際に upstream へ送られる model ID も
 # proxy が suffix を除去した後の base 名である。上記 CLAUDE_GPT_MODEL_* 定義部コメント参照）。
-for m in "$CLAUDE_GPT_MODEL_MAIN" "$CLAUDE_GPT_MODEL_OPUS" "$CLAUDE_GPT_MODEL_HAIKU"; do
-  m_base=$(claude_gpt_strip_context_hint "$m")
+# required set は固定 MAIN/OPUS/HAIKU 列挙ではなく、effective runtime consumer
+# （main/opus/sonnet/haiku・small-fast/Auto review classifier）からの一方向
+# derivation（`claude_gpt_required_model_set()`）を単一の source of truth とする
+# （Issue #2801 AC8。将来 SONNET や Auto review classifier だけが別 model に
+# 変更されても drift をここで検出できる）。
+# shellcheck disable=SC2086 # 意図的な word-splitting: 改行区切りの model ID 一覧をそのまま反復する
+REQUIRED_MODELS_NL=$(claude_gpt_required_model_set)
+for m_base in $REQUIRED_MODELS_NL; do
   case "$MODELS_JSON" in
     *"\"$m_base\""*) : ;;
     *) MODEL_ALIAS_OK=false ;;
@@ -1051,10 +1062,17 @@ done
 
 # --- model alias 未解決は通常起動でも fail-closed で止める（従来は check-only 時のみ
 #     判定していた。P1-3） ---
+# Issue #2801 AC1/AC3/AC6/AC9: 既存 top-level reason:model_alias_not_resolved /
+# model_alias_ok / exit code 7 の semantics は変えず、missing model ID・選択した
+# proxy の path/version・repair path を additive fields として追加した structured
+# failure を返す（local catalog incompatibility のみを示し、account entitlement 系
+# の分類は行わない）。
 if [ "$MODEL_ALIAS_OK" != "true" ]; then
   kill "$PROXY_PID" 2>/dev/null
   wait "$PROXY_PID" 2>/dev/null
-  printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"failed","reason":"model_alias_not_resolved","port":%s}\n' "$PROXY_PORT"
+  # shellcheck disable=SC2086 # 意図的な word-splitting: 改行区切りの model ID 一覧を可変引数として渡す
+  MISSING_MODELS_NL=$(claude_gpt_missing_models "$MODELS_JSON" $REQUIRED_MODELS_NL)
+  claude_gpt_build_model_incompatibility_json "$PROXY_PORT" "$PROXY_BIN_TARGET" "$PROXY_VERSION_TARGET" "$REQUIRED_MODELS_NL" "$MISSING_MODELS_NL"
   exit 7
 fi
 
