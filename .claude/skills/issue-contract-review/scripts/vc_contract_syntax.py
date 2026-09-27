@@ -147,6 +147,23 @@ def parse_vc_role_annotation(line: str) -> tuple[Optional[str], bool]:
     return value if value else None, bool(value)
 
 
+# Compound-shell operator characters (Issue #2788 fix_delta P1-A).  A shlex
+# token is treated as a compound-shell OPERATOR token when it is composed
+# ENTIRELY of characters from this set -- this generalizes the previous
+# exact-match-against-a-finite-operator-set approach (which only recognized
+# `{"&&", "||", "|", ";", "&", "<<", "<", ">", ">>", "<<<"}` verbatim) so
+# that ANY punctuation-only run built from these characters is caught,
+# including Bash-legal combinations the finite set missed:
+# `>&` (`2>&1`), `&>` (`&>out`), `|&` (`|& tee x`), `>|` (`>| out`),
+# `<>` (`<> file`).
+#
+# A token that MIXES an operator character with a word character (e.g. the
+# quoted-regex-alternation token `foo|bar` shlex produces for
+# `rg -n "foo|bar" PATH` -- Issue #589 / #2788 AC9 regression contract) is
+# NEVER all-operator-chars, so it is correctly left non-compound.
+_COMPOUND_OPERATOR_CHARS = frozenset(";&|<>")
+
+
 def detect_compound_command(command: str) -> bool:
     """Detect whether ``command`` contains compound shell syntax.
 
@@ -162,7 +179,12 @@ def detect_compound_command(command: str) -> bool:
     - A ``|`` inside a quoted string (e.g. ``rg -n "foo|bar" PATH``) is NOT
       a false positive (quote-aware; Issue #589 / #2788 AC9).
     - Redirects (``>``, ``<``, ``>>``, etc.) are treated as compound
-      (fail-closed).
+      (fail-closed), including the less-common Bash redirect/pipe forms
+      ``2>&1``, ``&>out``, ``|& tee x``, ``>| out``, and ``<> file``
+      (Issue #2788 fix_delta P1-A -- these were previously false negatives
+      because ``shlex``'s ``punctuation_chars=True`` tokenizer merges a
+      contiguous run of punctuation characters into ONE token, e.g. ``>&``,
+      which did not exact-match any entry in the old finite operator set).
     - A tokenization failure (malformed shell quoting) is treated as
       compound (fail-closed) -- preserving existing fail-closed semantics
       for malformed shell tokenization.
@@ -174,8 +196,10 @@ def detect_compound_command(command: str) -> bool:
         # parse failure = ambiguous/complex command = fail-closed as compound
         return True
 
-    operators = {"&&", "||", "|", ";", "&", "<<", "<", ">", ">>", "<<<"}
-    return any(t in operators for t in tokens)
+    return any(
+        token and all(ch in _COMPOUND_OPERATOR_CHARS for ch in token)
+        for token in tokens
+    )
 
 
 def extract_vc_regex_intent_annotation(lines: list, target_line_idx: int) -> Optional[str]:
@@ -420,6 +444,20 @@ class VcCommandEntry:
                          merely parsed-and-discarded).
         annotation_source_raw: Raw text of that same annotation line, or
                          None.
+        block_line_number: 1-based line number of this command WITHIN its
+                         own enclosing ```bash fence (i.e. relative to the
+                         first line after the ```bash opening fence line,
+                         NOT relative to the whole VC section) -- Issue
+                         #2788 fix_delta P2. This is an ADDITIVE provenance
+                         field carried purely so legacy consumers that
+                         expect ``parse_commands_from_block()``'s
+                         block-relative line-number semantics (e.g. the
+                         `results[].line` field in
+                         ``baseline_vc_preflight.py``'s JSON output) can
+                         recover that EXACT SAME coordinate system through
+                         the shared adapter, without changing
+                         `line_number`'s own (section-relative) semantics,
+                         which other existing consumers already depend on.
     """
     ac_refs: set  # set[str]
     command: str
@@ -430,6 +468,7 @@ class VcCommandEntry:
     vc_regex_intent: Optional[str] = None
     annotation_source_line: Optional[int] = None
     annotation_source_raw: Optional[str] = None
+    block_line_number: Optional[int] = None
 
 
 @dataclass
@@ -754,6 +793,13 @@ def parse_verification_commands_section(vc_section: str) -> "VcParseResult":
                 vc_regex_intent=vc_regex_intent_val,
                 annotation_source_line=annotation_source_line_val,
                 annotation_source_raw=annotation_source_raw_val,
+                # Issue #2788 fix_delta P2: block_idx is the 0-based index of
+                # THIS command line within `bash_block_lines` (the content
+                # of the enclosing ```bash fence, fence markers excluded) --
+                # the SAME coordinate system `extract_fenced_bash_blocks()` +
+                # `parse_commands_from_block()`'s `i` (1-based) legacy
+                # block-relative `line_number` used.
+                block_line_number=block_idx + 1,
             )
             result.commands.append(entry)
             result.canonical_ac_refs.update(resolved_ac)

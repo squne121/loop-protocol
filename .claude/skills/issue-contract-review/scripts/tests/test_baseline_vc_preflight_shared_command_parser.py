@@ -19,6 +19,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 _SCRIPTS_DIR = Path(__file__).parent.parent
 PREFLIGHT_SCRIPT = _SCRIPTS_DIR / "baseline_vc_preflight.py"
 
@@ -139,24 +141,37 @@ def test_explanatory_non_dollar_line_rejected_by_normal_execution():
 
 
 def test_explanatory_non_dollar_line_excluded_from_canonical_plan():
-    """AC2/AC3/AC13: `compute_canonical_vc_plan()` excludes the explanatory
-    line from `command_occurrences` -- it is REJECTED by omission (never a
-    subprocess candidate), without raising any new exception type that
-    would propagate to `contract_readiness_check.py` /
-    `run_contract_review_once.py` / `run_root_review_pipeline.py` (outside
-    this Issue's Allowed Paths)."""
+    """AC2/AC3/AC13 (fix_delta P1-B): `compute_canonical_vc_plan()` must
+    converge on the SAME whole-body rejection normal execution applies to
+    `EXPLANATORY_NON_DOLLAR_BODY` -- which contains BOTH the explanatory
+    non-`$` line AND an otherwise well-formed `$ echo canonical_command`
+    line. Normal execution rejects the WHOLE body (zero subprocess
+    candidates, `results: []`) the instant any `non_dollar_command` error
+    is present, so the canonical plan must ALSO produce ZERO command
+    occurrences here -- not one occurrence for the still-well-formed `$`
+    line -- otherwise the plan's occurrence/budget candidate set would
+    drift from what normal execution actually runs, without raising any
+    new exception type that would propagate to
+    `contract_readiness_check.py` / `run_contract_review_once.py` /
+    `run_root_review_pipeline.py` (outside this Issue's Allowed Paths)."""
     plan = bvp.compute_canonical_vc_plan(EXPLANATORY_NON_DOLLAR_BODY)
-    assert plan["command_occurrence_count"] == 1
+    assert plan["command_occurrence_count"] == 0
+    assert plan["command_occurrences"] == []
+    assert plan["command_budgets"] == []
     # No exception raised getting here -- this assertion IS the AC13 check.
 
 
 def test_explanatory_non_dollar_line_excluded_from_distinct_command_texts():
-    """AC12: `_distinct_command_texts_from_body()` returns the SAME command
-    population `compute_canonical_vc_plan()` / normal execution use -- the
-    explanatory line is excluded, not just silently retained as a rogue
-    'command' entry."""
+    """AC12 (fix_delta P1-B): `_distinct_command_texts_from_body()` returns
+    the SAME command population `compute_canonical_vc_plan()` / normal
+    execution use. `EXPLANATORY_NON_DOLLAR_BODY` triggers a whole-body
+    `non_dollar_command` rejection in BOTH of those -- zero commands, not
+    just the explanatory line silently dropped while the otherwise
+    well-formed `$ echo canonical_command` line is kept -- so this
+    function must ALSO return an empty list for the SAME body, to keep its
+    own AC12 "same population" claim true."""
     texts = bvp._distinct_command_texts_from_body(EXPLANATORY_NON_DOLLAR_BODY)
-    assert texts == ["echo canonical_command"]
+    assert texts == []
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +220,47 @@ def test_detect_compound_command_is_the_single_shared_primitive():
     are the SAME function object -- no second/third independent compound
     detector exists."""
     assert bvp.detect_compound_command is vcs.detect_compound_command
+
+
+# ---------------------------------------------------------------------------
+# fix_delta P1-A: punctuation-run false negatives in detect_compound_command()
+# ---------------------------------------------------------------------------
+
+_PUNCTUATION_RUN_COMPOUND_CASES = [
+    pytest.param("echo hi 2>&1", id="stderr-to-stdout-2>&1"),
+    pytest.param("echo hi &>out", id="redirect-both-streams-&>"),
+    pytest.param("echo hi |& tee x", id="pipe-both-streams-|&"),
+    pytest.param("echo hi >| out", id="clobber-redirect->|"),
+    pytest.param("echo hi <> file", id="read-write-redirect-<>"),
+]
+
+
+@pytest.mark.parametrize("command", _PUNCTUATION_RUN_COMPOUND_CASES)
+def test_punctuation_run_redirect_operators_detected_as_compound(command):
+    """fix_delta P1-A: Bash-legal multi-character punctuation-run shell
+    operators (`>&`, `&>`, `|&`, `>|`, `<>`) must be detected as compound,
+    even though NONE of them exact-match the old finite operator set
+    `{"&&", "||", "|", ";", "&", "<<", "<", ">", ">>", "<<<"}` --
+    `shlex.shlex(..., punctuation_chars=True)` merges a contiguous run of
+    punctuation characters into ONE multi-character token (e.g. `2>&1`
+    tokenizes to `["2", ">&", "1"]`), so exact-matching against a finite
+    set of known operator strings missed these."""
+    assert vcs.detect_compound_command(command) is True
+
+    section = f"```bash\n$ {command}\n```\n"
+    result = vcs.parse_verification_commands_section(section)
+    assert any(e.kind == "compound_shell" for e in result.errors), (
+        f"expected compound_shell error for {command!r}, got errors={result.errors!r}"
+    )
+
+
+def test_quoted_regex_alternation_still_not_compound_after_punctuation_run_fix():
+    """fix_delta P1-A non-regression: the #589 quoted-regex-alternation
+    negative control (`rg -n "foo|bar" PATH`) must remain non-compound
+    after generalizing punctuation-run detection -- the quoted token
+    `foo|bar` mixes word characters with `|`, so it is never an
+    all-operator-characters token."""
+    assert vcs.detect_compound_command('rg -n "foo|bar" some/path.py') is False
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +410,11 @@ def test_compute_canonical_vc_plan_never_raises_on_non_canonical_body():
     must never observe an unhandled exception from this call."""
     # Should not raise.
     plan = bvp.compute_canonical_vc_plan(EXPLANATORY_NON_DOLLAR_BODY)
-    assert plan["command_occurrence_count"] >= 0
+    # fix_delta P1-B: exact 0, not merely non-negative -- see
+    # test_explanatory_non_dollar_line_excluded_from_canonical_plan() for
+    # the full rationale (whole-body rejection convergence with normal
+    # execution).
+    assert plan["command_occurrence_count"] == 0
 
 
 def test_compute_canonical_vc_plan_fully_non_canonical_body_zero_occurrences():
@@ -371,3 +431,80 @@ Only explanatory prose here, no command at all.
     plan = bvp.compute_canonical_vc_plan(body)
     assert plan["command_occurrence_count"] == 0
     assert plan["command_occurrences"] == []
+
+
+# ---------------------------------------------------------------------------
+# fix_delta P2: results[].line / annotation_source.line coordinate system
+# ---------------------------------------------------------------------------
+
+MULTI_FENCE_WITH_PROSE_BODY = """## Verification Commands
+
+Some prose before the fence explaining context.
+
+```bash
+# AC1
+$ echo first
+```
+
+More prose between fences.
+
+```bash
+# AC2
+# baseline-expect: pass
+$ echo second
+```
+"""
+
+
+def test_result_line_is_block_relative_not_section_relative():
+    """fix_delta P2: `results[].line` must be BLOCK-relative (relative to
+    the first line after the command's OWN enclosing ```bash opening
+    fence line) -- the EXACT pre-migration `parse_commands_from_block()`
+    coordinate system -- not section-relative (relative to the whole
+    `## Verification Commands` section, which is what the shared parser's
+    OWN `VcCommandEntry.line_number` measures and which would be much
+    larger here due to the leading prose line and the first bash fence).
+
+    Fixture layout (`MULTI_FENCE_WITH_PROSE_BODY`):
+      fence 1 content: line 1 = "# AC1", line 2 = "$ echo first"
+      fence 2 content: line 1 = "# AC2", line 2 = "# baseline-expect: pass",
+                        line 3 = "$ echo second"
+    """
+    data = run_normal(MULTI_FENCE_WITH_PROSE_BODY)
+    assert len(data["results"]) == 2
+
+    first, second = data["results"]
+    assert first["raw_command"] == "echo first"
+    assert first["line"] == 2
+    assert first["annotation_source"]["line"] is None
+    assert first["annotation_source"]["raw"] is None
+
+    assert second["raw_command"] == "echo second"
+    assert second["line"] == 3
+    # The `# baseline-expect: pass` annotation line is block-relative line 2
+    # (bash_block_lines[1]) in the SAME fence -- `line` (3) and
+    # `annotation_source.line` (2) both use the SAME block-relative
+    # coordinate system, so their difference (1) matches the actual
+    # physical distance between the two source lines within fence 2.
+    assert second["annotation_source"]["line"] == 2
+    assert second["annotation_source"]["raw"] == "# baseline-expect: pass"
+
+
+def test_command_entries_from_shared_parser_line_no_is_block_relative():
+    """fix_delta P2: the legacy 9-tuple's `line_no` slot (index 2), as
+    produced by `_command_entries_from_shared_parser()`, is sourced from
+    `VcCommandEntry.block_line_number` -- exercised directly (without
+    going through the CLI) against the SAME fixture."""
+    section = bvp.extract_verification_commands_section(
+        MULTI_FENCE_WITH_PROSE_BODY
+    ) or ""
+    tuples, parse_result = bvp._command_entries_from_shared_parser(section)
+    assert [t[1] for t in tuples] == ["echo first", "echo second"]
+    assert [t[2] for t in tuples] == [2, 3]
+
+    # `VcCommandEntry.line_number` (section-relative) is a LARGER number
+    # than `block_line_number` (block-relative) for both entries here,
+    # confirming the two coordinate systems are genuinely different for
+    # this fixture (i.e. this test is not accidentally vacuous).
+    for entry in parse_result.commands:
+        assert entry.line_number > entry.block_line_number

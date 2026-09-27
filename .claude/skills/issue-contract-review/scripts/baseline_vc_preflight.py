@@ -1020,6 +1020,20 @@ def _command_entries_from_shared_parser(
     No new independent VC grammar parser is introduced by this function --
     it performs pure data reshaping over the shared parser's own output.
 
+    Issue #2788 fix_delta P2: the tuple's `line_no` slot (index 2) is
+    sourced from `entry.block_line_number` (block-relative -- i.e. relative
+    to the first line after the command's own enclosing ```bash opening
+    fence line), NOT `entry.line_number` (section-relative -- i.e. relative
+    to the whole `## Verification Commands` section content). This
+    preserves the EXACT pre-migration `results[].line` coordinate system
+    `parse_commands_from_block()` produced, and keeps it consistent with
+    `annotation_source_line` (already block-relative, since
+    `extract_baseline_expect_annotation()` is invoked against
+    `bash_block_lines` both before and after this migration) -- so a single
+    result item's `line` and `annotation_source.line` always refer to the
+    SAME coordinate system instead of silently drifting between
+    section-relative and block-relative.
+
     Returns `(command_tuples, parse_result)` so a caller can ALSO inspect
     `parse_result.static_errors` (e.g. to reject a non-canonical body
     BEFORE building any subprocess candidate, Issue #2788 AC3) without
@@ -1031,7 +1045,7 @@ def _command_entries_from_shared_parser(
         command_tuples.append((
             _ac_refs_to_scalar_label(entry.ac_refs),
             entry.command,
-            entry.line_number,
+            entry.block_line_number,
             entry.preflight_scope,
             entry.vc_regex_intent,
             entry.baseline_expect,
@@ -1389,6 +1403,26 @@ def compute_canonical_vc_plan(
     # Paths).
     command_tuples, _parse_result = _command_entries_from_shared_parser(section)
 
+    # Issue #2788 fix_delta P1-B: normal execution (`_main_impl()`) rejects
+    # the WHOLE body -- zero subprocess candidates, `results: []`,
+    # `status: blocked` -- the instant ANY `non_dollar_command` static
+    # error is present anywhere in `_parse_result.static_errors`, even when
+    # OTHER, individually well-formed `$ command` lines exist in the SAME
+    # section (see the `_non_canonical_errors` whole-body-rejection branch
+    # in `_main_impl()` below). Before this fix, THIS function ignored
+    # `_parse_result` entirely and still built a command occurrence / timeout
+    # budget candidate from every remaining well-formed `$ command` line --
+    # drifting from what normal execution actually runs (violating AC2/AC3).
+    # Discarding `command_tuples` here (rather than raising) preserves the
+    # existing no-new-exception-type contract for
+    # `contract_readiness_check.py` / `run_contract_review_once.py` /
+    # `run_root_review_pipeline.py` (AC13, outside this Issue's Allowed
+    # Paths) -- this plan simply converges on the SAME "reject by omission"
+    # outcome (zero occurrences) normal execution's whole-body rejection
+    # already produces.
+    if any(se.kind == "non_dollar_command" for se in _parse_result.static_errors):
+        command_tuples = []
+
     command_occurrence_count = 0
     launch_upper_bound = 0
     state_epoch = 0
@@ -1611,9 +1645,21 @@ def _distinct_command_texts_from_body(body: str) -> List[str]:
     and normal execution use, instead of independently re-deriving it from
     the legacy `extract_fenced_bash_blocks()` + `parse_commands_from_block()`
     grammar -- keeping this docstring's claim actually true.
+
+    Issue #2788 fix_delta P1-B: for a body containing a `non_dollar_command`
+    static error (an explanatory non-`$` line inside a bash fence), normal
+    execution and `compute_canonical_vc_plan()` both reject the WHOLE body
+    (zero commands) -- see `compute_canonical_vc_plan()`'s own P1-B
+    docstring note. This function converges on the SAME empty population
+    for the SAME reason, so its AC12 claim above ("the SAME command
+    population `compute_canonical_vc_plan()` ... use") stays true even for
+    a mixed body that has both a non-`$` line AND an otherwise well-formed
+    `$ command` line.
     """
     section = extract_verification_commands_section(body) or ""
     command_tuples, _parse_result = _command_entries_from_shared_parser(section)
+    if any(se.kind == "non_dollar_command" for se in _parse_result.static_errors):
+        return []
     seen: set = set()
     ordered: List[str] = []
     for entry in command_tuples:
