@@ -40,6 +40,13 @@ REDACT_PATTERNS = [
     (re.compile(r"ghs_[A-Za-z0-9._-]{36,}"), "<GITHUB_TOKEN>"),
     # GitHub token (ghs_, ghp_, gho_, ghu_, ghr_ prefixes with 20+ chars)
     (re.compile(r"gh[opsur]_[A-Za-z0-9_]{20,}"), "<GITHUB_TOKEN>"),
+    # GitHub fine-grained personal access token (github_pat_ prefix).
+    # This is a distinct token family from the classic gh[opsur]_ prefixes
+    # above and is not matched by that pattern (the third character after
+    # `gh` is `i`, not one of o/p/s/u/r), so a dedicated matcher is
+    # required. Conservative repository redaction policy — not a
+    # reproduction of GitHub's exact official grammar (Issue #2736).
+    (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "<GITHUB_TOKEN>"),
     # OpenAI key
     (re.compile(r"sk-[A-Za-z0-9]{32,}"), "<OPENAI_KEY>"),
     # AWS key
