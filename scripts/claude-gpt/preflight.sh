@@ -35,6 +35,29 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd -P)
 # shellcheck source=./lib.sh
 . "$SCRIPT_DIR/lib.sh"
 
+# `home_source` provenance（Issue #2803 AC3）: 検査対象の `CLAUDE_GPT_HOME`
+# （source 後の最終的な effective 値）が `lib.sh` の canonical default 式
+# （`${HOME}/.claude-gpt`）と一致するかどうかで判定する。credential の中身
+# （token / auth.json content）は一切含めず、`default` / `env_override` の
+# 2値のみを保持する。
+#
+# 「source 前に env var の有無を snapshot する」方式（一見自然に見えるが）は
+# 採用しない: `launch.sh` は本 script を invoke する前に自身の `lib.sh` を
+# source して `CLAUDE_GPT_HOME` を export 済みにしてしまうため、`launch.sh`
+# 経由（`launch.sh --check-only` 等）で本 script が子プロセスとして呼ばれる
+# 場合、元の外部呼び出し元が `CLAUDE_GPT_HOME` を未設定にしていたとしても
+# 本 script からは常に「既に export されている（= override されたように
+# 見える）」状態になり、`default` 判定が事実上到達不能になる（AC6 の
+# nested `launch.sh --check-only` 経路で実測確認済み）。effective 値と
+# canonical default 式の比較であれば、`launch.sh` 経由・単体実行のいずれでも
+# 同じ判定になり、この問題を回避できる。
+CANONICAL_DEFAULT_CLAUDE_GPT_HOME="${HOME}/.claude-gpt"
+if [ "$CLAUDE_GPT_HOME" = "$CANONICAL_DEFAULT_CLAUDE_GPT_HOME" ]; then
+  HOME_SOURCE=default
+else
+  HOME_SOURCE=env_override
+fi
+
 # --env-only: バイナリ存在 + ChatGPT subscription 認証のみ確認する（起動前の環境可用性判定用）。
 # runtime_smoke_test.sh の SKIP 判定はディレクトリ/設定ファイルがまだ存在しない段階で行うため、
 # canonical path 検証・read 制限 settings 検証（launch.sh がディレクトリ/設定を作成した後に
@@ -223,6 +246,7 @@ cat <<JSON_EOF
 {
   "schema": "CLAUDE_GPT_PREFLIGHT_RESULT_V1",
   "env_only": ${ENV_ONLY},
+  "home_source": "${HOME_SOURCE}",
   "binary_available": ${BINARY_OK},
   "proxy": {
     "absolute_path": "${PROXY_BIN}",
