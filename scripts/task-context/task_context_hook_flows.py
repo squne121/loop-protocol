@@ -242,38 +242,50 @@ def _create_new_binding_and_run(
     claude_session_id: str | None,
     event_type: str,
     reason_code: str,
+    evict_foreign_holder: bool,
 ) -> dict[str, Any]:
-    """Shared "no existing Binding -- create one from scratch" sequence,
-    used by both a brand-new SessionStart Tab (the ``existing_binding is
-    None`` branch of ``on_session_start`` below) and the explicit `/task
-    <target>` unbound-session bootstrap (``bootstrap_unbound_session``,
-    Issue #2790 AC2/AC5). Creates one independent Binding + managed
+    """"No existing Binding -- create one from scratch" sequence for a
+    brand-new SessionStart Tab (the ``existing_binding is None`` branch of
+    ``on_session_start`` below). Creates one independent Binding + managed
     ExecutionRun, relocates it to ``herdr_locator``, and (if a Claude
     session id is known) attaches it -- this never inherits/steals any
-    other Binding's identity."""
+    other Binding's identity.
+
+    (The explicit `/task <target>` unbound-session self-heal, Issue #2790
+    AC2/AC5, used to share this helper but now calls
+    ``service.bootstrap_binding_and_bind_target`` directly -- PR #2795
+    review fix_delta P1-A -- so the bootstrap and the immediately-following
+    target bind run inside one transaction instead of two.)
+
+    ``evict_foreign_holder`` (PR #2795 review fix_delta P1-B, comment
+    5852749710): a genuine brand-new Herdr Tab's own locator can never
+    legitimately still be claimed by a *live* other Binding, so reclaiming
+    a stale claim on it (``True``, the existing PR #2731 P1-3 reassignment
+    contract) is safe here."""
     run_kind, runtime_profile, resume_profile = config.normalize_operator_profiles_for_new_run(
         *config.operator_run_kind_and_profiles()
     )
-    binding = service.create_binding(conn)
-    binding_id = binding["id"]
-    service.relocate_binding(conn, binding_id, herdr_locator, **location_fields)
-    run = service.start_execution_run(
+    # PR #2795 review fix_delta P1-A (comment 5852749710, finding 1): this
+    # used to be a chain of independently-committing `service.*` calls
+    # (create_binding -> relocate_binding -> start_execution_run ->
+    # set_execution_run_session -> set_binding_session -> append_event),
+    # each opening its own `BEGIN IMMEDIATE`. A failure partway through
+    # could leave a real, committed orphan Binding/RuntimeLocation/
+    # ExecutionRun behind. `service.bootstrap_binding_with_run` runs the
+    # whole sequence inside one transaction instead.
+    result = service.bootstrap_binding_with_run(
         conn,
+        herdr_locator=herdr_locator,
+        location_fields=location_fields,
+        claude_session_id=claude_session_id,
         run_kind=run_kind,
-        binding_id=binding_id,
         runtime_profile=runtime_profile,
         resume_profile=resume_profile,
-    )
-    if claude_session_id:
-        _set_session_on_run(conn, binding_id, run["id"], claude_session_id)
-    service.append_event(
-        conn,
         event_type=event_type,
-        binding_id=binding_id,
-        execution_run_id=run["id"],
-        metadata=_event_metadata(reason_code, "ok"),
+        reason_code=reason_code,
+        evict_foreign_holder=evict_foreign_holder,
     )
-    return {"binding_id": binding_id, "execution_run_id": run["id"]}
+    return {"binding_id": result["binding_id"], "execution_run_id": result["execution_run_id"]}
 
 
 def on_session_start(conn, payload: dict[str, Any]) -> dict[str, Any]:
@@ -367,6 +379,10 @@ def on_session_start(conn, payload: dict[str, Any]) -> dict[str, Any]:
             claude_session_id=claude_session_id,
             event_type="hook:SessionStart",
             reason_code=f"{source}_new_binding",
+            # A genuine new Herdr Tab's own locator preserves the existing
+            # PR #2731 P1-3 reassignment contract: reclaim a stale claim
+            # left behind by a Binding that cold-restarted elsewhere.
+            evict_foreign_holder=True,
         )
         binding_id = created["binding_id"]
         projection = _bump_projection(conn, binding_id)
@@ -450,19 +466,6 @@ def on_session_start(conn, payload: dict[str, Any]) -> dict[str, Any]:
         "task_id": task_id,
         **projection,
     }
-
-
-def _set_session_on_run(conn, binding_id: str, execution_run_id: str, claude_session_id: str) -> None:
-    """Attach ``claude_session_id`` to an already-started ExecutionRun and
-    sync the Binding's ``current_claude_session_id`` copy.
-
-    ``execution_runs.claude_session_id`` is normally set at
-    ``start_execution_run`` time, but the SessionStart recovery/new-binding
-    flows above only learn the actual session id *after* starting the run,
-    so ``service.set_execution_run_session`` performs the (typed,
-    service-layer) UPDATE instead of this module issuing raw SQL."""
-    service.set_execution_run_session(conn, execution_run_id, claude_session_id)
-    service.set_binding_session(conn, binding_id, claude_session_id, execution_run_id=execution_run_id)
 
 
 # ---------------------------------------------------------------------------
@@ -633,46 +636,35 @@ def on_user_prompt_submit(conn, payload: dict[str, Any]) -> dict[str, Any]:
 # Skill/command being expanded) and are always a silent, non-mutating
 # pass-through.
 #
-# Issue #2790 AC2/AC5: `bootstrap_unbound_session` below is the primary
-# design candidate this Issue validated for a Herdr-tracked session whose
-# current Binding is absent (`fork`'s by-design non-inheritance of the
-# parent operator's TabBinding, Issue #2564 AC15, is the case this was
-# written for, but the precondition below never actually inspects
-# `SessionStart`'s `source` -- `UserPromptExpansion` does not even carry
-# it -- so it applies uniformly to *any* confirmed-absent Binding for a
-# Herdr-tracked session with a valid Claude session identity, which also
-# self-heals a hypothetical `startup`/`resume`/`clear` binding-restoration
-# gap the same way). It is built entirely out of the existing typed
-# `task_context_service` primitives already used elsewhere in this module
-# (no new daemon/lease/lock/table) and is only ever invoked once
-# `on_user_prompt_expansion` has itself confirmed every precondition
-# (Herdr-tracked, valid session id, Binding absent, explicit `/task`
-# invocation carrying an already-parsed target) -- never speculatively.
+# Issue #2790 AC2/AC5: the `binding is None` branch of
+# `on_user_prompt_expansion` below is the primary design candidate this
+# Issue validated for a Herdr-tracked session whose current Binding is
+# absent (`fork`'s by-design non-inheritance of the parent operator's
+# TabBinding, Issue #2564 AC15, is the case this was written for, but the
+# precondition below never actually inspects `SessionStart`'s `source` --
+# `UserPromptExpansion` does not even carry it -- so it applies uniformly to
+# *any* confirmed-absent Binding for a Herdr-tracked session with a valid
+# Claude session identity, which also self-heals a hypothetical
+# `startup`/`resume`/`clear` binding-restoration gap the same way). It is
+# built entirely out of the existing typed `task_context_service` primitives
+# already used elsewhere in this module (no new daemon/lease/lock/table) and
+# only ever runs once `on_user_prompt_expansion` has itself confirmed every
+# precondition (Herdr-tracked, valid session id, Binding absent, explicit
+# `/task` invocation carrying an already-parsed target) -- never
+# speculatively.
+#
+# PR #2795 review fix_delta P1-A (comment 5852749710, finding 1): the
+# bootstrap (previously a separate `bootstrap_unbound_session` call) and the
+# immediately-following target bind (previously a separate
+# `service.bind_target_to_binding` / `service.bind_ad_hoc_task_to_binding`
+# call) used to be two independently-committing top-level operations. A
+# failure in the bind half left a real, committed Binding/RuntimeLocation/
+# ExecutionRun/session-claim/event with no Task attached -- exactly the
+# `origin_task_unattached`-shaped half-applied state the review identifies.
+# `service.bootstrap_binding_and_bind_target` now runs both halves inside a
+# single `BEGIN IMMEDIATE`, so `/task`'s self-heal either fully succeeds or
+# leaves no trace.
 # ---------------------------------------------------------------------------
-
-
-def bootstrap_unbound_session(
-    conn,
-    *,
-    herdr_locator: str,
-    claude_session_id: str,
-    location_fields: dict[str, Any],
-) -> dict[str, Any]:
-    """Issue #2790 AC2/AC5: create one independent Binding + managed
-    ExecutionRun for a Herdr-tracked session that has no current Binding,
-    so the caller's already-validated explicit `/task <target>` can bind it
-    immediately afterward. Never inherits/steals any other Binding's
-    identity (this only ever creates a brand-new one, exactly like a
-    genuinely new Tab's SessionStart would) -- see
-    `_create_new_binding_and_run` for the shared sequence."""
-    return _create_new_binding_and_run(
-        conn,
-        herdr_locator=herdr_locator,
-        location_fields=location_fields,
-        claude_session_id=claude_session_id,
-        event_type="hook:UserPromptExpansion",
-        reason_code="slash_task_bootstrap_unbound_session",
-    )
 
 
 def on_user_prompt_expansion(conn, payload: dict[str, Any]) -> dict[str, Any]:
@@ -697,11 +689,12 @@ def on_user_prompt_expansion(conn, payload: dict[str, Any]) -> dict[str, Any]:
     by-design non-inheritance of the parent operator's TabBinding, though
     this precondition never actually inspects `source`), an explicit
     `/task <target>` that already carries a resolvable target (a GitHub ref
-    or an ad-hoc title) now self-heals via `bootstrap_unbound_session`
-    instead of dead-ending -- only when a target is genuinely absent too
-    does this remain the `no_binding_for_session` command failure it always
-    was (see the hook adapter's `_task_command_failure_message` for why
-    that message is now always accurate for this reason_code)."""
+    or an ad-hoc title) now self-heals via a single atomic
+    `service.bootstrap_binding_and_bind_target` call instead of
+    dead-ending -- only when a target is genuinely absent too does this
+    remain the `no_binding_for_session` command failure it always was (see
+    the hook adapter's `_task_command_failure_message` for why that message
+    is now always accurate for this reason_code)."""
     command_name = payload.get("command_name")
     if command_name != "task":
         return {"decision": "pass", "reason_code": "not_task_command"}
@@ -740,41 +733,59 @@ def on_user_prompt_expansion(conn, payload: dict[str, Any]) -> dict[str, Any]:
         if not has_explicit_target:
             return {"decision": "block", "reason_code": "no_binding_for_session"}
         herdr_locator = payload.get("herdr_locator") or herdr_tab_id
-        created = bootstrap_unbound_session(
+        run_kind, runtime_profile, resume_profile = config.normalize_operator_profiles_for_new_run(
+            *config.operator_run_kind_and_profiles()
+        )
+        # PR #2795 review fix_delta P1-A/P1-B (comment 5852749710): the
+        # bootstrap (create Binding, relocate WITHOUT evicting a foreign
+        # holder, start run, attach session) and the target bind now run
+        # inside a single `BEGIN IMMEDIATE` via
+        # `bootstrap_binding_and_bind_target` -- a failure anywhere in
+        # either half leaves no half-applied Binding/RuntimeLocation/
+        # ExecutionRun/Task behind.
+        rebound = service.bootstrap_binding_and_bind_target(
             conn,
             herdr_locator=herdr_locator,
-            claude_session_id=claude_session_id,
             location_fields=_location_fields(payload),
+            claude_session_id=claude_session_id,
+            run_kind=run_kind,
+            runtime_profile=runtime_profile,
+            resume_profile=resume_profile,
+            bootstrap_event_type="hook:UserPromptExpansion",
+            bootstrap_reason_code="slash_task_bootstrap_unbound_session",
+            bind_event_type="hook:UserPromptExpansion",
+            bind_reason_code="slash_task_rebind",
+            target_repo=target_repo,
+            target_ref_kind=target_ref_kind,
+            target_ref_number=target_ref_number,
+            ad_hoc_title=ad_hoc_title,
         )
-        binding_id = created["binding_id"]
-        current_run_id = created["execution_run_id"]
         bootstrapped = True
     else:
         binding_id = binding["id"]
         _, _, current_run_id = service.get_current_task_activity_for_binding(conn, binding_id)
-
-    if target_repo and target_ref_kind and target_ref_number is not None:
-        rebound = service.bind_target_to_binding(
-            conn,
-            binding_id=binding_id,
-            execution_run_id=current_run_id,
-            repo=target_repo,
-            ref_kind=target_ref_kind,
-            ref_number=target_ref_number,
-            reason_code="slash_task_rebind",
-            event_type="hook:UserPromptExpansion",
-        )
-    elif ad_hoc_title:
-        rebound = service.bind_ad_hoc_task_to_binding(
-            conn,
-            binding_id=binding_id,
-            execution_run_id=current_run_id,
-            title=ad_hoc_title,
-            reason_code="slash_task_rebind",
-            event_type="hook:UserPromptExpansion",
-        )
-    else:
-        return {"decision": "block", "reason_code": "slash_task_missing_target"}
+        if target_repo and target_ref_kind and target_ref_number is not None:
+            rebound = service.bind_target_to_binding(
+                conn,
+                binding_id=binding_id,
+                execution_run_id=current_run_id,
+                repo=target_repo,
+                ref_kind=target_ref_kind,
+                ref_number=target_ref_number,
+                reason_code="slash_task_rebind",
+                event_type="hook:UserPromptExpansion",
+            )
+        elif ad_hoc_title:
+            rebound = service.bind_ad_hoc_task_to_binding(
+                conn,
+                binding_id=binding_id,
+                execution_run_id=current_run_id,
+                title=ad_hoc_title,
+                reason_code="slash_task_rebind",
+                event_type="hook:UserPromptExpansion",
+            )
+        else:
+            return {"decision": "block", "reason_code": "slash_task_missing_target"}
 
     return {
         "decision": "pass",

@@ -166,6 +166,15 @@ def test_given_fork_session_when_task_expanded_with_target_then_bootstrap_rebind
     )
     parent_task_id = parent_prompt["task_id"]
 
+    # PR #2795 review fix_delta P1-B (comment 5852749710, finding 2): the
+    # parent and fork share the exact same `herdr_tab_id`/locator ("tab-6"),
+    # so the fork bootstrap below must never release the parent Binding's
+    # own live location observation just because the fork's independent
+    # Binding also observes that same locator.
+    parent_location_before = service.get_current_location(conn, parent_binding_id)
+    assert parent_location_before is not None
+    assert parent_location_before["released_at"] is None
+
     fork_result = hook_flows.on_session_start(
         conn, {"source": "fork", "herdr_tab_id": "tab-6", "claude_session_id": "fork-s1"}
     )
@@ -198,6 +207,20 @@ def test_given_fork_session_when_task_expanded_with_target_then_bootstrap_rebind
     assert parent_binding["current_claude_session_id"] == "parent-s1"
     still_parent_task_id, _, _ = service.get_current_task_activity_for_binding(conn, parent_binding_id)
     assert still_parent_task_id == parent_task_id
+
+    # fix_delta P1-B: the parent's RuntimeLocation observation on the shared
+    # locator must be the exact same still-unreleased row -- not just "some
+    # unreleased row exists". Bootstrapping the fork's own independent
+    # Binding on the same Pane must not evict the parent's claim.
+    parent_location_after = service.get_current_location(conn, parent_binding_id)
+    assert parent_location_after == parent_location_before
+
+    # And the fork's own Binding legitimately observes the same locator too
+    # (co-observation, not eviction of the other party).
+    fork_location = service.get_current_location(conn, fork_binding["id"])
+    assert fork_location is not None
+    assert fork_location["herdr_locator"] == "tab-6"
+    assert fork_location["released_at"] is None
 
 
 def test_given_bound_session_when_compact_then_binding_task_activity_execution_run_identity_unchanged(conn):

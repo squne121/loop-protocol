@@ -139,9 +139,45 @@ def _dispatch_query_current_by_session(session_id: str) -> dict:
         conn.close()
 
 
+def _dispatch_signal_diagnose_origin() -> dict:
+    """Issue #2790 AC3/AC7 + PR #2795 review fix_delta P2-B (comment
+    5852749710, finding 4): ``diagnose_origin()`` itself issues no write,
+    but this dispatcher used to route through ``_open_db_and_migrate()``
+    like every mutating operation -- opening a write-capable connection
+    (creating the parent directory/DB file if absent) and running
+    migrations before the read-only diagnostic even ran. "The diagnostic
+    function has no UPDATE" and "the published diagnostic command has no
+    write side effect" are different claims; this makes the second one
+    true too, by branching to ``task_context_db.connect_readonly`` (mirroring
+    ``_dispatch_query_current_by_session`` above) *before* any write-capable
+    initialization, exactly like the existing `query current` session
+    selector.
+
+    A DB that does not exist yet is reported as "no state" (nothing to
+    resolve) without creating it. A DB whose schema is unreadable/
+    incompatible surfaces that as an error (via the generic exception
+    handling in ``_run`` below) rather than migrating it -- diagnosis never
+    mutates schema or business data."""
+    db_file = config.db_path()
+    conn = db.connect_readonly(db_file)
+    if conn is None:
+        return envelope.build_ok_result({"resolved": False, "reason_code": "origin_run_not_found"})
+    try:
+        result = workflow_signals.diagnose_origin(conn, os.environ.get("CLAUDE_CODE_SESSION_ID"))
+        return envelope.build_ok_result(result)
+    finally:
+        conn.close()
+
+
 def _dispatch(operation: str, payload: dict) -> dict:
     if operation == "query_current" and payload.get("session_id") and not payload.get("task_id"):
         return _dispatch_query_current_by_session(payload["session_id"])
+
+    if operation == "signal_diagnose_origin":
+        # PR #2795 review fix_delta P2-B: this branch must be evaluated
+        # strictly before `_open_db_and_migrate()` below -- see
+        # `_dispatch_signal_diagnose_origin`'s docstring.
+        return _dispatch_signal_diagnose_origin()
 
     if (
         operation == "hook"
@@ -209,15 +245,6 @@ def _dispatch(operation: str, payload: dict) -> dict:
                 payload,
                 origin_session_id=os.environ.get("CLAUDE_CODE_SESSION_ID"),
             )
-            return envelope.build_ok_result(result)
-
-        if operation == "signal_diagnose_origin":
-            # Issue #2790 AC3/AC7: read-only diagnostic counterpart of
-            # `signal apply` -- never mutates, never persists an event, and
-            # never changes the frozen public `unbound` disposition/
-            # reason_code contract other callers (e.g. `signal apply`)
-            # still return unchanged.
-            result = workflow_signals.diagnose_origin(conn, os.environ.get("CLAUDE_CODE_SESSION_ID"))
             return envelope.build_ok_result(result)
 
         if operation == "cleanup_begin":
