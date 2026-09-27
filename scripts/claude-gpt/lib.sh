@@ -344,11 +344,67 @@ CLAUDE_GPT_MODEL_HAIKU="gpt-5.6-luna[1m]"
 # 変更前は gpt-5.6-luna へ固定到達していたことの確認）で確認済みである。
 CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY="gpt-5.6-terra"
 
+# --- Issue #2801: proxy model catalog compatibility preflight / repair ---------
+#
+# repository が要求する model set の live catalog に対する compatibility check の
+# authority は version number ではなく実際の `/v1/models` capability である
+# （Design 4節）。この定数はあくまで repair helper（repair_proxy.sh）が既定で
+# pin する upstream `raine/claude-code-proxy` の version 補助情報であり、単独では
+# 起動可否を決めない。
+CLAUDE_GPT_MIN_KNOWN_COMPATIBLE_PROXY_VERSION="0.1.42"
+
+# `CLAUDE_GPT_LAUNCH_RESULT_V1` の additive field `repair_command` に載せる、
+# operator がその場で実行できる repository-supported one-command repair path
+# （Outcome 5節）。
+CLAUDE_GPT_REPAIR_COMMAND="scripts/claude-gpt/repair_proxy.sh"
+
 # claude_gpt_strip_context_hint: model alias 末尾の `[1m]` 等 context-window hint suffix
 # を取り除き、proxy `/v1/models` が返す base model 名と比較できる形にする。
 # 引数1: model alias 文字列（例: "gpt-5.6-terra[1m]"）
 claude_gpt_strip_context_hint() {
   printf '%s' "$1" | sed 's/\[[^]]*\]$//'
+}
+
+# claude_gpt_required_model_set: effective runtime consumer（main / opus / sonnet /
+# haiku・small-fast / Auto review classifier）から実際に使用される model alias を
+# `claude_gpt_strip_context_hint()` 後の base model ID へ変換し、重複を除いた一意な
+# ID を改行区切りで返す（一方向 derivation。Issue #2801 AC8）。固定
+# `MAIN`/`OPUS`/`HAIKU` サブセットの手書き列挙はしない -- `SONNET` や Auto review
+# classifier だけが将来別 model に変更されても、この derivation を経由する限り
+# 自動的に required set へ反映される。`gpt-6-astra` 等 on-demand escalation model は
+# 通常の effective runtime consumer に含まれないため、ここでは対象にしない
+# （#2772 の方針を維持）。
+claude_gpt_required_model_set() {
+  _cgt_req_seen=""
+  for _cgt_req_alias in \
+    "$CLAUDE_GPT_MODEL_MAIN" \
+    "$CLAUDE_GPT_MODEL_OPUS" \
+    "$CLAUDE_GPT_MODEL_SONNET" \
+    "$CLAUDE_GPT_MODEL_HAIKU" \
+    "$CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY"; do
+    _cgt_req_base=$(claude_gpt_strip_context_hint "$_cgt_req_alias")
+    case " $_cgt_req_seen " in
+      *" $_cgt_req_base "*) : ;;
+      *)
+        _cgt_req_seen="$_cgt_req_seen $_cgt_req_base"
+        printf '%s\n' "$_cgt_req_base"
+        ;;
+    esac
+  done
+}
+
+# claude_gpt_missing_models: 引数1 に proxy `/v1/models` の生 JSON 文字列、
+# 引数2 以降に required base model ID 群を受け取り、生 JSON 中に存在しない
+# model ID だけを改行区切りで返す（1件も欠落が無ければ何も出力しない）。
+claude_gpt_missing_models() {
+  _cgt_miss_json="$1"
+  shift
+  for _cgt_miss_required in "$@"; do
+    case "$_cgt_miss_json" in
+      *"\"$_cgt_miss_required\""*) : ;;
+      *) printf '%s\n' "$_cgt_miss_required" ;;
+    esac
+  done
 }
 
 # --- claude 実行バイナリの解決（P1-1） ---
@@ -376,6 +432,76 @@ claude_gpt_resolve_proxy_bin() {
     return 0
   fi
   command -v claude-code-proxy 2>/dev/null
+}
+
+# claude_gpt_home_bin_dir: Claude-GPT-owned managed binary の isolated install
+# directory（binary precedence の第2候補。Issue #2801 Design 3節）。
+claude_gpt_home_bin_dir() {
+  printf '%s/bin\n' "$CLAUDE_GPT_HOME"
+}
+
+# claude_gpt_find_free_port: OS に ephemeral port を割り当てさせ、bind 可能な
+# loopback port 番号を1つ返す。python3 が使えない環境では固定 fallback port を
+# 返す（VC preflight allowlist 外コマンドへ依存しない。claude_gpt_sha256_file と
+# 同型のフォールバック方針）。
+claude_gpt_find_free_port() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
+  else
+    printf '48732\n'
+  fi
+}
+
+# claude_gpt_probe_live_catalog: repair_proxy.sh の再検証専用の軽量プローブ
+# （Issue #2801 AC5）。指定した proxy バイナリを ephemeral port で起動し、
+# `/v1/models` の live catalog 生 JSON を取得してから kill する。launch.sh 本体の
+# 起動シーケンス（port TOCTOU retry・loopback bind 厳密確認等）とは独立した
+# 単純化済みの一度きりプローブであり、launch.sh の起動ロジックを置き換えない。
+# 取得できなければ空文字列を返す（呼び出し側は required set 全件を missing 扱いに
+# できる）。running な既存 proxy/session には一切触れない。
+# 引数1: proxy バイナリの絶対パス
+# 引数2: probe に使う loopback port
+claude_gpt_probe_live_catalog() {
+  _cgt_probe_bin="$1"
+  _cgt_probe_port="$2"
+  if [ -z "$_cgt_probe_bin" ] || [ -z "$_cgt_probe_port" ]; then
+    printf ''
+    return 0
+  fi
+  _cgt_probe_home=$(mktemp -d 2>/dev/null) || { printf ''; return 0; }
+  env -i \
+    "PATH=$PATH" \
+    "HOME=$_cgt_probe_home" \
+    "CCP_CONFIG_DIR=$_cgt_probe_home/proxy-config" \
+    "XDG_STATE_HOME=$_cgt_probe_home/xdg-state" \
+    "CCP_BIND_ADDRESS=127.0.0.1" \
+    "CCP_LOG_STDERR=1" \
+    "$_cgt_probe_bin" serve --port "$_cgt_probe_port" --no-monitor >"$_cgt_probe_home/proxy.log" 2>&1 &
+  _cgt_probe_pid=$!
+
+  _cgt_probe_i=0
+  _cgt_probe_ready=false
+  while [ "$_cgt_probe_i" -lt 20 ]; do
+    if ! kill -0 "$_cgt_probe_pid" 2>/dev/null; then
+      break
+    fi
+    if curl --fail --show-error -s -o /dev/null -m 1 "http://127.0.0.1:${_cgt_probe_port}/v1/models" 2>/dev/null; then
+      _cgt_probe_ready=true
+      break
+    fi
+    _cgt_probe_i=$((_cgt_probe_i + 1))
+    sleep 0.5
+  done
+
+  _cgt_probe_models=""
+  if [ "$_cgt_probe_ready" = "true" ]; then
+    _cgt_probe_models=$(curl --fail --show-error -s -m 3 "http://127.0.0.1:${_cgt_probe_port}/v1/models" 2>/dev/null)
+  fi
+
+  kill "$_cgt_probe_pid" 2>/dev/null
+  wait "$_cgt_probe_pid" 2>/dev/null
+  rm -rf "$_cgt_probe_home" 2>/dev/null
+  printf '%s' "$_cgt_probe_models"
 }
 
 # claude_gpt_proxy_version: 起動対象 proxy バイナリの version 識別子を取得する。
@@ -515,6 +641,63 @@ claude_gpt_json_escape() {
     esc=$(printf '%s' "$value" | sed 's/\\/\\\\/g; s/"/\\"/g')
     printf '"%s"' "$esc"
   fi
+}
+
+# claude_gpt_json_array_from_lines: 改行区切り文字列を JSON string array（例:
+# `["a","b"]`）へ変換する。空文字列なら `[]` を返す（Issue #2801）。
+# 引数1: 改行区切りの生文字列（各行が1要素）
+claude_gpt_json_array_from_lines() {
+  _cgt_arr_lines="$1"
+  if [ -z "$_cgt_arr_lines" ]; then
+    printf '[]'
+    return 0
+  fi
+  _cgt_arr_out="["
+  _cgt_arr_first=true
+  _cgt_arr_old_ifs=$IFS
+  IFS='
+'
+  for _cgt_arr_line in $_cgt_arr_lines; do
+    [ -z "$_cgt_arr_line" ] && continue
+    if [ "$_cgt_arr_first" = "true" ]; then
+      _cgt_arr_first=false
+    else
+      _cgt_arr_out="${_cgt_arr_out},"
+    fi
+    _cgt_arr_out="${_cgt_arr_out}$(claude_gpt_json_escape "$_cgt_arr_line")"
+  done
+  IFS=$_cgt_arr_old_ifs
+  _cgt_arr_out="${_cgt_arr_out}]"
+  printf '%s' "$_cgt_arr_out"
+}
+
+# claude_gpt_build_model_incompatibility_json: `CLAUDE_GPT_LAUNCH_RESULT_V1` の
+# 既存 top-level キー（schema/status/reason/model_alias_ok）はそのまま維持し、
+# additive fields（cause/required_models/missing_models/proxy/
+# minimum_known_compatible_version/repair_command）を追加した failure JSON を
+# 組み立てる（Issue #2801 AC1/AC3/AC6/AC9）。`cause` は本 helper が生成する限り
+# 常に `proxy_model_catalog_incompatible` であり、account entitlement 系の
+# 分類とは混同しない（AC3。通常起動での entitlement probe は追加しない）。
+# 引数1: proxy port
+# 引数2: 選択した proxy バイナリの絶対パス
+# 引数3: 選択した proxy バイナリの version 識別子
+# 引数4: required base model ID（改行区切り）
+# 引数5: missing model ID（改行区切り）
+claude_gpt_build_model_incompatibility_json() {
+  _cgt_bmi_port="$1"
+  _cgt_bmi_proxy_path="$2"
+  _cgt_bmi_proxy_version="$3"
+  _cgt_bmi_required_nl="$4"
+  _cgt_bmi_missing_nl="$5"
+
+  printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"failed","reason":"model_alias_not_resolved","model_alias_ok":false,"port":%s,"cause":"proxy_model_catalog_incompatible","required_models":%s,"missing_models":%s,"proxy":{"path":%s,"version":%s},"minimum_known_compatible_version":%s,"repair_command":%s}\n' \
+    "$_cgt_bmi_port" \
+    "$(claude_gpt_json_array_from_lines "$_cgt_bmi_required_nl")" \
+    "$(claude_gpt_json_array_from_lines "$_cgt_bmi_missing_nl")" \
+    "$(claude_gpt_json_escape "$_cgt_bmi_proxy_path")" \
+    "$(claude_gpt_json_escape "$_cgt_bmi_proxy_version")" \
+    "$(claude_gpt_json_escape "$CLAUDE_GPT_MIN_KNOWN_COMPATIBLE_PROXY_VERSION")" \
+    "$(claude_gpt_json_escape "$CLAUDE_GPT_REPAIR_COMMAND")"
 }
 
 # claude_gpt_auto_mode_json_fragment: settings JSON の `"autoMode": {...}` フィールド

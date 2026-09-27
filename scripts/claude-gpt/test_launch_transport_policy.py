@@ -432,5 +432,39 @@ def test_child_env_contains_only_expected_allowlist_keys(tmp_path):
     assert (set(captured.keys()) - runtime_artifact_keys) == expected_keys
 
 
+# --- proxy identity 表示の malformed prefix regression（Issue #2801 AC7） ----------
+
+
+def test_proxy_identity_display_has_no_malformed_v_prefix(tmp_path):
+    """GIVEN a fake proxy whose `--version` output is
+    "fake-claude-code-proxy 0.0.0-test" (`claude_gpt_proxy_version()` already
+    returns the whole `--version` line, not a bare version number)
+    WHEN launch.sh runs (any invocation reaching the startup diagnostic line,
+    here `--dry-run` so no full proxy startup is required)
+    THEN the stderr diagnostic line displays `proxy=fake-claude-code-proxy
+    0.0.0-test` -- reproducing and fixing the malformed
+    `proxy=vclaude-code-proxy 0.1.36` display bug (Issue #2801 Directly
+    Observed Failure) that unconditionally prepended `v` to an already
+    human-readable version string.
+    """
+    fake_proxy = _write_executable(tmp_path / "fake-claude-code-proxy", FAKE_PROXY_SOURCE)
+    env = dict(os.environ)
+    env["CLAUDE_GPT_PROXY_BIN"] = str(fake_proxy)
+    env.pop("CLAUDE_GPT_CLAUDE_BIN", None)
+
+    result = subprocess.run(
+        [str(LAUNCH_SH), "--dry-run"],
+        cwd=str(SCRIPT_DIR),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "proxy=fake-claude-code-proxy 0.0.0-test" in result.stderr
+    assert "proxy=vfake-claude-code-proxy" not in result.stderr
+    assert "proxy=v" not in result.stderr
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
