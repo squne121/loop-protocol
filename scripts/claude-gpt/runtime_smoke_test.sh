@@ -90,6 +90,14 @@ done
 # This loop is the LAST consumer of "$@" in this script (verified: no code
 # after this point reads $1/$@), so shifting it away here is safe. ---
 ISSUE_TO_IMPL_SCENARIO=false
+# --- Issue #2772 AC10 sub-scenario 3: `--scenario auto_classifier` mode.
+# Reuses the SAME default smoke launch/convo-step machinery below (no
+# separate fake-provider fixture, no new env wiring) -- it only adds one
+# extra classification-forcing convo step and one extra post-run assertion
+# on the (now model-carrying) transport_log.py `requests[]`. Declared here
+# alongside the other scenario flags so the single strict argv loop below
+# can set it. ---
+AUTO_CLASSIFIER_SCENARIO=false
 SCENARIO_VALUE=""
 FIXTURE_ARG_PATH=""
 EVIDENCE_OUT_ARG_PATH=""
@@ -146,8 +154,9 @@ if [ -n "$SCENARIO_VALUE" ]; then
   case "$SCENARIO_VALUE" in
     issue_create) : ;;
     issue_to_impl) ISSUE_TO_IMPL_SCENARIO=true ;;
+    auto_classifier) AUTO_CLASSIFIER_SCENARIO=true ;;
     *)
-      echo "FAIL: unknown --scenario value '${SCENARIO_VALUE}' (known values: issue_create, issue_to_impl). Refusing to fall back to the default smoke scenario (Issue #2278 AC11)." >&2
+      echo "FAIL: unknown --scenario value '${SCENARIO_VALUE}' (known values: issue_create, issue_to_impl, auto_classifier). Refusing to fall back to the default smoke scenario (Issue #2278 AC11)." >&2
       exit 2
       ;;
   esac
@@ -1423,6 +1432,32 @@ run_convo_step "text" "You are running inside an automated, non-interactive runt
 TEXT_STDOUT="$STEP_STDOUT"
 TEXT_RC="$STEP_RC"
 
+# --- Issue #2772 AC10 sub-scenario 3 (`--scenario auto_classifier` only):
+# one additional convo step whose Bash command is deliberately NOT covered
+# by an `--allowedTools` grant (unlike the "bash" step above, which
+# pre-approves `Bash(echo *)` and therefore never reaches Claude Code's
+# own built-in auto-mode risk classifier). No new env wiring is added here
+# -- `CCP_AUTO_REVIEW_MODEL=gpt-6-luna` (lib.sh) and
+# `CLAUDE_CODE_AUTO_MODE_SERVER=0` (launch.sh) are already unconditionally
+# in effect for every launch.sh invocation in this script, including this
+# one. The probe command itself is read-only and does not match any
+# hard_deny pattern (`claude_gpt_auto_mode_json_fragment`, lib.sh) --
+# it is chosen to be a plausible, non-trivial, uncommon-flag-combination
+# read-only Bash command specifically so it is unlikely to match a
+# pre-approved `$defaults`/narrow-allow pattern and must instead be
+# classified. Whether the command is ultimately allowed or denied by the
+# classifier is irrelevant to this probe: what is asserted below is that
+# the classification request itself reached `gpt-6-luna` (transport_log.py
+# `model` field), independent of the session model (`gpt-6-sol`). ---
+CLASSIFIER_PROBE_STDOUT=""
+CLASSIFIER_PROBE_RC=0
+if [ "$AUTO_CLASSIFIER_SCENARIO" = "true" ]; then
+  run_convo_step "classifier_probe" "You are running inside an automated, non-interactive runtime smoke test with no real user present. Use the Bash tool right now (an actual tool call, not a description) to run exactly: find /tmp -maxdepth 1 -iname '*${SMOKE_CANARY_NONCE}-classifier-probe*' -printf '%f\n'
+This command is read-only and expected to print nothing (no matching file exists). After running it, print exactly: ${TEXT_MARKER}" "" ""
+  CLASSIFIER_PROBE_STDOUT="$STEP_STDOUT"
+  CLASSIFIER_PROBE_RC="$STEP_RC"
+fi
+
 TEXT_MARKER_OK=false
 case "$TEXT_STDOUT" in
   *"$TEXT_MARKER"*) TEXT_MARKER_OK=true ;;
@@ -1437,6 +1472,20 @@ SUBAGENT_MARKER_OK=false
 case "$SUBAGENT_STDOUT" in
   *"$SUBAGENT_MARKER"*) SUBAGENT_MARKER_OK=true ;;
 esac
+
+# --- Issue #2772 AC10 sub-scenario 3: the classifier_probe step's own turn
+#     must actually complete (deterministic marker observed), not just exit
+#     rc==0 -- otherwise a hung/truncated turn that never issued the
+#     classified Bash call at all could still report rc==0 while never
+#     having reached the classifier. Vacuously true when the scenario is not
+#     selected (mirrors AUTO_CLASSIFIER_LUNA_OBSERVED/_SESSION_MODEL_OK). ---
+CLASSIFIER_PROBE_MARKER_OK=true
+if [ "$AUTO_CLASSIFIER_SCENARIO" = "true" ]; then
+  CLASSIFIER_PROBE_MARKER_OK=false
+  case "$CLASSIFIER_PROBE_STDOUT" in
+    *"$TEXT_MARKER"*) CLASSIFIER_PROBE_MARKER_OK=true ;;
+  esac
+fi
 
 # --- SubAgent lifecycle 一次証跡（Issue #2204 P0-3。部分対応 — Gap は PR body に明記する）:
 #     現時点では標準出力 marker 検出のみを一次証跡とする。SubagentStart/SubagentStop hook
@@ -1455,10 +1504,39 @@ CONVO_RC=0
 if [ "$BASH_RC" -ne 0 ] || [ "$SUBAGENT_RC" -ne 0 ] || [ "$TEXT_RC" -ne 0 ]; then
   CONVO_RC=1
 fi
+if [ "$AUTO_CLASSIFIER_SCENARIO" = "true" ] && [ "$CLASSIFIER_PROBE_RC" -ne 0 ]; then
+  CONVO_RC=1
+fi
 
 GIT_DIRTY_OK=false
 if [ "$SUT_GIT_DIRTY" = "false" ]; then
   GIT_DIRTY_OK=true
+fi
+
+REQUESTS_JSON_ARRAY="[${REQUESTS_JSON_PARTS}]"
+
+# --- Issue #2772 AC10 sub-scenario 3: independence assertion (`--scenario
+# auto_classifier` only). transport_log.py now carries a per-request
+# `model` field (see transport_log.py Issue #2772 addendum); this proves,
+# from the proxy's own structured log (not self-report), that at least one
+# request actually reached `gpt-6-luna` while the session model recorded
+# by the FIRST observed request (`MODEL_USED`, captured from the "bash"
+# step above, before any classifier probe) stayed `gpt-6-sol`. When this
+# scenario is not selected, both checks are vacuously true (n/a). ---
+AUTO_CLASSIFIER_LUNA_OBSERVED=false
+AUTO_CLASSIFIER_SESSION_MODEL_OK=false
+if [ "$AUTO_CLASSIFIER_SCENARIO" = "true" ]; then
+  AUTO_CLASSIFIER_LUNA_OBSERVED=$(printf '%s' "$REQUESTS_JSON_ARRAY" | python3 -c '
+import json, sys
+requests = json.load(sys.stdin)
+print("true" if any(str(r.get("model") or "").startswith("gpt-6-luna") for r in requests) else "false")
+' 2>/dev/null || echo false)
+  case "$MODEL_USED" in
+    gpt-6-sol*) AUTO_CLASSIFIER_SESSION_MODEL_OK=true ;;
+  esac
+else
+  AUTO_CLASSIFIER_LUNA_OBSERVED=true
+  AUTO_CLASSIFIER_SESSION_MODEL_OK=true
 fi
 
 RUNTIME_CONVERSATION_OK=false
@@ -1469,7 +1547,10 @@ if [ "$CONVO_RC" -eq 0 ] \
   && [ "$TRANSPORT_ALL_OK" = "true" ] \
   && [ "$CONVO_CLEANUP_OK" = "true" ] \
   && [ "$CLEANUP_INDEPENDENT_OK" = "true" ] \
-  && [ "$GIT_DIRTY_OK" = "true" ]; then
+  && [ "$GIT_DIRTY_OK" = "true" ] \
+  && [ "$CLASSIFIER_PROBE_MARKER_OK" = "true" ] \
+  && [ "$AUTO_CLASSIFIER_LUNA_OBSERVED" = "true" ] \
+  && [ "$AUTO_CLASSIFIER_SESSION_MODEL_OK" = "true" ]; then
   RUNTIME_CONVERSATION_OK=true
 fi
 
@@ -1485,8 +1566,6 @@ fi
 json_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' '
 }
-
-REQUESTS_JSON_ARRAY="[${REQUESTS_JSON_PARTS}]"
 
 cat > "$EVIDENCE_FILE" <<EVIDENCE_JSON_EOF
 {
@@ -1553,6 +1632,16 @@ cat > "$EVIDENCE_FILE" <<EVIDENCE_JSON_EOF
     "pid_absent": ${CLEANUP_PID_ABSENT_ALL},
     "socket_absent": ${CLEANUP_SOCKET_ABSENT_ALL},
     "herdr_session_absent": "not_verified"
+  },
+  "auto_classifier": {
+    "applicable": ${AUTO_CLASSIFIER_SCENARIO},
+    "session_model": "$(json_escape "$MODEL_USED")",
+    "session_model_is_sol": ${AUTO_CLASSIFIER_SESSION_MODEL_OK},
+    "luna_classifier_request_observed": ${AUTO_CLASSIFIER_LUNA_OBSERVED},
+    "classifier_probe_claude_exit_code": ${CLASSIFIER_PROBE_RC},
+    "classifier_probe_marker_ok": ${CLASSIFIER_PROBE_MARKER_OK},
+    "ok": $([ "$AUTO_CLASSIFIER_LUNA_OBSERVED" = "true" ] && [ "$AUTO_CLASSIFIER_SESSION_MODEL_OK" = "true" ] && [ "$CLASSIFIER_PROBE_MARKER_OK" = "true" ] && echo true || echo false),
+    "note": "Issue #2772 AC10 sub-scenario 3: session model（gpt-6-sol）とは独立した auto-mode classifier request が gpt-6-luna へ実際に到達したことを、request_completed/codex_upstream_request_started の model フィールド（transport_log.py）で確認する。applicable=false の場合（--scenario auto_classifier 以外）は n/a。"
   }
 }
 EVIDENCE_JSON_EOF
@@ -1560,7 +1649,7 @@ EVIDENCE_JSON_EOF
 if [ "$STATUS" = "pass" ]; then
   echo "PASS: claude-gpt launcher runtime smoke test（構造確認 + 対話 runtime 確認）が成功しました。証跡: ${EVIDENCE_FILE}"
 else
-  echo "FAIL: claude-gpt launcher runtime smoke test が失敗しました（structural_ok=${STRUCTURAL_OK}, runtime_conversation_ok=${RUNTIME_CONVERSATION_OK}, transport_ok=${TRANSPORT_ALL_OK}, git_dirty_ok=${GIT_DIRTY_OK}）。証跡: ${EVIDENCE_FILE}"
+  echo "FAIL: claude-gpt launcher runtime smoke test が失敗しました（structural_ok=${STRUCTURAL_OK}, runtime_conversation_ok=${RUNTIME_CONVERSATION_OK}, transport_ok=${TRANSPORT_ALL_OK}, git_dirty_ok=${GIT_DIRTY_OK}, auto_classifier_scenario=${AUTO_CLASSIFIER_SCENARIO}, luna_observed=${AUTO_CLASSIFIER_LUNA_OBSERVED}, session_model_is_sol=${AUTO_CLASSIFIER_SESSION_MODEL_OK}）。証跡: ${EVIDENCE_FILE}"
 fi
 
 exit "$EXIT_CODE"

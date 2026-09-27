@@ -49,6 +49,14 @@ v0.1.36 はこの他に `codex_upstream_request_failed` / `request_failed` イ�
   python3 transport_log.py <structured_log_path>
   終了コード: 0=PASS(ok), 1=FAIL, 2=usage エラー
   stdout に判定結果の JSON を 1 行出力する。
+
+Issue #2772 追記: `requests[]` の各要素に `model` フィールドを追加した（純追加、既存
+フィールド・exit code・pass/fail 判定には一切影響しない）。`model` は同一 reqId の
+`request_completed` イベントの `fields.model` を優先し、それが無ければ
+`codex_upstream_request_started` イベントの `fields.model` を使う。どちらにも無ければ
+`None`。auto mode classifier（gpt-6-luna）が session model（gpt-6-sol）とは独立した
+upstream request として実際に発火したことを、この `model` フィールドで
+per-request に確認できるようにする（AC10 sub-scenario 3）。
 """
 from __future__ import annotations
 
@@ -201,6 +209,11 @@ def evaluate_transport_log(log_path: str) -> TransportVerdict:
         if (matched_requests or matched_completed) and not response_ok:
             reasons.append(f"unconfirmed_response_for_reqId={req_id}")
 
+        completed_model = (
+            _fields(matched_completed[-1]).get("model") if matched_completed else None
+        )
+        model = completed_model if completed_model is not None else started_fields.get("model")
+
         requests.append(
             {
                 "req_id": req_id,
@@ -208,6 +221,7 @@ def evaluate_transport_log(log_path: str) -> TransportVerdict:
                 "response_path": response_path,
                 "response_status": response_status,
                 "response_ok": response_ok,
+                "model": model,
             }
         )
 
