@@ -589,3 +589,159 @@ def test_extract_allowed_paths_annotation_no_backtick():
 """
     paths = extract_allowed_paths(body)
     assert paths == ["src/render/CanvasRenderer.ts"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #2783: canonical/legacy no-path marker (`(none)`) integration into
+# extract_allowed_paths() / _rg_has_broad_search_path()
+# ---------------------------------------------------------------------------
+
+
+def test_extract_allowed_paths_canonical_marker_returns_empty():
+    """AC2: canonical marker `(none)` as the sole Allowed Paths entry ->
+    extract_allowed_paths() returns []."""
+    from baseline_vc_preflight import extract_allowed_paths
+
+    body = """## Allowed Paths
+
+- (none)
+"""
+    assert extract_allowed_paths(body) == []
+
+
+def test_extract_allowed_paths_legacy_marker_returns_empty():
+    """AC3: legacy exact marker `読み取り専用。リポジトリ変更なし（既定）` as the
+    sole Allowed Paths entry -> extract_allowed_paths() returns [] (previously
+    the trailing full-width paren annotation stripper turned this into a
+    bogus non-empty "path" entry)."""
+    from baseline_vc_preflight import extract_allowed_paths
+
+    body = """## Allowed Paths
+
+- 読み取り専用。リポジトリ変更なし（既定）
+"""
+    assert extract_allowed_paths(body) == []
+
+
+def test_broad_search_no_path_marker_not_flagged_broad():
+    """AC4: a read-only body (Allowed Paths == canonical or legacy no-path
+    marker) with a specific `rg pattern specific/file.py` VC must not be
+    misclassified as broad_search_path_unbounded."""
+    specific_path = ".claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py"
+    body_canonical = make_body(
+        f"rg some_unique_pattern_for_test_ac4 {specific_path}",
+        allowed_paths=["(none)"],
+    )
+    data_canonical = run_preflight(body_canonical)
+    r_canonical = data_canonical["results"][0]
+    assert r_canonical["category"] != "broad_search_path_unbounded", (
+        f"canonical no-path marker must not force broad; got {r_canonical['category']}"
+    )
+
+    body_legacy = make_body(
+        f"rg some_unique_pattern_for_test_ac4 {specific_path}",
+        allowed_paths=["読み取り専用。リポジトリ変更なし（既定）"],
+    )
+    data_legacy = run_preflight(body_legacy)
+    r_legacy = data_legacy["results"][0]
+    assert r_legacy["category"] != "broad_search_path_unbounded", (
+        f"legacy no-path marker must not force broad; got {r_legacy['category']}"
+    )
+
+
+def test_broad_search_pattern_only_and_dot_still_broad():
+    """AC5 (regression guard): `rg pattern` (no path) and `rg pattern .`
+    remain broad_search_path_unbounded even when Allowed Paths is the
+    no-path marker."""
+    body_no_path = make_body(
+        "rg some_unique_pattern_for_test_ac5",
+        allowed_paths=["(none)"],
+    )
+    data_no_path = run_preflight(body_no_path)
+    r_no_path = data_no_path["results"][0]
+    assert r_no_path["category"] == "broad_search_path_unbounded", (
+        f"rg without a path must stay broad; got {r_no_path['category']}"
+    )
+
+    body_dot = make_body(
+        "rg some_unique_pattern_for_test_ac5 .",
+        allowed_paths=["(none)"],
+    )
+    data_dot = run_preflight(body_dot)
+    r_dot = data_dot["results"][0]
+    assert r_dot["category"] == "broad_search_path_unbounded", (
+        f"rg . must stay broad; got {r_dot['category']}"
+    )
+
+
+def test_extract_allowed_paths_unicode_punctuation_path_preserved():
+    """AC6: a real path containing Unicode / punctuation (not an exact
+    marker match) must be preserved as a path, not misdetected as a
+    no-path marker."""
+    from baseline_vc_preflight import extract_allowed_paths
+
+    body = """## Allowed Paths
+
+- docs/日本語。md
+"""
+    assert extract_allowed_paths(body) == ["docs/日本語。md"]
+
+
+def test_extract_allowed_paths_annotation_real_path_preserved():
+    """AC7: an existing real-path + annotation entry (PR #684 semantics)
+    is preserved as a real path, unaffected by the marker integration."""
+    from baseline_vc_preflight import extract_allowed_paths
+
+    body = """## Allowed Paths
+
+- some/path.py（読み取り専用）
+"""
+    assert extract_allowed_paths(body) == ["some/path.py"]
+
+
+def test_marker_judgment_order_wrapper_removed_before_check():
+    """AC8: bullet-wrapped `(none)` and code-fence-wrapped `(none)` are
+    judged identically as no-path markers (wrapper removed before marker
+    match, per the fixed judgment order)."""
+    from baseline_vc_preflight import extract_allowed_paths
+
+    body_bullet = """## Allowed Paths
+
+- (none)
+"""
+    body_fence = """## Allowed Paths
+
+```
+(none)
+```
+"""
+    assert extract_allowed_paths(body_bullet) == []
+    assert extract_allowed_paths(body_fence) == []
+
+
+def test_legacy_marker_trailing_prose_not_auto_interpreted():
+    """AC9: a legacy marker line followed by unrelated investigation-target
+    prose (the #2762-style malformed shape) still resolves the marker line
+    itself to 0 paths, WITHOUT this Issue adding any new auto-classification
+    of the trailing prose line (that remains explicitly out of scope; the
+    prose line's existing -- unrelated -- annotation-normalization behavior
+    is left untouched by this regression)."""
+    from baseline_vc_preflight import extract_allowed_paths
+
+    body = """## Allowed Paths
+
+- 読み取り専用。リポジトリ変更なし（既定）
+- 調査対象として `.claude/hooks/` を参照可能（変更は行わない）
+"""
+    paths = extract_allowed_paths(body)
+    # The marker line itself contributes 0 paths.
+    assert "読み取り専用。リポジトリ変更なし" not in paths
+    assert "読み取り専用。リポジトリ変更なし（既定）" not in paths
+    # This Issue does not add new interpretation of the trailing prose line;
+    # whatever extract_allowed_paths already does with it (existing #684
+    # annotation-normalization behavior) is untouched -- only the marker
+    # line's own semantics changed. We only assert this Issue's own scope: no
+    # marker artifact leaks into the prose entry, and the marker line does
+    # not silently swallow the prose line too (there is still exactly one
+    # remaining candidate entry from the non-marker line).
+    assert len(paths) == 1

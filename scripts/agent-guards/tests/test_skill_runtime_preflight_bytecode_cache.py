@@ -269,6 +269,12 @@ def _real_repair_source() -> str:
     return (SCRIPTS_DIR / "repair_issue_contract.py").read_text(encoding="utf-8")
 
 
+def _real_allowed_paths_policy_source() -> str:
+    return (REPO_ROOT / "scripts" / "agent-ops" / "allowed_paths_policy.py").read_text(
+        encoding="utf-8"
+    )
+
+
 def _real_validate_issue_execution_decision_source() -> str:
     return (SCRIPTS_DIR / "validate_issue_execution_decision.py").read_text(encoding="utf-8")
 
@@ -370,6 +376,15 @@ def _install_real_preflight_fixture(repo_root: Path, *, negative_writer: str | N
     _write_text(
         dest_scripts / "validate_issue_execution_decision.py",
         _real_validate_issue_execution_decision_source(),
+    )
+    # Issue #2783 fix_delta: repair_issue_contract.py now imports the shared
+    # `allowed_paths_policy.is_no_path_marker` helper from
+    # `scripts/agent-ops/`. The isolated fixture repo must mirror that
+    # dependency at the same relative location (self-contained, no
+    # PYTHONPATH escape to the real repo).
+    _write_text(
+        repo_root / "scripts" / "agent-ops" / "allowed_paths_policy.py",
+        _real_allowed_paths_policy_source(),
     )
     _write_text(
         repo_root / "docs" / "dev" / "github-ops.md",

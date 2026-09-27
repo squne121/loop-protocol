@@ -2580,3 +2580,103 @@ class TestStructuralRepairWiring:
             == "no_missing_fields_detected"
         )
         assert result["status"] in ("pass", "warn", "needs_fix", "blocked", "environment_failure")
+
+
+# ---------------------------------------------------------------------------
+# AC10 (Issue #2783): canonical Step 2 review pipeline integration -- a
+# #2730-style read-only body (legacy no-path marker Allowed Paths + a
+# specific-file `rg` Verification Command) must not fall into
+# needs_fix/human_judgment via a spurious broad_search_path_unbounded
+# finding, which would risk escalating to
+# `STEP_5_OPERATOR_INTERVENTION_REQUIRED` / `contract_readiness_human_judgment`
+# upstream in `run_root_review_pipeline.py`.
+# ---------------------------------------------------------------------------
+
+
+_ISSUE_CONTRACT_REVIEW_SCRIPTS_DIR = (
+    Path(__file__).resolve().parents[2] / "issue-contract-review" / "scripts"
+)
+_BASELINE_VC_PREFLIGHT_PY = _ISSUE_CONTRACT_REVIEW_SCRIPTS_DIR / "baseline_vc_preflight.py"
+
+
+def test_operator_intervention_not_triggered_by_no_path_marker():
+    """AC10: run the REAL `baseline_vc_preflight.py` (the same executor
+    `contract_readiness_check.py`'s canonical Step 2 review pipeline spawns
+    in `--mode execute`) against an Issue #2730-style body, then feed its
+    REAL output into the REAL `contract_readiness_check.map_preflight_result_to_errors()`
+    aggregation function. The result must not carry a
+    `broad_search_path_unbounded` finding, and the aggregate readiness
+    status must not be `human_judgment` (the status that
+    `run_root_review_pipeline.route_canonical_step2_result()` treats as
+    `contract_readiness_human_judgment`, routing toward
+    `STEP_5_OPERATOR_INTERVENTION_REQUIRED`)."""
+    import json
+    import subprocess
+    import tempfile
+    import os
+
+    sys.path.insert(0, str(_ISSUE_CONTRACT_REVIEW_SCRIPTS_DIR))
+    from contract_readiness_check import map_preflight_result_to_errors  # noqa: E402
+
+    body = """## Outcome
+
+Read-only research issue (Issue #2730-style shape).
+
+## Acceptance Criteria
+
+- [ ] AC1: investigation only, no repository mutation.
+
+## Verification Commands
+
+```bash
+rg -n "is_no_path_marker" scripts/agent-ops/allowed_paths_policy.py
+```
+
+## Allowed Paths
+
+- 読み取り専用。リポジトリ変更なし（既定）
+
+## Stop Conditions
+
+- none
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        f.write(body)
+        fixture_file = f.name
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(_BASELINE_VC_PREFLIGHT_PY),
+                "--body-file",
+                fixture_file,
+                "--issue",
+                "2730",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.stdout, f"No output from preflight: stderr={result.stderr}"
+        preflight_result = json.loads(result.stdout)
+    finally:
+        os.unlink(fixture_file)
+
+    errors, aggregate = map_preflight_result_to_errors(preflight_result)
+    assert not any(
+        e.get("category") == "broad_search_path_unbounded" for e in errors
+    ), f"spurious broad_search_path_unbounded finding: {errors}"
+    assert aggregate != "human_judgment", f"unexpected human_judgment escalation: {errors}"
+
+
+def test_extract_allowed_paths_from_issue_body_no_path_marker_returns_empty():
+    """AC12 (Issue #2783): `_extract_allowed_paths_from_issue_body()`
+    resolves the canonical marker `(none)` and legacy marker
+    `読み取り専用。リポジトリ変更なし（既定）` to [] (previously this function
+    had no annotation stripping at all, so both markers leaked as literal
+    non-empty "path" strings)."""
+    body_canonical = "## Allowed Paths\n\n- (none)\n"
+    assert wrapper._extract_allowed_paths_from_issue_body(body_canonical) == []
+
+    body_legacy = "## Allowed Paths\n\n- 読み取り専用。リポジトリ変更なし（既定）\n"
+    assert wrapper._extract_allowed_paths_from_issue_body(body_legacy) == []

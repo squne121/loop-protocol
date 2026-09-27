@@ -1390,3 +1390,15 @@ class TestSelfValidation:
         assert "script_file_sha256" in sv, "self_validation must contain script_file_sha256"
         assert isinstance(sv["script_file_sha256"], str)
         assert len(sv["script_file_sha256"]) == 64
+
+
+def test_extract_allowed_paths_no_path_marker_returns_empty():
+    """AC12 (Issue #2783): canonical marker `(none)` and legacy marker
+    `読み取り専用。リポジトリ変更なし（既定）` as the sole Allowed Paths entry
+    both resolve to frozenset() (this module's own missing-section
+    sentinel), not a bogus literal-string "path"."""
+    item_canonical = {"body": "## Allowed Paths\n\n- (none)\n"}
+    assert rollup._extract_allowed_paths(item_canonical) == frozenset()
+
+    item_legacy = {"body": "## Allowed Paths\n\n- 読み取り専用。リポジトリ変更なし（既定）\n"}
+    assert rollup._extract_allowed_paths(item_legacy) == frozenset()

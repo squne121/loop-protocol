@@ -138,6 +138,43 @@ change_kind: workflow
 """
 
 
+def test_build_scope_manifest_no_path_marker_returns_empty():
+    """AC12 (Issue #2783): canonical marker `(none)` and legacy marker
+    `読み取り専用。リポジトリ変更なし（既定）` as the sole Allowed Paths entry
+    both resolve `allowed_paths` to [] (this filtering is Allowed-Paths
+    specific -- In Scope / Acceptance Criteria are unaffected)."""
+    body_canonical = """## Machine-Readable Contract
+```yaml
+goal_ref: marker goal
+change_kind: workflow
+```
+## In Scope
+- build intake
+## Acceptance Criteria
+- [ ] AC1: scope normalizes
+## Allowed Paths
+- (none)
+"""
+    manifest_canonical = mod.build_scope_manifest(body_canonical)
+    assert manifest_canonical["allowed_paths"] == []
+    assert manifest_canonical["in_scope"] == ["build intake"]
+
+    body_legacy = """## Machine-Readable Contract
+```yaml
+goal_ref: marker goal
+change_kind: workflow
+```
+## In Scope
+- build intake
+## Acceptance Criteria
+- [ ] AC1: scope normalizes
+## Allowed Paths
+- 読み取り専用。リポジトリ変更なし（既定）
+"""
+    manifest_legacy = mod.build_scope_manifest(body_legacy)
+    assert manifest_legacy["allowed_paths"] == []
+
+
 def test_scope_normalizer_excludes_operational_prose_and_progress_state():
     """AC2: the canonical normalizer includes only the "Canonical
     Implementation Scope Normalizer" semantic fields (goal_ref / change_kind
