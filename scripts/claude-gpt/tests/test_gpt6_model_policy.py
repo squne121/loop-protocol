@@ -326,18 +326,33 @@ def test_opus_default_is_not_astra():
 
 
 def test_startup_preflight_loop_excludes_astra():
-    """GIVEN launch.sh の model alias resolution ループ
-    WHEN 対象変数リストを読む
-    THEN MAIN/OPUS/HAIKU のみが対象で、Astra 用の変数を含まない（AC2:
-    起動可否が Astra entitlement に依存しない）。
+    """GIVEN launch.sh の model alias resolution preflight ブロック
+    WHEN `claude_gpt_required_model_set()` からの derivation ループ本体を読む
+    THEN `CLAUDE_GPT_MODEL_ASTRA` を含まない（AC2: 起動可否が Astra
+    entitlement に依存しない）。
+
+    Issue #2801 AC8 が、この preflight ループを固定 MAIN/OPUS/HAIKU 列挙から
+    `claude_gpt_required_model_set()` 由来の derivation ループへ置き換えた
+    （旧 hardcoded 列挙が存在しないことは
+    `test_launch_sh_model_check_loop_uses_derived_required_set_not_hardcoded_subset`
+    が明示的に固定している）。この recurrence test はその新しい構造を対象に
+    更新し、意図（Astra が起動時 preflight から除外されていること）を維持
+    する。単に「ASTRA という文字列がファイルのどこにも無い」という broad
+    file-wide 否定にはしない -- Astra は on-demand escalation 用に別の場所
+    （明示 --model 要求時の availability check）で正当に参照されているため、
+    broad な否定は偽陰性・偽陽性双方のリスクがある。
     """
     content = LAUNCH_SH.read_text(encoding="utf-8")
-    start = content.index('for m in "$CLAUDE_GPT_MODEL_MAIN"')
-    line = content[start : content.index("\n", start)]
-    assert "CLAUDE_GPT_MODEL_ASTRA" not in line
-    assert "$CLAUDE_GPT_MODEL_MAIN" in line
-    assert "$CLAUDE_GPT_MODEL_OPUS" in line
-    assert "$CLAUDE_GPT_MODEL_HAIKU" in line
+    start = content.index("REQUIRED_MODELS_NL=$(claude_gpt_required_model_set)")
+    loop_start = content.index("for m_base in $REQUIRED_MODELS_NL", start)
+    loop_end = content.index("\ndone", loop_start)
+    block = content[start : loop_end + len("\ndone")]
+
+    # derivation が実際にこのブロックで呼ばれていること自体を確認する
+    # （「ASTRA という文字列が無い」だけの緩い assertion にしない）。
+    assert "claude_gpt_required_model_set" in block
+    assert "for m_base in $REQUIRED_MODELS_NL" in block
+    assert "CLAUDE_GPT_MODEL_ASTRA" not in block
 
 
 def test_default_check_only_launch_succeeds_without_astra_in_registry(tmp_path):
