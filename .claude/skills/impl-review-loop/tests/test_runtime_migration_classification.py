@@ -13,7 +13,6 @@ from __future__ import annotations
 import importlib.util
 import os
 import stat
-import sys
 from pathlib import Path
 
 import pytest
@@ -193,7 +192,14 @@ def test_human_capability_blocker_report_fields_are_all_present_and_non_empty():
     target_environment / verification_command / resume_condition are all
     present and non-empty (Issue #2810 AC5 required stop-report fields)."""
     result = classify_runtime_migration(
-        _base_payload(capability_flags={"needs_credential": True, "needs_secret": False, "needs_privilege": False, "destructive_or_global": False})
+        _base_payload(
+            capability_flags={
+                "needs_credential": True,
+                "needs_secret": False,
+                "needs_privilege": False,
+                "destructive_or_global": False,
+            }
+        )
     )
     report = result["human_action_report"]
     for field in (

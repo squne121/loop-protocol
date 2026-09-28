@@ -296,7 +296,7 @@ Auto-mode の classifier / hook が `repair_command` の tool_use 自体を拒�
 `status: permission_blocked` + `reason_code: permission_denied` を返す（`status: blocked`
 ではない）。拒否された場合は再試行・迂回しない。
 
-### result
+### 結果
 
 `IMPLEMENTATION_WORKER_RESULT_V2` の `runtime_migration` フィールド（`exit_code` /
 `claude_gpt_repair_proxy_result_v1_status` / `installed_path` / `installed_version` /
