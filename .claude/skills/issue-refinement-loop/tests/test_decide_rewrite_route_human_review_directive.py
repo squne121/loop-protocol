@@ -250,6 +250,78 @@ def test_ac1_consumer_reaches_issue_editor_required_for_freeform_explicit_direct
     assert fetch_calls["count"] >= 1
 
 
+# ---------------------------------------------------------------------------
+# Issue #2812 AC5: the SAME full production routing chain as
+# test_ac1_consumer_reaches_issue_editor_required_for_freeform_explicit_
+# directive() above, but with the directive expressed as a native Markdown
+# ORDERED list (`1. `, `2. `) instead of the unordered `- ` form -- Issue
+# #2805 regression (native Markdown ordered list detection gap in
+# `_BULLET_LINE_RE` / `extract_directive_items()` /
+# `classify_directive_confidence()`, fixed in scope_signal_delta.py).
+#
+# PR #2814 OWNER REQUEST_CHANGES fix_delta (finding D): investigated
+# whether this fixture (deliberately carrying NO known
+# `_DIRECTIVE_SECTION_MARKERS` heading) actually exercises the real #2805
+# production failure/fix route, or a different branch
+# (`operator_asserted_human_context` + `_has_semantic_directive_bullet()`).
+# Confirmed empirically (by adding a `## Revised Acceptance Criteria`
+# heading here and observing the consumer's actual behavior) that a
+# marker-present route can NEVER reach `issue_editor_required` for this
+# assertion: `_decide_human_review_directive_editor_route()` requires
+# `operations_empty=True` (see the dedicated
+# `safe_patch_representation_exists` negative case in
+# `test_ac3_ac4_any_single_failing_predicate_never_routes_to_issue_editor_
+# required` above), and `derive_contract_patch_operations()` in
+# `scope_signal_delta.py` ALWAYS derives at least one operation once
+# `directive_markers` is non-empty and at least one directive item was
+# extracted (its `else` branch falls back to the `"revised acceptance
+# criteria"` section default even for an unmapped marker) -- so an
+# explicit, marker-present, non-empty-directive comment always has a safe
+# section-bound patch representation and is routed to the ORDINARY
+# `contract_update_required` patch lane instead, never to
+# `issue_editor_required`. The no-marker freeform lane below (explicit via
+# `operator_asserted_human_context` + `_has_semantic_directive_bullet()`,
+# where `derive_contract_patch_operations()` short-circuits to `[]`
+# whenever `directive_markers` is empty) is therefore the ONLY
+# production-reachable route to `issue_editor_required` with
+# `writes == 0` -- this fixture already correctly exercises it. Per this
+# fix delta's own no-op escape hatch, the fixture body is left unchanged.
+# ---------------------------------------------------------------------------
+
+_ORDERED_LIST_ANCHOR_BODY = (
+    "Please restructure the onboarding walkthrough narrative so new "
+    "contributors are not dropped mid-flow.\n\n"
+    "1. Please restructure the onboarding walkthrough narrative to add "
+    "clarifying context for new contributors.\n"
+    "2. Please also add a troubleshooting section for common walkthrough "
+    "errors.\n"
+)
+
+
+def test_ac5_ordered_list_directive_reaches_issue_editor_required_writes_zero():
+    """AC5 (#2812): a freeform human-context comment whose directive is
+    expressed as a native Markdown ORDERED list (`1. `, `2. `) -- not the
+    unordered `-`/`*` form already covered by
+    test_ac1_consumer_reaches_issue_editor_required_for_freeform_explicit_
+    directive() -- reaches the SAME production route via the real
+    production consumer: `rewrite_route.route == issue_editor_required`
+    with `writes == 0` preserved, and the canonical `reviewer_feedback_url`
+    (never the raw anchor body) echoed unchanged."""
+    kwargs = _consumer_kwargs(anchor_body=_ORDERED_LIST_ANCHOR_BODY)
+    fetch_current, fetch_calls = _fetch_current_unchanged(
+        anchor_body=_ORDERED_LIST_ANCHOR_BODY
+    )
+    kwargs["callbacks"] = {"fetch_current": fetch_current}
+    result = preflight.consume_trusted_anchor_contract_patch_plan(**kwargs)
+
+    assert result["writes"] == 0
+    assert result["rewrite_route"]["route"] == "issue_editor_required"
+    assert result["reviewer_feedback_url"] == _ANCHOR_URL
+    assert result["reviewer_feedback_url"] != _ORDERED_LIST_ANCHOR_BODY
+    assert "reviewer_feedback_text" not in result
+    assert fetch_calls["count"] >= 1
+
+
 def test_ac3_untrusted_author_association_never_escalates():
     """AC3: an untrusted author association (NONE) never reaches
     issue_editor_required -- fails closed via the existing
