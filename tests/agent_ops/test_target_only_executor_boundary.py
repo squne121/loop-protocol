@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -83,6 +84,17 @@ if len(args) >= 2 and args[0] == "issue" and args[1] == "view":
     if "url" in fields:
         payload["url"] = ""
     _out(json.dumps(payload))
+elif len(args) >= 2 and args[0] == "api" and args[1] == "graphql":
+    # #2815: target PR closing relation observation (0 closing issues =>
+    # NO_LINK), so open_pr never starts the real Task Context `signal apply`.
+    pr_number = 0
+    for idx, arg in enumerate(args):
+        if arg == "-F" and idx + 1 < len(args) and args[idx + 1].startswith("number="):
+            pr_number = int(args[idx + 1][len("number="):])
+    _out(json.dumps({"data": {"repository": {
+        "nameWithOwner": "example/repo",
+        "pullRequest": {"number": pr_number, "closingIssuesReferences": {"nodes": []}},
+    }}}))
 elif len(args) >= 1 and args[0] == "api":
     target = args[1] if len(args) > 1 else ""
     full_name = target[len("repos/"):] if target.startswith("repos/") else "unknown/unknown"
@@ -179,19 +191,170 @@ def _run_open_pr_main(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, linked_is
 # ---------------------------------------------------------------------------
 
 
-def test_no_peer_inventory_search_or_graphql_subprocess_call(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+_FAKE_GH_PR_NUMBER = "999"  # fake `gh pr create` が返す PR 番号
+
+# #2815: peer Issue inventory / search / pagination / peer readback を示す禁止 token。
+# target PR 自身の bounded closing relation observation（GraphQL transport）は
+# 許可し、transport 名ではなく query の意味で禁止対象を判定する。
+_FORBIDDEN_PEER_TOKENS = (
+    "issues(",
+    "states:",
+    "search",
+    "issue list",
+    "--paginate",
+    "pageinfo",
+    "after:",
+    "endcursor",
+    "dependenc",
+    "comments",
+    "labels",
+    "body",
+)
+
+# closing relation query の selection set に現れてよい識別子（Issue number と
+# repository{nameWithOwner} の relation identity に限る）。
+_ALLOWED_RELATION_QUERY_IDENTIFIERS = frozenset(
+    {
+        "repository",
+        "owner",
+        "name",
+        "nameWithOwner",
+        "pullRequest",
+        "number",
+        "closingIssuesReferences",
+        "first",
+        "excludeUserLinked",
+        "userLinkedOnly",
+        "nodes",
+        "false",
+    }
+)
+
+
+def _balanced_brace_body(text: str, marker: str) -> str:
+    """`marker` の直後の `{` から対応する `}` までの内側を返す。"""
+    idx = text.index(marker) + len(marker) - 1
+    assert text[idx] == "{"
+    depth = 0
+    for pos in range(idx, len(text)):
+        if text[pos] == "{":
+            depth += 1
+        elif text[pos] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[idx + 1 : pos]
+    raise AssertionError(f"unbalanced braces after {marker!r}: {text}")
+
+
+def _assert_bounded_target_pr_relation_call(call: list[str], *, expected_pr_number: str) -> None:
+    """present lane の GraphQL 呼び出しが target PR 起点の bounded observation
+    であり、peer Issue inventory / search / readback を含まないことを検証する。"""
+    query_args = [arg for arg in call if arg.startswith("query=")]
+    assert len(query_args) == 1, f"exactly one query= argument expected: {call}"
+    query = query_args[0][len("query="):]
+    joined = " ".join(call).lower()
+
+    for token in _FORBIDDEN_PEER_TOKENS:
+        assert token not in joined, f"forbidden peer-inventory token {token!r} in graphql call: {call}"
+
+    # canonical target repository / actual target PR number
+    assert "owner=example" in call and "name=repo" in call, f"canonical repo variables expected: {call}"
+    assert f"number={expected_pr_number}" in call, f"actual target PR number expected: {call}"
+    for flag_value in ("owner=example", "name=repo", f"number={expected_pr_number}"):
+        assert call[call.index(flag_value) - 1] == "-F", f"{flag_value} must be passed with -F: {call}"
+
+    # target PR 起点 + bounded closing relation observation
+    assert query.count("pullRequest(number:") == 1, f"single pullRequest(number:) root expected: {query}"
+    assert query.count("closingIssuesReferences(first:2") == 1, f"bounded first:2 expected: {query}"
+
+    # 取得 field は Issue `number` と `repository{nameWithOwner}` に限る
+    nodes_body = _balanced_brace_body(query, "nodes{")
+    assert re.findall(r"[A-Za-z_]\w*", nodes_body) == ["number", "repository", "nameWithOwner"], (
+        f"relation nodes must select only number and repository{{nameWithOwner}}: {nodes_body}"
+    )
+    selection = re.sub(r"^\s*query\([^)]*\)", "", query)
+    identifiers = set(re.findall(r"[A-Za-z_]\w*", selection))
+    unexpected = identifiers - _ALLOWED_RELATION_QUERY_IDENTIFIERS
+    assert not unexpected, f"unexpected field(s) selected in relation query: {sorted(unexpected)}"
+
+
+@pytest.mark.parametrize("session_bound", [False, True])
+def test_no_peer_inventory_or_search_from_target_only_executor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, session_bound: bool
 ) -> None:
+    # lane は外側の shell 環境ではなくテスト自身が確定する（#2815）。
+    if session_bound:
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "boundary-test-session")
+    else:
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
     log_path = _fake_gh_env(tmp_path, monkeypatch)
     rc = _run_open_pr_main(tmp_path, monkeypatch)
     assert rc == 0
     calls = _read_fake_gh_log(log_path)
     assert calls, "expected at least one gh subprocess call"
+
+    # peer inventory / search / pagination は両 lane で禁止（transport 名ではなく意味で判定）。
     for call in calls:
-        joined = " ".join(call)
+        joined = " ".join(call).lower()
         assert not (call[:2] == ["issue", "list"]), f"peer Issue inventory call must not happen: {call}"
-        assert "graphql" not in joined.lower(), f"GraphQL API call must not happen: {call}"
-        assert "search" not in joined.lower(), f"Issue search call must not happen: {call}"
+        assert "issue list" not in joined, f"peer Issue inventory call must not happen: {call}"
+        assert "search" not in joined, f"Issue search call must not happen: {call}"
+        assert "--paginate" not in call, f"pagination must not happen: {call}"
+
+    graphql_calls = [call for call in calls if call[:2] == ["api", "graphql"]]
+    if not session_bound:
+        assert graphql_calls == [], f"unbound lane must not call api graphql: {graphql_calls}"
+        return
+
+    assert len(graphql_calls) == 1, f"exactly one target PR relation observation expected: {graphql_calls}"
+    _assert_bounded_target_pr_relation_call(graphql_calls[0], expected_pr_number=_FAKE_GH_PR_NUMBER)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        ("closingIssuesReferences(first:2", "closingIssuesReferences(first:100"),
+        ("{nodes{number repository{nameWithOwner}}}", "{pageInfo{endCursor} nodes{number repository{nameWithOwner}}}"),
+        ("nodes{number repository{nameWithOwner}}", "nodes{number body repository{nameWithOwner}}"),
+        ("nodes{number repository{nameWithOwner}}", "nodes{number labels{nodes{name}} repository{nameWithOwner}}"),
+        ("nodes{number repository{nameWithOwner}}", "nodes{number comments{totalCount} repository{nameWithOwner}}"),
+        ("repository(owner:$owner,name:$name)", "repository(owner:$owner,name:$name) search(query:\"x\")"),
+        ("{nameWithOwner pullRequest(", "{nameWithOwner issues(states:OPEN){nodes{number}} pullRequest("),
+        ("closingIssuesReferences(first:2,", "closingIssuesReferences(first:2,after:$cursor,"),
+        (
+            "nodes{number repository{nameWithOwner}}",
+            "nodes{number trackedIssues{totalCount} repository{nameWithOwner}}",
+        ),
+    ],
+    ids=[
+        "first-100",
+        "pageinfo",
+        "body",
+        "labels",
+        "comments",
+        "search",
+        "issues-states",
+        "after-cursor",
+        "unlisted-field",
+    ],
+)
+def test_relation_call_assertion_rejects_peer_inventory_mutations(mutation: tuple[str, str]) -> None:
+    """present lane の semantic assertion が、禁止 token を query へ加えると
+    実際に失敗する（vacuous でない）ことを示す。"""
+    query = (
+        "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name)"
+        "{nameWithOwner pullRequest(number:$number){number "
+        "closingIssuesReferences(first:2,excludeUserLinked:false,userLinkedOnly:false)"
+        "{nodes{number repository{nameWithOwner}}}}}"
+    )
+    call = ["api", "graphql", "-f", f"query={query}", "-F", "owner=example", "-F", "name=repo", "-F", "number=999"]
+    _assert_bounded_target_pr_relation_call(call, expected_pr_number="999")  # 現行 query は許可
+
+    before, after = mutation
+    assert before in query
+    mutated = [arg.replace(before, after) if arg.startswith("query=") else arg for arg in call]
+    with pytest.raises(AssertionError):
+        _assert_bounded_target_pr_relation_call(mutated, expected_pr_number="999")
 
 
 # ---------------------------------------------------------------------------
