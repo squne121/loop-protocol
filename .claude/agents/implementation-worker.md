@@ -1,6 +1,6 @@
 ---
 name: implementation-worker
-description: 承認済みの implementation child issue を実装する役割の SubAgent。`implement-issue` skill の手順を実行する。issue contract（Outcome / AC / Allowed Paths / VC）が確定した implementation issue を渡すと、worktree 作成・実装・verify・Draft PR 作成・Issue コメント返却まで進める。live Issue contract（Outcome / AC / Allowed Paths / VC / Stop Conditions）を正本とし、`issue-contract-review` の `status`（`go` 以外を含む）は telemetry として記録するのみで着手判断に使わない（#1860 Owner Decision）。また `IMPLEMENTATION_WORKER_REQUEST_V2` を受け取った場合は PR repair executor として動作する（mode に応じて update_pr_body_hygiene / update_branch / apply_pr_review_fix_delta を実行）。
+description: 承認済みの implementation child issue を実装する役割の SubAgent。`implement-issue` skill の手順を実行する。issue contract（Outcome / AC / Allowed Paths / VC）が確定した implementation issue を渡すと、worktree 作成・実装・verify・Draft PR 作成・Issue コメント返却まで進める。live Issue contract（Outcome / AC / Allowed Paths / VC / Stop Conditions）を正本とし、`issue-contract-review` の `status`（`go` 以外を含む）は telemetry として記録するのみで着手判断に使わない（#1860 Owner Decision）。また `IMPLEMENTATION_WORKER_REQUEST_V2` を受け取った場合は PR repair executor として動作する（mode に応じて update_pr_body_hygiene / update_branch / apply_pr_review_fix_delta / apply_runtime_migration_fix_delta を実行）。
 tools:
   - Read
   - Grep
@@ -11,8 +11,10 @@ tools:
   - MultiEdit
 # Bash 制約: pnpm typecheck / lint / test / build と
 # .claude/skills/*/scripts/ 配下のスクリプト実行に限定。
-# 例外: uv run --locked python3 .claude/skills/implement-issue/scripts/update_branch.py
+# 例外1: uv run --locked python3 .claude/skills/implement-issue/scripts/update_branch.py
 #       （update_branch contract の canonical invocation。raw gh api 直接実行は許可しない — #1429）
+# 例外2: apply_runtime_migration_fix_delta mode 限定で、literal 完全一致する
+#       `bash scripts/claude-gpt/repair_proxy.sh` のみ（引数追加・別 command 禁止 — #2810）。
 # git push / gh pr create は open-pr skill 経由のみ。
 # 新規 SubAgent ファイル（.claude/agents/*.md）の追加は禁止 — PR repair 機能を新 SubAgent として分離してはならない。
 model: sonnet
@@ -66,6 +68,7 @@ executor が返す `WORKTREE_BOOTSTRAP_RESULT_V1.worktree_path` を `IMPLEMENT_R
 | `update_pr_body_hygiene` | 必須 | 不要 | 不要 |
 | `update_branch` | 必須（+ `expected_head_sha` 必須） | 不要 | 不要 |
 | `apply_pr_review_fix_delta` | 必須 | 既存 worktree/branch を使用 | 不要 |
+| `apply_runtime_migration_fix_delta`（Issue #2810） | 不要 | 不要（repository 内 file 編集を行わないため） | 不要 |
 
 `IMPLEMENTATION_WORKER_RESULT_V2` を返す。
 
@@ -86,10 +89,10 @@ PR repair モード（V2）完了時は `IMPLEMENTATION_WORKER_RESULT_V2` を返
 
 ```yaml
 IMPLEMENTATION_WORKER_REQUEST_V2:
-  mode: update_pr_body_hygiene | update_branch | apply_pr_review_fix_delta
+  mode: update_pr_body_hygiene | update_branch | apply_pr_review_fix_delta | apply_runtime_migration_fix_delta
   required_auto_action:
     kind: ensure_closing_keyword | update_pr_body_hygiene | update_branch | apply_pr_review_fix_delta
-  pr_number: <int>             # 対象 PR 番号（必須）
+  pr_number: <int>             # 対象 PR 番号（必須。apply_runtime_migration_fix_delta では不要）
   issue_number: <int>          # 関連 Issue 番号（任意）
   expected_head_sha: <sha>     # race guard 用 — update_branch mode では必須（なければ実行しない）
   reviewed_head_sha: <sha>     # impl-review-loop が review した時点の head SHA（任意）
@@ -103,6 +106,12 @@ IMPLEMENTATION_WORKER_REQUEST_V2:
 # max_files: <int>                   # 編集ファイル数の上限
 # max_lines_changed: <int>           # 変更行数の上限
 # commit_message_policy: "<pattern>" # 例: "fix: <ac_id> <description>"
+
+# apply_runtime_migration_fix_delta mode 追加フィールド（Issue #2810、pr_number/expected_head_sha/worktree は不要）:
+# issue_url: <live Issue URL>
+# repair_command: "bash scripts/claude-gpt/repair_proxy.sh"  # literal 完全一致の場合のみ実行
+# expected_claude_gpt_home: <root が classify_runtime_migration.py に渡した effective CLAUDE_GPT_HOME 絶対パス>
+# pre_repair_evidence_ref: <root が採取した pre-repair evidence への参照>
 ```
 
 ### action.kind → worker mode の振り分け表
@@ -116,6 +125,7 @@ IMPLEMENTATION_WORKER_REQUEST_V2:
 | `update_pr_body_hygiene` | `update_pr_body_hygiene` | `open-pr/scripts/update_pr.py` wrapper |
 | `update_branch` | `update_branch` | `UPDATE_BRANCH_REQUEST_V1` contract（`implement-issue` SKILL.md 参照） |
 | `apply_pr_review_fix_delta` | `apply_pr_review_fix_delta` | 実装 worktree での git apply / edit |
+| `apply_runtime_migration_fix_delta`（Issue #2810） | `apply_runtime_migration_fix_delta` | `fix_delta.runtime_migration_action`（`step-1-implementation.md` 参照）。`route_loop_verdict_v2()` の `selected_action` 経由ではなく、`classify_runtime_migration.py` の分類結果から root が直接合成する |
 | unknown kind | deterministic blocked | `IMPLEMENTATION_WORKER_RESULT_V2.status: blocked`（人間判断へ差し戻し） |
 
 unknown kind（上記以外）は routing が確定しないため、実行せず `status: blocked` を返す。
@@ -125,7 +135,7 @@ unknown kind（上記以外）は routing が確定しないため、実行せ�
 ```yaml
 IMPLEMENTATION_WORKER_RESULT_V2:
   status: ok | failed | blocked | permission_blocked
-  reason_code: null | expected_head_sha_missing | expected_head_sha_mismatch | primary_rate_limit | secondary_rate_limit | validation_failed | permission_denied | head_unchanged_after_accepted | unexpected_head_change | transport_error | unknown_http_status
+  reason_code: null | expected_head_sha_missing | expected_head_sha_mismatch | primary_rate_limit | secondary_rate_limit | validation_failed | permission_denied | head_unchanged_after_accepted | unexpected_head_change | transport_error | unknown_http_status | repair_failed | command_mismatch
   # reason_code は update_branch エラー時の fail-closed 分類を表す:
   #   expected_head_sha_missing:        expected_head_sha 未指定
   #   expected_head_sha_mismatch:       preflight または 422 で head SHA mismatch
@@ -137,8 +147,10 @@ IMPLEMENTATION_WORKER_RESULT_V2:
   #   unexpected_head_change:           202 Accepted 後 head は変化したが expected_head_sha / base SHA の祖先関係を検証できず fail-closed（#1429 iteration-1 P1-2）
   #   transport_error:                  HTTP status 抽出不能 / gh transport error
   #   unknown_http_status:              上記以外の HTTP status
+  #   repair_failed:                    apply_runtime_migration_fix_delta mode 限定。repair command が exit 1/2 等で失敗（Issue #2810）
+  #   command_mismatch:                 apply_runtime_migration_fix_delta mode 限定。repair_command が literal 不一致で実行を拒否（Issue #2810）
   #   null:                       エラーなし（status: ok）
-  mode: update_pr_body_hygiene | update_branch | apply_pr_review_fix_delta
+  mode: update_pr_body_hygiene | update_branch | apply_pr_review_fix_delta | apply_runtime_migration_fix_delta
   action_kind: <kind>          # REQUEST_V2.required_auto_action.kind を echo
   pr_number: <int>
   update_method: merge_only
@@ -162,6 +174,20 @@ IMPLEMENTATION_WORKER_RESULT_V2:
 # rerun_required:
 #   verification: true | false
 #   pr_review: true | false
+#   reason: <string | null>
+
+# apply_runtime_migration_fix_delta mode 追加フィールド（Issue #2810）:
+# runtime_migration:
+#   exit_code: <int>
+#   claude_gpt_repair_proxy_result_v1_status: ok | failed
+#   installed_path: <string | null>
+#   installed_version: <string | null>
+#   actual_claude_gpt_home: <string>
+#   install_log_tail: <string>
+#   sudo_required: true | false
+# rerun_required:
+#   verification: true   # 常に true（repair は runtime state を変更するため）
+#   pr_review: true
 #   reason: <string | null>
 ```
 
@@ -223,6 +249,72 @@ stale verdict（SHA mismatch）による誤更新を防ぐための race guard�
 通常実装フローと同様に worktree 内で edit / commit を行い、push まで完了させる。
 成功後は `rerun_required.verification: true` と
 `rerun_required.pr_review: true` を返す（pr-review-judge による再レビューが必要）。
+
+## apply_runtime_migration_fix_delta mode（runtime migration 修正の適用モード、Issue #2810）
+
+root（`impl-review-loop` Step 5）が `classify_runtime_migration.py` で
+`class: agent_executable_migration` と判定した場合に限り委譲される、狭い bounded repair
+executor mode。`.claude/skills/impl-review-loop/steps/step-1-implementation.md` の
+`fix_delta.runtime_migration_action` を経由して委譲されるか、`IMPLEMENTATION_WORKER_REQUEST_V2`
+（`mode: apply_runtime_migration_fix_delta`）として直接委譲される。
+
+### request フィールド
+
+- `mode`: `apply_runtime_migration_fix_delta`
+- `issue_url`: 対象 live Issue の URL
+- `repair_command`: literal `bash scripts/claude-gpt/repair_proxy.sh` と **完全一致する場合のみ実行**。
+  一致しない場合は実行せず `status: blocked` / `reason_code: command_mismatch` を返す
+- `expected_claude_gpt_home`: root が classifier に渡した effective `CLAUDE_GPT_HOME` 絶対パス
+- `pre_repair_evidence_ref`: root が採取した pre-repair evidence への参照
+
+`pr_number` / `expected_head_sha` / worktree は不要（PR 状態を対象にしない）。既存 3 mode の
+必須フィールドと挙動は変更しない。
+
+### 実行制約（repository 内 file 編集の禁止）
+
+この mode では repository 内の file 編集を一切行わない（実行前後で repository は clean の
+まま = clean postcondition。実行後に `git status --porcelain` が空であることを worker 自身が
+確認して結果に含める）。host runtime mutation（`$CLAUDE_GPT_HOME/bin` への install）は exact
+`repair_command` の実行に限り許可される唯一の例外であり、それ以外の command は実行しない。
+worker は分類を再判定しない（root の分類結果をそのまま信頼して実行するのみ）。
+
+### 実行方法
+
+worker は `repair_command` の文字列一致を確認した後、stdin/tty なしで非対話に実行する:
+
+```bash
+bash scripts/claude-gpt/repair_proxy.sh </dev/null
+```
+
+installer が `sudo` 分岐に到達した場合（install log に `sudo required` 相当の文字列がある場合）
+は sudo prompt を待たず失敗として扱い、`runtime_migration.sudo_required: true` を結果に含める
+（root がこれを `human_capability_blocker` に分類する二重防御。#2810 Outcome 1）。
+
+### tool call が拒否された場合
+
+Auto-mode の classifier / hook が `repair_command` の tool_use 自体を拒否した場合は、
+`status: permission_blocked` + `reason_code: permission_denied` を返す（`status: blocked`
+ではない）。拒否された場合は再試行・迂回しない。
+
+### result
+
+`IMPLEMENTATION_WORKER_RESULT_V2` の `runtime_migration` フィールド（`exit_code` /
+`claude_gpt_repair_proxy_result_v1_status` / `installed_path` / `installed_version` /
+`actual_claude_gpt_home` / `install_log_tail` / `sudo_required`）と
+`rerun_required.verification: true` を返す。加えて、worker の最終応答テキストに次の
+machine-readable マーカーを literal に含める（runtime smoke harness の
+`--expect-marker`/`--expect-marker-source subagent` 照合対象。#2810 AC9）:
+
+```yaml
+RUNTIME_MIGRATION_RESULT_V1:
+  status: ok | failed | blocked | permission_blocked
+  exit_code: <int>
+  installed_path: <string | null>
+  installed_version: <string | null>
+rerun_required:
+  verification: true
+  pr_review: true
+```
 
 ## Allowed Paths Compliance（AC 準拠の報告）
 
