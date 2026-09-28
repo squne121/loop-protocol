@@ -32,7 +32,7 @@ def test_body_authoring_separates_code_merge_from_runtime_migration_acceptance()
     Issues whose actual/canonical runtime AC needs local runtime state
     migration."""
     doc_text = _read(BODY_AUTHORING_PATH)
-    assert "runtime dependency migration ownership の明記規則" in doc_text
+    assert "ランタイム依存 migration の ownership 明記規則" in doc_text
     assert (
         "「repository code が merge された」ことと「target runtime が実際に\n"
         "migration/acceptance を完了した」ことは別の完了条件であり" in doc_text
@@ -79,8 +79,8 @@ def test_runtime_verification_policy_has_one_shot_migration_ownership_section():
     ownership, human intervention necessary conditions, and required
     report fields (Issue #2810)."""
     doc_text = _read(RUNTIME_VERIFICATION_POLICY_PATH)
-    assert "runtime dependency migration の one-shot ownership（Issue #2810）" in doc_text
-    assert "「code merge」と「target runtime migration/acceptance」の分離" in doc_text
+    assert "runtime 依存関係 migration の一回限りの ownership（Issue #2810）" in doc_text
+    assert "「コード統合」と「対象 runtime の migration/acceptance」の分離" in doc_text
     assert "#2772 -> #2801" in doc_text
     assert "migration ownership" in doc_text
 
