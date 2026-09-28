@@ -8,6 +8,26 @@
 - PR / diff / issue に safety 境界ワードを含む
 - issue ラベル/本文に `safety`, `permission`, `runtime verification`, ... が含まれる
 
+## Deterministic Minimum Floor（producer と reviewer が共有する最小判定基準、Issue #2808 AC4）
+
+上記の reviewer 判定は本節が定義する floor より広く、reviewer はこの floor 以外の
+semantic concern を引き続き検出してよい。一方、authoring 側の
+`.claude/skills/open-pr/scripts/validate_pr_body.py::_is_safety_sensitive()` は
+reviewer の全 semantic 判定を複製せず、両者が最低限共有すべき **deterministic
+minimum floor** だけを実装する。
+
+- 入力: `changed_paths` + PR body + （利用可能な場合の）linked Issue body の3つに限定する。
+- path 側は既存の `SAFETY_SENSITIVE_PATH_PATTERNS`（`transport|permission|sandbox|auth|mcp|.claude/skills/|.github/workflows/`）。
+- text 側は `SAFETY_SENSITIVE_TEXT_PATTERNS`（GitHub PAT prefix `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_`、
+  `personal access token`、`secret-like token`、`credential redaction`、`redaction`）という強い signal に限定し、
+  bare `token` のような naive substring では判定しない（PR #2806 の credential redaction 再発防止・
+  近傍語 `parser token` / `design token` の過検知回避、Issue #2808 AC4/AC5）。
+- この floor が sensitive と判定した場合、authoring（`open_pr.py` の create path、`update_pr.py` の
+  update path の両方）と reviewer は必ず Safety Claim Matrix を要求する。
+- floor が non-sensitive と判定しても、reviewer は上記セクション冒頭の判定基準（semantic wording 等）で
+  追加的に safety-sensitive と判断してよい。floor は authoring 側の false-pass を閉じるための下限であり、
+  reviewer の判断力の上限ではない。
+
 ## 要求
 
 - `Safety Claim Matrix` セクション必須

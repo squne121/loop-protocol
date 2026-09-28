@@ -271,6 +271,19 @@ class TestAC4UpdatePrClosesKeywordCheck:
 
 ## Notes
 {reference}
+
+## 受け入れ条件の達成状況
+- [x] AC1: 達成（fixture）
+
+## 検証コマンド結果
+```text
+$ pnpm typecheck
+pass
+```
+
+## Allowed Paths 遵守
+- 変更ファイル: fixture のみ
+- Allowed Paths 逸脱: なし
 """
 
     # changed_paths must be non-empty: an empty list makes LP058 ("changed paths could

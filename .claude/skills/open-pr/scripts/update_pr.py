@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import subprocess
 import sys
@@ -77,6 +78,24 @@ def resolve_repo() -> str:
     return match.group(1) if match else ""
 
 
+def get_linked_issue_body(repo: str, issue_number: int) -> str | None:
+    """Best-effort fetch of the linked Issue body (Issue #2808 AC4).
+
+    Mirrors `open_pr.py::get_linked_issue_body()` so the update path applies the same
+    safety-applicability minimum floor input surface (changed_paths + PR body + linked
+    Issue body) as the create path. Not shared as a module to avoid a new cross-script
+    package (matches the existing duplication pattern already used by `resolve_repo()` /
+    `run_gh()` / `resolve_changed_paths()` in this file).
+    """
+    try:
+        result = run_gh("issue", "view", str(issue_number), "--repo", repo, "--json", "body")
+        payload = json.loads(result.stdout)
+    except (subprocess.SubprocessError, OSError, json.JSONDecodeError):
+        return None
+    body = payload.get("body") if isinstance(payload, dict) else None
+    return body if isinstance(body, str) else None
+
+
 def resolve_changed_paths(provided_paths: list[str] | None = None) -> list[str] | None:
     if provided_paths is not None:
         return [path for path in provided_paths if path]
@@ -108,10 +127,13 @@ def _run_pr_body_validator(
     body_text: str,
     changed_paths: list[str] | None,
     linked_issue: int | None,
+    linked_issue_body: str | None = None,
 ) -> dict[str, object]:
     """Run validate_pr_body.py validator and return result dict.
 
     Returns dict with keys: status, schema, target, body_sha256, errors, message (if internal error).
+    `linked_issue_body` (Issue #2808 AC4) is best-effort input to the safety-applicability
+    minimum floor shared with `open_pr.py`'s create path; its absence never blocks validation.
     """
     validator_script = (
         Path(__file__).resolve().parent / "validate_pr_body.py"
@@ -124,6 +146,7 @@ def _run_pr_body_validator(
         delete=False,
     )
     changed_paths_file = None
+    linked_issue_body_file = None
     try:
         body_file.write(body_text)
         body_file.flush()
@@ -150,6 +173,18 @@ def _run_pr_body_validator(
             changed_paths_file.flush()
             changed_paths_file.close()
             cmd.extend(["--changed-paths-file", changed_paths_file.name])
+
+        if linked_issue_body:
+            linked_issue_body_file = tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".md",
+                encoding="utf-8",
+                delete=False,
+            )
+            linked_issue_body_file.write(linked_issue_body)
+            linked_issue_body_file.flush()
+            linked_issue_body_file.close()
+            cmd.extend(["--linked-issue-body-file", linked_issue_body_file.name])
 
         try:
             cp = subprocess.run(
@@ -262,6 +297,8 @@ def _run_pr_body_validator(
         Path(body_file.name).unlink(missing_ok=True)
         if changed_paths_file is not None:
             Path(changed_paths_file.name).unlink(missing_ok=True)
+        if linked_issue_body_file is not None:
+            Path(linked_issue_body_file.name).unlink(missing_ok=True)
 
 
 
@@ -386,6 +423,30 @@ def _run_japanese_content_validator(
     finally:
         Path(body_file.name).unlink(missing_ok=True)
 
+def _call_pr_body_validator(
+    validator_callable,
+    body_text: str,
+    changed_paths: list[str] | None,
+    linked_issue: int | None,
+    linked_issue_body: str | None,
+) -> dict[str, object]:
+    """Call `_run_pr_body_validator` with the Issue #2808 AC4 `linked_issue_body`
+    argument when the bound callable supports it, and fall back to the pre-#2808
+    3-argument call otherwise (mirrors `open_pr.py::_call_pr_body_validator()`).
+
+    This indirection exists solely so that pre-existing tests which monkeypatch
+    `_run_pr_body_validator` with a fixed 3-argument test double keep working
+    unchanged after AC4 added a 4th parameter to the real implementation.
+    """
+    try:
+        accepts_linked_issue_body = len(inspect.signature(validator_callable).parameters) >= 4
+    except (TypeError, ValueError):
+        accepts_linked_issue_body = False
+    if accepts_linked_issue_body:
+        return validator_callable(body_text, changed_paths, linked_issue, linked_issue_body)
+    return validator_callable(body_text, changed_paths, linked_issue)
+
+
 def update_pr(repo: str, pr_number: int, body_text: str) -> bool:
     """Update PR body using gh pr edit --body-file with validated body text.
 
@@ -447,7 +508,14 @@ def main(argv: list[str] | None = None) -> int:
     else:
         changed_paths = resolve_changed_paths(args.changed_paths)
 
-    validator_result = _run_pr_body_validator(body_text, changed_paths, args.linked_issue)
+    # Issue #2808 AC4: apply the same safety-applicability minimum floor input surface
+    # (changed_paths + PR body + linked Issue body) as open_pr.py's create path. Best-effort:
+    # a fetch failure (None) never blocks the update; it only narrows the floor's text input.
+    linked_issue_body = get_linked_issue_body(repo, args.linked_issue) if args.linked_issue else None
+
+    validator_result = _call_pr_body_validator(
+        _run_pr_body_validator, body_text, changed_paths, args.linked_issue, linked_issue_body
+    )
 
     # AC3/AC4: Fail-closed enforcement for both exit 1 (fail) and exit 2 (internal error)
     if validator_result.get("status") != "pass":

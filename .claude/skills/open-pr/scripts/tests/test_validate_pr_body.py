@@ -13,11 +13,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from validate_pr_body import validate_pr_body
+from validate_pr_body import REQUIRED_SECTIONS, validate_pr_body
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "pr_body"
 SCRIPT_PATH = Path(__file__).parent.parent / "validate_pr_body.py"
+REPO_ROOT = Path(__file__).resolve().parents[5]
+EVIDENCE_SECTIONS = ("受け入れ条件の達成状況", "検証コマンド結果", "Allowed Paths 遵守")
 
 
 def load_fixture(name: str) -> str:
@@ -425,6 +427,22 @@ safety_claims:
 ## Notes
 
 - Related issue: #330
+
+## 受け入れ条件の達成状況
+
+- [x] AC1: 達成（fixture）
+
+## 検証コマンド結果
+
+```text
+$ pnpm typecheck
+pass
+```
+
+## Allowed Paths 遵守
+
+- 変更ファイル: fixture のみ
+- Allowed Paths 逸脱: なし
 """
     result = validate_pr_body(body, [".github/workflows/ci.yml"], linked_issue=330)
     assert result.status == "pass"
@@ -531,7 +549,14 @@ def test_fenced_code_heading_guard():
         "## Safety Claim Matrix\n\n"
         "N/A\nreason: docs only\n\n"
         "## Notes\n\n"
-        "- Related issue: #330\n"
+        "- Related issue: #330\n\n"
+        "## 受け入れ条件の達成状況\n\n"
+        "- [x] AC1: 達成（fixture）\n\n"
+        "## 検証コマンド結果\n\n"
+        + fence + "text\n$ pnpm typecheck\npass\n" + fence + "\n\n"
+        "## Allowed Paths 遵守\n\n"
+        "- 変更ファイル: fixture のみ\n"
+        "- Allowed Paths 逸脱: なし\n"
     )
     result = validate_pr_body(body, load_paths("non_safety_paths.txt"), linked_issue=330)
     errors = [error for error in result.errors if error.rule_id == "LP052"]
@@ -599,6 +624,185 @@ def test_follow_up_missing_contract_when_omitted():
     errors = [error for error in result.errors if error.rule_id == "E_FOLLOW_UP_MISSING_CONTRACT"]
     assert result.status == "fail"
     assert len(errors) == 1
+
+
+def _evidence_sections_block() -> str:
+    return (
+        "## 受け入れ条件の達成状況\n\n"
+        "- [x] AC1: 達成（fixture）\n\n"
+        "## 検証コマンド結果\n\n"
+        "```text\n$ pnpm typecheck\npass\n```\n\n"
+        "## Allowed Paths 遵守\n\n"
+        "- 変更ファイル: fixture のみ\n"
+        "- Allowed Paths 逸脱: なし\n"
+    )
+
+
+def test_ac1_required_sections_include_evidence_headings():
+    for section in EVIDENCE_SECTIONS:
+        assert section in REQUIRED_SECTIONS
+
+
+def test_ac2_legacy_body_missing_evidence_sections_fails_lp052():
+    # #2806-equivalent legacy body: satisfies the old (pre-#2808) LP052 six-section
+    # inventory, but is missing the three reviewer-required evidence sections.
+    body = """## Summary
+
+- summarize_agent_transcript.py の GitHub token redaction を github_pat_ 対応にする
+
+## Checks
+
+- [ ] `pnpm typecheck`
+
+## Schema Change Applicability
+
+- decision: not_schema_change
+- reason: parser のみ変更
+
+## Schema Consumer Inventory
+
+N/A
+reason: schema を変更しない
+
+## Safety Claim Matrix
+
+N/A
+reason: docs only
+
+## Notes
+
+- Related issue: #2806
+"""
+    result = validate_pr_body(body, load_paths("non_safety_paths.txt"), linked_issue=2806)
+    lp052_messages = {error.message for error in result.errors if error.rule_id == "LP052"}
+    assert result.status == "fail"
+    for section in EVIDENCE_SECTIONS:
+        assert any(section in message for message in lp052_messages), section
+
+
+def test_ac3_body_with_evidence_sections_and_real_evidence_passes():
+    body = (
+        "## Summary\n\n"
+        "- evidence section parity fixture\n\n"
+        "## Checks\n\n"
+        "- [x] `pnpm typecheck`\n\n"
+        "## Schema Change Applicability\n\n"
+        "- decision: not_schema_change\n"
+        "- reason: parser のみ変更\n\n"
+        "## Schema Consumer Inventory\n\n"
+        "N/A\nreason: schema を変更しない\n\n"
+        "## Safety Claim Matrix\n\n"
+        "N/A\nreason: safety-sensitive path に該当しない\n\n"
+        "## Notes\n\n"
+        "- Related issue: #330\n\n"
+    ) + _evidence_sections_block()
+    result = validate_pr_body(body, load_paths("non_safety_paths.txt"), linked_issue=330)
+    assert result.status == "pass"
+    assert result.errors == []
+
+
+def test_ac4_safety_floor_credential_redaction_text_signal_triggers_lp051():
+    # PR #2806 regression: scripts/summarize_agent_transcript.py does not match any
+    # SAFETY_SENSITIVE_PATH_PATTERNS, so only the text-based floor can catch this.
+    body = (
+        "## Summary\n\n"
+        "- summarize_agent_transcript.py の GitHub token redaction を github_pat_ 対応にする\n\n"
+        "## Checks\n\n"
+        "- [x] `pnpm typecheck`\n\n"
+        "## Schema Change Applicability\n\n"
+        "- decision: not_schema_change\n"
+        "- reason: parser のみ変更\n\n"
+        "## Schema Consumer Inventory\n\n"
+        "N/A\nreason: schema を変更しない\n\n"
+        "## Safety Claim Matrix\n\n"
+        "N/A\nreason: docs only\n\n"
+        "## Notes\n\n"
+        "- Related issue: #2806\n\n"
+    ) + _evidence_sections_block()
+    result = validate_pr_body(body, ["scripts/summarize_agent_transcript.py"], linked_issue=2806)
+    errors = [error for error in result.errors if error.rule_id == "LP051"]
+    assert result.status == "fail"
+    assert len(errors) == 1
+
+
+def test_ac4_safety_floor_applies_to_linked_issue_body_text_signal():
+    # The changed path and PR body carry no strong signal on their own; only the linked
+    # Issue body (available when the caller passes it) mentions the credential context.
+    body = (
+        "## Summary\n\n"
+        "- fix transcript summarizer parser bug\n\n"
+        "## Checks\n\n"
+        "- [x] `pnpm typecheck`\n\n"
+        "## Schema Change Applicability\n\n"
+        "- decision: not_schema_change\n"
+        "- reason: parser のみ変更\n\n"
+        "## Schema Consumer Inventory\n\n"
+        "N/A\nreason: schema を変更しない\n\n"
+        "## Safety Claim Matrix\n\n"
+        "N/A\nreason: docs only\n\n"
+        "## Notes\n\n"
+        "- Related issue: #2806\n\n"
+    ) + _evidence_sections_block()
+    linked_issue_body = "この Issue は personal access token の redaction 対応を扱う。"
+    result = validate_pr_body(
+        body,
+        ["scripts/summarize_agent_transcript.py"],
+        linked_issue=2806,
+        linked_issue_body=linked_issue_body,
+    )
+    errors = [error for error in result.errors if error.rule_id == "LP051"]
+    assert result.status == "fail"
+    assert len(errors) == 1
+    # Without the linked Issue body, this exact PR body/path pair is not text-sensitive.
+    without_linked_body = validate_pr_body(
+        body, ["scripts/summarize_agent_transcript.py"], linked_issue=2806
+    )
+    assert not [error for error in without_linked_body.errors if error.rule_id == "LP051"]
+
+
+def test_ac5_near_miss_parser_and_design_token_wording_stays_non_safety_sensitive():
+    body = (
+        "## Summary\n\n"
+        "- rename the parser token type and the design token palette constant\n\n"
+        "## Checks\n\n"
+        "- [x] `pnpm typecheck`\n\n"
+        "## Schema Change Applicability\n\n"
+        "- decision: not_schema_change\n"
+        "- reason: rename only\n\n"
+        "## Schema Consumer Inventory\n\n"
+        "N/A\nreason: schema を変更しない\n\n"
+        "## Safety Claim Matrix\n\n"
+        "N/A\nreason: parser token / design token wording のみで credential を扱わない\n\n"
+        "## Notes\n\n"
+        "- Related issue: #330\n\n"
+    ) + _evidence_sections_block()
+    result = validate_pr_body(body, ["src/parser/token_lexer.ts"], linked_issue=330)
+    safety_rule_ids = {error.rule_id for error in result.errors} & {"LP051", "LP055", "LP056"}
+    assert not safety_rule_ids
+    assert result.status == "pass"
+
+
+def test_ac6_no_independent_safety_claims_v1_gate_script():
+    # Issue #144 owns SAFETY_CLAIMS_V1 schema / check_safety_claims.py; #2808 must not add
+    # a duplicate independent gate script.
+    gate_script = REPO_ROOT / ".claude" / "skills" / "pr-review-judge" / "scripts" / "check_safety_claims.py"
+    assert not gate_script.exists()
+
+
+def test_ac9_pull_request_template_projects_all_required_sections():
+    template_path = REPO_ROOT / ".github" / "pull_request_template.md"
+    text = template_path.read_text(encoding="utf-8")
+    for section in REQUIRED_SECTIONS:
+        assert f"## {section}" in text, f"template missing projected section: {section}"
+
+
+def test_ac9_ac_evidence_checks_projects_evidence_required_sections():
+    reference_path = (
+        REPO_ROOT / ".claude" / "skills" / "pr-review-judge" / "references" / "ac-evidence-checks.md"
+    )
+    text = reference_path.read_text(encoding="utf-8")
+    for section in EVIDENCE_SECTIONS:
+        assert f"## {section}" in text, f"ac-evidence-checks.md missing projected section: {section}"
 
 
 def test_follow_up_missing_contract_when_empty_list():

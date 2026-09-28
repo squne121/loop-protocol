@@ -15,6 +15,10 @@ from typing import Literal
 import yaml
 
 SCHEMA_DECISIONS = {"schema_change", "not_schema_change", "uncertain"}
+# Canonical required-section inventory (Issue #2808 AC1). `.github/pull_request_template.md`
+# and `.claude/skills/pr-review-judge/references/ac-evidence-checks.md` are materialized
+# projections of this single deterministic definition (parity is checked by focused pytest;
+# neither file runtime-imports this Python module).
 REQUIRED_SECTIONS = [
     "Summary",
     "Checks",
@@ -22,6 +26,13 @@ REQUIRED_SECTIONS = [
     "Schema Consumer Inventory",
     "Safety Claim Matrix",
     "Notes",
+    # Reviewer-required evidence sections (Issue #2808 AC1 / AC2 / AC3):
+    # pr-review-judge already requires these three via
+    # `.claude/skills/pr-review-judge/references/ac-evidence-checks.md`. Adding them here
+    # closes the authoring/validator split-brain where LP052 previously did not enforce them.
+    "受け入れ条件の達成状況",
+    "検証コマンド結果",
+    "Allowed Paths 遵守",
 ]
 SAFETY_SENSITIVE_PATH_PATTERNS = [
     "transport",
@@ -31,6 +42,20 @@ SAFETY_SENSITIVE_PATH_PATTERNS = [
     "mcp",
     ".claude/skills/",
     ".github/workflows/",
+]
+# Deterministic minimum safety-applicability floor (Issue #2808 AC4). These are strong,
+# low-false-positive text signals (as opposed to a bare `token` substring, which also matches
+# unrelated near-miss wording like "parser token" / "design token" — see AC5). Matching any of
+# these against PR body + (when available) linked Issue body means the PR is safety-sensitive
+# even when none of SAFETY_SENSITIVE_PATH_PATTERNS matched the changed paths (the #2806 failure
+# class: `scripts/summarize_agent_transcript.py` does not match any path pattern above).
+SAFETY_SENSITIVE_TEXT_PATTERNS = [
+    re.compile(r"gh[pousr]_[A-Za-z0-9]*"),  # classic GitHub PAT prefixes: ghp_/gho_/ghu_/ghs_/ghr_
+    re.compile(r"github_pat_"),  # fine-grained GitHub PAT prefix
+    re.compile(r"(?i)personal access token"),
+    re.compile(r"(?i)secret-?like token"),
+    re.compile(r"(?i)credential redaction"),
+    re.compile(r"(?i)\bredaction\b"),
 ]
 SAFETY_COLUMNS = ["Claim", "Implemented?", "Not controlled", "Evidence", "Follow-up"]
 INVENTORY_COLUMNS = ["Consumer ファイル", "更新有無", "備考"]
@@ -123,8 +148,28 @@ def _load_changed_paths(changed_paths_file: str | None) -> list[str] | None:
     return [path.strip() for path in paths if path.strip()]
 
 
-def _is_safety_sensitive(changed_paths: list[str]) -> bool:
+def _is_path_safety_sensitive(changed_paths: list[str]) -> bool:
     return any(pattern in path for path in changed_paths for pattern in SAFETY_SENSITIVE_PATH_PATTERNS)
+
+
+def _is_text_safety_sensitive(texts: list[str]) -> bool:
+    combined = "\n".join(text for text in texts if text)
+    if not combined:
+        return False
+    return any(pattern.search(combined) for pattern in SAFETY_SENSITIVE_TEXT_PATTERNS)
+
+
+def _is_safety_sensitive(changed_paths: list[str] | None, texts: list[str]) -> bool:
+    """Deterministic minimum safety-applicability floor (Issue #2808 AC4).
+
+    Input surface is limited to changed_paths + texts (PR body +, when available, linked
+    Issue body). `open_pr.py` (create path) and `update_pr.py` (update path) both apply this
+    same floor. Reviewer (`pr-review-judge`) may additionally detect safety concerns outside
+    this floor; this function is not a replacement for that broader semantic judgment.
+    """
+    if changed_paths is not None and _is_path_safety_sensitive(changed_paths):
+        return True
+    return _is_text_safety_sensitive(texts)
 
 
 def _extract_notes_related_issue(notes_content: str) -> str | None:
@@ -306,9 +351,9 @@ def _validate_lp050(
 def _validate_lp051(
     body: str,
     sections: dict[str, tuple[str, int, int]],
-    changed_paths: list[str] | None
+    is_safety_sensitive: bool
 ) -> list[ValidationError]:
-    if changed_paths is None or not _is_safety_sensitive(changed_paths):
+    if not is_safety_sensitive:
         return []
     info = sections.get("Safety Claim Matrix")
     if not info:
@@ -621,16 +666,20 @@ def validate_pr_body(
     changed_paths: list[str] | None,
     linked_issue: int | None = None,
     schema_decision_override: str | None = None,
+    linked_issue_body: str | None = None,
 ) -> ValidationResult:
     body_sha256 = f"sha256:{hashlib.sha256(body.encode('utf-8')).hexdigest()}"
     sections, duplicates = _extract_sections(body)
-    is_safety_sensitive = changed_paths is not None and _is_safety_sensitive(changed_paths)
+    texts = [body]
+    if linked_issue_body:
+        texts.append(linked_issue_body)
+    is_safety_sensitive = _is_safety_sensitive(changed_paths, texts)
     errors: list[ValidationError] = []
     errors.extend(_validate_lp052(body, sections))
     errors.extend(_validate_lp054(body, duplicates))
     errors.extend(_validate_lp053(body, sections))
     errors.extend(_validate_lp050(body, sections, schema_decision_override))
-    errors.extend(_validate_lp051(body, sections, changed_paths))
+    errors.extend(_validate_lp051(body, sections, is_safety_sensitive))
     errors.extend(_validate_lp055(body, sections, is_safety_sensitive))
     errors.extend(_validate_lp056(body, sections, is_safety_sensitive))
     errors.extend(_validate_safety_claims_v1_yaml_contract(body, sections))
@@ -648,6 +697,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--body-file", required=True, type=str)
     parser.add_argument("--changed-paths-file", type=str, default="")
     parser.add_argument("--linked-issue", required=True, type=int)
+    parser.add_argument(
+        "--linked-issue-body-file",
+        type=str,
+        default="",
+        help="linked Issue body file（利用可能な場合のみ。safety-applicability minimum floor の入力）",
+    )
     args = parser.parse_args(argv)
     try:
         body = Path(args.body_file).read_text(encoding="utf-8")
@@ -659,7 +714,14 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as exc:
         print(f"ERROR: Cannot read changed-paths file: {exc}", file=sys.stderr)
         return 2
-    result = validate_pr_body(body, changed_paths, args.linked_issue)
+    linked_issue_body = None
+    if args.linked_issue_body_file:
+        try:
+            linked_issue_body = Path(args.linked_issue_body_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"ERROR: Cannot read linked-issue-body file: {exc}", file=sys.stderr)
+            return 2
+    result = validate_pr_body(body, changed_paths, args.linked_issue, linked_issue_body=linked_issue_body)
     print(json.dumps(
         {
             "schema": result.schema,

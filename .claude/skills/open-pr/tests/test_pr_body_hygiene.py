@@ -115,6 +115,9 @@ def test_generate_pr_body_emits_required_headings():
     headings = [line for line in body.splitlines() if line.startswith("## ")]
     assert headings == [
         "## Summary",
+        "## 受け入れ条件の達成状況",
+        "## 検証コマンド結果",
+        "## Allowed Paths 遵守",
         "## Checks",
         "## Schema Change Applicability",
         "## Schema Consumer Inventory",
