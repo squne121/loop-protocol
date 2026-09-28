@@ -166,7 +166,7 @@ fixture semantics AC の PASS は canonical runtime acceptance AC の代替に�
 
 fixture proxy の path/version のみを記載した evidence は、canonical runtime acceptance AC の充足として **明示的に不十分** である。catalog / proxy-selection AC は fake `CLAUDE_GPT_PROXY_BIN` override なしの current-head production `scripts/claude-gpt/launch.sh --check-only` を canonical acceptance の最低限とし、authenticated request / transport の意味論自体を AC が要求する場合に限り `scripts/claude-gpt/runtime_smoke_test.sh` の full smoke を追加要求する。full smoke の認証不足 SKIP は catalog-only AC を failure 扱いしないが、authenticated request / transport AC 自体を PASS にはしない。canonical runtime evidence の取得には、新しい harness を作らず既存の `scripts/claude-gpt/launch.sh --check-only` / `scripts/claude-gpt/runtime_smoke_test.sh` のような current-head production 実行資産を参照する。
 
-### runtime dependency migration ownership の明記規則（Issue #2810）
+### ランタイム依存 migration の ownership 明記規則（Issue #2810）
 
 AC が actual/canonical runtime acceptance を要求し、その受け入れが **local runtime
 state migration**（対象 runtime host 上の dependency/proxy/binary 等の repair・
