@@ -345,3 +345,310 @@ def test_bare_severity_heading_does_not_produce_explicit_directive_confidence():
     assert items == ["please fix this"]
     confidence = delta.classify_directive_confidence(text)
     assert confidence == delta.DIRECTIVE_CONFIDENCE_INFERRED
+
+
+# ---------------------------------------------------------------------------
+# Issue #2812: `_BULLET_LINE_RE` / `extract_directive_items()` Markdown
+# ORDERED-list marker (`1. `, `2. `, `1)`, `2)`) detection gap. Regression
+# parent: #2778 (research) -- Issue #2730 (CF_HTML clipboard-paste
+# `<ol><li>`) and Issue #2805 (native Markdown ordered list) both reproduce
+# the same underlying gap: `_BULLET_LINE_RE` only ever matched unordered
+# `-`/`*` bullets, so a structured `human_review_directive` expressed as an
+# ordered list was misclassified as `ambiguous` and never reached
+# `issue_editor_required`.
+# ---------------------------------------------------------------------------
+
+
+# AC1 ------------------------------------------------------------------------
+
+
+def test_bullet_line_re_still_matches_unordered_dash_and_asterisk_markers():
+    """GIVEN unordered bullet lines (the pre-existing `-`/`*` behavior)
+    WHEN `_BULLET_LINE_RE` scans them
+    THEN both marker styles still match (no regression from the ordered-
+    list extension)."""
+    assert delta._BULLET_LINE_RE.search("- unordered dash item") is not None
+    assert delta._BULLET_LINE_RE.search("* unordered asterisk item") is not None
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["1. first ordered item", "2. second ordered item", "1) paren-style ordered item"],
+)
+def test_bullet_line_re_matches_new_ordered_list_markers(line):
+    """AC1: GIVEN a Markdown ORDERED-list marker line (`1. `, `2. `, or the
+    `1)` paren-style variant)
+    WHEN `_BULLET_LINE_RE` scans it
+    THEN it now matches -- the ordered-list detection gap (#2778/#2805) is
+    closed."""
+    assert delta._BULLET_LINE_RE.search(line) is not None
+
+
+def test_bullet_line_re_does_not_match_non_list_prose_or_version_strings():
+    """AC1 boundary: plain prose and a dotted version string (no marker +
+    space at the line start) must not spuriously match the extended
+    pattern."""
+    assert delta._BULLET_LINE_RE.search("Not a bullet at all.") is None
+    assert delta._BULLET_LINE_RE.search("Released version 1.2.3 today.") is None
+
+
+# ---------------------------------------------------------------------------
+# PR #2814 OWNER REQUEST_CHANGES fix_delta (findings A/B/C): line-local
+# marker whitespace (never absorbing the next line's prose into a
+# marker-only match) and ASCII-only/max-9-digit ordered-marker grammar,
+# shared between the detector (`_BULLET_LINE_RE`) and the extractor
+# (`_ORDERED_LIST_ITEM_PREFIX_RE` inside `extract_directive_items()`).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "label,line",
+    [
+        ("ten_digit_marker", "1234567890. Please update X"),
+        ("arabic_indic_digit_marker", "١. Please update X"),
+        ("full_width_digit_marker", "１. Please update X"),
+    ],
+)
+def test_bullet_line_re_rejects_non_gfm_ordered_markers(label, line):
+    """Finding B: a 10+ digit run, an Arabic-Indic digit, or a full-width
+    digit must never be accepted as a GFM ordered-list marker -- only
+    ASCII `[0-9]{1,9}` followed by `.`/`)` is a valid marker."""
+    assert delta._BULLET_LINE_RE.search(line) is None, label
+
+
+def test_bullet_line_re_still_accepts_nine_digit_ordered_marker():
+    """Finding B boundary: the maximum valid GFM ordered-marker digit
+    count (9 digits) still matches."""
+    assert delta._BULLET_LINE_RE.search("123456789. Please update X") is not None
+
+
+def test_bullet_line_re_does_not_absorb_next_line_prose_into_marker_only_line():
+    """Finding A: a marker-only line (`1.` with no content on the SAME
+    line) must never match by consuming the newline and absorbing the
+    NEXT line's prose into a single span -- the marker's surrounding
+    whitespace is line-local (`[ \\t]`), never bare `\\s` (which also
+    matches `\\n`)."""
+    text = "## Revised Acceptance Criteria\n1.\nPlease update X\n"
+    assert delta._BULLET_LINE_RE.search(text) is None
+
+
+def test_bullet_line_re_does_not_absorb_next_line_prose_when_marker_has_trailing_whitespace():
+    """Finding A variant: a marker line followed only by trailing
+    whitespace (e.g. `1.    `) before the next line's prose must also
+    never be absorbed into a single cross-line match."""
+    text = "## Revised Acceptance Criteria\n1.    \nPlease update X\n"
+    assert delta._BULLET_LINE_RE.search(text) is None
+
+
+# AC2 ------------------------------------------------------------------------
+
+
+def test_extract_directive_items_extracts_ordered_list_content_symmetrically_with_unordered():
+    """AC2: GIVEN a body mixing unordered (`-`/`*`) and ordered (`1. `,
+    `2. `) list lines
+    WHEN `extract_directive_items()` runs
+    THEN every line's content is extracted, in document order, regardless
+    of marker style -- ordered-list extraction is symmetric with the
+    pre-existing unordered extraction."""
+    text = (
+        "- unordered dash content\n"
+        "* unordered asterisk content\n"
+        "1. first ordered content\n"
+        "2. second ordered content\n"
+    )
+    items = delta.extract_directive_items(text)
+    assert items == [
+        "unordered dash content",
+        "unordered asterisk content",
+        "first ordered content",
+        "second ordered content",
+    ]
+
+
+def test_extract_directive_items_ordered_marker_alone_matches_unordered_stripping_behavior():
+    """AC2: an ordered-list line with only marker + whitespace (no content)
+    yields no item -- symmetric with the existing unordered `"- "` / `"* "`
+    behavior (an empty-content bullet line is never appended)."""
+    text = "1.    \n-    \n2. real content\n"
+    assert delta.extract_directive_items(text) == ["real content"]
+
+
+# ---------------------------------------------------------------------------
+# PR #2814 OWNER REQUEST_CHANGES fix_delta (finding C): marker-only-line
+# regression fixed at the extractor level -- `extract_directive_items()`
+# must never fabricate an item from a marker-only line, and its verdict
+# (empty list) must stay consistent with `_BULLET_LINE_RE.search()`
+# returning no match on the same input (no detector/extractor semantic
+# split).
+# ---------------------------------------------------------------------------
+
+
+def test_extract_directive_items_marker_only_line_yields_no_item_and_stays_consistent_with_detector():
+    """Finding C: a bare `1.` marker-only line followed by prose on the
+    NEXT line yields zero items from `extract_directive_items()` (each
+    input line is processed independently after `splitlines()`, so no
+    item is ever fabricated from just `"1."`), and this stays consistent
+    with `_BULLET_LINE_RE.search()` also finding no match on the SAME
+    raw text -- detector and extractor never disagree."""
+    text = "## Revised Acceptance Criteria\n1.\nPlease update X\n"
+    assert delta.extract_directive_items(text) == []
+    assert delta._BULLET_LINE_RE.search(text) is None
+
+
+def test_extract_directive_items_marker_with_trailing_whitespace_only_yields_no_item():
+    """Finding C variant: a marker line followed only by trailing
+    whitespace (`"1.    "`) before the next line's prose also yields zero
+    items, staying consistent with the detector."""
+    text = "## Revised Acceptance Criteria\n1.    \nPlease update X\n"
+    assert delta.extract_directive_items(text) == []
+    assert delta._BULLET_LINE_RE.search(text) is None
+
+
+# AC3: positive representation matrix -----------------------------------
+
+
+_CF_HTML_ORDERED_DIRECTIVE = (
+    "<html>\n<body>\n<!--StartFragment-->\n<ol>\n"
+    "<li>Extend the ordered list marker detection for structured "
+    "directives.</li>\n</ol>\n<!--EndFragment-->\n</body>\n</html>"
+    "## Revised Acceptance Criteria\n\n"
+    "1. Extend the ordered list marker detection for structured "
+    "directives.\n"
+)
+_CF_HTML_UNORDERED_DIRECTIVE = (
+    "<html>\n<body>\n<!--StartFragment-->\n<ul>\n"
+    "<li>Add retry handling to the sync worker for transient network "
+    "failures.</li>\n</ul>\n<!--EndFragment-->\n</body>\n</html>"
+    "## Revised Acceptance Criteria\n\n"
+    "- Add retry handling to the sync worker for transient network "
+    "failures.\n"
+)
+
+
+@pytest.mark.parametrize(
+    "label,text",
+    [
+        (
+            "markdown_unordered_dash",
+            "## Revised Acceptance Criteria\n\n"
+            "- Please extend the ordered list marker detection.\n",
+        ),
+        (
+            "markdown_unordered_asterisk",
+            "## Revised Acceptance Criteria\n\n"
+            "* Please extend the ordered list marker detection.\n",
+        ),
+        (
+            "markdown_native_ordered",
+            "## Revised Acceptance Criteria\n\n"
+            "1. Please extend the ordered list marker detection.\n"
+            "2. Please also add regression tests for the new markers.\n",
+        ),
+        ("cf_html_ordered_paste", _CF_HTML_ORDERED_DIRECTIVE),
+        ("cf_html_unordered_paste", _CF_HTML_UNORDERED_DIRECTIVE),
+    ],
+)
+def test_positive_representation_matrix_yields_explicit_directive_confidence(label, text):
+    """AC3: GIVEN each representative directive shape -- Markdown unordered
+    `- `/`* `, native Markdown ordered `1. `/`2. `, and (via existing
+    envelope canonicalization) CF_HTML clipboard-paste `<ol><li>`/`<ul><li>`
+    -- accompanied by a genuine directive section marker
+    WHEN `classify_directive_confidence()` runs
+    THEN every representation yields `directive.confidence: explicit`
+    (#2730/#2805 regression fixtures)."""
+    confidence = delta.classify_directive_confidence(text)
+    assert confidence == delta.DIRECTIVE_CONFIDENCE_EXPLICIT, label
+
+
+# AC4: negative controls ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "label,text,operator_asserted_human_context",
+    [
+        (
+            "plain_observation_list_no_marker_verb",
+            "1. The button color is blue.\n2. The header font size is 14px.\n",
+            True,
+        ),
+        (
+            "failure_log_ordered_list",
+            "1. Traceback (most recent call last):\n"
+            "2. ValueError: invalid literal for int() with base 10.\n",
+            True,
+        ),
+        (
+            "todo_status_report_ordered_list",
+            "1. TODO: revisit this later.\n2. Status: pending review.\n",
+            True,
+        ),
+        (
+            "mixed_list_no_imperative_directive_content",
+            "- Observed a timeout after 30 seconds.\n1. Retry count is 3.\n",
+            True,
+        ),
+        (
+            "non_with_human_context_lane_comment",
+            "1. Please fix the ordered list detection gap.\n"
+            "2. Please add regression tests.\n",
+            False,
+        ),
+    ],
+)
+def test_negative_controls_never_misclassify_as_explicit(
+    label, text, operator_asserted_human_context
+):
+    """AC4: GIVEN a plain observation list, a failure log, a TODO/status
+    report, an ordered/unordered list carrying no imperative directive
+    content, and a genuine-looking directive on a NON-`with_human_context`
+    lane (no known directive-section marker present in any case)
+    WHEN `classify_directive_confidence()` runs
+    THEN none of them are misclassified as `explicit` -- the existing
+    `_has_semantic_directive_bullet()` imperative-verb/negation safeguard is
+    not weakened by the new ordered-list detection."""
+    confidence = delta.classify_directive_confidence(
+        text, operator_asserted_human_context=operator_asserted_human_context
+    )
+    assert confidence != delta.DIRECTIVE_CONFIDENCE_EXPLICIT, label
+
+
+# ---------------------------------------------------------------------------
+# PR #2814 OWNER REQUEST_CHANGES fix_delta (finding C, classifier level):
+# a marker-only line must never, by itself, be able to promote
+# `classify_directive_confidence()` to `explicit` -- the failure class is
+# fixed all the way up from the regex (`_BULLET_LINE_RE`) through the
+# extractor (`extract_directive_items()`) to the classifier, not merely
+# as an isolated regex unit test.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "label,text",
+    [
+        (
+            "marker_only_line_no_trailing_whitespace",
+            "## Revised Acceptance Criteria\n1.\nPlease update X\n",
+        ),
+        (
+            "marker_only_line_trailing_whitespace_only",
+            "## Revised Acceptance Criteria\n1.    \nPlease update X\n",
+        ),
+    ],
+)
+def test_classify_directive_confidence_marker_only_line_does_not_promote_to_explicit(
+    label, text
+):
+    """Finding C (classifier level): GIVEN a genuine directive section
+    marker heading (so `extract_directive_markers()` is non-empty) followed
+    by a marker-only ordered-list line (`1.` or `1.    `) and the directive
+    prose only on the NEXT line
+    WHEN `classify_directive_confidence()` runs
+    THEN it must NOT be promoted to `explicit` on the strength of that
+    marker-only line alone -- `has_bullets` and `extract_directive_items()`
+    must agree that there is no structured bullet-list content here, so
+    the result falls back to `ambiguous` (marker present, no structured
+    list)."""
+    assert delta.extract_directive_items(text) == [], label
+    assert delta._BULLET_LINE_RE.search(text) is None, label
+    confidence = delta.classify_directive_confidence(text)
+    assert confidence == delta.DIRECTIVE_CONFIDENCE_AMBIGUOUS, label
