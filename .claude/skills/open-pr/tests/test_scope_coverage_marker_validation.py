@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -171,3 +172,51 @@ def test_marker_absent_live_dependency_failure_still_signals_unavailable(monkeyp
     monkeypatch.setattr(open_pr, "resolve_head_sha", lambda: "c" * 40)
 
     assert open_pr.append_implementation_scope_coverage("## Summary\n\n本文\n", repo=REPO, linked_issue=ISSUE) is None
+
+
+def _validate_after_append(result: str):
+    """Real create path: `append_implementation_scope_coverage()` output goes to the validator."""
+    name = "validate_pr_body_marker_create_path"
+    spec = importlib.util.spec_from_file_location(name, ROOT / ".claude/skills/open-pr/scripts/validate_pr_body.py")
+    assert spec and spec.loader
+    validator = importlib.util.module_from_spec(spec)
+    sys.modules[name] = validator  # dataclasses need the module registered
+    try:
+        spec.loader.exec_module(validator)
+        return validator._validate_lp059(result, ISSUE)
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_quoted_key_and_unparsable_fence_fail_closed_on_create_path(monkeypatch):
+    """Issue #2811 P1: quoted-key invalid / unparsable fence are neither repaired nor regenerated,
+    and the validator (LP059) that runs next fails closed."""
+    open_pr = _load(OPEN_PR, "open_pr_marker_create_path")
+    evidence = _load(EVIDENCE, "evidence_marker_create_path")
+    quoted = _malformed_marker_body().replace(
+        "IMPLEMENTATION_SCOPE_COVERAGE_V1:", "'IMPLEMENTATION_SCOPE_COVERAGE_V1':", 1
+    )
+    assert "IMPLEMENTATION_SCOPE_COVERAGE_V1:" not in quoted
+    unparsable = (
+        "## Summary\n\n本文の説明です。\n\n```yaml\nIMPLEMENTATION_SCOPE_COVERAGE_V1:\n  schema_version: [\n```\n"
+    )
+    _forbid_live_dependencies(monkeypatch, open_pr)
+
+    expected_error = {
+        "quoted": None,  # any non-missing reject class
+        "unparsable": "scope_coverage_marker_ambiguous_or_invalid",
+    }
+    for label, body in (("quoted", quoted), ("unparsable", unparsable)):
+        _, errors = evidence._parse_marker(body, issue_number=ISSUE)
+        assert errors and errors != ["scope_coverage_marker_missing"], (label, errors)
+        if expected_error[label]:
+            assert errors == [expected_error[label]]
+
+        # Producer path: body unchanged (no valid marker appended behind the malformed fence, no live call).
+        result = open_pr.append_implementation_scope_coverage(body, repo=REPO, linked_issue=ISSUE)
+        assert result == body, label
+
+        # Validator: LP059 fails closed on the exact output of the producer path.
+        lp059 = _validate_after_append(result)
+        assert len(lp059) == 1, label
+        assert lp059[0].rule_id == "LP059"

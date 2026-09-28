@@ -118,3 +118,18 @@ def test_malformed_marker_blocks_gh_pr_edit(tmp_path, monkeypatch, capsys):
     assert gh_calls == []
     assert "ERROR=E_VALIDATION_FAILED" in out
     assert "LP059" in out
+
+
+def test_quoted_key_and_unparsable_marker_block_gh_pr_edit(tmp_path, monkeypatch, capsys):
+    """Issue #2811 P1: quoted-key invalid marker and unparsable marker fence are stopped before `gh pr edit`."""
+    quoted = _malformed_block().replace("IMPLEMENTATION_SCOPE_COVERAGE_V1:", "'IMPLEMENTATION_SCOPE_COVERAGE_V1':", 1)
+    assert "IMPLEMENTATION_SCOPE_COVERAGE_V1:" not in quoted
+    unparsable = "```yaml\nIMPLEMENTATION_SCOPE_COVERAGE_V1:\n  schema_version: [\n```\n"
+    for block in (quoted, unparsable):
+        exit_code, edit_calls, gh_calls = _run_main(tmp_path, monkeypatch, VALID_BODY + "\n" + block)
+        out = capsys.readouterr().out
+        assert exit_code == 1
+        assert edit_calls == []
+        assert gh_calls == []
+        assert "ERROR=E_VALIDATION_FAILED" in out
+        assert "LP059" in out

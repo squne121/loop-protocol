@@ -140,3 +140,65 @@ def test_token_without_parseable_marker_fence_is_treated_as_absent():
     result = validate_pr_body(body, CHANGED_PATHS, linked_issue=ISSUE)
     assert result.status == "pass", result.errors
     assert _lp059(result) == []
+
+
+def _quoted_key_block(quote: str) -> str:
+    """Invalid marker whose mapping key is a quoted scalar: raw `TOKEN:` substring is absent."""
+    return _malformed_block().replace(
+        "IMPLEMENTATION_SCOPE_COVERAGE_V1:", f"{quote}IMPLEMENTATION_SCOPE_COVERAGE_V1{quote}:", 1
+    )
+
+
+UNPARSABLE_FENCE = "```yaml\nIMPLEMENTATION_SCOPE_COVERAGE_V1:\n  schema_version: [\n```\n"
+
+
+def test_lp059_quoted_key_and_unparsable_fence_fail_closed():
+    """Issue #2811 P1: LP059 must not use a raw substring as authority ahead of the canonical parser."""
+    evidence = _load_evidence()
+
+    # Quoted mapping keys are semantically the marker key (YAML presentation != semantics).
+    for quote in ("'", '"'):
+        block = _quoted_key_block(quote)
+        assert "IMPLEMENTATION_SCOPE_COVERAGE_V1:" not in block  # raw-token prefilter would skip it
+        _, parse_errors = evidence._parse_marker(block, issue_number=ISSUE)
+        assert parse_errors != ["scope_coverage_marker_missing"]
+        result = validate_pr_body(BASE_BODY + "\n" + block, CHANGED_PATHS, linked_issue=ISSUE)
+        assert result.status == "fail", quote
+        errors = _lp059(result)
+        assert len(errors) == 1, quote
+        assert "scope_coverage_schema_version_invalid" in errors[0].message
+
+    # A fence that names the schema but is not parseable YAML is malformed, not "absent".
+    result = validate_pr_body(BASE_BODY + "\n" + UNPARSABLE_FENCE, CHANGED_PATHS, linked_issue=ISSUE)
+    assert result.status == "fail"
+    errors = _lp059(result)
+    assert len(errors) == 1
+    assert "scope_coverage_marker_ambiguous_or_invalid" in errors[0].message
+
+    # A valid marker plus an unparsable marker candidate must not silently pass.
+    marker = evidence.build_scope_coverage_marker(issue_number=ISSUE, issue_body=_issue_body(), pr_head_sha="a" * 40)
+    valid_block = evidence.render_scope_coverage_marker(marker)
+    mixed = validate_pr_body(
+        BASE_BODY + "\n" + valid_block + "\n\n" + UNPARSABLE_FENCE, CHANGED_PATHS, linked_issue=ISSUE
+    )
+    assert mixed.status == "fail"
+    assert len(_lp059(mixed)) == 1
+
+    # Controls: valid marker / genuinely absent / prose-only token / quoted-key valid marker => no LP059.
+    valid = validate_pr_body(BASE_BODY + "\n" + valid_block + "\n", CHANGED_PATHS, linked_issue=ISSUE)
+    assert _lp059(valid) == []
+    quoted_valid = validate_pr_body(
+        BASE_BODY
+        + "\n"
+        + valid_block.replace("IMPLEMENTATION_SCOPE_COVERAGE_V1:\n", "'IMPLEMENTATION_SCOPE_COVERAGE_V1':\n", 1)
+        + "\n",
+        CHANGED_PATHS,
+        linked_issue=ISSUE,
+    )
+    assert _lp059(quoted_valid) == []
+    absent = validate_pr_body(BASE_BODY, CHANGED_PATHS, linked_issue=ISSUE)
+    assert _lp059(absent) == []
+    prose = validate_pr_body(
+        BASE_BODY + "\nIMPLEMENTATION_SCOPE_COVERAGE_V1 は生成済みです。\n", CHANGED_PATHS, linked_issue=ISSUE
+    )
+    assert _lp059(prose) == []

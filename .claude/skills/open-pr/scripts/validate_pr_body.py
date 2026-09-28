@@ -661,9 +661,6 @@ def _validate_lp058(body: str, changed_paths: list[str] | None) -> list[Validati
     )]
 
 
-SCOPE_COVERAGE_MARKER_TOKEN = "IMPLEMENTATION_SCOPE_COVERAGE_V1:"
-
-
 def _load_implementation_scope_evidence_module():
     """Load the canonical marker parser without creating a shared package (Issue #2811).
 
@@ -684,17 +681,17 @@ def _load_implementation_scope_evidence_module():
 def _validate_lp059(body: str, linked_issue: int | None) -> list[ValidationError]:
     """Validate-if-present check for the IMPLEMENTATION_SCOPE_COVERAGE_V1 marker (Issue #2811).
 
-    - marker token absent: allowed (unchanged behavior).
+    The canonical parser is always the authority; no raw-substring prefilter runs ahead of
+    it (a quoted mapping key such as `'IMPLEMENTATION_SCOPE_COVERAGE_V1':` has no raw
+    `TOKEN:` substring yet is the marker key after YAML parsing).
+
+    - canonical parser reports `scope_coverage_marker_missing` (genuinely absent): allowed.
     - marker present + canonical parser valid: allowed.
-    - marker present + canonical parser invalid: fail-closed. This single pre-write choke
-      point is shared by `open_pr.py` (create) and `update_pr.py` (update), so a malformed
-      marker can never reach `gh pr create` / `gh pr edit`.
-    A token that appears without any parseable marker fence
-    (`scope_coverage_marker_missing`) is treated as marker-absent, matching
-    `open_pr.py::append_implementation_scope_coverage()`.
+    - anything else (invalid marker, ambiguous marker, unparsable marker fence): fail-closed.
+      This single pre-write choke point is shared by `open_pr.py` (create) and
+      `update_pr.py` (update), so a malformed marker can never reach `gh pr create` /
+      `gh pr edit`.
     """
-    if SCOPE_COVERAGE_MARKER_TOKEN not in body:
-        return []
     try:
         module = _load_implementation_scope_evidence_module()
         if module is None:
