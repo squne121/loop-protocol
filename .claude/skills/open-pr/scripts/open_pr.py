@@ -263,10 +263,35 @@ def resolve_head_sha() -> str | None:
 
 
 def append_implementation_scope_coverage(body: str, *, repo: str, linked_issue: int) -> str | None:
-    """Embed the immutable publication-time marker before validation/create."""
+    """Embed the immutable publication-time marker before validation/create.
+
+    Issue #2811: idempotency is decided by the canonical parser
+    (`implementation_landed_evidence.py::_parse_marker()`), not by a bare
+    substring check, and it is decided BEFORE any live dependency
+    (`get_linked_issue_body()` / `resolve_head_sha()` /
+    `build_scope_coverage_marker()` / `render_scope_coverage_marker()`).
+
+    - marker present + canonical-parser valid: body is returned unchanged.
+    - marker present + canonical-parser invalid (any reject class other than
+      `scope_coverage_marker_missing`): body is ALSO returned unchanged. This
+      function never regenerates / repairs a malformed marker and raises no
+      exception / error code. Fail-closed rejection is delegated to
+      `validate_pr_body.py`'s validate-if-present check (LP059), which both
+      `open_pr.py::_validate_pr_body()` (create) and
+      `update_pr.py::_run_pr_body_validator()` (update) always run next.
+    - marker absent (`scope_coverage_marker_missing`, i.e. no parseable
+      marker fence): the existing producer path below materializes one.
+    """
+    module = _load_implementation_scope_evidence_module()
+    if module is not None:
+        existing_marker, parse_errors = module._parse_marker(body, issue_number=linked_issue)
+        if existing_marker is not None:
+            return body
+        if parse_errors != ["scope_coverage_marker_missing"]:
+            return body
+
     issue_body = get_linked_issue_body(repo, linked_issue)
     head_sha = resolve_head_sha()
-    module = _load_implementation_scope_evidence_module()
     if issue_body is None or head_sha is None or module is None:
         return None
     try:
@@ -276,10 +301,6 @@ def append_implementation_scope_coverage(body: str, *, repo: str, linked_issue: 
         block = module.render_scope_coverage_marker(marker)
     except (AttributeError, TypeError, ValueError):
         return None
-    # The wrapper is idempotent: a retry must never create two historical
-    # snapshots for the same publication transaction.
-    if "IMPLEMENTATION_SCOPE_COVERAGE_V1:" in body:
-        return body
     return body.rstrip() + "\n\n" + block + "\n"
 
 
