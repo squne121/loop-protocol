@@ -258,6 +258,34 @@ def test_ac1_consumer_reaches_issue_editor_required_for_freeform_explicit_direct
 # #2805 regression (native Markdown ordered list detection gap in
 # `_BULLET_LINE_RE` / `extract_directive_items()` /
 # `classify_directive_confidence()`, fixed in scope_signal_delta.py).
+#
+# PR #2814 OWNER REQUEST_CHANGES fix_delta (finding D): investigated
+# whether this fixture (deliberately carrying NO known
+# `_DIRECTIVE_SECTION_MARKERS` heading) actually exercises the real #2805
+# production failure/fix route, or a different branch
+# (`operator_asserted_human_context` + `_has_semantic_directive_bullet()`).
+# Confirmed empirically (by adding a `## Revised Acceptance Criteria`
+# heading here and observing the consumer's actual behavior) that a
+# marker-present route can NEVER reach `issue_editor_required` for this
+# assertion: `_decide_human_review_directive_editor_route()` requires
+# `operations_empty=True` (see the dedicated
+# `safe_patch_representation_exists` negative case in
+# `test_ac3_ac4_any_single_failing_predicate_never_routes_to_issue_editor_
+# required` above), and `derive_contract_patch_operations()` in
+# `scope_signal_delta.py` ALWAYS derives at least one operation once
+# `directive_markers` is non-empty and at least one directive item was
+# extracted (its `else` branch falls back to the `"revised acceptance
+# criteria"` section default even for an unmapped marker) -- so an
+# explicit, marker-present, non-empty-directive comment always has a safe
+# section-bound patch representation and is routed to the ORDINARY
+# `contract_update_required` patch lane instead, never to
+# `issue_editor_required`. The no-marker freeform lane below (explicit via
+# `operator_asserted_human_context` + `_has_semantic_directive_bullet()`,
+# where `derive_contract_patch_operations()` short-circuits to `[]`
+# whenever `directive_markers` is empty) is therefore the ONLY
+# production-reachable route to `issue_editor_required` with
+# `writes == 0` -- this fixture already correctly exercises it. Per this
+# fix delta's own no-op escape hatch, the fixture body is left unchanged.
 # ---------------------------------------------------------------------------
 
 _ORDERED_LIST_ANCHOR_BODY = (

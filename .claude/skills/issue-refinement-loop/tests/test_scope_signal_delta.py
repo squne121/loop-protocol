@@ -392,6 +392,54 @@ def test_bullet_line_re_does_not_match_non_list_prose_or_version_strings():
     assert delta._BULLET_LINE_RE.search("Released version 1.2.3 today.") is None
 
 
+# ---------------------------------------------------------------------------
+# PR #2814 OWNER REQUEST_CHANGES fix_delta (findings A/B/C): line-local
+# marker whitespace (never absorbing the next line's prose into a
+# marker-only match) and ASCII-only/max-9-digit ordered-marker grammar,
+# shared between the detector (`_BULLET_LINE_RE`) and the extractor
+# (`_ORDERED_LIST_ITEM_PREFIX_RE` inside `extract_directive_items()`).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "label,line",
+    [
+        ("ten_digit_marker", "1234567890. Please update X"),
+        ("arabic_indic_digit_marker", "١. Please update X"),
+        ("full_width_digit_marker", "１. Please update X"),
+    ],
+)
+def test_bullet_line_re_rejects_non_gfm_ordered_markers(label, line):
+    """Finding B: a 10+ digit run, an Arabic-Indic digit, or a full-width
+    digit must never be accepted as a GFM ordered-list marker -- only
+    ASCII `[0-9]{1,9}` followed by `.`/`)` is a valid marker."""
+    assert delta._BULLET_LINE_RE.search(line) is None, label
+
+
+def test_bullet_line_re_still_accepts_nine_digit_ordered_marker():
+    """Finding B boundary: the maximum valid GFM ordered-marker digit
+    count (9 digits) still matches."""
+    assert delta._BULLET_LINE_RE.search("123456789. Please update X") is not None
+
+
+def test_bullet_line_re_does_not_absorb_next_line_prose_into_marker_only_line():
+    """Finding A: a marker-only line (`1.` with no content on the SAME
+    line) must never match by consuming the newline and absorbing the
+    NEXT line's prose into a single span -- the marker's surrounding
+    whitespace is line-local (`[ \\t]`), never bare `\\s` (which also
+    matches `\\n`)."""
+    text = "## Revised Acceptance Criteria\n1.\nPlease update X\n"
+    assert delta._BULLET_LINE_RE.search(text) is None
+
+
+def test_bullet_line_re_does_not_absorb_next_line_prose_when_marker_has_trailing_whitespace():
+    """Finding A variant: a marker line followed only by trailing
+    whitespace (e.g. `1.    `) before the next line's prose must also
+    never be absorbed into a single cross-line match."""
+    text = "## Revised Acceptance Criteria\n1.    \nPlease update X\n"
+    assert delta._BULLET_LINE_RE.search(text) is None
+
+
 # AC2 ------------------------------------------------------------------------
 
 
@@ -423,6 +471,37 @@ def test_extract_directive_items_ordered_marker_alone_matches_unordered_strippin
     behavior (an empty-content bullet line is never appended)."""
     text = "1.    \n-    \n2. real content\n"
     assert delta.extract_directive_items(text) == ["real content"]
+
+
+# ---------------------------------------------------------------------------
+# PR #2814 OWNER REQUEST_CHANGES fix_delta (finding C): marker-only-line
+# regression fixed at the extractor level -- `extract_directive_items()`
+# must never fabricate an item from a marker-only line, and its verdict
+# (empty list) must stay consistent with `_BULLET_LINE_RE.search()`
+# returning no match on the same input (no detector/extractor semantic
+# split).
+# ---------------------------------------------------------------------------
+
+
+def test_extract_directive_items_marker_only_line_yields_no_item_and_stays_consistent_with_detector():
+    """Finding C: a bare `1.` marker-only line followed by prose on the
+    NEXT line yields zero items from `extract_directive_items()` (each
+    input line is processed independently after `splitlines()`, so no
+    item is ever fabricated from just `"1."`), and this stays consistent
+    with `_BULLET_LINE_RE.search()` also finding no match on the SAME
+    raw text -- detector and extractor never disagree."""
+    text = "## Revised Acceptance Criteria\n1.\nPlease update X\n"
+    assert delta.extract_directive_items(text) == []
+    assert delta._BULLET_LINE_RE.search(text) is None
+
+
+def test_extract_directive_items_marker_with_trailing_whitespace_only_yields_no_item():
+    """Finding C variant: a marker line followed only by trailing
+    whitespace (`"1.    "`) before the next line's prose also yields zero
+    items, staying consistent with the detector."""
+    text = "## Revised Acceptance Criteria\n1.    \nPlease update X\n"
+    assert delta.extract_directive_items(text) == []
+    assert delta._BULLET_LINE_RE.search(text) is None
 
 
 # AC3: positive representation matrix -----------------------------------
@@ -531,3 +610,45 @@ def test_negative_controls_never_misclassify_as_explicit(
         text, operator_asserted_human_context=operator_asserted_human_context
     )
     assert confidence != delta.DIRECTIVE_CONFIDENCE_EXPLICIT, label
+
+
+# ---------------------------------------------------------------------------
+# PR #2814 OWNER REQUEST_CHANGES fix_delta (finding C, classifier level):
+# a marker-only line must never, by itself, be able to promote
+# `classify_directive_confidence()` to `explicit` -- the failure class is
+# fixed all the way up from the regex (`_BULLET_LINE_RE`) through the
+# extractor (`extract_directive_items()`) to the classifier, not merely
+# as an isolated regex unit test.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "label,text",
+    [
+        (
+            "marker_only_line_no_trailing_whitespace",
+            "## Revised Acceptance Criteria\n1.\nPlease update X\n",
+        ),
+        (
+            "marker_only_line_trailing_whitespace_only",
+            "## Revised Acceptance Criteria\n1.    \nPlease update X\n",
+        ),
+    ],
+)
+def test_classify_directive_confidence_marker_only_line_does_not_promote_to_explicit(
+    label, text
+):
+    """Finding C (classifier level): GIVEN a genuine directive section
+    marker heading (so `extract_directive_markers()` is non-empty) followed
+    by a marker-only ordered-list line (`1.` or `1.    `) and the directive
+    prose only on the NEXT line
+    WHEN `classify_directive_confidence()` runs
+    THEN it must NOT be promoted to `explicit` on the strength of that
+    marker-only line alone -- `has_bullets` and `extract_directive_items()`
+    must agree that there is no structured bullet-list content here, so
+    the result falls back to `ambiguous` (marker present, no structured
+    list)."""
+    assert delta.extract_directive_items(text) == [], label
+    assert delta._BULLET_LINE_RE.search(text) is None, label
+    confidence = delta.classify_directive_confidence(text)
+    assert confidence == delta.DIRECTIVE_CONFIDENCE_AMBIGUOUS, label

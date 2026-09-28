@@ -805,21 +805,56 @@ _DIRECTIVE_SECTION_MARKERS = (
 
 # #2812 fix_delta: originally only matched unordered `-`/`*` bullet
 # markers. Extended to ALSO match Markdown ordered-list markers (`1. `,
-# `2. `, `1)`, `2)` etc. -- `\d+[.)]`) so a structured
-# `human_review_directive` expressed as a native Markdown ordered list
-# (Issue #2805 repro) or a CF_HTML clipboard-paste `<ol><li>` rendition
-# (Issue #2730 repro, canonicalized to plain ordered-list Markdown by
-# `_canonicalize_cf_html_envelope()` before this pattern ever sees it) is
-# detected the same way an unordered bullet already was. This is a minimal
+# `2. `, `1)`, `2)` etc.) so a structured `human_review_directive`
+# expressed as a native Markdown ordered list (Issue #2805 repro) is
+# detected the same way an unordered bullet already was.
+#
+# A CF_HTML clipboard-paste `<ol><li>` envelope (Issue #2730 repro) is
+# handled too -- but NOT by this pattern parsing or converting the raw
+# `<ol><li>` HTML into Markdown. `_canonicalize_cf_html_envelope()`
+# never touches the HTML fragment's content at all: it only locates the
+# envelope boundary (StartFragment/EndFragment) and SELECTS the trailing
+# duplicated Markdown-only rendition that the SAME clipboard payload
+# already carries after that boundary (see that function's docstring).
+# This pattern only ever sees that already-Markdown trailing text, the
+# same as any other native Markdown ordered list. This is a minimal
 # regex extension only -- no general Markdown/HTML parser is introduced
 # (#2778 research parent, out-of-scope raw HTML tag detection).
-_BULLET_LINE_RE = re.compile(r"^\s*(?:[-*]|\d+[.)])\s+\S.*$", re.MULTILINE)
+#
+# #2814 fix_delta (OWNER REQUEST_CHANGES finding A/B): the marker's
+# surrounding whitespace is deliberately LINE-LOCAL (`[ \t]`, never bare
+# `\s`, which also matches `\n`) so a marker-only line (e.g. a lone
+# `1.` with the directive prose on the FOLLOWING line) can never absorb
+# that next line's prose into the same match by consuming the newline
+# between them -- that previously let `has_bullets` become `True` while
+# `extract_directive_items()` (which processes one already-`splitlines()`
+# line at a time and therefore never saw that merged span) still
+# extracted zero items from the same input, a detector/extractor
+# semantic split that could feed a false `explicit` classification in
+# `classify_directive_confidence()`. The ordered-marker digit class is
+# `_ORDERED_MARKER_RE_FRAGMENT` (ASCII `[0-9]` only, max 9 digits) --
+# shared with `_ORDERED_LIST_ITEM_PREFIX_RE` below so the detector and
+# the extractor can never drift onto different marker grammars again.
+_ORDERED_MARKER_RE_FRAGMENT = r"[0-9]{1,9}[.)]"
+_BULLET_LINE_RE = re.compile(
+    r"^[ \t]*(?:[-*]|" + _ORDERED_MARKER_RE_FRAGMENT + r")[ \t]+\S.*$",
+    re.MULTILINE,
+)
 
 # #2812 fix_delta: matches the ordered-list marker prefix of a single
 # (already `.strip()`-ped) line, e.g. "1. " / "2) " -- used by
 # `extract_directive_items()` to extract content symmetrically with the
 # existing unordered `"- "` / `"* "` prefix check below.
-_ORDERED_LIST_ITEM_PREFIX_RE = re.compile(r"^\d+[.)]\s+")
+#
+# #2814 fix_delta (finding B): shares `_ORDERED_MARKER_RE_FRAGMENT` with
+# `_BULLET_LINE_RE` above (ASCII digits only, max 9 -- GFM ordered-list
+# marker grammar) instead of a separately-maintained `\d+[.)]`, so a
+# 10+ digit run, an Arabic-Indic digit (e.g. `١.`), or a full-width
+# digit (e.g. `１.`) is never accepted as an ordered-list marker by
+# either the detector or the extractor.
+_ORDERED_LIST_ITEM_PREFIX_RE = re.compile(
+    r"^" + _ORDERED_MARKER_RE_FRAGMENT + r"[ \t]+"
+)
 
 # #2086 AC1 P1 fix_delta: a bullet line's mere PRESENCE is not itself
 # evidence of a scope-expansion directive (an observation note, a TODO
