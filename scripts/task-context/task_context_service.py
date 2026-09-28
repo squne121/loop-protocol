@@ -553,6 +553,58 @@ def start_execution_run(
     return get_execution_run(conn, run_id)
 
 
+def record_subagent_start(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str | None = None,
+    activity_id: str | None = None,
+    claude_session_id: str | None = None,
+    agent_id: str | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """Idempotent ``SubagentStart`` bookkeeping (Issue #2822 AC4 refire
+    contract). Returns ``(run, created)``.
+
+    Claude Code fires ``SubagentStart`` not only when an Agent is launched but
+    also on subagent resume and whenever an in-process teammate processes a
+    new message, so the same ``(session, agent_id)`` can be reported again
+    while its run is still open:
+
+    - ``agent_id`` given and an *open* ``run_kind='subagent'`` row already
+      carries it -> no-op, return the existing row (``created=False``). No
+      ``IntegrityError`` from ``ux_execution_runs_open_subagent_agent_id``.
+    - ``agent_id`` given and only *ended* rows carry it -> ``ended_at`` is
+      never touched (no re-open); a new run row is inserted.
+    - no ``agent_id`` -> always a new row (unchanged legacy behavior; a
+      SubAgent that supplies no identity cannot be deduplicated).
+
+    ``claude_session_id`` is stored on the row as the *parent/caller* session
+    (hook common ``session_id``), never as an operator session -- see
+    ``docs/dev/task-context.md`` and the reader-side protection in
+    ``task_context_workflow_signals._classify_origin_candidates``.
+
+    Check + insert share one ``BEGIN IMMEDIATE`` transaction, so two
+    concurrent refires cannot both pass the open-row check."""
+    with db.write_transaction(conn):
+        if agent_id is not None:
+            existing = conn.execute(
+                "SELECT id FROM execution_runs "
+                "WHERE run_kind = 'subagent' AND agent_id = ? AND ended_at IS NULL "
+                "ORDER BY started_at DESC LIMIT 1",
+                (agent_id,),
+            ).fetchone()
+            if existing is not None:
+                return get_execution_run(conn, existing["id"]), False
+        run_id = _start_execution_run_tx(
+            conn,
+            run_kind="subagent",
+            task_id=task_id,
+            activity_id=activity_id,
+            claude_session_id=claude_session_id,
+            agent_id=agent_id,
+        )
+    return get_execution_run(conn, run_id), True
+
+
 def _set_execution_run_session_tx(conn: sqlite3.Connection, run_id: str, claude_session_id: str) -> None:
     """Transaction-internal counterpart of ``set_execution_run_session`` (PR
     #2731 review fix_delta Finding 3 follow-up factoring -- see
@@ -1013,6 +1065,46 @@ def find_open_execution_runs(
     sql = "SELECT * FROM execution_runs WHERE " + " AND ".join(conditions) + " ORDER BY started_at DESC"
     rows = db.execute_readonly(conn, sql, tuple(params)).fetchall()
     return [dict(r) for r in rows]
+
+
+def find_addressable_subagent_runs(
+    conn: sqlite3.Connection,
+    *,
+    claude_session_id: str | None,
+    agent_id: str,
+) -> list[dict[str, Any]]:
+    """The single addressability lookup for ``SendMessage`` (Issue #2822).
+
+    Returns ``run_kind='subagent'`` rows for ``agent_id`` that the *caller*
+    session may address, most-recently started first:
+
+    - rows bound to the caller's own ``claude_session_id``, **ended or not**
+      -- Claude Code resumes a completed / stopped SubAgent when it is sent a
+      message, so an ended ExecutionRun does not make an agent unaddressable;
+    - legacy rows with ``claude_session_id IS NULL`` (written before session
+      binding existed) only while still **open** -- i.e. exactly the previous
+      ``find_open_execution_runs(agent_id=...)`` behavior; they never grant
+      name or ended-row addressability.
+
+    A row bound to a *different* session is never returned. When the caller
+    session is unknown (``None`` / empty) only the legacy open rows can match.
+    Several rows for one ``agent_id`` (refire history) are one addressable
+    identity, not a collision -- callers only test for non-emptiness."""
+    if not agent_id:
+        return []
+    legacy = "(claude_session_id IS NULL AND ended_at IS NULL)"
+    if claude_session_id:
+        where = f"(claude_session_id = ? OR {legacy})"
+        params: tuple[Any, ...] = (agent_id, claude_session_id)
+    else:
+        where = legacy
+        params = (agent_id,)
+    sql = (
+        "SELECT * FROM execution_runs WHERE run_kind = 'subagent' AND agent_id = ? AND "
+        + where
+        + " ORDER BY started_at DESC"
+    )
+    return [dict(r) for r in db.execute_readonly(conn, sql, params).fetchall()]
 
 
 def get_current_task_activity_for_binding(

@@ -233,6 +233,78 @@ live ref-claim を取得し、競合した場合 loser は
 `task_context_service.claim_task_ref` の `{"status": "conflict",
 "winning_task_id": ...}` 経由で winning Task を readback する。
 
+### `execution_runs.claude_session_id` の二義性と origin resolver の保護（Issue #2822）
+
+`execution_runs.claude_session_id` は row の種類によって意味が異なる。
+
+| row の種類 | `claude_session_id` の意味 | `binding_id` |
+|---|---|---|
+| managed operator row（`native_operator` / `claude_gpt`） | その operator 自身の Claude session | あり |
+| hook 由来 subagent row（`SubagentStart` adapter が書く `run_kind='subagent'`） | その SubAgent を所有する **親 / caller session**（hook 共通入力の `session_id`） | **なし（NULL）** |
+
+hook 由来 subagent row に親 session を持たせる目的は、`SendMessage` の宛先が
+「caller session から Claude Code が現在 addressable と確認できる SubAgent」か
+どうかを判定するためだけである。新しい列・DDL は追加しない（既存の nullable
+列を再利用する）。
+
+managed-origin resolution（`task_context_workflow_signals._resolve_origin_tx`
+と `diagnose_origin`、および両者が共有する `_classify_origin_candidates`）は、
+**hook 由来 subagent row（`run_kind='subagent' AND binding_id IS NULL`）を
+origin candidate として無視する**。`claude_session_id` の一致だけを origin の
+根拠にしない。SQL に `run_kind IN managed` の単純 filter を足すことも
+`agent_id IS NOT NULL` を判別子にすることもしない（binding を持つ
+subagent row は従来どおり `origin_run_kind_mismatch` を返す既存契約
+#2719 / #2790 を保つため）。これにより次の既存挙動が維持される。
+
+- ended な operator row と同 session の open な hook subagent row が共存しても
+  `origin_run_ended` のまま。
+- valid な managed origin row と hook subagent row が共存しても解決結果は
+  変わらず、ambiguity / kind mismatch にならない。
+- hook subagent row しか持たない session は `origin_run_not_found` のままで、
+  `workflow:origin_resolution_failed` event を書かない（非 mutating）。
+
+## `SendMessage` の宛先が addressable かどうかの判定規則（Issue #2822）
+
+`PreToolUse:SendMessage` guard は、Claude Code が受理する宛先だけを
+`in_session_subagent` として PASS する。何が addressable かの権威は Claude
+Code 側にあり、Task Context は hook から観測できる identity だけを参照する
+（独自の peer registry / message bus / daemon は作らない）。
+
+| `to` の種類 | 判定 | 根拠 |
+|---|---|---|
+| agent ID（caller session で記録済みの subagent） | PASS | `find_addressable_subagent_runs` が同一 caller session の row を `ended_at` 不問で検索する。完了済み SubAgent も resume できるため、`ended_at` を unaddressable の根拠にしない |
+| session 未束縛の legacy row（`claude_session_id IS NULL`） | open のときだけ agent_id 一致で PASS | 従来の `find_open_execution_runs(agent_id=...)` と同じ互換。name 経由・ended 経由は不可 |
+| Agent Teams teammate の name | 条件成立時のみ PASS | 下記「teammate name」参照 |
+| 通常 named SubAgent の name | ASK | Agent tool の `tool_input` に `name` が無く `SubagentStart` も `name` を渡さないため、hook から name と agent ID の対応を観測できない（AC1 canary で確認） |
+| `agent_type` のみ一致 | ASK | `agent_type` は addressable name ではない |
+| 別 caller session の同名 / 同 agent ID | ASK | session 束縛済み row は所有 session からのみ addressable |
+| known cross-Task independent session | ASK | 既存契約を維持 |
+| known same-Task independent session | PASS | 既存契約を維持 |
+
+- 宛先 lookup は `task_context_service.find_addressable_subagent_runs` の
+  1 関数だけで、ended row を含める。`find_open_execution_runs` は変更しない。
+- 同じ agent ID の履歴が複数 row あっても 1 つの addressable identity として
+  扱い collision と見なさない。collision は異なる identity の競合だけである。
+- **teammate name**: Claude Code が所有する team config
+  `<config-root>/teams/session-<session id 先頭 8 文字>/config.json` の
+  `members[].name` を read-only・fail-closed で参照する
+  （`task_context_team_config.py`）。experimental flag
+  `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` が有効、config が読める、schema が
+  期待どおり（`members[]` が list で各要素に非空の `name`）、caller session の
+  team dir と照合できる、`members[]` 内で name が一意、の全てを満たす場合だけ
+  PASS。それ以外（flag 無効・dir 無し・parse 不能・schema 不一致・別 session・
+  removed・重複 name・独立 session 名との衝突）は ASK。config root は
+  `CLAUDE_CONFIG_DIR`（Claude-GPT の isolated root を含む）を優先し、未設定時
+  のみ Native 既定を使う。テスト用に `LOOP_TASK_CONTEXT_TEAMS_DIR` で上書き
+  できる。team config は手編集せず、書き込みも行わない。
+- **`SubagentStart` の再発火**（resume / teammate の新 message 処理でも
+  発火する）は `record_subagent_start` が冪等に扱う。同一 agent ID の open row
+  があれば no-op で既存 row を返し（`ux_execution_runs_open_subagent_agent_id`
+  の `IntegrityError` を起こさない）、ended row しか無ければ `ended_at` を
+  変更せず新 row を insert し、agent ID が無ければ従来どおり毎回新 row を作る。
+- 保存するのは address resolution に必要な `claude_session_id` / `agent_id`
+  のみで、message body・transcript・terminal 内容は保存しない。
+
 ## Logical FK / 論理的な関連整合性（fix_delta finding 7 対応）
 
 AC1 の unique/partial-unique 制約に加え、以下の relational integrity も

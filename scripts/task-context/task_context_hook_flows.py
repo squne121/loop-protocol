@@ -50,6 +50,7 @@ import task_context_errors as errors  # noqa: E402
 import task_context_service as service  # noqa: E402
 import task_context_session_registry as session_registry  # noqa: E402
 import task_context_target_kind as target_kind  # noqa: E402
+import task_context_team_config as team_config  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # small shared helpers
@@ -857,9 +858,26 @@ def on_subagent_start(conn, payload: dict[str, Any]) -> dict[str, Any]:
     claude_session_id = payload.get("claude_session_id")
     agent_id = payload.get("agent_id") or None
     task_id, activity_id = _parent_task_activity_for_session(conn, claude_session_id)
-    run = service.start_execution_run(
-        conn, run_kind="subagent", task_id=task_id, activity_id=activity_id, agent_id=agent_id
+    # Issue #2822: `claude_session_id` on a hook-origin subagent row is the
+    # *parent/caller* session (the hook's common `session_id`), used only to
+    # scope SendMessage addressability. `binding_id` stays NULL, which is what
+    # keeps managed-origin resolution from ever treating this row as an
+    # operator origin (see `task_context_workflow_signals`).
+    run, created = service.record_subagent_start(
+        conn,
+        task_id=task_id,
+        activity_id=activity_id,
+        claude_session_id=claude_session_id,
+        agent_id=agent_id,
     )
+    if not created:
+        # Resume / teammate-new-message refire of an already-open run: no-op.
+        return {
+            "decision": "pass",
+            "reason_code": "subagent_start_refire_noop",
+            "execution_run_id": run["id"],
+            "agent_id": agent_id,
+        }
     _record(
         conn,
         event_type="hook:SubagentStart",
@@ -1029,14 +1047,35 @@ def _on_pre_tool_use_send_message(conn, payload: dict[str, Any]) -> dict[str, An
     peer_session_found = False
     peer_task_id: str | None = None
     if to:
-        # `to` matching an *open* SubAgent ExecutionRun's own `agent_id`
-        # (already tracked via SubagentStart, Issue #2564) covers both an
-        # in-session SubAgent and an Agent Teams teammate represented the
-        # same way -- never a new peer registry, just the existing
-        # ExecutionRun bookkeeping.
-        if service.find_open_execution_runs(conn, run_kind="subagent", agent_id=to):
+        caller_session_id = payload.get("claude_session_id")
+        # Issue #2822 addressability decision table (Claude Code, not Task
+        # Context, owns what is addressable; this only mirrors the
+        # identities Claude Code exposes to hooks):
+        #   (a) `to` is the agent_id of a SubAgent recorded for *this caller
+        #       session* (ended or not -- a completed SubAgent can be resumed
+        #       by SendMessage; legacy session-less rows only while open) ->
+        #       in-session SubAgent.
+        #   (b) `to` is the name of a teammate in this session's Claude-owned
+        #       team config `members[]` (experimental flag on, schema ok,
+        #       read-only, fail-closed) -> in-session teammate, unless the
+        #       same name also resolves to an independent session (identity
+        #       collision -> falls to unknown/ASK).
+        #   (c) anything else -> independent-session resolution below. A
+        #       named ordinary SubAgent's `name` is NOT observable from hooks
+        #       (Issue #2822 AC1 canary: Agent tool_input has no `name`, and
+        #       SubagentStart carries only agent_id/agent_type), and
+        #       `agent_type` is never an authority, so those stay ASK.
+        registry_session_id = session_registry.resolve_session_name_to_claude_session_id(to)
+        teammate_addressable = False
+        if service.find_addressable_subagent_runs(
+            conn, claude_session_id=caller_session_id, agent_id=to
+        ):
             is_in_session_subagent = True
         else:
+            teammate_addressable, _teammate_reason = team_config.resolve_teammate_by_name(to, caller_session_id)
+            if teammate_addressable and registry_session_id is None:
+                is_in_session_subagent = True
+        if not is_in_session_subagent and not teammate_addressable:
             peer_binding = None
             # Name-based resolution against Claude Code's own on-disk
             # session registry (read-only; see docstring above and
@@ -1045,7 +1084,7 @@ def _on_pre_tool_use_send_message(conn, payload: dict[str, Any]) -> dict[str, An
             # `sessionId` up as a Binding -- an unresolved name (no match,
             # or a collision) falls through to the legacy direct fallback
             # below rather than being guessed at.
-            resolved_session_id = session_registry.resolve_session_name_to_claude_session_id(to)
+            resolved_session_id = registry_session_id
             if resolved_session_id:
                 try:
                     peer_binding = service.get_binding_by_current_session(conn, resolved_session_id)
