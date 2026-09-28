@@ -53,15 +53,16 @@ from route_loop_verdict_v2 import route_loop_verdict_v2  # noqa: E402
 # Fake `gh` executable harness (AC1 / AC2 Runtime Verification Applicability)
 # ---------------------------------------------------------------------------
 
-_FAKE_GH_SCRIPT = '''#!/usr/bin/env python3
+_FAKE_GH_SCRIPT = r'''#!/usr/bin/env python3
 import json
 import os
+import re
 import sys
 
 log_path = os.environ.get("FAKE_GH_LOG")
 if log_path:
     with open(log_path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(sys.argv[1:]) + "\\n")
+        fh.write(json.dumps(sys.argv[1:]) + "\n")
 
 args = sys.argv[1:]
 
@@ -87,13 +88,38 @@ if len(args) >= 2 and args[0] == "issue" and args[1] == "view":
 elif len(args) >= 2 and args[0] == "api" and args[1] == "graphql":
     # #2815: target PR closing relation observation (0 closing issues =>
     # NO_LINK), so open_pr never starts the real Task Context `signal apply`.
-    pr_number = 0
-    for idx, arg in enumerate(args):
-        if arg == "-F" and idx + 1 < len(args) and args[idx + 1].startswith("number="):
-            pr_number = int(args[idx + 1][len("number="):])
+    # 汎用 GraphQL evaluator ではない。critical binding
+    # (repository(owner:$owner,name:$name) / pullRequest(number:$number)) が
+    # 成立する query にだけ、-F 変数値から identity を返す。
+    fields = {}
+    for idx, arg in enumerate(args[:-1]):
+        if arg in ("-f", "-F", "--field", "--raw-field"):
+            key, _, value = args[idx + 1].partition("=")
+            fields[key] = value
+    query = fields.get("query", "")
+
+    def _arg_map(field):
+        bodies = re.findall(r"\b" + field + r"\s*\(([^()]*)\)", query)
+        if len(bodies) != 1:
+            return None
+        return dict(re.findall(r'([A-Za-z_]\w*)\s*:\s*(\$?\w+|"[^"]*")', bodies[0]))
+
+    bound = (
+        _arg_map("repository") == {"owner": "$owner", "name": "$name"}
+        and _arg_map("pullRequest") == {"number": "$number"}
+        and fields.get("owner")
+        and fields.get("name")
+        and fields.get("number", "").isdigit()
+    )
+    if not bound:
+        sys.stderr.write(
+            "fake gh: graphql query does not bind repository(owner:$owner,name:$name) "
+            "and pullRequest(number:$number) to -F variables\n"
+        )
+        sys.exit(1)
     _out(json.dumps({"data": {"repository": {
-        "nameWithOwner": "example/repo",
-        "pullRequest": {"number": pr_number, "closingIssuesReferences": {"nodes": []}},
+        "nameWithOwner": fields["owner"] + "/" + fields["name"],
+        "pullRequest": {"number": int(fields["number"]), "closingIssuesReferences": {"nodes": []}},
     }}}))
 elif len(args) >= 1 and args[0] == "api":
     target = args[1] if len(args) > 1 else ""
@@ -102,7 +128,7 @@ elif len(args) >= 1 and args[0] == "api":
 elif len(args) >= 2 and args[0] == "pr" and args[1] == "list":
     _out("[]")
 elif len(args) >= 2 and args[0] == "pr" and args[1] == "create":
-    _out("https://github.com/example/repo/pull/999\\n")
+    _out("https://github.com/example/repo/pull/999\n")
 else:
     _out("{}")
 
@@ -230,52 +256,174 @@ _ALLOWED_RELATION_QUERY_IDENTIFIERS = frozenset(
     }
 )
 
+_GH_FIELD_FLAGS = ("-f", "-F", "--field", "--raw-field")
+_GQL_ARGUMENT_RE = re.compile(r'([A-Za-z_]\w*)\s*:\s*(\$?\w+|"[^"]*")')
+_GQL_OPERATION_HEADER_RE = re.compile(r"^\s*query\b(?:\s+[A-Za-z_]\w*)?\s*(?:\([^()]*\))?")
 
-def _balanced_brace_body(text: str, marker: str) -> str:
-    """`marker` の直後の `{` から対応する `}` までの内側を返す。"""
-    idx = text.index(marker) + len(marker) - 1
-    assert text[idx] == "{"
+
+def _balanced_brace_body(text: str, open_brace_index: int) -> str:
+    """`open_brace_index` の `{` から対応する `}` までの内側を返す。"""
+    assert text[open_brace_index] == "{"
     depth = 0
-    for pos in range(idx, len(text)):
+    for pos in range(open_brace_index, len(text)):
         if text[pos] == "{":
             depth += 1
         elif text[pos] == "}":
             depth -= 1
             if depth == 0:
-                return text[idx + 1 : pos]
-    raise AssertionError(f"unbalanced braces after {marker!r}: {text}")
+                return text[open_brace_index + 1 : pos]
+    raise AssertionError(f"unbalanced braces from index {open_brace_index}: {text}")
 
 
-def _assert_bounded_target_pr_relation_call(call: list[str], *, expected_pr_number: str) -> None:
+def _gh_field_arguments(call: list[str]) -> dict[str, list[tuple[str, str]]]:
+    """`-f/-F key=value` を `{key: [(flag, value), ...]}` に分解する。"""
+    fields: dict[str, list[tuple[str, str]]] = {}
+    for idx, arg in enumerate(call[:-1]):
+        if arg in _GH_FIELD_FLAGS:
+            key, _, value = call[idx + 1].partition("=")
+            fields.setdefault(key, []).append((arg, value))
+    return fields
+
+
+def _graphql_field_arguments(query: str, field: str) -> dict[str, str]:
+    """`field(...)` の引数本文を `{name: value}` に分解する（整形・引数順は問わない）。
+
+    `field(` は query 内でちょうど 1 回だけ現れ、引数本文は `name: value` の並び
+    （重複なし・解釈不能な残余なし）でなければならない。"""
+    bodies = re.findall(rf"\b{field}\s*\(([^()]*)\)", query)
+    assert len(bodies) == 1, f"exactly one {field}(...) call expected: {query}"
+    body = bodies[0]
+    leftover = _GQL_ARGUMENT_RE.sub("", body)
+    assert not leftover.strip(" ,\t\r\n"), f"unparseable {field}(...) argument text {leftover!r}: {query}"
+    pairs = _GQL_ARGUMENT_RE.findall(body)
+    names = [name for name, _ in pairs]
+    assert len(set(names)) == len(names), f"duplicate {field}(...) argument: {body}"
+    return dict(pairs)
+
+
+def _assert_bounded_target_pr_relation_call(
+    call: list[str],
+    *,
+    expected_pr_number: str,
+    expected_owner: str = "example",
+    expected_name: str = "repo",
+) -> None:
     """present lane の GraphQL 呼び出しが target PR 起点の bounded observation
-    であり、peer Issue inventory / search / readback を含まないことを検証する。"""
-    query_args = [arg for arg in call if arg.startswith("query=")]
-    assert len(query_args) == 1, f"exactly one query= argument expected: {call}"
-    query = query_args[0][len("query="):]
+    であり、peer Issue inventory / search / readback を含まないことを検証する。
+
+    証明する意味（整形・引数順・named operation は固定しない）:
+    - `repository(owner: $owner, name: $name)` と `pullRequest(number: $number)` に
+      変数が束縛され、その変数へ canonical repository / actual PR number が `-F` で渡る
+      （owner/name の入れ替えや repository・PR 番号の hardcode は拒否）
+    - `closingIssuesReferences` は `first: 2` の bounded observation
+    - relation nodes の取得 field は Issue `number` と `repository{nameWithOwner}` のみ"""
+    fields = _gh_field_arguments(call)
+    assert len(fields.get("query", [])) == 1, f"exactly one query= argument expected: {call}"
+    query_flag, query = fields["query"][0]
+    assert query_flag in ("-f", "--raw-field", "-F", "--field"), call
     joined = " ".join(call).lower()
 
     for token in _FORBIDDEN_PEER_TOKENS:
         assert token not in joined, f"forbidden peer-inventory token {token!r} in graphql call: {call}"
 
-    # canonical target repository / actual target PR number
-    assert "owner=example" in call and "name=repo" in call, f"canonical repo variables expected: {call}"
-    assert f"number={expected_pr_number}" in call, f"actual target PR number expected: {call}"
-    for flag_value in ("owner=example", "name=repo", f"number={expected_pr_number}"):
-        assert call[call.index(flag_value) - 1] == "-F", f"{flag_value} must be passed with -F: {call}"
+    # canonical target repository / actual target PR number は -F 変数として渡す
+    expected_variables = {"owner": expected_owner, "name": expected_name, "number": expected_pr_number}
+    for variable, expected_value in expected_variables.items():
+        assert fields.get(variable) == [("-F", expected_value)], (
+            f"variable {variable}={expected_value} must be passed exactly once with -F: {call}"
+        )
 
-    # target PR 起点 + bounded closing relation observation
-    assert query.count("pullRequest(number:") == 1, f"single pullRequest(number:) root expected: {query}"
-    assert query.count("closingIssuesReferences(first:2") == 1, f"bounded first:2 expected: {query}"
+    # critical binding edge: 変数が実際に引数位置で使われていること
+    assert _graphql_field_arguments(query, "repository") == {"owner": "$owner", "name": "$name"}, (
+        f"repository(owner:$owner,name:$name) binding expected: {query}"
+    )
+    assert _graphql_field_arguments(query, "pullRequest") == {"number": "$number"}, (
+        f"pullRequest(number:$number) binding expected: {query}"
+    )
+    header = _GQL_OPERATION_HEADER_RE.match(query)
+    assert header is not None, f"query operation expected: {query}"
+    for variable in expected_variables:
+        assert re.search(rf"\${variable}\s*:", header.group(0)), f"${variable} must be declared: {query}"
+
+    # bounded closing relation observation（first: 2 のみ。cursor / last 等は不可）
+    relation_args = _graphql_field_arguments(query, "closingIssuesReferences")
+    assert relation_args.get("first") == "2", f"bounded first:2 expected: {query}"
+    assert set(relation_args) <= {"first", "excludeUserLinked", "userLinkedOnly"}, (
+        f"unexpected closingIssuesReferences argument(s): {sorted(relation_args)}"
+    )
 
     # 取得 field は Issue `number` と `repository{nameWithOwner}` に限る
-    nodes_body = _balanced_brace_body(query, "nodes{")
+    nodes_markers = list(re.finditer(r"\bnodes\s*\{", query))
+    assert len(nodes_markers) == 1, f"single relation nodes selection expected: {query}"
+    nodes_body = _balanced_brace_body(query, nodes_markers[0].end() - 1)
     assert re.findall(r"[A-Za-z_]\w*", nodes_body) == ["number", "repository", "nameWithOwner"], (
         f"relation nodes must select only number and repository{{nameWithOwner}}: {nodes_body}"
     )
-    selection = re.sub(r"^\s*query\([^)]*\)", "", query)
+    selection = query[header.end() :]
     identifiers = set(re.findall(r"[A-Za-z_]\w*", selection))
     unexpected = identifiers - _ALLOWED_RELATION_QUERY_IDENTIFIERS
     assert not unexpected, f"unexpected field(s) selected in relation query: {sorted(unexpected)}"
+
+
+# REST `gh api` の peer OPEN Issue inventory / search surface（collection・search）だけを
+# 拒否する。target-local API（`repos/<owner>/<repo>` の resolve、target PR 系）は許可する。
+_GH_API_VALUE_FLAGS = frozenset(
+    {
+        "-f", "-F", "--field", "--raw-field", "-H", "--header", "-X", "--method", "--jq", "-q",
+        "-t", "--template", "--input", "--hostname", "--cache", "-p", "--preview",
+    }
+)
+_PEER_REST_INVENTORY_RE = re.compile(
+    r"^(?:"
+    r"repos/[^/]+/[^/]+/issues(?:/(?:comments|events))?"  # repo Issue collection / repo-wide comments・events
+    r"|(?:user|orgs/[^/]+)/issues"  # user / org Issue inventory
+    r"|issues"  # authenticated user Issue inventory
+    r"|search(?:/.*)?"  # search surface
+    r")$"
+)
+
+
+def _gh_api_rest_endpoint(call: list[str]) -> str | None:
+    """`gh api <endpoint> ...` の endpoint を正規化して返す（GraphQL / 非 api は None）。"""
+    if call[:1] != ["api"]:
+        return None
+    endpoint = None
+    skip_next = False
+    for arg in call[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in _GH_API_VALUE_FLAGS:
+            skip_next = True
+            continue
+        if arg.startswith("-"):
+            continue
+        endpoint = arg
+        break
+    if endpoint is None or endpoint == "graphql":
+        return None
+    endpoint = re.sub(r"^https?://[^/]+/", "", endpoint)
+    endpoint = endpoint.split("?", 1)[0].split("#", 1)[0].strip("/")
+    return endpoint.lower()
+
+
+def _assert_no_peer_rest_inventory_call(call: list[str]) -> None:
+    endpoint = _gh_api_rest_endpoint(call)
+    if endpoint is None:
+        return
+    assert not _PEER_REST_INVENTORY_RE.match(endpoint), (
+        f"peer Issue inventory / search REST surface must not be called: {call}"
+    )
+
+
+def _assert_no_peer_inventory_call(call: list[str]) -> None:
+    """両 lane の全 subprocess call に適用する peer inventory / search / pagination 禁止。"""
+    joined = " ".join(call).lower()
+    assert call[:2] != ["issue", "list"], f"peer Issue inventory call must not happen: {call}"
+    assert "issue list" not in joined, f"peer Issue inventory call must not happen: {call}"
+    assert call[:1] != ["search"], f"Issue search call must not happen: {call}"
+    assert "--paginate" not in call, f"pagination must not happen: {call}"
+    _assert_no_peer_rest_inventory_call(call)
 
 
 @pytest.mark.parametrize("session_bound", [False, True])
@@ -295,11 +443,7 @@ def test_no_peer_inventory_or_search_from_target_only_executor(
 
     # peer inventory / search / pagination は両 lane で禁止（transport 名ではなく意味で判定）。
     for call in calls:
-        joined = " ".join(call).lower()
-        assert not (call[:2] == ["issue", "list"]), f"peer Issue inventory call must not happen: {call}"
-        assert "issue list" not in joined, f"peer Issue inventory call must not happen: {call}"
-        assert "search" not in joined, f"Issue search call must not happen: {call}"
-        assert "--paginate" not in call, f"pagination must not happen: {call}"
+        _assert_no_peer_inventory_call(call)
 
     graphql_calls = [call for call in calls if call[:2] == ["api", "graphql"]]
     if not session_bound:
@@ -311,50 +455,163 @@ def test_no_peer_inventory_or_search_from_target_only_executor(
 
 
 @pytest.mark.parametrize(
-    "mutation",
+    "call",
     [
-        ("closingIssuesReferences(first:2", "closingIssuesReferences(first:100"),
-        ("{nodes{number repository{nameWithOwner}}}", "{pageInfo{endCursor} nodes{number repository{nameWithOwner}}}"),
-        ("nodes{number repository{nameWithOwner}}", "nodes{number body repository{nameWithOwner}}"),
-        ("nodes{number repository{nameWithOwner}}", "nodes{number labels{nodes{name}} repository{nameWithOwner}}"),
-        ("nodes{number repository{nameWithOwner}}", "nodes{number comments{totalCount} repository{nameWithOwner}}"),
-        ("repository(owner:$owner,name:$name)", "repository(owner:$owner,name:$name) search(query:\"x\")"),
-        ("{nameWithOwner pullRequest(", "{nameWithOwner issues(states:OPEN){nodes{number}} pullRequest("),
-        ("closingIssuesReferences(first:2,", "closingIssuesReferences(first:2,after:$cursor,"),
-        (
-            "nodes{number repository{nameWithOwner}}",
-            "nodes{number trackedIssues{totalCount} repository{nameWithOwner}}",
-        ),
-    ],
-    ids=[
-        "first-100",
-        "pageinfo",
-        "body",
-        "labels",
-        "comments",
-        "search",
-        "issues-states",
-        "after-cursor",
-        "unlisted-field",
+        ["api", "repos/example/repo/issues", "-f", "state=open"],
+        ["api", "/repos/example/repo/issues"],
+        ["api", "repos/example/repo/issues/"],
+        ["api", "/repos/example/repo/issues/"],
+        ["api", "repos/example/repo/issues?state=open&per_page=100"],
+        ["api", "-X", "GET", "-H", "Accept: application/json", "repos/example/repo/issues"],
+        ["api", "https://api.github.com/repos/example/repo/issues"],
+        ["api", "repos/example/repo/issues/comments"],
+        ["api", "repos/example/repo/issues/events"],
+        ["api", "search/issues", "-f", "q=repo:example/repo is:issue is:open"],
+        ["api", "/search/issues?q=repo:example/repo"],
+        ["api", "search/code", "-f", "q=x"],
+        ["api", "orgs/example/issues"],
+        ["api", "user/issues"],
+        ["api", "issues"],
     ],
 )
-def test_relation_call_assertion_rejects_peer_inventory_mutations(mutation: tuple[str, str]) -> None:
-    """present lane の semantic assertion が、禁止 token を query へ加えると
-    実際に失敗する（vacuous でない）ことを示す。"""
-    query = (
-        "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name)"
-        "{nameWithOwner pullRequest(number:$number){number "
-        "closingIssuesReferences(first:2,excludeUserLinked:false,userLinkedOnly:false)"
-        "{nodes{number repository{nameWithOwner}}}}}"
-    )
-    call = ["api", "graphql", "-f", f"query={query}", "-F", "owner=example", "-F", "name=repo", "-F", "number=999"]
-    _assert_bounded_target_pr_relation_call(call, expected_pr_number="999")  # 現行 query は許可
-
-    before, after = mutation
-    assert before in query
-    mutated = [arg.replace(before, after) if arg.startswith("query=") else arg for arg in call]
+def test_rest_peer_issue_inventory_call_is_rejected(call: list[str]) -> None:
     with pytest.raises(AssertionError):
-        _assert_bounded_target_pr_relation_call(mutated, expected_pr_number="999")
+        _assert_no_peer_inventory_call(call)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        ["api", "repos/example/repo"],  # canonical repository resolve
+        ["api", "/repos/example/repo/"],
+        ["api", "repos/example/repo/pulls/999"],  # target PR
+        ["api", "repos/example/repo/pulls/999/reviews", "-H", "Accept: application/json"],
+        ["api", "repos/example/repo/commits/abc/check-runs"],
+        ["issue", "view", "9999", "--json", "state"],
+        ["pr", "list", "--head", "branch", "--json", "url"],
+        ["pr", "create", "--title", "search issues report"],  # 文字列としての "search" は許可
+    ],
+)
+def test_target_local_rest_and_pr_calls_are_not_rejected(call: list[str]) -> None:
+    _assert_no_peer_inventory_call(call)
+
+
+@pytest.fixture
+def production_relation_call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """実 production（`open_pr.py`）が発行する present lane の GraphQL 呼び出しを取得する。"""
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "boundary-test-session")
+    log_path = _fake_gh_env(tmp_path, monkeypatch)
+    assert _run_open_pr_main(tmp_path, monkeypatch) == 0
+    graphql_calls = [call for call in _read_fake_gh_log(log_path) if call[:2] == ["api", "graphql"]]
+    assert len(graphql_calls) == 1, graphql_calls
+    return graphql_calls[0]
+
+
+def _replace_query(call: list[str], pattern: str, replacement: str, *, many: bool = False) -> list[str]:
+    """`query=` 引数へ regex 置換を適用する（既定は 1 回だけ。適用されない場合は失敗）。"""
+    result = []
+    applied = 0
+    for arg in call:
+        if arg.startswith("query="):
+            arg, count = re.subn(pattern, replacement, arg, flags=re.MULTILINE)
+            applied += count
+        result.append(arg)
+    assert applied >= 1 and (many or applied == 1), (
+        f"mutation pattern must apply {'at least' if many else 'exactly'} once (applied={applied}): {pattern}"
+    )
+    return result
+
+
+_REPOSITORY_ARGS = r"(\brepository\s*\()[^()]*\)"
+_NODES_OPEN = r"(\bnodes\s*\{\s*number)"
+
+_REJECTED_MUTATIONS = {
+    "first-100": (r"(closingIssuesReferences\s*\(\s*first\s*:\s*)2\b", r"\g<1>100"),
+    "pageinfo": (r"(\bnodes\s*\{)", r"pageInfo{endCursor} \g<1>"),
+    "body": (_NODES_OPEN, r"\g<1> body"),
+    "labels": (_NODES_OPEN, r"\g<1> labels{nodes{name}}"),
+    "comments": (_NODES_OPEN, r"\g<1> comments{totalCount}"),
+    "search": (r"(\brepository\s*\([^()]*\))", r'\g<1> search(query:"x")'),
+    "issues-states": (r"(\bpullRequest\s*\()", r"issues(states:OPEN){nodes{number}} \g<1>"),
+    "after-cursor": (r"(closingIssuesReferences\s*\()", r"\g<1>after:$cursor,"),
+    "unlisted-field": (_NODES_OPEN, r"\g<1> trackedIssues{totalCount}"),
+    "swap-owner-name": (_REPOSITORY_ARGS, r"\g<1>owner:$name,name:$owner)"),
+    "hardcoded-pr-number": (r"(\bpullRequest\s*\(\s*number\s*:\s*)\$number", r"\g<1>999"),
+    "hardcoded-repository": (_REPOSITORY_ARGS, r'\g<1>owner:"example",name:"repo")'),
+}
+
+
+def test_production_relation_call_satisfies_assertion(production_relation_call: list[str]) -> None:
+    _assert_bounded_target_pr_relation_call(production_relation_call, expected_pr_number=_FAKE_GH_PR_NUMBER)
+
+
+@pytest.mark.parametrize("mutation_id", list(_REJECTED_MUTATIONS))
+def test_relation_call_assertion_rejects_peer_inventory_mutations(
+    production_relation_call: list[str], mutation_id: str
+) -> None:
+    """present lane の semantic assertion が、peer inventory 混入や binding 破壊を
+    現 production query へ加えると実際に失敗する（vacuous でない）ことを示す。"""
+    pattern, replacement = _REJECTED_MUTATIONS[mutation_id]
+    mutated = _replace_query(production_relation_call, pattern, replacement)
+    with pytest.raises(AssertionError):
+        _assert_bounded_target_pr_relation_call(mutated, expected_pr_number=_FAKE_GH_PR_NUMBER)
+
+
+# 意味が同一の整形差（false-negative にしてはならない）。
+_EQUIVALENT_FORMATTING_VARIANTS = {
+    "space-before-paren": [
+        (r"\brepository\(", "repository ("),
+        (r"\bpullRequest\(", "pullRequest ("),
+        (r"\bclosingIssuesReferences\(", "closingIssuesReferences ("),
+    ],
+    "space-around-colon": [
+        (r"\bowner:\$owner", "owner : $owner"),
+        (r"\bname:\$name", "name : $name"),
+        (r"\bnumber:\$number", "number : $number"),
+        (r"\bfirst:2", "first : 2"),
+    ],
+    "named-operation": [(r"query=query\(", "query=query Foo(")],
+    "argument-order-swap": [(_REPOSITORY_ARGS, r"\g<1>name:$name,owner:$owner)")],
+    "multiline": [(r"([{},])", "\\g<1>\n  ", True)],
+    "space-before-nodes-brace": [(r"\bnodes\{", "nodes {")],
+}
+
+
+@pytest.mark.parametrize("variant_id", list(_EQUIVALENT_FORMATTING_VARIANTS))
+def test_relation_call_assertion_accepts_equivalent_formatting(
+    production_relation_call: list[str], variant_id: str
+) -> None:
+    """binding / bound=2 / selected fields が同一なら整形差で落ちない（harness friction 除去）。"""
+    call = production_relation_call
+    for pattern, replacement, *rest in _EQUIVALENT_FORMATTING_VARIANTS[variant_id]:
+        call = _replace_query(call, pattern, replacement, many=bool(rest))
+    _assert_bounded_target_pr_relation_call(call, expected_pr_number=_FAKE_GH_PR_NUMBER)
+
+
+def _run_fake_gh_graphql(call: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["gh", *call], capture_output=True, text=True, timeout=10)
+
+
+def test_fake_gh_graphql_requires_critical_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, production_relation_call: list[str]
+) -> None:
+    """fake `gh` は critical binding が成立する query にだけ、-F 変数値から
+    identity を返す（query が間違った repository を指しても正しい identity を捏造しない）。"""
+    ok = _run_fake_gh_graphql(production_relation_call)
+    assert ok.returncode == 0, ok.stderr
+    repository = json.loads(ok.stdout)["data"]["repository"]
+    assert repository["nameWithOwner"] == "example/repo"
+    assert repository["pullRequest"]["number"] == int(_FAKE_GH_PR_NUMBER)
+
+    reformatted = _replace_query(production_relation_call, r"\bowner:\$owner", "owner : $owner")
+    assert _run_fake_gh_graphql(reformatted).returncode == 0
+
+    for mutation_id in ("swap-owner-name", "hardcoded-pr-number", "hardcoded-repository"):
+        pattern, replacement = _REJECTED_MUTATIONS[mutation_id]
+        rejected = _run_fake_gh_graphql(_replace_query(production_relation_call, pattern, replacement))
+        assert rejected.returncode != 0, f"fake gh must not fabricate identity for {mutation_id}"
+        assert "does not bind" in rejected.stderr
+        assert rejected.stdout == ""
 
 
 # ---------------------------------------------------------------------------
