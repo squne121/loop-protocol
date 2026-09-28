@@ -60,7 +60,7 @@ fix_delta:
 
 implementation-worker は fix_delta を読み取り、該当箇所のみ修正する（スコープ拡大禁止）。
 
-### runtime_migration_action（optional、Issue #2810）
+### runtime_migration_action（任意、Issue #2810）
 
 `fix_delta.runtime_migration_action` は、root（Step 5）が `classify_runtime_migration.py`
 （`.claude/skills/impl-review-loop/scripts/classify_runtime_migration.py`）で `class:

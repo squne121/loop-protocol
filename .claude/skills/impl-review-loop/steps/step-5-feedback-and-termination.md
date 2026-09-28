@@ -104,9 +104,9 @@ classification** として次の3分類に決定論的に分類する。分類�
 `.claude/skills/impl-review-loop/scripts/classify_runtime_migration.py` の CLI（stdin JSON ->
 stdout JSON）を実際に経由して行い、markdown の文字列一致や目視判断で代替しない。
 
-1. **agent-executable bounded runtime migration**（`class: agent_executable_migration`）
-2. **implementation defect**（`class: implementation_defect`）
-3. **genuine human capability blocker**（`class: human_capability_blocker`）
+1. **agent-executable bounded runtime migration**（`class: agent_executable_migration`、エージェントが実行可能）
+2. **implementation defect**（`class: implementation_defect`、実装側の不具合）
+3. **genuine human capability blocker**（`class: human_capability_blocker`、人間対応が必要）
 
 3分類の詳細な充足条件は `classify_runtime_migration.py` のモジュール docstring を正本とする。
 本セクションは Step 5 が classifier の入出力をどう扱うかの **routing 手順**のみを定める

@@ -696,9 +696,9 @@ failure（ChatGPT アカウントの再認証が必要という結論）と誤�
 
 ---
 
-## 13. runtime dependency migration の one-shot ownership（Issue #2810）
+## 13. runtime 依存関係 migration の一回限りの ownership（Issue #2810）
 
-### 「code merge」と「target runtime migration/acceptance」の分離
+### 「コード統合」と「対象 runtime の migration/acceptance」の分離
 
 repository code が merge されたことと、target runtime が実際にその変更を反映して
 動作できることは別の完了条件である。runtime dependency（例: Claude-GPT の

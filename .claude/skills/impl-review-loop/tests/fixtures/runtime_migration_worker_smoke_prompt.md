@@ -1,10 +1,13 @@
 Issue #2810 AC9 runtime smoke (implementation-worker `apply_runtime_migration_fix_delta` mode).
+<!-- このタイトル行は Issue #2810 の AC9 runtime smoke test を説明する日本語注記である。 -->
 
 This is a hermetic smoke test. `CLAUDE_GPT_HOME` and `CLAUDE_GPT_REPAIR_INSTALLER_URL` are
 already set in your process environment (by the harness) to a fixture-only home directory and a
 `file://` fixture installer -- neither touches the operator's real `~/.claude-gpt`.
+<!-- この段落は隔離された fixture 環境変数の設定を説明する日本語注記である。 -->
 
 Use the Task tool to launch the `implementation-worker` SubAgent with exactly this message:
+<!-- 次のコードブロックは SubAgent へ送信する指示文そのものであり、内容は変更しないこと。 -->
 
 ```
 Objective: execute the apply_runtime_migration_fix_delta mode (Issue #2810) for a hermetic
@@ -44,6 +47,8 @@ After the SubAgent returns, print its full final response text verbatim in your 
 message (so the runner's transcript capture can locate the `RUNTIME_MIGRATION_RESULT_V1
 status=ok`, `rerun_required.verification=true`, and installed-path markers). Do not summarize,
 paraphrase, or omit any of those literal strings.
+<!-- この段落は SubAgent の最終応答をそのまま転記する要件を説明する日本語注記である。 -->
 
 Do not modify any repository-tracked file yourself. Do not run any command other than what you
 instruct the SubAgent to run via the Task tool.
+<!-- この段落は自分自身でファイルを変更しない制約を説明する日本語注記である。 -->
