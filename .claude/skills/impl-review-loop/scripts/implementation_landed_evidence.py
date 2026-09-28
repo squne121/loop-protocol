@@ -187,15 +187,22 @@ def render_scope_coverage_marker(marker: Mapping[str, Any]) -> str:
 
 def _parse_marker(pr_body: str, *, issue_number: int) -> tuple[dict[str, Any] | None, list[str]]:
     matches: list[Any] = []
+    # Issue #2811: a fence that names the marker schema but is not parseable YAML is a
+    # malformed marker candidate, not an absent marker (fail-closed, never `marker_missing`).
+    unparsable_candidates = 0
     for fence in _FENCE_RE.findall(pr_body or ""):
         try:
             import yaml
 
             parsed = yaml.safe_load(fence)
         except Exception:
+            if COVERAGE_SCHEMA in fence:
+                unparsable_candidates += 1
             continue
         if isinstance(parsed, Mapping) and COVERAGE_SCHEMA in parsed:
             matches.append(parsed[COVERAGE_SCHEMA])
+    if unparsable_candidates:
+        return None, ["scope_coverage_marker_ambiguous_or_invalid"]
     if not matches:
         return None, ["scope_coverage_marker_missing"]
     if len(matches) != 1 or not isinstance(matches[0], Mapping):

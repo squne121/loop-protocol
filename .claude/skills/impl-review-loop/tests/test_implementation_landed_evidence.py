@@ -1771,3 +1771,51 @@ def test_freshness_rebind_qualified_sibling_verified_empty_closing_refs_still_co
     )
     assert result["decision_time_rebind"]["status"] == "fresh"
     assert result["landing_disposition"]["disposition"] == "implementation_already_landed"
+
+
+def test_parse_marker_unparsable_marker_fence_is_invalid_not_missing():
+    """Issue #2811 P1 (Blocker B): a YAML fence that names the marker schema but cannot be
+    parsed is a malformed marker candidate (invalid), never `scope_coverage_marker_missing`."""
+    issue_number = 2811
+    invalid = ["scope_coverage_marker_ambiguous_or_invalid"]
+    missing = ["scope_coverage_marker_missing"]
+    unparsable_marker = "```yaml\nIMPLEMENTATION_SCOPE_COVERAGE_V1:\n  schema_version: [\n```\n"
+    unparsable_other = "```yaml\nunrelated_key: [\n```\n"
+    prose_only = "IMPLEMENTATION_SCOPE_COVERAGE_V1: は生成済みです。\n"
+    valid_yaml_non_marker = "```yaml\nnote: IMPLEMENTATION_SCOPE_COVERAGE_V1 is generated later\n```\n"
+    marker = mod.build_scope_coverage_marker(
+        issue_number=issue_number, issue_body=_scope_manifest_issue_body(), pr_head_sha="a" * 40
+    )
+    valid_block = mod.render_scope_coverage_marker(marker)
+
+    # parse-unparsable fence that names the schema: invalid (not missing).
+    result, errors = mod._parse_marker("## Summary\n\n" + unparsable_marker, issue_number=issue_number)
+    assert result is None
+    assert errors == invalid
+
+    # Unparsable fence WITHOUT the schema token: unchanged behavior (ignored -> missing).
+    result, errors = mod._parse_marker("## Summary\n\n" + unparsable_other, issue_number=issue_number)
+    assert result is None
+    assert errors == missing
+
+    # Prose-only token (no fence) and a valid YAML fence that merely mentions the token: missing.
+    missing_bodies = (
+        prose_only,
+        "## Summary\n\n" + valid_yaml_non_marker,
+        "## Summary\n\n" + prose_only + unparsable_other,
+    )
+    for body in missing_bodies:
+        result, errors = mod._parse_marker(body, issue_number=issue_number)
+        assert result is None, body
+        assert errors == missing, (body, errors)
+
+    # Valid marker alone: returned.
+    result, errors = mod._parse_marker("## Summary\n\n" + valid_block + "\n", issue_number=issue_number)
+    assert errors == []
+    assert result is not None and result["issue_number"] == issue_number
+
+    # Valid marker + another unparsable marker candidate: fail-closed (either order).
+    for body in (valid_block + "\n\n" + unparsable_marker, unparsable_marker + "\n\n" + valid_block + "\n"):
+        result, errors = mod._parse_marker(body, issue_number=issue_number)
+        assert result is None
+        assert errors == invalid
