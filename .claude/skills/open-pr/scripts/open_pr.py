@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import os
 import subprocess
@@ -313,6 +314,7 @@ def _run_pr_body_validator(
     body_text: str,
     changed_paths: list[str] | None,
     linked_issue: int,
+    linked_issue_body: str | None = None,
 ) -> dict[str, object]:
     validator_script = Path(__file__).resolve().parent / "validate_pr_body.py"
 
@@ -323,6 +325,7 @@ def _run_pr_body_validator(
         delete=False,
     )
     changed_paths_file = None
+    linked_issue_body_file = None
     try:
         body_file.write(body_text)
         body_file.flush()
@@ -348,6 +351,20 @@ def _run_pr_body_validator(
             changed_paths_file.flush()
             changed_paths_file.close()
             cmd.extend(["--changed-paths-file", changed_paths_file.name])
+
+        if linked_issue_body:
+            # Issue #2808 AC4: create path applies the same safety-applicability minimum
+            # floor input (changed_paths + PR body + linked Issue body) as the update path.
+            linked_issue_body_file = tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".md",
+                encoding="utf-8",
+                delete=False,
+            )
+            linked_issue_body_file.write(linked_issue_body)
+            linked_issue_body_file.flush()
+            linked_issue_body_file.close()
+            cmd.extend(["--linked-issue-body-file", linked_issue_body_file.name])
 
         try:
             cp = subprocess.run(
@@ -435,6 +452,8 @@ def _run_pr_body_validator(
         Path(body_file.name).unlink(missing_ok=True)
         if changed_paths_file is not None:
             Path(changed_paths_file.name).unlink(missing_ok=True)
+        if linked_issue_body_file is not None:
+            Path(linked_issue_body_file.name).unlink(missing_ok=True)
 
 
 def _run_japanese_content_validator(
@@ -669,17 +688,48 @@ def emit_implementation_pr_observed(*, repo: str, pr_number: int, linked_issue: 
         return "deferred", "RELATION_UNAVAILABLE"
 
 
+def _call_pr_body_validator(
+    validator_callable,
+    body_text: str,
+    changed_paths: list[str] | None,
+    linked_issue: int | None,
+    linked_issue_body: str | None,
+) -> dict[str, object]:
+    """Call `_run_pr_body_validator` with the Issue #2808 AC4 `linked_issue_body`
+    argument when the bound callable supports it, and fall back to the pre-#2808
+    3-argument call otherwise.
+
+    This indirection exists solely so that pre-existing tests which monkeypatch
+    `_run_pr_body_validator` with a fixed 3-argument test double keep working
+    unchanged after AC4 added a 4th parameter to the real implementation.
+    """
+    try:
+        accepts_linked_issue_body = len(inspect.signature(validator_callable).parameters) >= 4
+    except (TypeError, ValueError):
+        accepts_linked_issue_body = False
+    if accepts_linked_issue_body:
+        return validator_callable(body_text, changed_paths, linked_issue, linked_issue_body)
+    return validator_callable(body_text, changed_paths, linked_issue)
+
+
 def _validate_pr_body(
-    body: str, changed_paths: list[str] | None, linked_issue: int
+    body: str,
+    changed_paths: list[str] | None,
+    linked_issue: int,
+    linked_issue_body: str | None = None,
 ) -> tuple[bool, str | None, str | None]:
     """Run both PR-body validators against `body`.
 
     Returns `(passed, error_code, detail)`. `error_code`/`detail` are set only
     when `passed` is False, mirroring the two `emit_error(...)` call sites
     this replaces. Any `VALIDATOR_RULE_IDS` / `PR_BODY_PREFLIGHT_RESULT_V1`
-    stdout emitted before the failure is still emitted here.
+    stdout emitted before the failure is still emitted here. `linked_issue_body`
+    (Issue #2808 AC4) is best-effort input to the safety-applicability minimum floor;
+    its absence never blocks validation on its own.
     """
-    validator_result = _run_pr_body_validator(body, changed_paths, linked_issue)
+    validator_result = _call_pr_body_validator(
+        _run_pr_body_validator, body, changed_paths, linked_issue, linked_issue_body
+    )
     if validator_result.get("status") != "pass":
         errors = validator_result.get("errors", [])
         rule_ids = ",".join(error.get("rule_id", "") for error in errors if isinstance(error, dict))
@@ -772,7 +822,13 @@ def main(argv: list[str] | None = None) -> int:
     # never depend on marker retrieval (live Issue body / branch HEAD /
     # shared normalizer availability).
     changed_paths = resolve_changed_paths(args.changed_paths)
-    passed, error_code, detail = _validate_pr_body(final_body, changed_paths, args.linked_issue)
+    # Issue #2808 AC4: best-effort linked Issue body fetch for the safety-applicability
+    # minimum floor input surface (changed_paths + PR body + linked Issue body). A fetch
+    # failure (None) never blocks validation; it only narrows the floor's text signal input.
+    linked_issue_body_for_validation = get_linked_issue_body(repo, args.linked_issue)
+    passed, error_code, detail = _validate_pr_body(
+        final_body, changed_paths, args.linked_issue, linked_issue_body_for_validation
+    )
     if not passed:
         emit_error(error_code, detail or "")
         return EXIT_BLOCKED
@@ -860,7 +916,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return EXIT_BLOCKED
         marker_passed, marker_error_code, marker_detail = _validate_pr_body(
-            marker_body, changed_paths, args.linked_issue
+            marker_body, changed_paths, args.linked_issue, linked_issue_body_for_validation
         )
         if not marker_passed:
             emit_error(marker_error_code, marker_detail or "")

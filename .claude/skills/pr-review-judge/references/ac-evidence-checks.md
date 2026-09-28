@@ -6,6 +6,13 @@
 - `## 検証コマンド結果`
 - `## Allowed Paths 遵守`
 
+上記3セクションは、authoring/validator 側の canonical required-section inventory
+（`.claude/skills/open-pr/scripts/validate_pr_body.py::REQUIRED_SECTIONS`）の
+materialized projection である（Issue #2808 AC1）。canonical list を変更する場合は、
+この一覧と `.github/pull_request_template.md` の該当セクションを同時に更新し、
+parity を focused pytest（`.claude/skills/open-pr/scripts/tests/test_validate_pr_body.py`）
+で検査する。本 reference 自体が Python module を runtime import することは要求しない。
+
 ## 判定
 
 - AC coverage: 各 AC が `[x]/[ ] + 根拠` で記載

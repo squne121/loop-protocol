@@ -2,6 +2,28 @@
 
 - 
 
+## 受け入れ条件の達成状況
+
+> linked Issue の各 Acceptance Criteria について `[x]/[ ]` + 根拠を記載してください（`pr-review-judge` が AC coverage 判定に使用します）。
+
+- [ ] AC1: <達成（根拠）/ 未達成（理由）>
+
+## 検証コマンド結果
+
+> linked Issue の Verification Commands を実行した結果を記載してください。
+
+```text
+$ <command>
+<結果>
+```
+
+## Allowed Paths 遵守
+
+> linked Issue の `## Allowed Paths` と実際の変更ファイルの対応を記載してください。
+
+- 変更ファイル: 
+- Allowed Paths 逸脱: なし / あり（理由）
+
 ## Checks
 
 - [ ] `pnpm typecheck`
