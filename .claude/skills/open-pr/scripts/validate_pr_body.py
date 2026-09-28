@@ -661,6 +661,70 @@ def _validate_lp058(body: str, changed_paths: list[str] | None) -> list[Validati
     )]
 
 
+SCOPE_COVERAGE_MARKER_TOKEN = "IMPLEMENTATION_SCOPE_COVERAGE_V1:"
+
+
+def _load_implementation_scope_evidence_module():
+    """Load the canonical marker parser without creating a shared package (Issue #2811).
+
+    `open_pr.py` loads the same file the same way; this validator reuses the canonical
+    `implementation_landed_evidence.py::_parse_marker()` rather than re-implementing it.
+    """
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[2] / "impl-review-loop" / "scripts" / "implementation_landed_evidence.py"
+    spec = importlib.util.spec_from_file_location("implementation_landed_evidence_for_validate_pr_body", path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _validate_lp059(body: str, linked_issue: int | None) -> list[ValidationError]:
+    """Validate-if-present check for the IMPLEMENTATION_SCOPE_COVERAGE_V1 marker (Issue #2811).
+
+    - marker token absent: allowed (unchanged behavior).
+    - marker present + canonical parser valid: allowed.
+    - marker present + canonical parser invalid: fail-closed. This single pre-write choke
+      point is shared by `open_pr.py` (create) and `update_pr.py` (update), so a malformed
+      marker can never reach `gh pr create` / `gh pr edit`.
+    A token that appears without any parseable marker fence
+    (`scope_coverage_marker_missing`) is treated as marker-absent, matching
+    `open_pr.py::append_implementation_scope_coverage()`.
+    """
+    if SCOPE_COVERAGE_MARKER_TOKEN not in body:
+        return []
+    try:
+        module = _load_implementation_scope_evidence_module()
+        if module is None:
+            raise ImportError("canonical marker parser could not be loaded")
+        marker, parse_errors = module._parse_marker(body, issue_number=linked_issue)
+    except Exception as exc:  # fail-closed: an unverifiable marker is never accepted
+        return [_error(
+            body,
+            "LP059",
+            "(global)",
+            1,
+            1,
+            f"IMPLEMENTATION_SCOPE_COVERAGE_V1 marker could not be verified: {type(exc).__name__}",
+            "Ensure implementation_landed_evidence.py is importable and the marker is well-formed."
+        )]
+    if marker is not None:
+        return []
+    if parse_errors == ["scope_coverage_marker_missing"]:
+        return []
+    return [_error(
+        body,
+        "LP059",
+        "(global)",
+        1,
+        1,
+        f"IMPLEMENTATION_SCOPE_COVERAGE_V1 marker is present but invalid: {', '.join(parse_errors)}",
+        "Do not hand-edit the marker; remove it so open-pr's canonical producer can regenerate it."
+    )]
+
+
 def validate_pr_body(
     body: str,
     changed_paths: list[str] | None,
@@ -685,6 +749,7 @@ def validate_pr_body(
     errors.extend(_validate_safety_claims_v1_yaml_contract(body, sections))
     errors.extend(_validate_lp057(body, sections, linked_issue))
     errors.extend(_validate_lp058(body, changed_paths))
+    errors.extend(_validate_lp059(body, linked_issue))
     return ValidationResult("loop_body_lint/v1", "pr", body_sha256, "fail" if errors else "pass", errors)
 
 
