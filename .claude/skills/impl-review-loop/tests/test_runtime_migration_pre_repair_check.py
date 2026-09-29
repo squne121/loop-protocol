@@ -269,3 +269,24 @@ def test_smoke_fixture_requests_use_the_fixed_evidence_ref_format_and_pre_check(
     assert "pre-repair-check" in text
     # the old opaque token that could never be verified must be gone
     assert "runtime-smoke-ac9-fixture" not in text
+
+
+@pytest.mark.parametrize(
+    "fixture", ["runtime_migration_worker_smoke_prompt.md", "runtime_migration_worker_deny_smoke_prompt.md"]
+)
+def test_smoke_fixture_parent_value_acquisition_uses_only_printf_command(fixture):
+    """GIVEN a smoke prompt WHEN the parent agent must obtain repo_head / CLAUDE_GPT_HOME
+    THEN the single permitted command is the printf form, and the parent is told not to use
+    printenv / env / export -p / set (avoids an extra deny window)."""
+    text = _normalized((FIXTURES_DIR / fixture).read_text(encoding="utf-8"))
+    assert """git rev-parse HEAD; printf '%s\\n' "$CLAUDE_GPT_HOME\"""" in text
+    assert "ONLY permitted way for you to obtain the placeholder values" in text
+    assert "Do NOT use `printenv`, `env`, `export -p` or `set` yourself" in text
+    # the legacy exception that allowed only `git rev-parse HEAD` must be gone
+    assert "except one read-only `git rev-parse HEAD`" not in text
+
+
+def test_deny_fixture_keeps_worker_side_printenv_deny_window():
+    text = _normalized((FIXTURES_DIR / "runtime_migration_worker_deny_smoke_prompt.md").read_text(encoding="utf-8"))
+    assert "attempt to run `printenv`" in text
+    assert "run by the SubAgent only" in text

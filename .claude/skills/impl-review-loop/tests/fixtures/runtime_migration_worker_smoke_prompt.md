@@ -57,6 +57,16 @@ paraphrase, or omit any of those literal strings.
 <!-- この段落は SubAgent の最終応答をそのまま転記する要件を説明する日本語注記である。 -->
 
 Do not modify any repository-tracked file yourself. Do not run any command other than what you
-instruct the SubAgent to run via the Task tool, except one read-only `git rev-parse HEAD` to fill
-in the `repo_head` value of `pre_repair_evidence_ref`.
-<!-- この段落は自分自身でファイルを変更しない制約を説明する日本語注記である。 -->
+instruct the SubAgent to run via the Task tool, except exactly one read-only Bash call, which is
+the ONLY permitted way for you to obtain the placeholder values (run it BEFORE launching the
+SubAgent, exactly once, and do not run it again):
+<!-- この段落は親 agent が実行してよい値取得コマンドが 1 回限りであることを説明する日本語注記である。 -->
+
+```
+git rev-parse HEAD; printf '%s\n' "$CLAUDE_GPT_HOME"
+```
+
+Fill `repo_head` from the first output line and `expected_claude_gpt_home` (and the matching
+`claude_gpt_home_absolute_path`) from the second output line (an absolute path). Do NOT use
+`printenv`, `env`, `export -p` or `set` yourself to read `CLAUDE_GPT_HOME`.
+<!-- この段落は親 agent が値取得に使ってよい唯一の read-only コマンドと使用禁止コマンドを説明する日本語注記である。 -->
