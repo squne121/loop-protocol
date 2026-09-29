@@ -9,7 +9,7 @@ SubagentStart and SubagentStop lifecycle events for one child SubAgent after the
 Use the Task tool to launch the `pr-reviewer` SubAgent with exactly this message:
 <!-- 次のコードブロックは SubAgent へ送信する指示文そのものであり、内容は変更しないこと。 -->
 
-```
+```text
 Do not run any tool. Reply with exactly one line and nothing else: RUNTIME_VC_LIFECYCLE_SMOKE_OK
 ```
 
