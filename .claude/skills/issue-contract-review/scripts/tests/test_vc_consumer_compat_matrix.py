@@ -153,7 +153,10 @@ def test_case_by_consumer_observable_matrix(case: CompatCase, tmp_path: Path) ->
     expected_population = [cmd for cmd, _ in case.commands] if case.plan_count else []
     assert plan["command_occurrence_count"] == case.plan_count
     assert len(plan["command_occurrences"]) == case.plan_count
+    expected_hashes = [preflight.compute_command_hash(cmd) for cmd in expected_population]
+    assert [item["command_hash"] for item in plan["command_occurrences"]] == expected_hashes
     assert len(plan["command_budgets"]) == len(set(expected_population))
+    assert {item["command_hash"] for item in plan["command_budgets"]} == set(expected_hashes)
     assert preflight._distinct_command_texts_from_body(case.body) == list(dict.fromkeys(expected_population))
 
     normal = _run_cli(case, tmp_path, "--strict")
@@ -296,6 +299,9 @@ def test_grouped_ac_one_source_one_occurrence_one_result_one_launch(
     plan = preflight.compute_canonical_vc_plan(GROUPED.body)
     assert plan["command_occurrence_count"] == len(plan["command_occurrences"]) == 1
     assert len(plan["command_budgets"]) == 1
+    grouped_hash = preflight.compute_command_hash(GROUPED.commands[0][0])
+    assert [item["command_hash"] for item in plan["command_occurrences"]] == [grouped_hash]
+    assert {item["command_hash"] for item in plan["command_budgets"]} == {grouped_hash}
     launches: list[str] = []
 
     def record_launch(command: str, timeout_seconds: int, cwd: str) -> tuple[int, str, str, int, dict]:
