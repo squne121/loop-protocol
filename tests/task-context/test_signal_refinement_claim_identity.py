@@ -194,3 +194,21 @@ def test_given_refine_activity_missing_or_terminal_when_claim_state_differs_then
     service.claim_task_ref(conn, task4["id"], REPO, "issue", ISSUE_A)
     conn.execute("UPDATE activities SET status = 'DONE', ended_at = '2026-01-01T00:00:00Z' WHERE id = ?", (refine4["id"],))
     assert _assert_non_mutating(conn, "session-4", ISSUE_B + 3) == CONFLICT
+
+
+def test_given_target_unclaimed_no_other_claim_when_refine_terminal_then_deferred_unclaimed_not_activity_terminal(conn):
+    """Claim state precedes Activity state: with no live Issue claim anywhere
+    (target B unclaimed, origin holds no other Issue claim) a terminal refine
+    Activity must NOT surface as activity_terminal; it stays TARGET_ISSUE_UNCLAIMED
+    and the terminal Activity row (and every other table) is left untouched."""
+    task, refine, _, _ = create_origin(conn, kind="refine")
+    conn.execute(
+        "UPDATE activities SET status = 'DONE', ended_at = '2026-01-01T00:00:00Z' WHERE id = ?", (refine["id"],)
+    )
+    assert service.count_live_task_ref_claims(conn, task["id"]) == 0
+    result = _assert_non_mutating(conn)
+    assert result == UNCLAIMED
+    assert result["reason_code"] != "activity_terminal"
+    assert service.get_activity(conn, refine["id"])["status"] == "DONE"
+    assert service.find_live_claim(conn, REPO, "issue", ISSUE_B) is None
+    assert service.count_live_task_ref_claims(conn, task["id"]) == 0
