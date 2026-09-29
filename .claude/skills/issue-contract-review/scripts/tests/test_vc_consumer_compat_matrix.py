@@ -1,12 +1,13 @@
-"""Issue #2799: reusable case × consumer VC compatibility oracle.
+"""Issue #2799: reusable five-path VC compatibility matrix.
 
-Rows describe source text AND expected observations independently for each
-consumer. Deliberately different statuses are not reconciled: static-only
-rejects every malformed family, while normal execution rejects the whole
-body ONLY for non-$ lines. External review orchestrators, security-policy
-coverage and deduplicated history estimates are excluded: they do not expose
-independent VC-grammar outputs for these source rows. The distinct-text
-candidate population is checked here, but history-store I/O is not.
+Rows compare shared parser, static-only, canonical plan, normal execution,
+and validate_issue_body.py observations independently. Deliberately different
+statuses are not reconciled: static-only rejects every malformed family,
+while normal execution rejects the whole body ONLY for non-$ lines.
+Guard-issue-body.py and check_issue_contract.py parity is covered by the
+existing test_vc_grammar_parity.py suite and open Issue #1719, not this matrix.
+Security-policy coverage and deduplicated history estimates are excluded;
+distinct-text candidate population is checked, but history-store I/O is not.
 """
 
 from __future__ import annotations
@@ -322,12 +323,9 @@ def test_grouped_ac_one_source_one_occurrence_one_result_one_launch(
     ]
     assert launches == ["true"]
     assert validator._extract_vc_ac_numbers(GROUPED.body) == {"AC2", "AC3"}
-    # The legacy LP016 check independently flags grouped marker syntax,
-    # although the shared parser and LP010 recognize both refs. Fixing that
-    # validator would require a production path outside Issue #2799; retain
-    # this observable mapping, not an invented validator PASS.
-    lint = validator.validate_issue_body(GROUPED.body)
-    assert [(e.rule_id, e.severity) for e in lint.errors] == [("LP016", "error")]
+    # Exclude validator grouped-marker LP016 from compatibility expectations:
+    # its known false rejection is owned by open Issue #1719, not Issue #2799.
+    # Keep the independent validator AC association observation above.
 
 
 def test_annotation_source_docstring_semantics() -> None:
