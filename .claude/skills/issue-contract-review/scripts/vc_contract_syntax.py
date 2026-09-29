@@ -436,12 +436,13 @@ class VcCommandEntry:
                          normal execution can exempt a backslash-pipe
                          regex-bearing command from
                          `regex_literal_pipe_suspected`).
-        annotation_source_line: 1-based line number (within the VC section
-                         content) of the `# baseline-expect:` annotation
-                         line this command's `baseline_expect` value was
-                         extracted from, or None (Issue #889 AC11
-                         provenance, #2788 AC5 -- preserved losslessly, not
-                         merely parsed-and-discarded).
+        annotation_source_line: 1-based line number within this command's
+                         enclosing bash block (first line after the opening
+                         ```bash fence is line 1) of the `# baseline-expect:`
+                         annotation, or None. Unlike section-relative
+                         `line_number`, this is block-relative, matching
+                         `block_line_number` and the legacy normal result's
+                         `annotation_source.line` (Issue #889 AC11 / #2788 AC5).
         annotation_source_raw: Raw text of that same annotation line, or
                          None.
         block_line_number: 1-based line number of this command WITHIN its
