@@ -392,6 +392,48 @@ def _apply_pre_tool_use_fields(payload: dict, hook_input: dict) -> None:
         payload["herdr_machine_scoped"] = parsed.machine_scoped
 
 
+# Issue #2822: an ordinary (non-teammate) SubAgent `agentId` as it appears in
+# `PostToolUse:Agent` `tool_response`. Deliberately narrow: teammate-form ids
+# (`name@session-<lead>`) and anything else are not accepted here.
+_ORDINARY_AGENT_ID_RE = re.compile(r"^[0-9A-Za-z_-]{1,128}$")
+_MAX_AGENT_NAME_LEN = 128
+
+
+def _apply_post_tool_use_fields(payload: dict, hook_input: dict) -> None:
+    """Issue #2822: reduce a `PostToolUse` `Agent` call to the two identity
+    strings needed to bind an ordinary named SubAgent's addressable `name` to
+    its `SubagentStart` row: `tool_input.name` and `tool_response.agentId`
+    (plus the caller `session_id`, already in the base payload). Neither the
+    prompt/description nor any other `tool_input`/`tool_response` content is
+    forwarded (AC7). A teammate-form response (it carries `agent_id` /
+    `team_name`, the Agent Teams team-config lane's territory), a missing /
+    non-string / oversized name, a missing or non-ordinary `agentId`, or a
+    missing caller session leaves the payload without the fields, which
+    `_post_tool_use_applicable` turns into a no-op."""
+    tool_name = hook_input.get("tool_name")
+    payload["tool_name"] = tool_name
+    if tool_name != "Agent" or not payload.get("claude_session_id"):
+        return
+    tool_input = hook_input.get("tool_input")
+    tool_response = hook_input.get("tool_response")
+    if not isinstance(tool_input, dict) or not isinstance(tool_response, dict):
+        return
+    if "agent_id" in tool_response or "team_name" in tool_response:
+        return
+    name = tool_input.get("name")
+    agent_id = tool_response.get("agentId")
+    if not isinstance(name, str) or not name or len(name) > _MAX_AGENT_NAME_LEN:
+        return
+    if not isinstance(agent_id, str) or not _ORDINARY_AGENT_ID_RE.match(agent_id):
+        return
+    payload["agent_name"] = name
+    payload["agent_id"] = agent_id
+
+
+def _post_tool_use_applicable(payload: dict) -> bool:
+    return bool(payload.get("agent_name") and payload.get("agent_id"))
+
+
 def _pre_tool_use_guard_applicable(payload: dict) -> bool:
     """True iff `_apply_pre_tool_use_fields` found something this guard
     actually needs to classify -- i.e. it is safe/correct to skip calling
@@ -493,6 +535,13 @@ def main(argv: list[str]) -> int:
             # skip `ctl_client.call_hook` (no `task-contextctl` subprocess
             # spawn) entirely and let the tool call proceed untouched.
             return 0
+    elif event == "PostToolUse":
+        # Issue #2822: only the `Agent` matcher is wired. Bounded hot path;
+        # never blocks or alters the completed tool call (exit 0, silent).
+        timeout = HOT_PATH_TIMEOUT_SECONDS
+        _apply_post_tool_use_fields(payload, hook_input)
+        if not _post_tool_use_applicable(payload):
+            return 0
     elif event in ("SubagentStart", "SubagentStop"):
         # fix_delta 5: Claude Code's SubagentStart/SubagentStop hook input
         # carries an `agent_id` UUID identifying the SubAgent *instance* --
@@ -590,6 +639,10 @@ def main(argv: list[str]) -> int:
         output = _pre_tool_use_hook_specific_output(decision, data.get("reason_code"), data.get("target_kind"))
         if output is not None:
             print(json.dumps(output))
+        return 0
+
+    if event == "PostToolUse":
+        # Issue #2822: observability/bookkeeping only -- no stdout, always 0.
         return 0
 
     if event == "SessionStart" and decision == "pass":

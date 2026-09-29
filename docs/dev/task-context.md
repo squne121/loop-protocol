@@ -244,8 +244,10 @@ live ref-claim を取得し、競合した場合 loser は
 
 hook 由来 subagent row に親 session を持たせる目的は、`SendMessage` の宛先が
 「caller session から Claude Code が現在 addressable と確認できる SubAgent」か
-どうかを判定するためだけである。新しい列・DDL は追加しない（既存の nullable
-列を再利用する）。
+どうかを判定するためだけである。この用途では既存の nullable 列を再利用する。
+通常 named SubAgent の name を保持するための additive nullable 列
+`execution_runs.addressable_name`（schema v4）だけを別途追加している
+（下記「通常 named SubAgent の name」参照）。
 
 managed-origin resolution（`task_context_workflow_signals._resolve_origin_tx`
 と `diagnose_origin`、および両者が共有する `_classify_origin_candidates`）は、
@@ -275,9 +277,9 @@ Code 側にあり、Task Context は hook から観測できる identity だけ�
 | agent ID（caller session で記録済みの subagent） | PASS | `find_addressable_subagent_runs` が同一 caller session の row を `ended_at` 不問で検索する。完了済み SubAgent も resume できるため、`ended_at` を unaddressable の根拠にしない |
 | session 未束縛の legacy row（`claude_session_id IS NULL`） | open のときだけ agent_id 一致で PASS | 従来の `find_open_execution_runs(agent_id=...)` と同じ互換。name 経由・ended 経由は不可 |
 | Agent Teams teammate の name | 条件成立時のみ PASS | 下記「teammate name」参照 |
-| 通常 named SubAgent の name | ASK | Agent tool の `tool_input` に `name` が無く `SubagentStart` も `name` を渡さないため、hook から name と agent ID の対応を観測できない（AC1 canary で確認） |
+| 通常 named SubAgent の name | 同一 caller session で name に対応する distinct agent ID がちょうど 1 種のときだけ PASS | `PostToolUse:Agent` が `tool_input.name` と `tool_response.agentId` を対応付けて `addressable_name` に記録する。ended row も対象（完了後の resume）。2 種以上は ASK |
 | `agent_type` のみ一致 | ASK | `agent_type` は addressable name ではない |
-| 別 caller session の同名 / 同 agent ID | ASK | session 束縛済み row は所有 session からのみ addressable |
+| 別 caller session の同名 / 同 agent ID | ASK | session 束縛済み row は所有 session からのみ addressable。session 未束縛（legacy）row は name 経由では PASS しない |
 | known cross-Task independent session | ASK | 既存契約を維持 |
 | known same-Task independent session | PASS | 既存契約を維持 |
 
@@ -297,13 +299,100 @@ Code 側にあり、Task Context は hook から観測できる identity だけ�
   `CLAUDE_CONFIG_DIR`（Claude-GPT の isolated root を含む）を優先し、未設定時
   のみ Native 既定を使う。テスト用に `LOOP_TASK_CONTEXT_TEAMS_DIR` で上書き
   できる。team config は手編集せず、書き込みも行わない。
+- **通常 named SubAgent の name**: `Agent` tool を `name` 付きで呼ぶと、
+  `PreToolUse:Agent` / `PostToolUse:Agent` の `tool_input.name` にその name が
+  入る（通常 named SubAgent の name は hook から観測できる）。一方
+  `SubagentStart` は `agent_id` / `agent_type` / `session_id` だけで name を
+  含まない。`PostToolUse:Agent` の `tool_response.agentId` が
+  `SubagentStart` の `agent_id` と一致するため、
+  `.claude/hooks/task_context/hook_entry.py` の `PostToolUse` adapter
+  （`.claude/settings.json` の matcher: `Agent`）が、`tool_input.name`（非空 str）・
+  `tool_response.agentId`（ordinary 形式のみ）・hook 共通 `session_id` が
+  揃った時に限り、`(claude_session_id, agent_id)` が一致する既存
+  `run_kind='subagent'` 行（ended 不問）へ name を書く。
+  - 一致行が無い場合（`PostToolUse` が `SubagentStart` より先に来た等）は
+    行を作らず no-op とし、`SendMessage` は ASK のまま残る（fail-safe）。
+  - teammate 形式の `tool_response`（`agent_id` / `team_name` を持つもの）、
+    name 欠落、oversize name は no-op。adapter は常に exit 0・stdout 無出力で、
+    hook 例外が `Agent` 実行を壊すことはない。prompt / description は転送も
+    保存もしない。
+  - resolver は `to` が agent ID に一致しない場合に限り、**同一 caller session に
+    束縛された行**で name が `to` に一致するものの distinct agent ID を集める。
+    ちょうど 1 種なら `in_session_subagent / pass`（ended 不問。同一 agent ID の
+    履歴複数行は 1 identity）。異なる agent ID が 2 種以上なら ASK
+    （同じ session で `name='gamma'` を 2 回 spawn すると別 agent ID が同名で
+    生成され、Claude 側の解決先は hook から観測できないため）。
+    別 session の同名、未束縛（legacy）行、`agent_type` のみの一致は ASK。
+    同じ name が独立 session 名や teammate 名とも衝突する場合も ASK。
+  - 追加列 `execution_runs.addressable_name` は additive nullable `TEXT`
+    （schema v4、`ALTER TABLE ... ADD COLUMN` のみ。既存列の drop / rename /
+    retype は無い）。既存 DB は v3 から in place で upgrade され、旧 row は
+    NULL のまま残り従来どおり agent ID だけで解決される。長さ 128 文字以内の
+    printable な str に限り、message body・transcript・prompt は保存しない。
 - **`SubagentStart` の再発火**（resume / teammate の新 message 処理でも
-  発火する）は `record_subagent_start` が冪等に扱う。同一 agent ID の open row
-  があれば no-op で既存 row を返し（`ux_execution_runs_open_subagent_agent_id`
-  の `IntegrityError` を起こさない）、ended row しか無ければ `ended_at` を
-  変更せず新 row を insert し、agent ID が無ければ従来どおり毎回新 row を作る。
-- 保存するのは address resolution に必要な `claude_session_id` / `agent_id`
-  のみで、message body・transcript・terminal 内容は保存しない。
+  発火する）は `record_subagent_start` が冪等に扱う。同一 `(claude_session_id,
+  agent_id)` の open row があれば no-op で既存 row を返し
+  （`ux_execution_runs_open_subagent_agent_id` の `IntegrityError` を起こさない）、
+  ended row しか無ければ `ended_at` を変更せず新 row を insert し、agent ID が
+  無ければ従来どおり毎回新 row を作る。
+- **agent ID の session scope**: 公式 docs は `agent_id` を "unique identifier"
+  とするだけで、全 session 横断の global uniqueness を保証する記述は無く、
+  実 runtime の ID は乱数（`a…` の 17 hex や `aalpha-…` の 16 hex）で契約上の
+  保証も無い。そのため本 repository の契約としては identity を
+  `(claude_session_id, agent_id)` のスコープで扱う。`record_subagent_start` の
+  open row 判定と `on_subagent_stop` の対象 row 解決は同一
+  `claude_session_id` に限定する（`claude_session_id` が NULL の legacy /
+  unbound 呼び出しは従来どおり `agent_id` のみで互換）。別 session が同じ
+  agent ID の open row を保持している状態での `SubagentStart` は、他 session の
+  row を書き換えず・奪わず・新規 insert もしない non-fatal no-op
+  （`reason_code: subagent_start_agent_id_open_in_other_session`）にし、
+  その agent ID への `SendMessage` は ASK のままとなる。同様に別 session の
+  `SubagentStop` は他 session の open row を終了しない。既存の
+  `ux_execution_runs_open_subagent_agent_id` は DDL を変更していない。
+- 保存するのは address resolution に必要な `claude_session_id` / `agent_id` /
+  `addressable_name` のみで、message body・transcript・terminal 内容は保存しない。
+
+### 実 runtime の canary で観測した事実（Issue #2822 AC1、public-safe）
+
+Claude Code 2.1.284 の interactive runtime（Native と Claude-GPT）で観測した
+事実のうち、resolver の設計根拠になっているものを記録する（message body /
+raw transcript は含まない）。
+
+1. **通常 named SubAgent の name は hook から観測できる**。flag
+   `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` 無効の Native で
+   `Agent(name='gamma', subagent_type='general-purpose', ...)` を実行すると、
+   `PreToolUse` / `PostToolUse`（`tool_name=Agent`）の `tool_input` の key は
+   `description` / `name` / `prompt` / `subagent_type` で `tool_input.name` が
+   入り、top-level `session_id` は caller（lead）session、`agent_id` は null。
+   `PostToolUse:Agent` の `tool_response` の key は `agentId` /
+   `canReadOutputFile` / `description` / `isAsync` / `outputFile` / `prompt` /
+   `resolvedModel` / `status` で、`agentId` は `SubagentStart` の `agent_id` と
+   一致する。`SubagentStart`（`agent_id` / `agent_type` / `session_id`）は
+   foreground 実行では `PostToolUse:Agent` より先に発火し、name は含まない。
+   完了後に同じ name へ `SendMessage` すると Claude Code が受理して resume し
+   （`SubagentStart` の再発火を観測）、この経路が従来 ASK を出し続けていた
+   症状そのものである。同一 session で `name='gamma'` を 2 回 spawn すると別
+   agent ID が同名で生成される。
+2. **Agent Teams（flag 有効）** で named Agent を spawn すると teammate になり、
+   `PostToolUse:Agent` の `tool_response` は `agent_id='alpha@session-<lead 先頭 8>'`・
+   `name`・`team_name` を持つ。`SubagentStart` の `agent_id`（`aalpha-<hex>`）は
+   これとは別物である。この経路は既存の team config lane が担当し、
+   `PostToolUse` adapter は teammate 形式を no-op とする。
+3. **in-process teammate** が `SendMessage` を呼ぶ時の hook は `session_id` が
+   lead と同一で、`agent_id=aalpha-<hex>`・`agent_type=<teammate 名>`。したがって
+   `caller_session_id[:8]` から `teams/session-<8>/config.json` を引く仮定が成立し、
+   team config lane に変更は不要である。
+4. **split-pane（tmux）teammate** は独立プロセスで `session_id` が lead と別
+   （team dir の prefix と不一致）、hook payload に team / parent の情報も無い。
+   このため現行実装は fail-closed で ASK を返す。これは AC1 が許容する
+   **既知の残余制限**であり、コードでは対処しない。
+5. **team config の配置**: Native は `~/.claude/teams/session-<8>/config.json`、
+   Claude-GPT は launcher が export する `CLAUDE_CONFIG_DIR` 配下
+   （`~/.claude-gpt/claude/teams/...`）。hook は `CLAUDE_CONFIG_DIR` を見て
+   解決できる（replay で確認済み）ため、`~/.claude` を直書きしない。
+6. **ID の非同一性**: hook の `agent_id`（`aalpha-<hex>`）と team config の
+   `members[].agentId`（`alpha@session-<8>`）は別 ID である。resolver は
+   name のみで team config と照合しており、この不一致の影響を受けない。
 
 ## Logical FK / 論理的な関連整合性（fix_delta finding 7 対応）
 
