@@ -223,3 +223,108 @@ def test_new_mode_section_heading_present():
         in doc_text
     )
     assert "repository 内の file 編集を一切行わない" in doc_text
+
+
+# --- RESULT_V2 mode-specific shape (Issue #2810 fix_delta P2-D) -------------
+
+
+def _result_v2_yaml_block() -> str:
+    text = _read(IMPLEMENTATION_WORKER_PATH)
+    start = text.index("IMPLEMENTATION_WORKER_RESULT_V2:\n")
+    return text[start : text.index("```", start)]
+
+
+def _mode_shape_table_rows() -> dict[str, list[str]]:
+    text = _read(IMPLEMENTATION_WORKER_PATH)
+    start = text.index("### RESULT_V2 の mode 別 field 表")
+    section = text[start : text.index("\n## ", start)]
+    rows: dict[str, list[str]] = {}
+    for line in section.splitlines():
+        if line.startswith("|") and not line.startswith("|---") and "field" not in line.split("|")[1]:
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            rows[cells[0]] = cells[1:]
+    return rows
+
+
+def test_result_v2_declares_pr_only_fields_omitted_for_runtime_mode():
+    """GIVEN implementation-worker.md WHEN inspected THEN pr_number /
+    action_kind / update_method / wrapper_used are forbidden (omitted, NOT
+    null) for apply_runtime_migration_fix_delta, and status / reason_code /
+    mode / errors / rerun_required / runtime_migration are required."""
+    rows = _mode_shape_table_rows()
+    pr_only = next(v for k, v in rows.items() if "`pr_number`" in k)
+    assert "forbidden" in pr_only[1] and "omitted" in pr_only[1]
+    assert "従来どおり" in pr_only[0]
+    assert "`action_kind`" in next(k for k in rows if "`pr_number`" in k)
+    assert "`update_method`" in next(k for k in rows if "`pr_number`" in k)
+    assert "`wrapper_used`" in next(k for k in rows if "`pr_number`" in k)
+    head_row = next(v for k, v in rows.items() if "`before_head_sha`" in k)
+    assert "forbidden" in head_row[1]
+    required_row = next(v for k, v in rows.items() if "`status`" in k)
+    assert required_row == ["必須", "必須"]
+    runtime_row = next(v for k, v in rows.items() if k == "`runtime_migration`")
+    assert runtime_row[0].startswith("対象外") and runtime_row[1].startswith("必須")
+    rerun_row = next(v for k, v in rows.items() if k == "`rerun_required`")
+    assert rerun_row[1].startswith("必須")
+
+    text = _normalized(_read(IMPLEMENTATION_WORKER_PATH))
+    assert "null ではなく omitted（key 自体を 返さない）" in text
+
+
+def test_result_v2_existing_three_modes_keep_their_required_fields_unchanged():
+    """GIVEN the RESULT_V2 yaml block WHEN inspected THEN every field the 3
+    pre-existing modes require is still declared, mode enum is unchanged
+    apart from the runtime mode, and the reason_code enum only GAINED
+    runtime-scoped members."""
+    block = _result_v2_yaml_block()
+    for field in (
+        "status:",
+        "reason_code:",
+        "mode:",
+        "action_kind:",
+        "pr_number:",
+        "update_method: merge_only",
+        "before_head_sha:",
+        "after_head_sha:",
+        "wrapper_used:",
+        "rerun_required:",
+        "rate_limit_diagnostics:",
+        "errors:",
+    ):
+        assert field in block, field
+    assert "status: ok | failed | blocked | permission_blocked" in block
+    for legacy_reason in (
+        "expected_head_sha_missing",
+        "expected_head_sha_mismatch",
+        "primary_rate_limit",
+        "secondary_rate_limit",
+        "validation_failed",
+        "permission_denied",
+        "head_unchanged_after_accepted",
+        "unexpected_head_change",
+        "transport_error",
+        "unknown_http_status",
+    ):
+        assert legacy_reason in block, legacy_reason
+    assert "  update_method: merge_only" in block
+    # the three legacy modes' PR-only fields are only annotated as omitted for the runtime mode
+    assert "pr_number: <int>" in block and "apply_runtime_migration_fix_delta では omitted" in block
+
+
+def test_result_v2_runtime_sub_object_declares_repair_executed_and_identity_mismatch():
+    """GIVEN implementation-worker.md WHEN inspected THEN identity_mismatch is
+    the single added reason_code, scoped to the runtime mode, and the
+    runtime_migration sub-object can express 'repair not executed'."""
+    text = _read(IMPLEMENTATION_WORKER_PATH)
+    block = _result_v2_yaml_block()
+    assert "identity_mismatch" in block
+    assert "repair_executed: true | false" in text
+    assert "exit_code: <int | null>" in text
+
+
+def test_step5_maps_identity_mismatch_to_fail_closed_root_contract_violation():
+    """GIVEN step-5 WHEN inspected THEN blocked + identity_mismatch is a
+    fail-closed stop that never reaches the classifier."""
+    doc_text = _normalized(_read(STEP5_PATH))
+    assert "`status: blocked` + `reason_code: identity_mismatch`" in doc_text
+    assert "repair 未実行" in doc_text

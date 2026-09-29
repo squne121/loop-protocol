@@ -205,6 +205,20 @@ Issue に migration ownership を明記する場合、次を含める:
   report に含める項目（`reason` / `required_human_action` / `target_environment` /
   `verification_command` / `resume_condition`）
 
+**agent 実行許可の機械判定述語（#2810 追加ガイダンス）**: agent-executable な bounded repair を
+許可する Issue は、許可を **1 行で明示**する。`impl-review-loop` の root
+（`classify_runtime_migration.py materialize`）は、Issue 本文の code fence 外の 1 行に
+literal `bash scripts/claude-gpt/repair_proxy.sh`（引数追加・suffix 連結なし）と agent 実行の
+許可 marker（`agent-executable` / `agent が実行してよい` 等）が同居し、かつ当該 literal を含む
+どの行にも禁止・曖昧 marker（`禁止` / `手動` / `human operator` / `Out of Scope` 等）が無い場合に
+限り `live_issue_authorizes_migration: true` とする（それ以外は fail-closed で false）。記載例:
+
+```markdown
+- migration 実行者: agent-executable bounded repair として `bash scripts/claude-gpt/repair_proxy.sh` を agent が実行してよい
+```
+
+VC の code block 内に literal を置いただけの記述、または許可 marker の無い言及は許可として扱われない。
+
 ### 実行時検証プロファイルの assertion binding 記法（`runtime_assertion_bindings`, Issue #2771）
 
 `docs/dev/extension-surface-runtime-policy.yaml` の risk-trigger rule に **hard** で一致する Allowed Paths を宣言した Issue は、その rule が要求する `verification_profile` の `assertions[]`（証明すべき postcondition）を、どの runtime AC が担うかを `runtime_assertion_bindings` として明示する。`enforcement == advisory` のみで到達した profile / assertion は required set に含まれない（PR #2370 の advisory non-blocking 方針を継続する）。

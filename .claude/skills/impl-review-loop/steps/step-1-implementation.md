@@ -55,7 +55,7 @@ fix_delta:
   runtime_migration_action:  # optional（Issue #2810）
     repair_command: "bash scripts/claude-gpt/repair_proxy.sh"
     expected_claude_gpt_home: <root が classify_runtime_migration.py に渡した effective CLAUDE_GPT_HOME 絶対パス>
-    pre_repair_evidence_ref: <root が採取した pre-repair evidence（run_head_sha / git_dirty / launch_sh_sha256 等）への参照>
+    pre_repair_evidence_ref: '<inline JSON 1 行: {"claude_gpt_home_absolute_path": "<絶対パス>", "repo_head": "<git rev-parse HEAD>"}>'  # 追加 key（launch_sh_sha256 等）は許容
 ```
 
 implementation-worker は fix_delta を読み取り、該当箇所のみ修正する（スコープ拡大禁止）。
@@ -72,7 +72,10 @@ classifier 結果から生成した exact command のみであり、raw test out
 `implement-issue` Procedure（worktree 作成・repo file 編集・PR 起票）を実行せず、
 `.claude/agents/implementation-worker.md` の `apply_runtime_migration_fix_delta` mode
 （`IMPLEMENTATION_WORKER_REQUEST_V2` の1つ）として扱う。この mode では repository 内の
-file 編集を一切行わない（実行前後で repository は clean のまま）。詳細は
+file 編集を一切行わない（実行前後で repository は clean のまま）。repair 実行前に
+`classify_runtime_migration.py pre-repair-check` で `expected_claude_gpt_home` と
+`pre_repair_evidence_ref` を検証し、不一致なら repair を起動せず `blocked` /
+`identity_mismatch` を返す。詳細は
 `implementation-worker.md` の `apply_runtime_migration_fix_delta mode` セクションを参照する。
 
 ## 期待する出力

@@ -13,8 +13,10 @@ tools:
 # .claude/skills/*/scripts/ 配下のスクリプト実行に限定。
 # 例外1: uv run --locked python3 .claude/skills/implement-issue/scripts/update_branch.py
 #       （update_branch contract の canonical invocation。raw gh api 直接実行は許可しない — #1429）
-# 例外2: apply_runtime_migration_fix_delta mode 限定で、literal 完全一致する
-#       `bash scripts/claude-gpt/repair_proxy.sh` のみ（引数追加・別 command 禁止 — #2810）。
+# 例外2: apply_runtime_migration_fix_delta mode 限定で、次の 2 種類のみ（別 command 禁止 — #2810）。
+#       (a) repair 直前の pre-check 1 種類:
+#           `uv run --locked python3 .claude/skills/impl-review-loop/scripts/classify_runtime_migration.py pre-repair-check ...`
+#       (b) literal 完全一致する `bash scripts/claude-gpt/repair_proxy.sh`（引数追加禁止）。
 # git push / gh pr create は open-pr skill 経由のみ。
 # 新規 SubAgent ファイル（.claude/agents/*.md）の追加は禁止 — PR repair 機能を新 SubAgent として分離してはならない。
 model: sonnet
@@ -111,7 +113,8 @@ IMPLEMENTATION_WORKER_REQUEST_V2:
 # issue_url: <live Issue URL>
 # repair_command: "bash scripts/claude-gpt/repair_proxy.sh"  # literal 完全一致の場合のみ実行
 # expected_claude_gpt_home: <root が classify_runtime_migration.py に渡した effective CLAUDE_GPT_HOME 絶対パス>
-# pre_repair_evidence_ref: <root が採取した pre-repair evidence への参照>
+# pre_repair_evidence_ref: '<inline JSON object 1 行: {"claude_gpt_home_absolute_path": "<絶対パス>", "repo_head": "<git rev-parse HEAD>"}>'
+#   （形式は inline JSON に固定。file path・opaque token は不可。追加 key は許容され無視される）
 ```
 
 ### action.kind → worker mode の振り分け表
@@ -135,7 +138,7 @@ unknown kind（上記以外）は routing が確定しないため、実行せ�
 ```yaml
 IMPLEMENTATION_WORKER_RESULT_V2:
   status: ok | failed | blocked | permission_blocked
-  reason_code: null | expected_head_sha_missing | expected_head_sha_mismatch | primary_rate_limit | secondary_rate_limit | validation_failed | permission_denied | head_unchanged_after_accepted | unexpected_head_change | transport_error | unknown_http_status | repair_failed | command_mismatch
+  reason_code: null | expected_head_sha_missing | expected_head_sha_mismatch | primary_rate_limit | secondary_rate_limit | validation_failed | permission_denied | head_unchanged_after_accepted | unexpected_head_change | transport_error | unknown_http_status | repair_failed | command_mismatch | identity_mismatch
   # reason_code は update_branch エラー時の fail-closed 分類を表す:
   #   expected_head_sha_missing:        expected_head_sha 未指定
   #   expected_head_sha_mismatch:       preflight または 422 で head SHA mismatch
@@ -149,11 +152,12 @@ IMPLEMENTATION_WORKER_RESULT_V2:
   #   unknown_http_status:              上記以外の HTTP status
   #   repair_failed:                    apply_runtime_migration_fix_delta mode 限定。repair command が exit 1/2 等で失敗（Issue #2810）
   #   command_mismatch:                 apply_runtime_migration_fix_delta mode 限定。repair_command が literal 不一致で実行を拒否（Issue #2810）
+  #   identity_mismatch:                apply_runtime_migration_fix_delta mode 限定。repair 実行前の pre-repair-check（expected_claude_gpt_home / pre_repair_evidence_ref binding）不一致で repair 未実行（Issue #2810）
   #   null:                       エラーなし（status: ok）
   mode: update_pr_body_hygiene | update_branch | apply_pr_review_fix_delta | apply_runtime_migration_fix_delta
-  action_kind: <kind>          # REQUEST_V2.required_auto_action.kind を echo
-  pr_number: <int>
-  update_method: merge_only
+  action_kind: <kind>          # REQUEST_V2.required_auto_action.kind を echo（apply_runtime_migration_fix_delta では omitted）
+  pr_number: <int>             # apply_runtime_migration_fix_delta では omitted
+  update_method: merge_only    # apply_runtime_migration_fix_delta では omitted
   before_head_sha: <sha>       # 実行前の head SHA（update_branch 時）
   after_head_sha: <sha>        # 実行後の head SHA（update_branch 202 + poll 成功時）
   wrapper_used: true | false   # update_pr_body_hygiene で update_pr.py wrapper を使用したか
@@ -178,18 +182,38 @@ IMPLEMENTATION_WORKER_RESULT_V2:
 
 # apply_runtime_migration_fix_delta mode 追加フィールド（Issue #2810）:
 # runtime_migration:
-#   exit_code: <int>
-#   claude_gpt_repair_proxy_result_v1_status: ok | failed
+#   repair_executed: true | false   # false = pre-repair-check 不一致等で repair_proxy.sh を起動していない
+#   exit_code: <int | null>          # repair_executed: false では null
+#   claude_gpt_repair_proxy_result_v1_status: ok | failed | null   # repair_executed: false では null
 #   installed_path: <string | null>
 #   installed_version: <string | null>
 #   actual_claude_gpt_home: <string>
 #   install_log_tail: <string>
 #   sudo_required: true | false
 # rerun_required:
-#   verification: true   # 常に true（repair は runtime state を変更するため）
+#   verification: true   # repair_executed: true では常に true（repair は runtime state を変更するため）
 #   pr_review: true
 #   reason: <string | null>
 ```
+
+### RESULT_V2 の mode 別 field 表（Issue #2810）
+
+PR を対象にする 3 mode と、PR を対象にしない `apply_runtime_migration_fix_delta` では
+返す field が異なる。PR 専用 field は runtime mode では **null ではなく omitted（key 自体を
+返さない）** に固定する。調査根拠: `impl-review-loop` 配下（step-5 / step-1 / scripts / tests）に
+runtime mode の `pr_number` / `action_kind` / `update_method` / `wrapper_used` を読む consumer は
+存在せず（Step 5 の runtime 写像は `status` / `reason_code` / `runtime_migration` のみ参照）、
+`update_method: merge_only` は `update_branch` 専用契約（`implement-issue` SKILL.md の
+`UPDATE_BRANCH_RESULT_V1`）の固定値である。`pr_number: null` や `update_method: merge_only` を
+runtime mode で返すのは契約違反とする。既存 3 mode の field と semantics は変更しない。
+
+| field | 既存 3 mode（`update_pr_body_hygiene` / `update_branch` / `apply_pr_review_fix_delta`） | `apply_runtime_migration_fix_delta` |
+|---|---|---|
+| `status` / `reason_code` / `mode` / `errors` | 必須 | 必須 |
+| `action_kind` / `pr_number` / `update_method` / `wrapper_used` | 従来どおり | **forbidden（omitted）** |
+| `before_head_sha` / `after_head_sha` / `rate_limit_diagnostics` | 従来どおり（mode ごと） | **forbidden（omitted）** |
+| `rerun_required` | 従来どおり | 必須（`verification` / `pr_review` / `reason`） |
+| `runtime_migration` | 対象外（返さない） | 必須（下記 sub-object） |
 
 ## update_pr_body_hygiene mode（PR 本文衛生修正モード）
 
@@ -270,17 +294,44 @@ executor mode。`.claude/skills/impl-review-loop/steps/step-1-implementation.md`
 `pr_number` / `expected_head_sha` / worktree は不要（PR 状態を対象にしない）。既存 3 mode の
 必須フィールドと挙動は変更しない。
 
+`pre_repair_evidence_ref` は **inline JSON object（1 行）** に固定する。必須 key は
+`claude_gpt_home_absolute_path`（root が採取した effective `CLAUDE_GPT_HOME` の絶対パス）と
+`repo_head`（root が採取した `git rev-parse HEAD`）。`launch_sh_sha256` 等の追加 key は許容され、
+pre-check では無視される。file path や opaque token は malformed として扱う。
+
 ### 実行制約（repository 内 file 編集の禁止）
 
 この mode では repository 内の file 編集を一切行わない（実行前後で repository は clean の
 まま = clean postcondition。実行後に `git status --porcelain` が空であることを worker 自身が
 確認して結果に含める）。host runtime mutation（`$CLAUDE_GPT_HOME/bin` への install）は exact
-`repair_command` の実行に限り許可される唯一の例外であり、それ以外の command は実行しない。
+`repair_command` の実行に限り許可される唯一の例外であり、それ以外の command は、repair 直前の
+`pre-repair-check`（下記「repair 実行前の identity 検証」）1 種類を除き実行しない。
 worker は分類を再判定しない（root の分類結果をそのまま信頼して実行するのみ）。
 
+### repair 実行前の identity 検証（pre-repair-check）
+
+worker は `repair_command` の文字列一致を確認した後、**repair 実行前**に次の決定論的 pre-check を
+1 回だけ実行する（この command が repair 直前に許可される唯一の追加 command である）:
+
+```bash
+uv run --locked python3 .claude/skills/impl-review-loop/scripts/classify_runtime_migration.py pre-repair-check \
+  --expected-claude-gpt-home "<expected_claude_gpt_home>" \
+  --pre-repair-evidence-json '<pre_repair_evidence_ref の inline JSON>'
+```
+
+pre-check は (1) effective `CLAUDE_GPT_HOME`（未設定なら `~/.claude-gpt`）を絶対パスへ正規化し、
+(2) `expected_claude_gpt_home`（絶対パス）と完全一致すること、(3) `pre_repair_evidence_ref` が
+同じ effective home と現在の repository head（`git rev-parse HEAD`）に bind されていることを検証する。
+exit code が 0 以外（1 = 不一致、2 = 引数・入力不正）の場合、worker は `repair_proxy.sh` を
+**実行せず**、`status: blocked` / `reason_code: identity_mismatch` を返す。この場合
+`runtime_migration.repair_executed: false`（`exit_code` / `claude_gpt_repair_proxy_result_v1_status`
+は null、`actual_claude_gpt_home` は pre-check が報告した effective home）、
+`rerun_required.verification: false` / `rerun_required.pr_review: false` とし、
+`RUNTIME_MIGRATION_RESULT_V1` の `status` は `blocked` にする。repair 後にのみ home 不一致を
+検知する設計にはしない。
 ### 実行方法
 
-worker は `repair_command` の文字列一致を確認した後、stdin/tty なしで非対話に実行する:
+worker は `repair_command` の文字列一致と上記 pre-repair-check の通過を確認した後、stdin/tty なしで非対話に実行する:
 
 ```bash
 bash scripts/claude-gpt/repair_proxy.sh </dev/null
@@ -298,7 +349,7 @@ Auto-mode の classifier / hook が `repair_command` の tool_use 自体を拒�
 
 ### 結果
 
-`IMPLEMENTATION_WORKER_RESULT_V2` の `runtime_migration` フィールド（`exit_code` /
+`IMPLEMENTATION_WORKER_RESULT_V2` の `runtime_migration` フィールド（`repair_executed` / `exit_code` /
 `claude_gpt_repair_proxy_result_v1_status` / `installed_path` / `installed_version` /
 `actual_claude_gpt_home` / `install_log_tail` / `sudo_required`）と
 `rerun_required.verification: true` を返す。加えて、worker の最終応答テキストに次の

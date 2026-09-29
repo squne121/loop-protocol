@@ -443,3 +443,139 @@ def test_probe_install_dir_writable_false_when_existing_proxy_blocks_replace(tmp
     finally:
         bin_dir.chmod(bin_original_mode)
         proxy_path.chmod(stat.S_IWUSR | stat.S_IRUSR)
+
+
+# --- primitive type validation (Issue #2810 fix_delta P1-C) -----------------
+
+MALFORMED_ROUTE = "malformed_input_type_fail_closed"
+
+
+def _with_path(payload, path, value):
+    """Return a deep-ish copy of ``payload`` with ``path`` (dotted) set."""
+    import copy
+
+    clone = copy.deepcopy(payload)
+    parts = path.split(".")
+    target = clone
+    for part in parts[:-1]:
+        target = target[part]
+    target[parts[-1]] = value
+    return clone
+
+
+@pytest.mark.parametrize(
+    "path,bad_value",
+    [
+        ("live_issue_authorizes_migration", "false"),
+        ("live_issue_authorizes_migration", "true"),
+        ("live_issue_authorizes_migration", 1),
+        ("live_issue_authorizes_migration", [True]),
+        ("effective_env.override_vars_present", "false"),
+        ("effective_env.override_vars_present", 0),
+        ("probes.install_dir_writable", "true"),
+        ("probes.install_dir_writable", 1),
+        ("probes.host_reachable", "true"),
+        ("probes.host_reachable", []),
+        ("capability_flags.needs_credential", "false"),
+        ("capability_flags.needs_secret", "false"),
+        ("capability_flags.needs_privilege", "false"),
+        ("capability_flags.destructive_or_global", 0),
+        ("failure_evidence.repair_command", ["bash", "scripts/claude-gpt/repair_proxy.sh"]),
+        ("failure_evidence.cause", True),
+        ("effective_env.claude_gpt_home", 123),
+    ],
+)
+def test_wrong_primitive_type_is_never_agent_executable_and_fails_closed(path, bad_value):
+    """GIVEN a fully agent-executable payload with ONE fixed key carrying a
+    wrong primitive type (JSON string "false"/"true", int 0/1, list, ...)
+    WHEN classified THEN the result is implementation_defect with the fixed
+    malformed_input_type_fail_closed route -- never agent_executable_migration
+    and never a (mis)flipped human_capability_blocker."""
+    result = classify_runtime_migration(_with_path(_base_payload(), path, bad_value))
+    assert result["class"] == "implementation_defect", (path, bad_value)
+    assert result["route"] == MALFORMED_ROUTE
+    assert result["human_action_report"] is None
+
+
+@pytest.mark.parametrize(
+    "path,bad_value",
+    [
+        ("status", 1),
+        ("reason_code", ["repair_failed"]),
+        ("exit_code", "1"),
+        ("exit_code", True),
+        ("deny_evidence_verified", "false"),
+        ("deny_evidence_verified", 1),
+        ("sudo_required_in_log", "false"),
+    ],
+)
+def test_worker_result_wrong_primitive_type_fails_closed(path, bad_value):
+    """GIVEN a verified-deny worker_result with one field of a wrong
+    primitive type WHEN classified THEN it never becomes a
+    human_capability_blocker (deny_evidence_verified:"false" is truthy under
+    bool() and must not be honoured) nor agent-executable."""
+    worker_result = {
+        "status": "permission_blocked",
+        "reason_code": "permission_denied",
+        "exit_code": None,
+        "deny_evidence_verified": True,
+        "sudo_required_in_log": False,
+    }
+    worker_result[path] = bad_value
+    result = classify_runtime_migration(_base_payload(worker_result=worker_result))
+    assert result["class"] == "implementation_defect"
+    assert result["route"] == MALFORMED_ROUTE
+
+
+def test_string_false_deny_evidence_does_not_grant_human_capability_blocker():
+    """GIVEN worker_result.deny_evidence_verified is the JSON string "false"
+    (truthy under bool()) WHEN classified THEN NOT human_capability_blocker."""
+    result = classify_runtime_migration(
+        _base_payload(
+            worker_result={
+                "status": "permission_blocked",
+                "reason_code": "permission_denied",
+                "exit_code": None,
+                "deny_evidence_verified": "false",
+                "sudo_required_in_log": False,
+            }
+        )
+    )
+    assert result["class"] != "human_capability_blocker"
+    assert result["class"] != "agent_executable_migration"
+
+
+@pytest.mark.parametrize("section", ["failure_evidence", "effective_env", "probes", "capability_flags"])
+def test_non_object_sub_object_fails_closed(section):
+    """GIVEN a sub-object that is a JSON string/list instead of an object
+    WHEN classified THEN it fails closed (not silently defaulted)."""
+    for bad in ("x", ["x"], 1, True):
+        result = classify_runtime_migration(_base_payload(**{section: bad}))
+        assert result["class"] == "implementation_defect", (section, bad)
+        assert result["route"] == MALFORMED_ROUTE
+
+
+def test_missing_keys_keep_historical_defaults_and_only_wrong_types_are_rejected():
+    """GIVEN keys that are simply ABSENT WHEN classified THEN the historical
+    default behaviour is preserved (no malformed_input_type_fail_closed):
+    missing live_issue_authorizes_migration -> not_authorized, missing
+    capability flags -> treated as False (agent-executable stays reachable)."""
+    payload = _base_payload()
+    del payload["live_issue_authorizes_migration"]
+    result = classify_runtime_migration(payload)
+    assert result["route"] == "not_authorized_implementation_defect"
+
+    payload = _base_payload()
+    payload["capability_flags"] = {}
+    payload["worker_result"] = None
+    assert classify_runtime_migration(payload)["class"] == "agent_executable_migration"
+
+
+def test_find_payload_type_violations_lists_offending_paths():
+    """GIVEN a payload with two wrong-typed keys WHEN inspected THEN both
+    dotted paths are reported."""
+    violations = classify_runtime_migration_mod.find_payload_type_violations(
+        _with_path(_with_path(_base_payload(), "probes.host_reachable", "true"), "capability_flags.needs_secret", "no")
+    )
+    assert any(v.startswith("probes.host_reachable") for v in violations)
+    assert any(v.startswith("capability_flags.needs_secret") for v in violations)

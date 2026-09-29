@@ -114,3 +114,15 @@ def test_runtime_verification_policy_required_report_fields():
     assert "`target_environment`:" in doc_text
     assert "`verification_command`:" in doc_text
     assert "`resume_condition`:" in doc_text
+
+
+def test_body_authoring_documents_machine_checkable_authorization_predicate():
+    """GIVEN body-authoring.md WHEN inspected THEN it documents the
+    deterministic predicate the impl-review-loop root uses for
+    live_issue_authorizes_migration (exact literal + agent-execution
+    allowance marker on one line, fail-closed otherwise) with a sample."""
+    doc_text = _read(BODY_AUTHORING_PATH)
+    assert "agent 実行許可の機械判定述語" in doc_text
+    assert "bash scripts/claude-gpt/repair_proxy.sh" in doc_text
+    assert "live_issue_authorizes_migration: true" in doc_text
+    assert "fail-closed" in doc_text
