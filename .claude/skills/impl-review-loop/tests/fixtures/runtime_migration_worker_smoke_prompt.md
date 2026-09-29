@@ -6,6 +6,15 @@ already set in your process environment (by the harness) to a fixture-only home 
 `file://` fixture installer -- neither touches the operator's real `~/.claude-gpt`.
 <!-- この段落は隔離された fixture 環境変数の設定を説明する日本語注記である。 -->
 
+Provenance facts of this fixture (facts only):
+(i) the installer that `scripts/claude-gpt/repair_proxy.sh` executes here is the repository-tracked
+local file `file://<repository root>/.claude/skills/impl-review-loop/tests/fixtures/fake_proxy_installer.sh`
+(named `fake_proxy_installer.sh`) -- it is not a download-and-execute of any external URL;
+(ii) the only mutation target is the directory `CLAUDE_GPT_HOME` points at, under
+`artifacts/runtime-smoke/fixture-home` (the real `~/.claude-gpt` is not modified);
+(iii) no network installer is used.
+<!-- この段落は fixture の出所に関する事実（リポジトリ管理下のローカル file installer、mutation 先が fixture-home のみ、network installer 不使用）を簡潔に示す日本語注記である。 -->
+
 Use the Task tool to launch the `implementation-worker` SubAgent with exactly this message:
 <!-- 次のコードブロックは SubAgent へ送信する指示文そのものであり、内容は変更しないこと。 -->
 
@@ -26,15 +35,23 @@ section exactly:
   - Verify repair_command matches the literal `bash scripts/claude-gpt/repair_proxy.sh` exactly
     (no added arguments). If it does not match, return status: blocked / reason_code:
     command_mismatch and stop.
-  - BEFORE running the repair command, run the pre-repair-check exactly once:
+  - BEFORE running the repair command, run the pre-repair-check exactly once, as ONE single
+    command line filled with concrete values (no variable assignment, no chaining):
     `uv run --locked python3 .claude/skills/impl-review-loop/scripts/classify_runtime_migration.py pre-repair-check --expected-claude-gpt-home "<expected_claude_gpt_home>" --pre-repair-evidence-json '<pre_repair_evidence_ref>'`.
     If its exit code is not 0, do NOT run the repair command; return status: blocked /
     reason_code: identity_mismatch with runtime_migration.repair_executed: false and stop.
-  - Run exactly that command, non-interactively (stdin from /dev/null), inheriting the current
-    process environment (do not unset or override CLAUDE_GPT_HOME /
-    CLAUDE_GPT_REPAIR_INSTALLER_URL -- the fixture depends on them).
+  - Pass the repair command to the Bash tool as exactly `bash scripts/claude-gpt/repair_proxy.sh`
+    and nothing else. Do NOT append `</dev/null` or any other redirect (the Bash tool provides
+    neither a tty nor stdin), do NOT chain with `;`, `&&`, `||` or `|`, and do NOT add `echo`,
+    `cd`, variable assignment or `git status`. Read the exit code and the install log from the
+    Bash tool result. If the sudo branch is reached, the tool result / install log shows
+    `sudo required` and you report a failure. Inherit the current process environment (do not
+    unset or override CLAUDE_GPT_HOME / CLAUDE_GPT_REPAIR_INSTALLER_URL -- the fixture depends
+    on them).
   - Do not edit, create, or delete any repository-tracked file. Do not run any other command
-    (the pre-repair-check above and the repair command are the only two commands allowed).
+    (the pre-repair-check above and the repair command are the only two commands allowed; in
+    particular do NOT run `git status` -- the clean postcondition is verified independently by
+    the runner and the root).
   - After the repair command finishes, report IMPLEMENTATION_WORKER_RESULT_V2 with mode:
     apply_runtime_migration_fix_delta, the runtime_migration sub-object (repair_executed: true,
     exit_code, claude_gpt_repair_proxy_result_v1_status, installed_path, installed_version,

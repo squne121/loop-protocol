@@ -72,7 +72,9 @@ classifier 結果から生成した exact command のみであり、raw test out
 `implement-issue` Procedure（worktree 作成・repo file 編集・PR 起票）を実行せず、
 `.claude/agents/implementation-worker.md` の `apply_runtime_migration_fix_delta` mode
 （`IMPLEMENTATION_WORKER_REQUEST_V2` の1つ）として扱う。この mode では repository 内の
-file 編集を一切行わない（実行前後で repository は clean のまま）。repair 実行前に
+file 編集を一切行わない（実行前後で repository は clean のまま。この postcondition は runner の
+`--require-clean-postcondition` と root が独立に検証し、worker は `git status` を実行しない）。
+Bash tool へ渡す command は redirect・連結・`echo` を含まない単一 command に固定する。repair 実行前に
 `classify_runtime_migration.py pre-repair-check` で `expected_claude_gpt_home` と
 `pre_repair_evidence_ref` を検証し、不一致なら repair を起動せず `blocked` /
 `identity_mismatch` を返す。詳細は

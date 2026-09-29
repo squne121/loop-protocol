@@ -16,7 +16,8 @@ tools:
 # 例外2: apply_runtime_migration_fix_delta mode 限定で、次の 2 種類のみ（別 command 禁止 — #2810）。
 #       (a) repair 直前の pre-check 1 種類:
 #           `uv run --locked python3 .claude/skills/impl-review-loop/scripts/classify_runtime_migration.py pre-repair-check ...`
-#       (b) literal 完全一致する `bash scripts/claude-gpt/repair_proxy.sh`（引数追加禁止）。
+#           （具体値で埋めた単一 command。変数代入・連結・追加 command 禁止）
+#       (b) literal 完全一致する `bash scripts/claude-gpt/repair_proxy.sh`（引数・redirect・連結・echo 追加禁止）。
 # git push / gh pr create は open-pr skill 経由のみ。
 # 新規 SubAgent ファイル（.claude/agents/*.md）の追加は禁止 — PR repair 機能を新 SubAgent として分離してはならない。
 model: sonnet
@@ -302,11 +303,34 @@ pre-check では無視される。file path や opaque token は malformed と�
 ### 実行制約（repository 内 file 編集の禁止）
 
 この mode では repository 内の file 編集を一切行わない（実行前後で repository は clean の
-まま = clean postcondition。実行後に `git status --porcelain` が空であることを worker 自身が
-確認して結果に含める）。host runtime mutation（`$CLAUDE_GPT_HOME/bin` への install）は exact
-`repair_command` の実行に限り許可される唯一の例外であり、それ以外の command は、repair 直前の
-`pre-repair-check`（下記「repair 実行前の identity 検証」）1 種類を除き実行しない。
-worker は分類を再判定しない（root の分類結果をそのまま信頼して実行するのみ）。
+まま = clean postcondition。この postcondition は runner の `--require-clean-postcondition` と
+root が独立に検証するため、**worker は `git status` を含む repository 状態確認 command を一切
+実行しない**。RESULT にも git status 由来の field は含めない）。host runtime mutation
+（`$CLAUDE_GPT_HOME/bin` への install）は exact `repair_command` の実行に限り許可される唯一の例外で
+あり、それ以外の command は、repair 直前の `pre-repair-check`（下記「repair 実行前の identity 検証」）
+1 種類を除き実行しない。worker は分類を再判定しない（root の分類結果をそのまま信頼して実行するのみ）。
+
+### Bash tool に渡す command 文字列の固定（Issue #2810 runtime evidence 由来）
+
+この mode で worker が Bash tool の `command` に渡してよい文字列は、次の 2 種類の **単一 command**
+のみであり、いずれも 1 文字も足してはならない（契約の literal と実際の tool_input を drift させると、
+permission classifier に契約外 command として拒否される）:
+
+1. `pre-repair-check`（下記）: 値を具体値で埋めた 1 行。
+2. repair: `bash scripts/claude-gpt/repair_proxy.sh`
+
+禁止事項（repair / pre-repair-check の両方に適用）:
+
+- stdin redirect（`</dev/null` 等）の付加。Bash tool は tty も stdin も提供しないため redirect は不要である。
+- `;` / `&&` / `||` / `|` による command の連結。
+- `echo` による exit code の出力（例: `; echo "EXIT=$?"`）。exit code と install log は
+  Bash tool の result（stdout / stderr / exit status）から読む。
+- `cd` / 変数代入（`H="$CLAUDE_GPT_HOME"` 等）/ 環境変数を読み出す command の追加。
+- `git status` を含む、契約外の追加 command。
+
+installer が `sudo` 分岐に到達した場合は、Bash tool result / install log に `sudo required` が出て
+失敗として返る（root の二重防御）。worker は sudo prompt を待たず、その失敗を `sudo_required: true`
+として報告する。
 
 ### repair 実行前の identity 検証（pre-repair-check）
 
@@ -314,10 +338,12 @@ worker は `repair_command` の文字列一致を確認した後、**repair 実�
 1 回だけ実行する（この command が repair 直前に許可される唯一の追加 command である）:
 
 ```bash
-uv run --locked python3 .claude/skills/impl-review-loop/scripts/classify_runtime_migration.py pre-repair-check \
-  --expected-claude-gpt-home "<expected_claude_gpt_home>" \
-  --pre-repair-evidence-json '<pre_repair_evidence_ref の inline JSON>'
+uv run --locked python3 .claude/skills/impl-review-loop/scripts/classify_runtime_migration.py pre-repair-check --expected-claude-gpt-home "<expected_claude_gpt_home の具体値>" --pre-repair-evidence-json '<pre_repair_evidence_ref の inline JSON の具体値>'
 ```
+
+上記のプレースホルダは、親 agent が request 経由で渡した具体値で埋めた **1 行** として Bash tool
+に渡す。変数代入・連結・追加 command は付けず、worker 自身が環境変数を読み出す command を実行して
+値を補ってはならない。
 
 pre-check は (1) effective `CLAUDE_GPT_HOME`（未設定なら `~/.claude-gpt`）を絶対パスへ正規化し、
 (2) `expected_claude_gpt_home`（絶対パス）と完全一致すること、(3) `pre_repair_evidence_ref` が
@@ -329,15 +355,18 @@ exit code が 0 以外（1 = 不一致、2 = 引数・入力不正）の場合�
 `rerun_required.verification: false` / `rerun_required.pr_review: false` とし、
 `RUNTIME_MIGRATION_RESULT_V1` の `status` は `blocked` にする。repair 後にのみ home 不一致を
 検知する設計にはしない。
+
 ### 実行方法
 
-worker は `repair_command` の文字列一致と上記 pre-repair-check の通過を確認した後、stdin/tty なしで非対話に実行する:
+worker は `repair_command` の文字列一致と上記 pre-repair-check の通過を確認した後、次の
+**単一 command を exact に** Bash tool へ渡す（redirect・連結・`echo` なし）:
 
 ```bash
-bash scripts/claude-gpt/repair_proxy.sh </dev/null
+bash scripts/claude-gpt/repair_proxy.sh
 ```
 
-installer が `sudo` 分岐に到達した場合（install log に `sudo required` 相当の文字列がある場合）
+exit code と install log は Bash tool result から読む。installer が `sudo` 分岐に到達した場合
+（Bash tool result / install log に `sudo required` 相当の文字列がある場合）
 は sudo prompt を待たず失敗として扱い、`runtime_migration.sudo_required: true` を結果に含める
 （root がこれを `human_capability_blocker` に分類する二重防御。#2810 Outcome 1）。
 

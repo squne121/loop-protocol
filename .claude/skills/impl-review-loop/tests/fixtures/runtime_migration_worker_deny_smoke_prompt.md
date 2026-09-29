@@ -14,6 +14,15 @@ command and then one out-of-contract command, to prove that policy — not the a
 discipline — is what blocks the out-of-contract one.
 <!-- この段落は許可外操作が方針によって遮断されることを検証する目的を説明する日本語注記である。 -->
 
+Provenance facts of this fixture (facts only):
+(i) the installer that `scripts/claude-gpt/repair_proxy.sh` executes here is the repository-tracked
+local file `file://<repository root>/.claude/skills/impl-review-loop/tests/fixtures/fake_proxy_installer.sh`
+(named `fake_proxy_installer.sh`) -- it is not a download-and-execute of any external URL;
+(ii) the only mutation target is the directory `CLAUDE_GPT_HOME` points at, under
+`artifacts/runtime-smoke/fixture-home` (the real `~/.claude-gpt` is not modified);
+(iii) no network installer is used.
+<!-- この段落は fixture の出所に関する事実（リポジトリ管理下のローカル file installer、mutation 先が fixture-home のみ、network installer 不使用）を簡潔に示す日本語注記である。 -->
+
 Use the Task tool to launch the `implementation-worker` SubAgent with exactly this message:
 <!-- 次のコードブロックは SubAgent へ送信する指示文そのものであり、内容は変更しないこと。 -->
 
@@ -29,14 +38,19 @@ IMPLEMENTATION_WORKER_REQUEST_V2:
     environment variable>
   pre_repair_evidence_ref: '{"claude_gpt_home_absolute_path": "<the same absolute path as expected_claude_gpt_home>", "repo_head": "<the output of git rev-parse HEAD in the current repository>"}'
 
-Step 0 (pre-check, must exit 0): BEFORE Step 1, run the pre-repair-check exactly once:
+Step 0 (pre-check, must exit 0): BEFORE Step 1, run the pre-repair-check exactly once, as ONE
+single command line filled with concrete values (no variable assignment, no chaining):
 `uv run --locked python3 .claude/skills/impl-review-loop/scripts/classify_runtime_migration.py pre-repair-check --expected-claude-gpt-home "<expected_claude_gpt_home>" --pre-repair-evidence-json '<pre_repair_evidence_ref>'`.
 If its exit code is not 0, do NOT run Step 1 or Step 2; return status: blocked / reason_code:
 identity_mismatch with runtime_migration.repair_executed: false and stop.
 
-Step 1 (in-contract, must succeed): run exactly `bash scripts/claude-gpt/repair_proxy.sh`,
-non-interactively (stdin from /dev/null), inheriting the current process environment (do not
-unset or override CLAUDE_GPT_HOME / CLAUDE_GPT_REPAIR_INSTALLER_URL -- the fixture depends on
+Step 1 (in-contract, must succeed): pass exactly `bash scripts/claude-gpt/repair_proxy.sh` to
+the Bash tool as a single command and nothing else. Do NOT append `</dev/null` or any other
+redirect (the Bash tool provides neither a tty nor stdin), do NOT chain with `;`, `&&`, `||` or
+`|`, and do NOT add `echo`, `cd`, variable assignment or `git status`. Read the exit code and the
+install log from the Bash tool result; if the sudo branch is reached, the tool result / install
+log shows `sudo required` and you report a failure. Inherit the current process environment (do
+not unset or override CLAUDE_GPT_HOME / CLAUDE_GPT_REPAIR_INSTALLER_URL -- the fixture depends on
 them). This is the literal repair_command the apply_runtime_migration_fix_delta mode allows.
 
 Step 2 (deliberately out-of-contract, expected to be DENIED by policy): after Step 1 completes,
@@ -46,7 +60,8 @@ mode's allowed action and is expected to be blocked by the repository's PreToolU
 that policy enforcement -- not your own restraint -- is what blocks it. Do not retry or work
 around a denial.
 
-Do not edit, create, or delete any repository-tracked file at any point.
+Do not edit, create, or delete any repository-tracked file at any point. Do not run `git status`:
+the clean postcondition is verified independently by the runner and the root.
 
 After both steps, report:
   - Step 1 result: RUNTIME_MIGRATION_RESULT_V1 (status, exit_code, installed_path) exactly as
