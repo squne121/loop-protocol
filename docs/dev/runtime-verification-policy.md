@@ -696,6 +696,63 @@ failure（ChatGPT アカウントの再認証が必要という結論）と誤�
 
 ---
 
+## 14. 承認が必要な runtime VC の approval carrier（Issue #2839）
+
+runtime VC が Auto mode の classifier に拒否される操作（例: repository 管理下の fixture installer を実行する repair command）を含む場合、対話 session で operator が承認しても、runner（`scripts/agent-ops/run_worktree_agent_runtime_smoke.py`）が起動する独立した `claude -p` にはその承認が届かない。本節は、この承認を子 session へ invocation 単位で bounded かつ auditable に渡す仕組み（approval carrier）と、それを渡せない契約を事前に検出する手順を定める。
+
+### 14.1 承認は継承されない（前提）
+
+親 transcript および親 session の承認は、独立した子 `claude -p` session に継承されない。classifier が読むのは、その session 自身の user message と実行される command だけである。したがって runtime VC の契約、docs、authoring guidance のいずれにも「対話 session で承認済みだから子でも通る」という前提を置いてはならない。承認が必要な runtime VC は、14.3 の carrier を使うか、14.5 の checker で `non_executable` と扱う。
+
+### 14.2 ownership decision（採用と不採用の理由）
+
+- **採用**: runner の closed enum `--approval-profile` による profile carrier。runner は既に settings overlay の唯一の producer であり、caller が settings を渡す入口を持たない。profile の registry、overlay の生成、precondition の検証、子 env の構築は `scripts/agent-ops/runtime_vc_approval_contract.py` に一箇所だけ定義し、runner はそれを読み込んで使う。
+- **不採用（consumer wrapper）**: 新しい wrapper script は settings を渡す面を増やし、generic passthrough に退化しやすい。
+- **不採用（caller 指定の `--settings`）**: caller が任意の JSON を渡せるため generic passthrough になる。
+- **不採用（`~/.claude/settings.json` の恒久変更）**: user 全体の persistent setting を既定解にしない。project の `.claude/settings*.json` は `autoMode` として読まれない（公式仕様）ため使えない。
+
+carrier が与える authority の出所は、repository でレビューされた registry 定数と、Issue の宣言（14.4）と、それらを含む PR の review である。live な operator 承認を runner が検証する仕組みは作らない。
+
+### 14.3 carrier の仕様
+
+- profile は closed enum で、初期値は `repair_proxy_hermetic_fixture` の 1 件だけである。
+- 固定 overlay は、runner の基底 overlay 定数（hooks と `permissions.deny`）に `autoMode.allow` として `"$defaults"` と固定 rule 1 件を足したものである。broad allow は含めず、`soft_deny` / `hard_deny` / `environment` の key は overlay に含めない。
+- carrier は native adapter かつ structured mode 専用で、`--expect-skill-command`・`--require-hook-chain-evidence`・`--hermetic-agent-definition` とは併用できない（第二の `--settings` や overlay の派生 variant の合成規則を定義しないため fail-closed とする）。
+- runner は子 session の起動前に、fixture installer の実体（regular file、symlink 不可、worktree 配下、git 追跡済み、未コミット変更なし）、`CLAUDE_GPT_REPAIR_INSTALLER_URL` の完全一致、`CLAUDE_GPT_HOME` の配置（worktree 配下の `artifacts/runtime-smoke/` 以下、symlink と `..` による逸脱なし）、override 変数の未設定を決定論的に検証し、不成立なら子 session を起動せず fail-closed で終了する。
+- 子 session の env は、検証済みの値で runner が明示的に組み立てて渡す。
+- audit として、evidence に `approval_carrier`（`profile_id`、`repo_head`、`overlay_sha256`、`fixture_git_blob_hash`、`fixture_unchanged`、検証済み precondition の要約）を記録する。flag を使わない run の argv と evidence は変わらない。
+
+carrier の実 classifier に対する効果は、classifier の run-to-run variance に依存するため、この節の hermetic pytest では検証しない。実 Auto mode での効果は、carrier を使う VC（例: Issue #2810 の AC9/AC10）の再実行で確認する。
+
+### 14.4 宣言 grammar
+
+承認を必要とする runtime VC を持つ Issue は、`## Runtime Verification Applicability` 内に 1 行 `approval_required_actions: [<profile_id>, ...]` を宣言し、対応する VC の runner command 行に `--approval-profile <profile_id>` を付ける。宣言が無いことは「承認不要の宣言」を意味する。VC と AC の紐づけは、VC ブロック内でコマンド行の直前にある `# AC<n>` コメント行で表す。
+
+### 14.5 non-executable 検出（checker）
+
+`scripts/agent-ops/runtime_vc_approval_contract.py` は Issue 本文を静的に照合し、`executable` / `non_executable` / `not_applicable` を返す。手動で実行する場合は次のとおり。
+
+```bash
+uv run --locked python3 scripts/agent-ops/runtime_vc_approval_contract.py --issue-body-file <file>
+```
+
+判定は次の順に評価し、最初に該当した行で確定する。行 (7a) は、宣言に無い、または registry に無い `--approval-profile` 値を持つ runner 行を `executable` と誤判定しないための補完である。
+
+| 行 | 条件 | 結果 |
+|---|---|---|
+| 0 | runner 行に解釈できない構文（`;`・`&&`・`\|`・`bash -c`・`$PWD` 以外の変数展開など）がある | `non_executable` |
+| 1 | 宣言が無く、flag も承認が必要な signature（`repair_proxy.sh` 実行、`CLAUDE_GPT_REPAIR_INSTALLER_URL=` の env prefix）も無い | `not_applicable` |
+| 2 | 宣言が無いが flag または signature がある | `non_executable` |
+| 3 | 宣言が空・重複・未知の id を含む | `non_executable` |
+| 4 | 宣言された id に対応する runner 行が無い | `non_executable` |
+| 5 | flag を持つ runner 行が AC に紐づかない | `non_executable` |
+| 6 | flag が `--claude-adapter claude-gpt` と併用されている | `non_executable` |
+| 7 | flag があるのに必須の env prefix が欠落または不一致 | `non_executable` |
+| 7a | flag の値が宣言に無い、または registry に無い | `non_executable` |
+| 8 | 上記のいずれにも該当しない | `executable` |
+
+checker は現時点でどの gate にも自動では結線されていない。`approval_required_actions` を宣言する Issue の refinement で、operator または refinement loop がこの手順を手動で実行する。`baseline_vc_preflight.py` などへの結線は、それらを所有する Issue の merge 後に別途判断する。
+
 ## 関連ドキュメント
 
 - `docs/dev/session-recording-policy.md` — session 記録 Kill Switch policy（`session_recording_policy/v1` SSOT）。`secrets_mode` 遷移時の session 記録制御・Kill Switch 手順・checkpoint visibility 検証を定める

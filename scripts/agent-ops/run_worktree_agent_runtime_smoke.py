@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -107,6 +108,11 @@ _PUBLIC_EVIDENCE_SHA_LENGTHS = {
     ("resolved_executable_sha256",): 64,
     ("mutation_boundary", "settings_digest_sha256"): 64,
     ("settings_provenance", "digest_sha256"): 64,
+    # Issue #2839: ``--approval-profile`` を使った run に限り evidence に載る
+    # ``approval_carrier`` の公開 hash (git の commit / blob hash と overlay の sha256)。
+    ("approval_carrier", "repo_head"): 40,
+    ("approval_carrier", "overlay_sha256"): 64,
+    ("approval_carrier", "fixture_git_blob_hash"): 40,
 }
 
 # Issue #2421: ``resolved_executable`` must never persist a raw absolute
@@ -795,6 +801,29 @@ def _task_context_env_pairs(
     return pairs
 
 
+_APPROVAL_CONTRACT_MODULE_NAME = "runtime_vc_approval_contract_for_runner"
+
+
+def _load_approval_contract():
+    """Issue #2839: 兄弟 module ``runtime_vc_approval_contract.py`` を file path で読み込む。
+
+    approval carrier の registry / overlay / precondition の唯一の定義はその module にあり、
+    runner はここで読み込んだ定数を使うだけである (二重定義しない)。共有 pytest session で
+    同名 module と衝突しないよう、一意な module 名で ``sys.modules`` に登録する。
+    """
+    module = sys.modules.get(_APPROVAL_CONTRACT_MODULE_NAME)
+    if module is not None:
+        return module
+    path = Path(__file__).resolve().parent / "runtime_vc_approval_contract.py"
+    spec = importlib.util.spec_from_file_location(_APPROVAL_CONTRACT_MODULE_NAME, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_APPROVAL_CONTRACT_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
                            max_turns: int, claude_bin: str = "claude",
                            claude_agent_name: str | None = None,
@@ -805,8 +834,15 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
                            include_hook_chain_evidence_hooks: bool = False,
                            task_context_scope: str | None = None,
                            task_context_state_root: str | None = None,
+                           approval_settings_json: str | None = None,
+                           approval_child_env: dict[str, str] | None = None,
                            ) -> tuple[int | None, str, str, bool]:
-    """Issue #2174 AC1 fix_delta (OWNER REQUEST_CHANGES
+    """Issue #2839: ``approval_settings_json`` / ``approval_child_env`` は
+    ``--approval-profile`` 使用時にだけ main() が渡す、registry 由来の固定 overlay と、
+    検証済みの値で明示的に組み立てた子 env である。どちらも既定 ``None`` で、未指定の
+    呼び出しの argv と env は変更前と byte-identical に保たれる。
+
+    Issue #2174 AC1 fix_delta (OWNER REQUEST_CHANGES
     https://github.com/squne121/loop-protocol/issues/2174#issuecomment-5302215173):
     ``claude_adapter`` is the ONLY input that decides launcher-specific argv
     shape / env-var injection -- never ``bool(claude_bin)`` alone (the prior
@@ -858,6 +894,10 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
     # ``--settings <JSON>`` flag unchanged (AC6 backward compatibility).
     launch_env = None
     if claude_adapter == "claude-gpt":
+        if approval_settings_json is not None or approval_child_env is not None:
+            # Issue #2839: launcher は ``--settings`` を policy-weakening flag として拒否する
+            # ため、carrier は native adapter 専用である (呼び出し側の precondition の二重防御)。
+            raise ValueError("approval carrier requires the native adapter")
         launch_env = os.environ.copy()
         launch_env["CLAUDE_GPT_RUNTIME_SMOKE_HOOKS"] = "subagent-start-stop"
     else:
@@ -907,6 +947,13 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
             ]
             hooks_obj["Stop"] = [{"hooks": [{"type": "command", "command": "cat"}]}]
             settings_json = json.dumps(settings_obj)
+        if approval_settings_json is not None:
+            # Issue #2839: registry 由来の固定 overlay に差し替える。基底の overlay 定数だけが
+            # 対象で、overlay の派生 variant を使う flag との併用は main() の precondition が
+            # 起動前に拒否している。
+            settings_json = approval_settings_json
+        if approval_child_env is not None:
+            launch_env = dict(approval_child_env)
         argv += ["--settings", settings_json]
         if include_hook_chain_evidence_hooks:
             # Issue #2663 AC2 live-trial fix, corrected by PR #2668
@@ -6629,6 +6676,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--approval-profile",
+        choices=list(_load_approval_contract().approval_profile_ids()),
+        default=None,
+        help=(
+            "Issue #2839: opt-in approval carrier. closed enum の profile id だけを受け付け "
+            "(任意の JSON / 文字列 / path は受け付けない)、registry 由来の固定 overlay "
+            "(autoMode.allow に \"$defaults\" と固定 rule 1 件) を、当該 invocation の "
+            "--settings にだけ載せる。native adapter かつ structured mode 専用で、"
+            "--expect-skill-command / --require-hook-chain-evidence / "
+            "--hermetic-agent-definition とは併用できない。precondition (fixture の実体と "
+            "CLAUDE_GPT_HOME / CLAUDE_GPT_REPAIR_INSTALLER_URL の束縛) が不成立なら子 "
+            "session を起動せず fail-closed で終了する。未指定なら従来と byte-identical。"
+        ),
+    )
+    parser.add_argument(
         "--hermetic-agent-definition",
         action="store_true",
         help=(
@@ -6761,6 +6823,36 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.additional_prompt and args.runtime != "claude":
         parser.error("--additional-prompt requires --runtime claude")
+    # Issue #2839: opt-in approval carrier。子 session を起動する前に precondition を
+    # 決定論的に検証し、不成立なら fail-closed で終了する (PASS / SKIP にはしない)。
+    approval_mod = None
+    approval_verified = None
+    approval_overlay_json = None
+    approval_child_env = None
+    if args.approval_profile:
+        approval_mod = _load_approval_contract()
+        if args.runtime != "claude":
+            parser.error("--approval-profile requires --runtime claude")
+        approval_verified = approval_mod.verify_approval_carrier_preconditions(
+            args.approval_profile,
+            worktree=os.path.abspath(args.worktree),
+            env=os.environ,
+            claude_adapter=args.claude_adapter,
+            mode=args.mode,
+            incompatible_flags={
+                "expect_skill_command": bool(args.expect_skill_command),
+                "require_hook_chain_evidence": bool(args.require_hook_chain_evidence),
+                "hermetic_agent_definition": bool(args.hermetic_agent_definition),
+            },
+        )
+        if not approval_verified["ok"]:
+            parser.error(
+                f"--approval-profile precondition failed: {approval_verified['reason_code']}"
+            )
+        approval_overlay_json = approval_mod.build_approval_overlay_json(
+            args.approval_profile, _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON
+        )
+        approval_child_env = approval_mod.build_approval_child_env(os.environ, approval_verified)
     # Issue #2219 fix_delta iteration 1 (Option B): the interactive lane's
     # own turn count is 1 (the initial --prompt-file turn) plus however many
     # --additional-prompt entries were supplied -- there is no --max-turns
@@ -7141,6 +7233,8 @@ def main(argv: list[str] | None = None) -> int:
                     include_hook_chain_evidence_hooks=bool(args.require_hook_chain_evidence),
                     task_context_scope=args.task_context_scope,
                     task_context_state_root=args.task_context_state_root,
+                    approval_settings_json=approval_overlay_json,
+                    approval_child_env=approval_child_env,
                 )
                 capability_decision, capability_reason = classify_claude_structured_outcome(
                     rc, out, err, timed_out
@@ -7150,6 +7244,22 @@ def main(argv: list[str] | None = None) -> int:
                 # --settings flag forwarded via a hermetic combination),
                 # never a synthesized/guessed classification.
                 schema_summary["claude_adapter"] = args.claude_adapter
+                if approval_verified is not None:
+                    # Issue #2839: run 後に fixture の内容 hash を再計算し、変わっていたら PASS
+                    # にしない (子 session が承認済み fixture を書き換えた場合の検出)。
+                    fixture_hash_after_run = approval_mod.fixture_content_blob_hash(
+                        str(worktree), approval_verified["fixture_relpath"]
+                    )
+                    schema_summary["approval_carrier"] = approval_mod.build_approval_carrier_evidence(
+                        approval_verified,
+                        overlay_json=approval_overlay_json,
+                        fixture_hash_after_run=fixture_hash_after_run,
+                    )
+                    if not schema_summary["approval_carrier"]["fixture_unchanged"]:
+                        errors.append(
+                            "approval carrier: fixture installer content changed during the run"
+                        )
+                        exit_code = EXIT_FAIL
                 schema_summary["claude_gpt_launcher_receipt"] = (
                     extract_claude_gpt_launcher_receipt(err)
                     if args.claude_adapter == "claude-gpt"
