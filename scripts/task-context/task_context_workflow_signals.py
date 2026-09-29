@@ -484,6 +484,44 @@ def _validate_required_claims_tx(
     return None
 
 
+def _validate_refinement_claim_tx(
+    conn: sqlite3.Connection, task_id: str, evidence: dict[str, Any], key: str
+) -> dict[str, Any] | None:
+    """Classify the ``refinement_approved`` target claim without writing.
+
+    Unlike ``_validate_required_claims_tx`` (still shared by
+    ``cleanup_completed``, whose strict "claim absent is a conflict" meaning
+    is unchanged), this distinguishes three genuinely different situations:
+
+    1. target Issue claimed by the origin Task -> ``None`` (normal path).
+    2. target Issue claimed by a different Task -> identity conflict.
+    3. target Issue unclaimed:
+       a. origin Task holds a live claim on a different Issue (stale origin /
+          wrong canonical Task, Issue #2810 failure class) -> identity
+          conflict; never downgraded to deferred.
+       b. this dedupe key was already accepted -> identity conflict; a past
+          accepted business fact must not be hidden by "no current claim".
+       c. otherwise (pure claim absence) -> non-mutating
+          ``deferred / TARGET_ISSUE_UNCLAIMED``.
+    """
+    repo, issue_number = evidence["repo"], evidence["issue_number"]
+    issue = _claim_for_tx(conn, repo, "issue", issue_number)
+    if issue is not None:
+        if issue["task_id"] != task_id:
+            return _outcome("conflict", "FACT_TASK_IDENTITY_CONFLICT")
+        return None
+    other_issue = conn.execute(
+        "SELECT 1 FROM task_ref_claims WHERE task_id = ? AND ref_kind = 'issue' AND released_at IS NULL "
+        "AND (repo != ? OR ref_number != ?) LIMIT 1",
+        (task_id, repo, issue_number),
+    ).fetchone()
+    if other_issue:
+        return _outcome("conflict", "FACT_TASK_IDENTITY_CONFLICT")
+    if _accepted_event_tx(conn, key) is not None:
+        return _outcome("conflict", "FACT_TASK_IDENTITY_CONFLICT")
+    return _outcome("deferred", "TARGET_ISSUE_UNCLAIMED")
+
+
 def _validate_merged_prerequisites_tx(
     conn: sqlite3.Connection, task_id: str, evidence: dict[str, Any]
 ) -> dict[str, Any] | None:
@@ -598,6 +636,8 @@ def apply_workflow_signal(
                 if accepted_merge is None:
                     return _outcome("conflict", "OUT_OF_ORDER_SIGNAL")
                 outcome = _validate_required_claims_tx(conn, task_id, evidence)
+            elif kind == "refinement_approved":
+                outcome = _validate_refinement_claim_tx(conn, task_id, evidence, key)
             else:
                 outcome = _validate_required_claims_tx(conn, task_id, evidence)
             if outcome:
