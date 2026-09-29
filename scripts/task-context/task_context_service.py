@@ -643,16 +643,36 @@ def record_subagent_addressable_name(
     claude_session_id: str | None,
     agent_id: str | None,
     name: object,
+    task_id: str | None = None,
+    activity_id: str | None = None,
 ) -> str:
     """Bind the ``Agent`` tool ``name`` to the SubAgent ExecutionRun(s) of
     exactly ``(claude_session_id, agent_id)`` (Issue #2822, written by the
     ``PostToolUse:Agent`` adapter). Returns a diagnostic reason code.
 
-    Pure UPDATE of existing ``run_kind='subagent'`` rows (ended or not; a
-    refire history of one agent_id is one identity). It never creates a row:
-    when no row matches yet (e.g. ``PostToolUse`` arrived before
-    ``SubagentStart``) it is a no-op and the destination stays ASK
-    (fail-safe). Other sessions' rows are never touched."""
+    Claude Code does not guarantee the relative order of ``SubagentStart``
+    and ``PostToolUse:Agent`` (they are separate hook processes fired at
+    almost the same instant), so the binding must not depend on it:
+
+    - A ``run_kind='subagent'`` row of ``(claude_session_id, agent_id)``
+      already exists (``SubagentStart`` won the race): its ``addressable_name``
+      is updated (ended or not; a refire history of one agent_id is one
+      identity).
+    - No such row yet (``PostToolUse`` won the race): exactly one **ended**
+      row carrying the name is inserted (``binding_id`` NULL, parent
+      Task/Activity as resolved by the caller, ``ended_at`` = insert time),
+      inside the same ``BEGIN IMMEDIATE`` transaction as the existence check.
+      Being ended it can never leak as an open run nor collide with
+      ``ux_execution_runs_open_subagent_agent_id``. The ``SubagentStart``
+      that arrives afterwards finds no open row and follows its normal
+      dedupe contract (a new open row; ``ended_at`` of the ended row is never
+      touched), so the two hooks converge on the same addressable identity.
+    - An *open* row with this ``agent_id`` belongs to a different session (or
+      is an unbound legacy row): nothing is written and nothing is taken
+      over -- identity is scoped to ``(claude_session_id, agent_id)`` and the
+      destination stays ASK (fail-safe).
+
+    Other sessions' rows are never touched. Invalid input is a no-op."""
     if not claude_session_id or not agent_id or not is_valid_addressable_name(name):
         return "addressable_name_not_recorded_invalid_input"
     with db.write_transaction(conn):
@@ -661,8 +681,28 @@ def record_subagent_addressable_name(
             "WHERE run_kind = 'subagent' AND claude_session_id = ? AND agent_id = ?",
             (name, claude_session_id, agent_id),
         )
-        matched = cursor.rowcount
-    return "addressable_name_recorded" if matched else "addressable_name_no_matching_subagent_run"
+        if cursor.rowcount:
+            return "addressable_name_recorded"
+        foreign_open = conn.execute(
+            "SELECT 1 FROM execution_runs WHERE run_kind = 'subagent' AND agent_id = ? "
+            "AND ended_at IS NULL LIMIT 1",
+            (agent_id,),
+        ).fetchone()
+        if foreign_open is not None:
+            return "addressable_name_agent_id_open_in_other_session"
+        run_id = _start_execution_run_tx(
+            conn,
+            run_kind="subagent",
+            task_id=task_id,
+            activity_id=activity_id,
+            claude_session_id=claude_session_id,
+            agent_id=agent_id,
+        )
+        conn.execute(
+            "UPDATE execution_runs SET addressable_name = ?, ended_at = ? WHERE id = ?",
+            (name, now_iso(), run_id),
+        )
+    return "addressable_name_recorded_ended_row"
 
 
 def _set_execution_run_session_tx(conn: sqlite3.Connection, run_id: str, claude_session_id: str) -> None:

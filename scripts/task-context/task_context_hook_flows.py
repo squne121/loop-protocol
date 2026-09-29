@@ -972,20 +972,27 @@ def on_subagent_stop(conn, payload: dict[str, Any]) -> dict[str, Any]:
 # tool_input and the SubAgent's own `agent_id` only in the tool_response
 # (`agentId`); SubagentStart carries neither the name nor the tool_use link.
 # This hook is the one place both are visible together, so it binds them onto
-# the ExecutionRun that SubagentStart already recorded. It never creates a run
-# and never touches another session's rows.
+# the ExecutionRun that SubagentStart recorded. Hook order is NOT guaranteed:
+# SubagentStart and PostToolUse:Agent run as separate processes fired at almost
+# the same instant, so when PostToolUse wins the race it inserts one *ended*
+# named row (never an open one) that a later SubagentStart dedupes against. It
+# never touches another session's rows.
 # ---------------------------------------------------------------------------
 
 
 def on_post_tool_use(conn, payload: dict[str, Any]) -> dict[str, Any]:
     if payload.get("tool_name") != "Agent":
         return {"decision": "pass", "reason_code": "observability_only"}
+    claude_session_id = payload.get("claude_session_id")
     try:
+        task_id, activity_id = _parent_task_activity_for_session(conn, claude_session_id)
         reason_code = service.record_subagent_addressable_name(
             conn,
-            claude_session_id=payload.get("claude_session_id"),
+            claude_session_id=claude_session_id,
             agent_id=payload.get("agent_id"),
             name=payload.get("agent_name"),
+            task_id=task_id,
+            activity_id=activity_id,
         )
     except errors.TaskContextError:
         # Non-fatal: a hook failure must never break the Agent tool call.
@@ -1047,6 +1054,11 @@ def _record_pre_tool_use_guard_event(
             "reason_code": reason_code,
         },
     )
+
+
+# Claude Code's reserved SendMessage address for the main (parent)
+# conversation; it cannot be used as an agent id or SubAgent name.
+RESERVED_MAIN_CONVERSATION_ADDRESS = "main"
 
 
 def _on_pre_tool_use_send_message(conn, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1114,10 +1126,26 @@ def _on_pre_tool_use_send_message(conn, payload: dict[str, Any]) -> dict[str, An
         #   For (b)/(c): if the same name also resolves to an independent
         #   session, or (b) and (c) both claim it, that is an identity
         #   collision -> ASK (never PASS).
+        #   (e) `to == "main"` from inside a SubAgent (`caller_agent_id` set) and
+        #       no independent session registered as `main` -> the parent
+        #       conversation (reserved address) -> in-session.
         #   (d) anything else -> independent-session resolution below.
         registry_session_id = session_registry.resolve_session_name_to_claude_session_id(to)
         lane_decided = False
-        if service.find_addressable_subagent_runs(conn, claude_session_id=caller_session_id, agent_id=to):
+        if (
+            to == RESERVED_MAIN_CONVERSATION_ADDRESS
+            and payload.get("caller_agent_id")
+            and registry_session_id is None
+        ):
+            # Issue #2822 (D2): `main` is Claude Code's reserved address for the
+            # parent (main) conversation -- it can never be an agent id or a
+            # SubAgent name. A SubAgent (hook input carries `agent_id`) replying
+            # to it is ordinary in-session communication. The lead itself
+            # (no `agent_id`) and an independent session that registered the
+            # name `main` (registry hit) keep the previous classification.
+            is_in_session_subagent = True
+            lane_decided = True
+        elif service.find_addressable_subagent_runs(conn, claude_session_id=caller_session_id, agent_id=to):
             is_in_session_subagent = True
             lane_decided = True
         else:

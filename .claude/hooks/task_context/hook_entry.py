@@ -367,6 +367,14 @@ def _apply_pre_tool_use_fields(payload: dict, hook_input: dict) -> None:
         payload["to"] = to if isinstance(to, str) else None
         if tool_input.get("notify_when_idle"):
             payload["notify_when_idle"] = True
+        # Issue #2822 (D2): Claude Code adds `agent_id` to the hook input only
+        # when the tool call is made *from inside a SubAgent*; the lead
+        # conversation has none. Forward just that bounded identity string so
+        # the guard can tell a SubAgent replying to the reserved parent-
+        # conversation address `main` from the lead itself.
+        caller_agent_id = hook_input.get("agent_id")
+        if isinstance(caller_agent_id, str) and 0 < len(caller_agent_id) <= _MAX_AGENT_NAME_LEN:
+            payload["caller_agent_id"] = caller_agent_id
         return
 
     if tool_name == "Bash":

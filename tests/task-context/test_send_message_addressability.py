@@ -247,9 +247,12 @@ def test_addr_must_ask_agent_type_only_is_not_an_address(conn):
 
 
 def test_addr_must_ask_ordinary_named_subagent_name_not_observable(conn):
-    """A SubAgent started with only an agent_id (no `PostToolUse:Agent` name
-    binding was ever recorded) has no addressable name, so a name `to` stays
-    ASK."""
+    """Only when `PostToolUse:Agent` *never arrived* (no name binding was ever
+    recorded for this SubAgent, in either hook order) does a name `to` stay
+    ASK. If PostToolUse did arrive, the name is recorded regardless of whether
+    it ran before or after SubagentStart (see the
+    ``test_addr_by_name_post_first_*`` / ``test_addr_by_name_start_first_*``
+    tests)."""
     _bind(conn, tab="tab-1", session=CALLER, ref_number=1)
     _start(conn, "a8c070c249972b5d4")
 
@@ -515,8 +518,8 @@ def test_addr_by_name_agent_id_lane_still_wins_and_is_unchanged(conn):
 
 
 def test_addr_by_name_post_tool_use_is_bounded_bookkeeping_only(conn):
-    """No row is ever created; only name-less rows of the exact
-    (session, agent_id) are updated."""
+    """PostToolUse before any SubagentStart inserts exactly one *ended* named
+    row (never an open one, no event); it never touches other rows."""
     _bind(conn, tab="tab-1", session=CALLER, ref_number=1)
     before = conn.execute("SELECT COUNT(*) FROM execution_runs").fetchone()[0]
     events_before = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
@@ -524,10 +527,15 @@ def test_addr_by_name_post_tool_use_is_bounded_bookkeeping_only(conn):
     out = _post_agent(conn, "gamma", "agent-not-started")
 
     assert out["decision"] == "pass"
-    assert out["reason_code"] == "addressable_name_no_matching_subagent_run"
-    assert conn.execute("SELECT COUNT(*) FROM execution_runs").fetchone()[0] == before
+    assert out["reason_code"] == "addressable_name_recorded_ended_row"
+    assert conn.execute("SELECT COUNT(*) FROM execution_runs").fetchone()[0] == before + 1
     assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == events_before
-    assert _send(conn, "gamma")["decision"] == "ask"
+    (row,) = _runs(conn, "agent-not-started")
+    assert row["addressable_name"] == "gamma"
+    assert row["claude_session_id"] == CALLER
+    assert row["binding_id"] is None
+    assert row["run_kind"] == "subagent"
+    assert row["ended_at"] is not None
 
 
 def test_addr_by_name_post_tool_use_ignores_non_agent_tools_and_bad_input(conn):
@@ -574,10 +582,14 @@ def test_addr_must_ask_ordinary_name_of_other_caller_session(conn):
     assert _send(conn, "gamma", session=CALLER)["decision"] == "ask"
     assert _send(conn, "gamma", session=OTHER)["decision"] == "pass"
     # a PostToolUse from the wrong session cannot name someone else's row
+    # ... and while OTHER's row with that agent_id is open, CALLER's PostToolUse
+    # neither renames it nor takes it over (no row inserted either).
     assert _post_agent(conn, "delta", "agent-of-other", session=CALLER)["reason_code"] == (
-        "addressable_name_no_matching_subagent_run"
+        "addressable_name_agent_id_open_in_other_session"
     )
     assert _name_of(conn, "agent-of-other", session=OTHER) == ["gamma"]
+    assert _name_of(conn, "agent-of-other", session=CALLER) == []
+    assert _send(conn, "delta", session=CALLER)["decision"] == "ask"
 
 
 def test_addr_must_ask_ordinary_name_never_from_legacy_unbound_row(conn):
@@ -587,8 +599,9 @@ def test_addr_must_ask_ordinary_name_never_from_legacy_unbound_row(conn):
 
     assert _send(conn, "gamma")["decision"] == "ask"
     assert _post_agent(conn, "gamma", "legacy-named")["reason_code"] == (
-        "addressable_name_no_matching_subagent_run"
+        "addressable_name_agent_id_open_in_other_session"
     )
+    assert _send(conn, "gamma")["decision"] == "ask"
 
 
 def test_addr_must_ask_ordinary_name_that_is_only_an_agent_type(conn):
@@ -949,21 +962,57 @@ def test_addr_by_name_real_hook_chain_post_tool_use_agent_then_send_message_emit
     assert _BODY_MARKER not in ok.stdout + other.stdout + posted.stdout + posted.stderr
 
 
-def test_addr_by_name_real_hook_chain_post_before_subagent_start_is_noop_and_stays_ask(
-    state_root, sessions_dir, teams_dir
-):
-    env = _chain_env(sessions_dir, teams_dir)
-    _hook_subprocess("SessionStart", {"session_id": CALLER, "source": "startup"}, state_root, env)
-    posted = _post_agent_subprocess(state_root, env, name="gamma", response={"agentId": "aaaa1111bbbb2222c"})
-    assert posted.returncode == 0 and posted.stdout.strip() == ""
-    _hook_subprocess(
+def _start_subprocess(state_root, env, agent_id, session=CALLER):
+    return _hook_subprocess(
         "SubagentStart",
-        {"session_id": CALLER, "agent_id": "aaaa1111bbbb2222c", "agent_type": "general-purpose"},
+        {"session_id": session, "agent_id": agent_id, "agent_type": "general-purpose"},
         state_root,
         env,
     )
 
-    assert '"ask"' in _send_subprocess(state_root, env, "gamma").stdout
+
+def _stop_subprocess(state_root, env, agent_id, session=CALLER):
+    return _hook_subprocess("SubagentStop", {"session_id": session, "agent_id": agent_id}, state_root, env)
+
+
+def test_addr_by_name_real_hook_chain_post_before_subagent_start_still_passes(
+    state_root, sessions_dir, teams_dir
+):
+    """Hook order PostToolUse -> SubagentStart -> SubagentStop -> SendMessage
+    (Claude Code fires the first two concurrently, so either order occurs)."""
+    env = _chain_env(sessions_dir, teams_dir)
+    _hook_subprocess("SessionStart", {"session_id": CALLER, "source": "startup"}, state_root, env)
+    posted = _post_agent_subprocess(state_root, env, name="gamma", response={"agentId": "aaaa1111bbbb2222c"})
+    assert posted.returncode == 0 and posted.stdout.strip() == ""
+    assert _start_subprocess(state_root, env, "aaaa1111bbbb2222c").returncode == 0
+    assert _stop_subprocess(state_root, env, "aaaa1111bbbb2222c").returncode == 0
+
+    ok = _send_subprocess(state_root, env, "gamma")
+    assert ok.returncode == 0, ok.stderr
+    assert ok.stdout.strip() == "", ok.stdout  # no ASK
+    assert _send_subprocess(state_root, env, "aaaa1111bbbb2222c").stdout.strip() == ""
+    assert '"ask"' in _send_subprocess(state_root, env, "gamma", session=OTHER).stdout
+    assert _BODY_MARKER not in ok.stdout + ok.stderr
+
+
+def test_addr_by_name_real_hook_chain_orderings_are_equivalent(state_root, sessions_dir, teams_dir):
+    """Every ordering of {SubagentStart, PostToolUse:Agent} followed by
+    SubagentStop yields a PASS for the name and the agent id."""
+    import itertools
+
+    env = _chain_env(sessions_dir, teams_dir)
+    _hook_subprocess("SessionStart", {"session_id": CALLER, "source": "startup"}, state_root, env)
+    for index, order in enumerate(itertools.permutations(("start", "post"))):
+        agent_id = f"agentorder{index}0000000"
+        name = f"gamma{index}"
+        for step in order:
+            if step == "start":
+                _start_subprocess(state_root, env, agent_id)
+            else:
+                _post_agent_subprocess(state_root, env, name=name, response={"agentId": agent_id})
+        _stop_subprocess(state_root, env, agent_id)
+        assert _send_subprocess(state_root, env, name).stdout.strip() == "", order
+        assert _send_subprocess(state_root, env, agent_id).stdout.strip() == "", order
 
 
 def test_addr_by_name_real_hook_chain_adapter_noop_shapes_stay_ask(state_root, sessions_dir, teams_dir):
@@ -1015,3 +1064,230 @@ def test_addr_by_name_post_tool_use_hook_is_wired_for_agent_matcher_only():
     first = settings["hooks"]["PostToolUse"][0]
     assert first["matcher"] == "Bash|Edit|Write"
     assert first["hooks"][0]["command"] == "node"
+
+
+# ---------------------------------------------------------------------------
+# D1 -- hook order between SubagentStart and PostToolUse:Agent is not
+# guaranteed (separate processes fired at almost the same instant)
+# ---------------------------------------------------------------------------
+
+
+def _open_subagent_rows(conn):
+    return conn.execute(
+        "SELECT * FROM execution_runs WHERE run_kind = 'subagent' AND ended_at IS NULL"
+    ).fetchall()
+
+
+def test_addr_by_name_post_first_then_start_then_stop_passes(conn):
+    """(a) PostToolUse -> SubagentStart -> SubagentStop -> SendMessage(name)."""
+    _bind(conn, tab="tab-1", session=CALLER, ref_number=1)
+
+    recorded = _post_agent(conn, "omega", "agent-race-a")
+    assert recorded["reason_code"] == "addressable_name_recorded_ended_row"
+    started = _start(conn, "agent-race-a")
+    assert started["reason_code"] == "subagent_started"  # ended row present -> new open row
+    assert len(_open_subagent_rows(conn)) == 1
+    _stop(conn, "agent-race-a")
+
+    assert _open_subagent_rows(conn) == []
+    rows = _runs(conn, "agent-race-a")
+    assert len(rows) == 2 and all(r["ended_at"] is not None for r in rows)
+    result = _send(conn, "omega")
+    assert result["decision"] == "pass"
+    assert result["target_kind"] == "in_session_subagent"
+    assert _send(conn, "agent-race-a")["decision"] == "pass"
+
+
+def test_addr_by_name_start_first_then_post_then_stop_passes(conn):
+    """(b) The conventional SubagentStart -> PostToolUse order still works."""
+    _bind(conn, tab="tab-1", session=CALLER, ref_number=1)
+
+    _start(conn, "agent-race-b")
+    assert _post_agent(conn, "omega", "agent-race-b")["reason_code"] == "addressable_name_recorded"
+    _stop(conn, "agent-race-b")
+
+    assert len(_runs(conn, "agent-race-b")) == 1  # named in place, no extra row
+    assert _send(conn, "omega")["decision"] == "pass"
+
+
+def test_addr_by_name_post_first_row_lives_in_caller_session_only(conn):
+    """(c) A PostToolUse-first row is scoped to (session, agent_id): the same
+    name / agent id from another session is still ASK."""
+    _bind(conn, tab="tab-1", session=CALLER, ref_number=1)
+    _bind(conn, tab="tab-2", session=OTHER, ref_number=1)
+    _post_agent(conn, "omega", "agent-race-c")
+
+    assert _send(conn, "omega", session=CALLER)["decision"] == "pass"
+    assert _send(conn, "omega", session=OTHER)["decision"] == "ask"
+    assert _send(conn, "agent-race-c", session=OTHER)["decision"] == "ask"
+    # the row carries the caller's session, never OTHER's
+    assert {r["claude_session_id"] for r in _runs(conn, "agent-race-c")} == {CALLER}
+
+
+def test_addr_must_ask_post_first_same_name_two_agent_ids(conn):
+    """(d) Two distinct agent_ids with one name in one session remain a
+    collision even when the rows were created PostToolUse-first."""
+    _bind(conn, tab="tab-1", session=CALLER, ref_number=1)
+    _post_agent(conn, "omega", "agent-race-d1")
+    _post_agent(conn, "omega", "agent-race-d2")
+    _start(conn, "agent-race-d1")
+    _stop(conn, "agent-race-d1")
+
+    result = _send(conn, "omega")
+    assert result["decision"] == "ask"
+    assert result["target_kind"] == "unknown_independent_session"
+    assert _send(conn, "agent-race-d1")["decision"] == "pass"
+    assert _send(conn, "agent-race-d2")["decision"] == "pass"
+
+
+def test_addr_refire_post_only_never_leaks_an_open_row(conn):
+    """(e) PostToolUse alone (SubagentStart never arrives) leaves no open row,
+    and repeating it neither duplicates the row nor breaks the open-agent_id
+    unique index."""
+    _bind(conn, tab="tab-1", session=CALLER, ref_number=1)
+
+    _post_agent(conn, "omega", "agent-race-e")
+    _post_agent(conn, "omega", "agent-race-e")
+
+    assert _open_subagent_rows(conn) == []
+    (row,) = _runs(conn, "agent-race-e")
+    assert row["ended_at"] is not None and row["addressable_name"] == "omega"
+    assert _send(conn, "omega")["decision"] == "pass"
+
+
+def test_addr_refire_post_first_inherits_parent_task_activity(conn):
+    _bind(conn, tab="tab-1", session=CALLER, ref_number=1)
+    _post_agent(conn, "omega", "agent-race-f")
+    _start(conn, "agent-race-f")
+
+    ended, opened = _runs(conn, "agent-race-f")
+    assert ended["task_id"] is not None
+    assert (ended["task_id"], ended["activity_id"]) == (opened["task_id"], opened["activity_id"])
+
+
+def test_addr_must_ask_post_first_does_not_take_over_open_row_of_other_session(conn):
+    _bind(conn, tab="tab-1", session=CALLER, ref_number=1)
+    _bind(conn, tab="tab-2", session=OTHER, ref_number=1)
+    _start(conn, "agent-shared-id", session=OTHER)
+
+    out = _post_agent(conn, "omega", "agent-shared-id", session=CALLER)
+
+    assert out["reason_code"] == "addressable_name_agent_id_open_in_other_session"
+    assert len(_runs(conn, "agent-shared-id")) == 1
+    assert _send(conn, "omega", session=CALLER)["decision"] == "ask"
+    assert _open_subagent_rows(conn)[0]["claude_session_id"] == OTHER
+
+
+def test_addr_by_name_real_hook_chain_start_first_order_still_passes(state_root, sessions_dir, teams_dir):
+    """(f) The other real-process ordering: SubagentStart -> PostToolUse ->
+    SubagentStop -> SendMessage."""
+    env = _chain_env(sessions_dir, teams_dir)
+    _hook_subprocess("SessionStart", {"session_id": CALLER, "source": "startup"}, state_root, env)
+    _start_subprocess(state_root, env, "bbbb1111cccc2222d")
+    _post_agent_subprocess(state_root, env, name="omega", response={"agentId": "bbbb1111cccc2222d"})
+    _stop_subprocess(state_root, env, "bbbb1111cccc2222d")
+
+    assert _send_subprocess(state_root, env, "omega").stdout.strip() == ""
+    assert '"ask"' in _send_subprocess(state_root, env, "omega", session=OTHER).stdout
+
+
+# ---------------------------------------------------------------------------
+# D2 -- a SubAgent replying to the reserved parent-conversation address `main`
+# ---------------------------------------------------------------------------
+
+
+def test_addr_by_agent_id_subagent_caller_to_main_passes(conn):
+    _bind(conn, tab="tab-1", session=CALLER, ref_number=1)
+    _start(conn, "agent-replier")
+
+    result = _send(conn, "main", caller_agent_id="agent-replier")
+
+    assert result["decision"] == "pass"
+    assert result["target_kind"] == "in_session_subagent"
+    assert _send(conn, "main", caller_agent_id="agent-replier", notify_when_idle=True)["decision"] == "pass"
+
+
+def test_addr_must_ask_lead_caller_to_main_keeps_previous_classification(conn):
+    """The lead conversation (no agent_id in the hook input) is not a SubAgent
+    replying to its parent; `main` is unknown to Task Context as before."""
+    _bind(conn, tab="tab-1", session=CALLER, ref_number=1)
+
+    result = _send(conn, "main")
+
+    assert result["decision"] == "ask"
+    assert result["target_kind"] == "unknown_independent_session"
+    assert _send(conn, "main", caller_agent_id=None)["decision"] == "ask"
+    assert _send(conn, "main", caller_agent_id="")["decision"] == "ask"
+
+
+def test_addr_must_ask_subagent_caller_to_other_unknown_name_stays_ask(conn):
+    _bind(conn, tab="tab-1", session=CALLER, ref_number=1)
+    _start(conn, "agent-replier")
+
+    for to in ("mainx", "Main", "team-lead", "unknown-peer"):
+        result = _send(conn, to, caller_agent_id="agent-replier")
+        assert result["decision"] == "ask", to
+        assert result["target_kind"] == "unknown_independent_session", to
+
+
+def test_addr_must_ask_subagent_caller_to_main_registered_independent_session(conn, sessions_dir):
+    """An independent session that registered the name `main` in Claude's
+    on-disk registry is not the parent conversation: previous classification
+    (here: unresolved registry hit without a Binding -> unknown -> ASK)."""
+    _bind(conn, tab="tab-1", session=CALLER, ref_number=1)
+    _start(conn, "agent-replier")
+    _write_registry(sessions_dir, pid=4242, session_id=OTHER, name="main")
+
+    result = _send(conn, "main", caller_agent_id="agent-replier")
+
+    assert result["decision"] == "ask"
+    assert result["target_kind"] == "unknown_independent_session"
+
+
+def test_addr_cross_task_subagent_caller_to_main_named_independent_session_stays_ask(conn, sessions_dir):
+    _bind(conn, tab="tab-1", session=CALLER, ref_number=1)
+    _bind(conn, tab="tab-2", session=OTHER, ref_number=2)
+    _start(conn, "agent-replier")
+    _write_registry(sessions_dir, pid=4243, session_id=OTHER, name="main")
+
+    result = _send(conn, "main", caller_agent_id="agent-replier")
+
+    assert result["decision"] == "ask"
+    assert result["target_kind"] == "known_cross_task_independent_session"
+
+
+def test_addr_cross_task_subagent_caller_known_cross_task_target_stays_ask(conn, sessions_dir):
+    _bind(conn, tab="tab-1", session=CALLER, ref_number=1)
+    _bind(conn, tab="tab-2", session=OTHER, ref_number=2)
+    _start(conn, "agent-replier")
+    _write_registry(sessions_dir, pid=4244, session_id=OTHER, name="peer-two")
+
+    result = _send(conn, "peer-two", caller_agent_id="agent-replier")
+
+    assert result["decision"] == "ask"
+    assert result["target_kind"] == "known_cross_task_independent_session"
+
+
+def test_addr_by_name_real_hook_chain_subagent_caller_to_main_emits_no_ask(state_root, sessions_dir, teams_dir):
+    env = _chain_env(sessions_dir, teams_dir)
+    _hook_subprocess("SessionStart", {"session_id": CALLER, "source": "startup"}, state_root, env)
+
+    def send(to, **hook_extra):
+        return _hook_subprocess(
+            "PreToolUse",
+            {
+                "session_id": CALLER,
+                "tool_name": "SendMessage",
+                "tool_input": {"to": to, "message": _BODY_MARKER},
+                **hook_extra,
+            },
+            state_root,
+            env,
+        )
+
+    from_subagent = send("main", agent_id="cccc1111dddd2222e", agent_type="general-purpose")
+    assert from_subagent.returncode == 0, from_subagent.stderr
+    assert from_subagent.stdout.strip() == "", from_subagent.stdout
+    assert '"ask"' in send("main").stdout  # lead caller: unchanged
+    assert '"ask"' in send("nobody", agent_id="cccc1111dddd2222e").stdout
+    assert _BODY_MARKER not in from_subagent.stdout + from_subagent.stderr

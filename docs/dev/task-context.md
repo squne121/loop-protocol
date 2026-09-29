@@ -280,6 +280,7 @@ Code 側にあり、Task Context は hook から観測できる identity だけ�
 | 通常 named SubAgent の name | 同一 caller session で name に対応する distinct agent ID がちょうど 1 種のときだけ PASS | `PostToolUse:Agent` が `tool_input.name` と `tool_response.agentId` を対応付けて `addressable_name` に記録する。ended row も対象（完了後の resume）。2 種以上は ASK |
 | `agent_type` のみ一致 | ASK | `agent_type` は addressable name ではない |
 | 別 caller session の同名 / 同 agent ID | ASK | session 束縛済み row は所有 session からのみ addressable。session 未束縛（legacy）row は name 経由では PASS しない |
+| `main`（SubAgent が親会話へ返信） | PASS | `main` は Claude Code が親（main）conversation へ routing する予約名で、agent ID / SubAgent 名としては使えない。hook 入力に `agent_id` がある（= SubAgent 内からの呼び出し。adapter は `caller_agent_id` として転送）場合だけ、独立 session の registry 名 `main` が無ければ `in_session_subagent` として PASS する。lead 自身（`agent_id` なし）、別名、registry 上 `main` を名乗る独立 session は従来分類のまま |
 | known cross-Task independent session | ASK | 既存契約を維持 |
 | known same-Task independent session | PASS | 既存契約を維持 |
 
@@ -310,8 +311,26 @@ Code 側にあり、Task Context は hook から観測できる identity だけ�
   `tool_response.agentId`（ordinary 形式のみ）・hook 共通 `session_id` が
   揃った時に限り、`(claude_session_id, agent_id)` が一致する既存
   `run_kind='subagent'` 行（ended 不問）へ name を書く。
-  - 一致行が無い場合（`PostToolUse` が `SubagentStart` より先に来た等）は
-    行を作らず no-op とし、`SendMessage` は ASK のまま残る（fail-safe）。
+  - **hook 順序は保証されない**。実測の順序は `PreToolUse:Agent` →
+    `SubagentStart` → `PostToolUse:Agent` → `SubagentStop` だが、`SubagentStart`
+    と `PostToolUse:Agent` は別 process としてほぼ同時（10ms 単位で同一）に
+    発火するため、`PostToolUse` が先に走ることがある。以前は一致行が無いと
+    no-op で name が永久に記録されず、完了後の `SendMessage(to=name)` が
+    非決定的に ASK になった。現在は `record_subagent_addressable_name` が
+    同一 `BEGIN IMMEDIATE` 内で次のとおり順序に依存せず収束させる。
+    - `(claude_session_id, agent_id)` の既存 row があれば name を書く
+      （`SubagentStart` 先の従来順序）。
+    - 無ければ、name 付きの **ended 済み** row を 1 件 insert する
+      （`run_kind='subagent'`、`binding_id` NULL、`ended_at` は insert 時刻、
+      parent の Task/Activity は `SubagentStart` と同じ解決）。ended なので open
+      row として leak せず、`ux_execution_runs_open_subagent_agent_id` にも違反
+      しない。後から来る `SubagentStart` は open row が無いため通常どおり新
+      open row を insert し（ended row の `ended_at` は変更しない）、同一 agent
+      ID の履歴は 1 identity として dedupe される。
+    - 同じ agent ID の open row が別 session（または session 未束縛 legacy）に
+      ある場合は何も書かず奪わない（`(session, agent_id)` scope を維持。
+      `reason_code: addressable_name_agent_id_open_in_other_session`）。
+    - `PostToolUse` が一度も来なければ name は記録されず ASK のまま。
   - teammate 形式の `tool_response`（`agent_id` / `team_name` を持つもの）、
     name 欠落、oversize name は no-op。adapter は常に exit 0・stdout 無出力で、
     hook 例外が `Agent` 実行を壊すことはない。prompt / description は転送も
