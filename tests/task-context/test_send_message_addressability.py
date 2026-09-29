@@ -1010,3 +1010,8 @@ def test_addr_by_name_post_tool_use_hook_is_wired_for_agent_matcher_only():
     assert wired[0]["matcher"] == "Agent"
     assert wired[0]["hooks"][0]["args"][-1] == "PostToolUse"
     assert wired[0]["hooks"][0]["timeout"] == 5
+    # The pre-existing session-manifest debounce group keeps its leading position
+    # (other tests read PostToolUse[0] as the node debounce entrypoint).
+    first = settings["hooks"]["PostToolUse"][0]
+    assert first["matcher"] == "Bash|Edit|Write"
+    assert first["hooks"][0]["command"] == "node"

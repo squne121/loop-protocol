@@ -294,17 +294,6 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Agent",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3",
-            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py", "PostToolUse"],
-            "timeout": 5
-          }
-        ]
-      },
-      {
         "matcher": "Bash|Edit|Write",
         "hooks": [
           {
@@ -315,6 +304,17 @@
             ],
             "timeout": 10,
             "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py", "PostToolUse"],
+            "timeout": 5
           }
         ]
       }
