@@ -1240,3 +1240,278 @@ def test_given_unrelated_subagent_message_has_marker_transcript_missing_then_not
     assert verdict["marker_provenance_verified"] is False
     assert verdict["causal_evidence_source"] != smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
     assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
+
+
+# ---------------------------------------------------------------------------
+# Issue #2848: Claude Code 2.1.285 drops ``last_assistant_message`` from the
+# SubagentStop payload. The correlated Agent tool's
+# ``tool_use_result.handbackReport.text`` is then the additional marker
+# provenance input -- fail-closed, and ignored entirely when
+# ``last_assistant_message`` is present.
+# ---------------------------------------------------------------------------
+
+HANDBACK_MARKER = "SUBAGENTSTOP_HANDBACK_PROVENANCE_SMOKE_OK"
+# 2.1.285 under ``--no-session-persistence``: the path is reported but the
+# file never exists.
+NONEXISTENT_TRANSCRIPT = "/nonexistent/agent-a14b7e0673d997e52.jsonl"
+
+
+def _handback_tool_result_event(
+    agent_id: str,
+    handback_report: object,
+    *,
+    status: str = "completed",
+    is_error: bool = False,
+    tool_use_id: str = AGENT_TOOL_USE_ID,
+    include_handback_report: bool = True,
+) -> str:
+    tool_use_result: dict = {"status": status, "agentId": agent_id, "agentType": AGENT_TYPE}
+    if include_handback_report:
+        tool_use_result["handbackReport"] = handback_report
+    return _line(
+        {
+            "type": "user",
+            "session_id": SESSION_ID,
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": "This agent's report was delivered to you as a message",
+                        "is_error": is_error,
+                    }
+                ]
+            },
+            "tool_use_result": tool_use_result,
+        }
+    )
+
+
+def _handback_stdout(
+    tool_result_events: list[str],
+    *,
+    last_assistant_message: str | None = None,
+    transcript_path: str | None = NONEXISTENT_TRANSCRIPT,
+    with_agent_tool_use: bool = True,
+) -> str:
+    lines = [_agent_tool_use_event()] if with_agent_tool_use else []
+    lines.append(_hook_event("SubagentStart", agent_id=CHILD_AGENT_ID))
+    lines.extend(tool_result_events)
+    lines.append(
+        _hook_event(
+            "SubagentStop",
+            agent_id=CHILD_AGENT_ID,
+            agent_transcript_path=transcript_path,
+            last_assistant_message=last_assistant_message,
+        )
+    )
+    return "\n".join(lines)
+
+
+def test_handbackreport_provenance_no_last_assistant_message_is_hook_id_correlated() -> None:
+    stdout = _handback_stdout(
+        [_handback_tool_result_event(CHILD_AGENT_ID, {"text": HANDBACK_MARKER})]
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [HANDBACK_MARKER])
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+    assert verdict["agent_id"] == CHILD_AGENT_ID
+    assert verdict["marker_provenance_verified"] is True
+    assert verdict["marker_provenance_transcript_fallback_used"] is False
+    assert verdict["tool_invocation_id_correlated"] is True
+    assert verdict["agent_transcript_verified"] is False
+    assert verdict["marker_provenance_handback_report_used"] is True
+
+
+def test_handbackreport_provenance_all_multiple_markers_in_report_is_hook_id_correlated() -> None:
+    stdout = _handback_stdout(
+        [
+            _handback_tool_result_event(
+                CHILD_AGENT_ID, {"text": f"{MARKER_1}\n{HANDBACK_MARKER}"}
+            )
+        ]
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [MARKER_1, HANDBACK_MARKER])
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+
+
+def test_handbackreport_provenance_identical_duplicate_reports_still_correlated() -> None:
+    event = _handback_tool_result_event(CHILD_AGENT_ID, {"text": HANDBACK_MARKER})
+    verdict = smoke.subagent_causal_evidence_verdict(
+        _handback_stdout([event, event]), [HANDBACK_MARKER]
+    )
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+
+
+def test_handbackreport_provenance_last_assistant_message_present_unchanged() -> None:
+    # last_assistant_message alone covers the marker: pre-#2848 behaviour,
+    # with no handback provenance field added even though a (consistent)
+    # handbackReport is also present.
+    stdout = _handback_stdout(
+        [_handback_tool_result_event(CHILD_AGENT_ID, {"text": HANDBACK_MARKER})],
+        last_assistant_message=f"child says {HANDBACK_MARKER}",
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [HANDBACK_MARKER])
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+    assert verdict["marker_provenance_transcript_fallback_used"] is False
+    assert "marker_provenance_handback_report_used" not in verdict
+
+
+def test_handbackreport_provenance_ignored_when_last_assistant_message_present() -> None:
+    # A present last_assistant_message WITHOUT the marker must not be
+    # rescued by handbackReport: with the key present, behaviour is
+    # byte-identical to before (transcript fallback -> missing file -> fail).
+    stdout = _handback_stdout(
+        [_handback_tool_result_event(CHILD_AGENT_ID, {"text": HANDBACK_MARKER})],
+        last_assistant_message="child said something else",
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [HANDBACK_MARKER])
+    assert verdict["marker_provenance_verified"] is False
+    assert verdict["marker_provenance_transcript_fallback_used"] is True
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
+    assert "marker_provenance_handback_report_used" not in verdict
+
+
+def test_handbackreport_provenance_field_absent_without_handback_report() -> None:
+    stdout = _handback_stdout([_agent_tool_result_event(CHILD_AGENT_ID)])
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [HANDBACK_MARKER])
+    assert "marker_provenance_handback_report_used" not in verdict
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
+
+
+def _assert_not_hook_id_correlated(stdout: str, markers: list[str]) -> dict:
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, markers)
+    assert verdict["causal_evidence_source"] != smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+    assert verdict["causal_evidence_source"] == smoke.CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
+    assert "marker_provenance_handback_report_used" not in verdict
+    return verdict
+
+
+def test_handbackreport_fail_closed_agent_id_mismatch() -> None:
+    # The only handbackReport belongs to a DIFFERENT agent; the hook's
+    # agent_id has a plain (report-less) tool_result of its own.
+    stdout = _handback_stdout(
+        [
+            _agent_tool_result_event(CHILD_AGENT_ID),
+            _handback_tool_result_event(OTHER_AGENT_ID, {"text": HANDBACK_MARKER}),
+        ]
+    )
+    _assert_not_hook_id_correlated(stdout, [HANDBACK_MARKER])
+
+
+def test_handbackreport_fail_closed_report_only_for_different_agent() -> None:
+    stdout = _handback_stdout(
+        [_handback_tool_result_event(OTHER_AGENT_ID, {"text": HANDBACK_MARKER})]
+    )
+    verdict = _assert_not_hook_id_correlated(stdout, [HANDBACK_MARKER])
+    assert verdict["tool_invocation_id_correlated"] is False
+
+
+def test_handbackreport_fail_closed_status_not_completed() -> None:
+    for status in ("async_launched", "failed", "running", "completed_with_errors"):
+        stdout = _handback_stdout(
+            [
+                _handback_tool_result_event(
+                    CHILD_AGENT_ID, {"text": HANDBACK_MARKER}, status=status
+                )
+            ]
+        )
+        _assert_not_hook_id_correlated(stdout, [HANDBACK_MARKER])
+
+
+def test_handbackreport_fail_closed_tool_result_is_error() -> None:
+    stdout = _handback_stdout(
+        [_handback_tool_result_event(CHILD_AGENT_ID, {"text": HANDBACK_MARKER}, is_error=True)]
+    )
+    _assert_not_hook_id_correlated(stdout, [HANDBACK_MARKER])
+
+
+def test_handbackreport_fail_closed_marker_missing() -> None:
+    stdout = _handback_stdout(
+        [_handback_tool_result_event(CHILD_AGENT_ID, {"text": "some other final text"})]
+    )
+    _assert_not_hook_id_correlated(stdout, [HANDBACK_MARKER])
+
+
+def test_handbackreport_fail_closed_only_some_expected_markers_present() -> None:
+    stdout = _handback_stdout(
+        [_handback_tool_result_event(CHILD_AGENT_ID, {"text": HANDBACK_MARKER})]
+    )
+    _assert_not_hook_id_correlated(stdout, [HANDBACK_MARKER, MARKER_2])
+
+
+def test_handbackreport_fail_closed_handback_report_absent() -> None:
+    stdout = _handback_stdout(
+        [_handback_tool_result_event(CHILD_AGENT_ID, None, include_handback_report=False)]
+    )
+    _assert_not_hook_id_correlated(stdout, [HANDBACK_MARKER])
+
+
+def test_handbackreport_fail_closed_malformed_report_shapes() -> None:
+    for report in (None, "SUBAGENTSTOP_HANDBACK_PROVENANCE_SMOKE_OK", {}, {"text": ""},
+                   {"text": "   "}, {"text": 7}, {"text": [HANDBACK_MARKER]}, [HANDBACK_MARKER]):
+        stdout = _handback_stdout([_handback_tool_result_event(CHILD_AGENT_ID, report)])
+        _assert_not_hook_id_correlated(stdout, [HANDBACK_MARKER])
+
+
+def test_handbackreport_fail_closed_conflicting_duplicate_reports() -> None:
+    # Two completed reports for the same agent that disagree: contradictory,
+    # even though one of them contains the marker.
+    stdout = _handback_stdout(
+        [
+            _handback_tool_result_event(CHILD_AGENT_ID, {"text": HANDBACK_MARKER}),
+            _handback_tool_result_event(CHILD_AGENT_ID, {"text": "different report text"}),
+        ]
+    )
+    _assert_not_hook_id_correlated(stdout, [HANDBACK_MARKER])
+
+
+def test_handbackreport_fail_closed_good_report_plus_non_terminal_report_conflict() -> None:
+    stdout = _handback_stdout(
+        [
+            _handback_tool_result_event(CHILD_AGENT_ID, {"text": HANDBACK_MARKER}),
+            _handback_tool_result_event(
+                CHILD_AGENT_ID, {"text": HANDBACK_MARKER}, status="failed"
+            ),
+        ]
+    )
+    _assert_not_hook_id_correlated(stdout, [HANDBACK_MARKER])
+
+
+def test_handbackreport_fail_closed_tool_result_not_tied_to_agent_tool_use() -> None:
+    stdout = _handback_stdout(
+        [
+            _handback_tool_result_event(
+                CHILD_AGENT_ID, {"text": HANDBACK_MARKER}, tool_use_id="toolu_unrelated"
+            )
+        ]
+    )
+    _assert_not_hook_id_correlated(stdout, [HANDBACK_MARKER])
+
+
+def test_handbackreport_fail_closed_no_agent_tool_use_at_all() -> None:
+    stdout = _handback_stdout(
+        [_handback_tool_result_event(CHILD_AGENT_ID, {"text": HANDBACK_MARKER})],
+        with_agent_tool_use=False,
+    )
+    _assert_not_hook_id_correlated(stdout, [HANDBACK_MARKER])
+
+
+def test_handbackreport_fail_closed_agent_transcript_path_still_required() -> None:
+    # handbackReport provenance does not relax any other requirement.
+    stdout = _handback_stdout(
+        [_handback_tool_result_event(CHILD_AGENT_ID, {"text": HANDBACK_MARKER})],
+        transcript_path=None,
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout, [HANDBACK_MARKER])
+    assert verdict["causal_evidence_source"] != smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED
+
+
+def test_handbackreport_fail_closed_no_expected_marker_uses_transcript_gate_unchanged() -> None:
+    # Without an expected marker the handback report is never consulted:
+    # the pre-existing transcript-verification requirement still applies.
+    stdout = _handback_stdout(
+        [_handback_tool_result_event(CHILD_AGENT_ID, {"text": HANDBACK_MARKER})]
+    )
+    verdict = smoke.subagent_causal_evidence_verdict(stdout)
+    assert verdict["marker_provenance_transcript_fallback_used"] is True
+    assert verdict["causal_evidence_source"] != smoke.CAUSAL_EVIDENCE_SOURCE_HOOK_ID_CORRELATED

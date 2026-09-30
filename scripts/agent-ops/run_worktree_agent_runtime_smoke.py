@@ -3582,10 +3582,92 @@ def _claude_agent_tool_invocation_correlated(
     return result
 
 
+def _claude_agent_handback_report_text(
+    stdout: str,
+    agent_id: str | None,
+    *,
+    session_id: str | None = None,
+    prompt_id: str | None = None,
+) -> str | None:
+    """Issue #2848: the child's own final report text as delivered by the
+    Agent tool's ``tool_use_result.handbackReport.text``, used as an
+    ADDITIONAL marker-provenance input only when the correlated
+    ``SubagentStop`` payload carries no ``last_assistant_message`` (Claude
+    Code 2.1.285 dropped that key; ``handbackReport`` is unchanged).
+
+    Reuses the same ``Agent`` tool_use / tool_result correlation and
+    session/prompt scoping as ``_claude_agent_tool_invocation_correlated``.
+    Returns the text only when EVERY matching envelope for ``agent_id`` is
+    consistent: ``tool_use_result.agentId == agent_id``,
+    ``status == "completed"``, the ``tool_result`` block is not
+    ``is_error: True`` and ``handbackReport.text`` is a non-empty string,
+    and all such envelopes agree on the same text. Fails closed to ``None``
+    on a missing/malformed report, an agentId mismatch (no envelope for
+    ``agent_id``), a non-terminal or errored envelope carrying a
+    ``handbackReport``, or conflicting duplicate reports."""
+    if not agent_id:
+        return None
+    pending_agent_tool_use_ids: set[str] = set()
+    texts: list[str] = []
+    contradictory = False
+    for payload in _iter_claude_stream_events(stdout):
+        payload_session_id = payload.get("session_id")
+        if not isinstance(payload_session_id, str) or not payload_session_id:
+            payload_session_id = payload.get("sessionId")
+        payload_prompt_id = payload.get("prompt_id")
+        if session_id and isinstance(payload_session_id, str) and payload_session_id:
+            if payload_session_id != session_id:
+                continue
+        if prompt_id and isinstance(payload_prompt_id, str) and payload_prompt_id:
+            if payload_prompt_id != prompt_id:
+                continue
+
+        message = payload.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        if payload.get("type") == "assistant":
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                if block.get("name") != _CLAUDE_SPAWN_TOOL_NAME:
+                    continue
+                tool_use_id = block.get("id")
+                if isinstance(tool_use_id, str) and tool_use_id:
+                    pending_agent_tool_use_ids.add(tool_use_id)
+        elif payload.get("type") == "user":
+            tool_use_result = payload.get("tool_use_result")
+            if not isinstance(tool_use_result, dict) or tool_use_result.get("agentId") != agent_id:
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                tool_use_id = block.get("tool_use_id")
+                if not isinstance(tool_use_id, str) or tool_use_id not in pending_agent_tool_use_ids:
+                    continue
+                if "handbackReport" not in tool_use_result:
+                    continue
+                report = tool_use_result.get("handbackReport")
+                text = report.get("text") if isinstance(report, dict) else None
+                if (
+                    tool_use_result.get("status") != "completed"
+                    or block.get("is_error") is True
+                    or not isinstance(text, str)
+                    or not text.strip()
+                ):
+                    contradictory = True
+                    continue
+                texts.append(text)
+    if contradictory or not texts or len(set(texts)) != 1:
+        return None
+    return texts[0]
+
+
 def _marker_provenance_verified(
     expected_markers: list[str] | None,
     last_assistant_message: str | None,
     transcript_content: str | None,
+    handback_report_text: str | None = None,
 ) -> tuple[bool, bool]:
     """Issue #2183 AC11/AC12 / PR #2220 P0-2 fix-delta (further refined by
     the P1-1-vs-``last_assistant_message``-primacy fix-delta below): whether
@@ -3633,9 +3715,22 @@ def _marker_provenance_verified(
     (no ``last_assistant_message``-alone fast path applies when there was
     no marker claim to satisfy from it in the first place), preserving the
     pre-existing requirement that a correlated Stop with no expected
-    markers still needs a genuinely verified transcript file (AC11)."""
+    markers still needs a genuinely verified transcript file (AC11).
+
+    Issue #2848: ``handback_report_text`` is the correlated Agent tool
+    ``handbackReport.text`` (see ``_claude_agent_handback_report_text``),
+    consulted ONLY when ``last_assistant_message`` is absent/empty --
+    Claude Code 2.1.285 omits that key from the ``SubagentStop`` payload.
+    Like ``last_assistant_message`` it is the child's own final report, so
+    when it ALONE covers every expected marker the result is
+    ``(True, False)`` (no transcript fallback). Otherwise the pre-existing
+    logic below is unchanged. When ``last_assistant_message`` is present
+    this parameter is ignored entirely."""
     if expected_markers and last_assistant_message:
         if all(marker in last_assistant_message for marker in expected_markers):
+            return True, False
+    if expected_markers and not last_assistant_message and handback_report_text:
+        if all(marker in handback_report_text for marker in expected_markers):
             return True, False
     child_texts: list[str] = []
     if last_assistant_message:
@@ -3760,10 +3855,29 @@ def subagent_causal_evidence_verdict(
         tool_invocation_id_correlated = tool_correlation["tool_invocation_id_correlated"]
         terminal_tool_result_success = tool_correlation["terminal_tool_result_success"]
 
+        # Issue #2848: only when the correlated Stop carries no
+        # ``last_assistant_message`` (Claude Code 2.1.285), consult the
+        # correlated Agent tool ``handbackReport.text`` as an additional
+        # provenance input. When ``last_assistant_message`` is present
+        # nothing below differs from the pre-#2848 behaviour.
+        handback_report_text: str | None = None
+        if expected_markers and not stop["last_assistant_message"]:
+            handback_report_text = _claude_agent_handback_report_text(
+                stdout, agent_id, session_id=stop["session_id"], prompt_id=stop["prompt_id"]
+            )
+
         marker_provenance_verified, marker_provenance_transcript_fallback_used = (
             _marker_provenance_verified(
-                expected_markers, stop["last_assistant_message"], transcript_content
+                expected_markers,
+                stop["last_assistant_message"],
+                transcript_content,
+                handback_report_text,
             )
+        )
+        marker_provenance_handback_report_used = bool(
+            handback_report_text
+            and marker_provenance_verified
+            and not marker_provenance_transcript_fallback_used
         )
 
         # P1-1-vs-primacy fix-delta (Issue #2183 PR #2220 OWNER P0-2
@@ -3798,6 +3912,7 @@ def subagent_causal_evidence_verdict(
                     marker_provenance_transcript_fallback_used
                 ),
                 "last_assistant_message": stop["last_assistant_message"],
+                "marker_provenance_handback_report_used": marker_provenance_handback_report_used,
                 "qualifies": qualifies,
             }
         )
@@ -3825,7 +3940,9 @@ def subagent_causal_evidence_verdict(
         marker_provenance_transcript_fallback_used = chosen[
             "marker_provenance_transcript_fallback_used"
         ]
+        marker_provenance_handback_report_used = chosen["marker_provenance_handback_report_used"]
     else:
+        marker_provenance_handback_report_used = False
         agent_id = None
         agent_transcript_path = None
         agent_transcript_verified = False
@@ -3853,7 +3970,7 @@ def subagent_causal_evidence_verdict(
         else:
             causal_evidence_source = CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
 
-    return {
+    verdict = {
         "agent_id": agent_id,
         "subagent_start_observed": subagent_start_observed,
         "subagent_stop_observed": subagent_stop_observed,
@@ -3877,6 +3994,13 @@ def subagent_causal_evidence_verdict(
             len(fully_qualifying) if len(fully_qualifying) > 1 else None
         ),
     }
+    # Issue #2848: additive audit field, emitted ONLY when marker provenance
+    # was actually satisfied from the Agent tool ``handbackReport.text``
+    # (Claude Code 2.1.285 SubagentStop has no ``last_assistant_message``).
+    # Absent otherwise, so every pre-#2848 verdict shape is unchanged.
+    if marker_provenance_handback_report_used:
+        verdict["marker_provenance_handback_report_used"] = True
+    return verdict
 
 
 def classify_claude_child_completion(stdout: str, spawn_agent_id: str | None) -> dict:
