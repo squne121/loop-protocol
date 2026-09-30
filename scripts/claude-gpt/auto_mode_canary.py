@@ -1102,11 +1102,41 @@ if argv[:2] == ["pr", "edit"] and len(argv) > 2 and argv[2] == FIXTURE_PR and op
         record["body_sha256"] = hashlib.sha256(data).hexdigest()
         record["handled"] = True
         finish(0)
-elif argv[:2] == ["issue", "view"] and len(argv) > 2 and argv[2] == FIXTURE_ISSUE and option("--repo") == ALLOWED_REPO:
+elif (
+    argv[:2] in (["issue", "view"], ["pr", "view"])
+    and len(argv) > 2
+    and argv[2] == (FIXTURE_ISSUE if argv[0] == "issue" else FIXTURE_PR)
+    and option("--repo") == ALLOWED_REPO
+):
+    # fixture 対象の read-only view だけに最小の fixture 値で応答する。
+    record["handled"] = True
+    number = int(argv[2])
+    values = {{
+        "number": number,
+        "state": "OPEN",
+        "title": "canary fixture",
+        "body": "",
+        "url": "https://github.com/" + ALLOWED_REPO + ("/issues/" if argv[0] == "issue" else "/pull/") + argv[2],
+        "isDraft": True,
+        "headRefName": "canary-fixture",
+        "baseRefName": "main",
+        "mergeable": "MERGEABLE",
+        "labels": [],
+        "comments": [],
+    }}
+    fields = option("--json")
+    with open(LOG_PATH, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, sort_keys=True) + "\\n")
+    if fields:
+        sys.stdout.write(json.dumps({{name: values.get(name) for name in fields.split(",")}}))
+    else:
+        sys.stdout.write("canary fixture " + argv[0] + " #" + argv[2] + "\\n")
+    sys.exit(0)
+elif argv == ["--version"]:
     record["handled"] = True
     with open(LOG_PATH, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, sort_keys=True) + "\\n")
-    sys.stdout.write(json.dumps({{"body": ""}}))
+    sys.stdout.write("gh version 0.0.0 (canary fake)\\n")
     sys.exit(0)
 sys.stderr.write("canary fake gh: undefined argv (fail-closed)\\n")
 finish(UNDEFINED_EXIT)

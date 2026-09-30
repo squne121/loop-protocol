@@ -628,6 +628,38 @@ def test_hermetic_fake_gh_records_path_and_argv_and_fails_closed_on_undefined_ar
     assert records[0]["body_sha256"] == canary._sha256_text(canary.CANONICAL_WORKFLOW_FIXTURE_BODY)
 
 
+def test_hermetic_fake_gh_answers_read_only_views_for_the_fixture_only(tmp_path):
+    """GIVEN canary 所有の fake gh
+    WHEN fixture 対象の read-only view を実行する
+    THEN 最小の fixture 値で応答し、fixture 以外の PR / Issue / repo は fail-closed のまま
+    """
+    log_path = tmp_path / "calls.jsonl"
+    shim = tmp_path / "gh"
+    shim.write_text(canary._fake_gh_source(log_path), encoding="utf-8")
+    shim.chmod(0o755)
+    pr = str(canary.CANONICAL_WORKFLOW_FIXTURE_PR_NUMBER)
+    issue = str(canary.CANONICAL_WORKFLOW_FIXTURE_ISSUE_NUMBER)
+
+    def run(*argv):
+        return subprocess.run([str(shim), *argv], capture_output=True, text=True, timeout=20, check=False)
+
+    view = run("pr", "view", pr, "--repo", canary.TRUSTED_REPO, "--json", "number,state,headRefName")
+    assert view.returncode == 0
+    assert json.loads(view.stdout) == {"number": int(pr), "state": "OPEN", "headRefName": "canary-fixture"}
+    assert json.loads(run("issue", "view", issue, "--repo", canary.TRUSTED_REPO, "--json", "body").stdout) == {
+        "body": ""
+    }
+    assert run("--version").returncode == 0
+    for argv in (
+        ("pr", "view", "123", "--repo", canary.TRUSTED_REPO),
+        ("issue", "view", "2843", "--repo", canary.TRUSTED_REPO),
+        ("pr", "view", pr, "--repo", "other/repo"),
+        ("pr", "merge", pr, "--repo", canary.TRUSTED_REPO),
+        ("api", "repos/x/y"),
+    ):
+        assert run(*argv).returncode == canary.FAKE_GH_UNDEFINED_ARGV_EXIT, argv
+
+
 def test_actual_update_pr_wrapper_reaches_only_the_hermetic_fake_gh(tmp_path):
     """GIVEN canary fixture body と PATH 先頭の fake gh
     WHEN actual update_pr.py を fixture PR (範囲外番号) に対して実行する
