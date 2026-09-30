@@ -11,6 +11,7 @@ guard-issue-body.py のユニットテスト。
 - PyYAML は yaml.safe_load() のみ使用
 """
 
+import inspect
 import json
 import subprocess
 import sys
@@ -569,8 +570,76 @@ class TestExtractIssueKindFromBody:
 
 
 # ---------------------------------------------------------------------------
-# guard_template のテスト（#68 AC2/AC3 対応）
+# guard_template のテスト（#68 AC2/AC3、#2794 の fence 境界）
 # ---------------------------------------------------------------------------
+
+# #2794 の記録に基づく literal fixture。#2788 編集前の raw bytes は未取得であり、
+# 当時の本文と同一だったという主張はしない。
+_ORPHAN_BACKTICK_LITERAL_BODY = """\
+## Machine-Readable Contract
+
+```yaml
+contract_schema_version: v1
+issue_kind: implementation
+```
+
+## Parent Issue
+
+none
+
+## Parent Goal Ref
+
+- Goal: テスト
+
+## Current Validated Scope
+
+- 範囲
+
+## Remaining Parent Gaps
+
+なし
+
+## Background
+
+次行は info string の末尾に backtick を含む不揃いな prose 行。
+```bash`
+
+## Outcome
+
+実在する成果物。
+
+## In Scope
+
+- 実在する対象。
+
+## Out of Scope
+
+- 対象外。
+
+## Acceptance Criteria
+
+- [ ] AC1: 見出しを保持する。
+
+## Verification Commands
+
+```bash
+# AC1
+uv run pytest tests/ -q
+```
+
+## Allowed Paths
+
+- tests/
+
+## Stop Conditions
+
+- 範囲外の変更時に停止。
+
+## Required Skills
+
+なし
+"""
+
 
 class TestGuardTemplate:
     def test_implementation_valid_body_passes(self, template_dir):
@@ -624,6 +693,107 @@ class TestGuardTemplate:
         result = guard_template(body, "nonexistent", template_dir=template_dir)
         assert result["passed"] is False
         assert "error" in result
+
+    def test_orphan_backtick_shared_parser_adapter(self, template_dir):
+        """GIVEN #2794 に記録された不揃いな prose WHEN guard_template THEN 実見出しを保持する。"""
+        lines = _ORPHAN_BACKTICK_LITERAL_BODY.splitlines()
+        orphan_index = lines.index("```bash`")
+        vc_index = lines.index("```bash", orphan_index + 1)
+        # opener の3文字 + info string 末尾の1文字を、文字列そのもので固定する。
+        assert lines[orphan_index].startswith("`" * 3 + "bash")
+        assert lines[orphan_index][3:] == "bash`"  # info string 末尾の U+0060
+        assert lines[orphan_index].count("`") == 4
+        assert lines[orphan_index] == lines[orphan_index].lstrip(" ")
+        assert len(lines[orphan_index]) - len(lines[orphan_index].lstrip(" ")) == 0
+        assert orphan_index < lines.index("## Outcome") < lines.index("## In Scope") < vc_index
+        assert lines[vc_index] == "```bash"
+        assert "```\n\n## Allowed Paths" in _ORPHAN_BACKTICK_LITERAL_BODY
+
+        result = guard_template(
+            _ORPHAN_BACKTICK_LITERAL_BODY, "implementation", template_dir=template_dir
+        )
+        assert result["passed"] is True
+        assert result["missing_sections"] == []
+
+        # 同じ不揃い文字列が prose の inline にある場合も実見出しを保持する。
+        inline_body = _ORPHAN_BACKTICK_LITERAL_BODY.replace(
+            "\n```bash`\n", "\n本文中の不揃い ```bash` は prose の一部。\n", 1
+        )
+        assert "本文中の不揃い ```bash` は prose の一部。" in inline_body
+        assert "\n```bash`\n" not in inline_body
+        assert guard_template(inline_body, "implementation", template_dir=template_dir)[
+            "missing_sections"
+        ] == []
+
+    def test_shared_parser_fence_boundary_cases(self, template_dir):
+        """GIVEN GFM fence 境界 WHEN guard_template THEN code 内だけ除外して実見出しを保持する。"""
+        base = make_implementation_body()
+        # opener の 0–3 spaces と、4-backtick 中の3-backtick、tilde、
+        # 同種・同長以上の closer 制約を consumer 経由で代表検証する。
+        fences = (
+            "```bash\n## Outcome\n```",                     # 通常の偽見出し
+            " ```bash\n## Outcome\n ```",                   # 1 space
+            "   ```bash\n## Outcome\n   ```",               # 3 spaces
+            "````bash\n```\n## Outcome\n````",            # 短い closer は無効
+            "~~~bash\n```\n## Outcome\n~~~",              # backtick は tilde を閉じない
+            "```bash\n~~~\n## Outcome\n```",              # tilde は backtick を閉じない
+        )
+        for fence in fences:
+            without_real = base.replace("## Outcome\n", fence + "\n## REMOVED\n", 1)
+            result = guard_template(without_real, "implementation", template_dir=template_dir)
+            assert "## Outcome" in result["missing_sections"], fence
+
+            with_real = base.replace("## Outcome\n", fence + "\n## Outcome\n", 1)
+            result = guard_template(with_real, "implementation", template_dir=template_dir)
+            assert result["missing_sections"] == [], fence
+
+        # 4-space indented opener と info string 内 backtick は fence ではない。
+        for prose_line, indent in (
+            ("    ```bash", 4),
+            (" ```bash`", 1),
+            ("   ```bash`", 3),
+            ("本文中の ```bash`", 0),
+        ):
+            assert len(prose_line) - len(prose_line.lstrip(" ")) == indent
+            if prose_line.lstrip(" ").startswith("```") and prose_line.endswith("`"):
+                assert prose_line.lstrip(" ")[3:] == "bash`"
+            body = base.replace("## Outcome\n", prose_line + "\n## Outcome\n", 1)
+            result = guard_template(body, "implementation", template_dir=template_dir)
+            assert result["missing_sections"] == [], prose_line
+
+        # EOF 未閉 fence は最後まで code。中の ## Outcome は実見出しではない。
+        unclosed = base.replace("## Outcome\n", "## REMOVED\n", 1)
+        unclosed += "\n```bash\n## Outcome\n"
+        result = guard_template(unclosed, "implementation", template_dir=template_dir)
+        assert "## Outcome" in result["missing_sections"]
+
+    def test_shared_parser_delegation_without_regex(self, template_dir, monkeypatch):
+        """GIVEN parser block 種別 WHEN guard_template THEN CODE_FENCE のみを除外する。"""
+        assert "_FENCED_CODE_BLOCK_RE" not in _MODULE_PATH.read_text(encoding="utf-8")
+        assert "_pbp.iter_markdown_blocks" in inspect.getsource(_mod._strip_fenced_code_blocks)
+        body = make_implementation_body().replace("## Outcome\n", "## REMOVED\n", 1)
+        seen = []
+
+        def blocks_without_outcome(text):
+            seen.append(text)
+            yield body, _mod._pbp.BLOCK_KIND_HUMAN_PROSE
+            yield "## Outcome\n", _mod._pbp.BLOCK_KIND_CODE_FENCE
+
+        monkeypatch.setattr(_mod._pbp, "iter_markdown_blocks", blocks_without_outcome)
+        result = guard_template(body, "implementation", template_dir=template_dir)
+        assert seen == [body]
+        assert "## Outcome" in result["missing_sections"]
+
+        def blocks_with_nonfence_outcome(text):
+            seen.append(text)
+            yield body, _mod._pbp.BLOCK_KIND_HUMAN_PROSE
+            yield "## Outcome\n", _mod._pbp.BLOCK_KIND_CODE_FENCE
+            yield "## Outcome\n", _mod._pbp.BLOCK_KIND_TABLE
+
+        monkeypatch.setattr(_mod._pbp, "iter_markdown_blocks", blocks_with_nonfence_outcome)
+        result = guard_template(body, "implementation", template_dir=template_dir)
+        assert seen == [body, body]
+        assert result["missing_sections"] == []
 
 
 # ---------------------------------------------------------------------------
