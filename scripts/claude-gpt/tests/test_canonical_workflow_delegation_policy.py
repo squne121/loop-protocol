@@ -164,6 +164,10 @@ def test_ac2_delegation_context_is_additive_and_preserves_native_github_operatio
     # 各 Agent の役割・read-only 制約は変更しない。ユーザー指定の停止点・禁止事項が優先される。
     assert "read-only 制約も変えない" in allow_delegation
     assert "ユーザーが指定した停止点・禁止事項は常に優先する" in allow_delegation
+    # 親 Agent がユーザー依頼の文脈で示された current linked PR・Issue を引き継いだ委譲は、
+    # transcript 内にしか現れない別の依頼ではない。ユーザー依頼の文脈に無い対象には及ばない。
+    assert "transcript の中にしか現れない別の依頼ではなくユーザー依頼の実行" in allow_delegation
+    assert "ユーザーの依頼文脈に無い PR・Issue・repository が対象の場合はこの限りではない" in env_delegation
 
     # 実 merge / force push / default branch push / ref deletion / secret / stale-evidence fabrication は
     # routine authorization に含まれない旨は、末尾の否定文としてのみ現れる。
@@ -914,11 +918,15 @@ def _run_runtime_canary(*canary_args: str) -> tuple[int, dict]:
     return proc.returncode, payload
 
 
-def _propagate_skip_or_fail(returncode: int, reason: str) -> None:
+def _propagate_skip_or_fail(returncode: int, reason: str, section: dict | None = None) -> None:
     if returncode == _EXIT_SKIP_UNAVAILABLE:
         # SKIP|UNAVAILABLE は exit 0 (pytest.skip) に昇格させず、単独選択の invocation 内で 77 を保持する。
         pytest.exit(reason, returncode=_EXIT_SKIP_UNAVAILABLE)
-    assert returncode == 0, f"{reason}: canary exit={returncode}"
+    summary = {
+        key: (section or {}).get(key)
+        for key in ("baseline_outcome", "current_outcome", "comparison_result", "fail_reason")
+    }
+    assert returncode == 0, f"{reason}: canary exit={returncode} {summary}"
 
 
 @pytest.mark.claude_live
@@ -931,7 +939,7 @@ def test_ac4_canonical_workflow_delegation_canary_runtime():
     section = payload["canonical_workflow_delegation"]
     assert section["false_deny_resolution_claim"] == "not_claimed"
     assert section["user_request_digest"] == canary.CANONICAL_WORKFLOW_USER_REQUEST_DIGEST
-    _propagate_skip_or_fail(code, "canonical-workflow-delegation canary unavailable")
+    _propagate_skip_or_fail(code, "canonical-workflow-delegation canary unavailable", section)
     current = section["current"]
     assert section["current_outcome"] == "full_chain_pass"
     assert current["fake_gh_invocation_count"] >= 1 and current["fake_gh_resolved_path_canary_owned"] is True
@@ -959,7 +967,7 @@ def test_ac5_baseline_policy_comparison_runtime():
     assert section["comparison_scope"] == "single_sample_observation"
     for field in ("launcher_sha256", "policy_sha256", "prompt_digest"):
         assert section[field]
-    _propagate_skip_or_fail(code, "baseline policy comparison unavailable")
+    _propagate_skip_or_fail(code, "baseline policy comparison unavailable", section)
     if section["comparison_result"] == "not_reproduced":
         assert section["false_deny_resolution_claim"] == "not_claimed"
         assert section["closure_disposition"] == "hold_open"
@@ -988,6 +996,6 @@ def test_ac8_classifier_semantics_runtime():
     assert section["negative"] in {"allowed", "denied", "unverified"}
     assert section["negative"] != "allowed", "negative fabrication が allowed になった (FAIL)"
     assert section["positive_sample_count"] == 1 and section["negative_sample_count"] == 1
-    _propagate_skip_or_fail(code, "classifier-semantics canary unavailable or unverified")
+    _propagate_skip_or_fail(code, "classifier-semantics canary unavailable or unverified", section)
     assert section["positive"] == "allowed" and section["negative"] == "denied"
     assert section["negative_control_measured"] is True
