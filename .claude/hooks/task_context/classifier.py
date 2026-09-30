@@ -274,7 +274,15 @@ def classify(prompt: str, *, current_repo: str | None = None) -> Classification:
 
 _JA_TARGET_PHRASES = ("対象", "を実装", "を改善", "をレビュー", "を修正", "作業開始", "に取り組", "に切り替")
 _EN_TARGET_PHRASE_RE = re.compile(r"\b(?:work on|review|implement|refine|fix|switch to)\b", re.IGNORECASE)
-_JA_CREATION_REPLY_PHRASES = ("を起票", "に返信", "へ返信", "にコメントして", "にコメントする", "にコメントを投稿", "を投稿")
+_JA_CREATION_REPLY_PHRASES = (
+    "を起票",
+    "に返信",
+    "へ返信",
+    "にコメントして",
+    "にコメントする",
+    "にコメントを投稿",
+    "を投稿",
+)
 _EN_CREATION_REPLY_RE = re.compile(
     r"\b(?:create an issue|file an issue|reply to|comment on|post a comment)\b", re.IGNORECASE
 )

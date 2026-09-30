@@ -1,13 +1,26 @@
 ---
 name: task
-description: Native Claude operator の ACTIVE Task を明示的に切り替える `/task <target>` escape hatch の仕様。Task Context v1（Issue #2564、advisory-only 化と authority 移管: Issue #2625）が `UserPromptExpansion` command lifecycle 内で deterministic に処理する唯一の手動 rebind 経路。「Task を切り替えたい」「別の Issue に移りたい」「/task の使い方」のトリガーで参照する。
+description: Native Claude operator の ACTIVE Task を明示的に強制切り替えする `/task <target>` の仕様。通常の Issue/PR 作業開始 prompt は Task Context が自動で追従する（Issue #2827）ため、`/task` は normal workflow の必須手順ではなく低頻度の explicit forced override（escape hatch）である。Task Context v1（Issue #2564、authority 移管: Issue #2625）が `UserPromptExpansion` command lifecycle 内で deterministic に処理する。「Task を強制的に切り替えたい」「自動で切り替わらなかった」「/task の使い方」のトリガーで参照する。
 ---
 
-# `/task <target>` — ACTIVE Task 明示切り替え escape hatch
+# `/task <target>` — ACTIVE Task 強制切り替え（explicit override / escape hatch）
 
 Task Context v1（Issue #2564、Issue #2625 で authority 移管）が Native Claude
-operator 向けに提供する、ACTIVE Task を人間が意図的に supersede/rebind する
-ための唯一の明示的経路。
+operator 向けに提供する、ACTIVE Task を人間が意図的に強制 supersede/rebind
+するための低頻度の explicit forced override（escape hatch）。
+
+## 通常の切り替えは `/task` を必要としない（Issue #2827）
+
+- ordinary な Issue/PR 作業開始 prompt（例: `Issue #123 を対象にレビューして`）が
+  ちょうど 1 つの high-confidence primary target（GitHub Issue、または local claim
+  済み PR）を明示している場合、Task Context は `UserPromptSubmit` の観測済み
+  provenance を根拠に、既存の atomic binder で対象の Task へ**自動で rebind**
+  する（`reason_code: user_prompt_primary_target_rebind`）。operator は
+  `/task` を先に入力する必要はない。
+- 自動 rebind しない場合（曖昧・複数 primary・参考のみ・未 claim PR・別の live
+  managed session が保持する Task・内部由来の入力など）でも Claude の通常処理は
+  継続し、確認 dialog や `/task` は強制されない。Task が自動では切り替わらなかった
+  ときの強制手段が、以下の `/task <target>` である。
 
 ## 位置づけ
 
@@ -33,9 +46,11 @@ operator 向けに提供する、ACTIVE Task を人間が意図的に supersede/
   解消するための変更である。
 - 判定の precedence は常に最優先: `UserPromptExpansion` 上の `/task`
   authority > 通常の primary-target classifier（EXPLICIT/INFERRED/
-  REFERENCE_ONLY/AMBIGUOUS/NONE）。ACTIVE な別 Task の mismatch は
-  advisory-only（Issue #2625 AC1/AC2）であり、`/task <target>` は常に
-  この advisory を無条件に supersede して rebind できる。
+  REFERENCE_ONLY/AMBIGUOUS/NONE）。ordinary prompt の自動 rebind が適格でない
+  ACTIVE な別 Task の mismatch は advisory-only（Issue #2625 AC1/AC2、mutation
+  なし）であり、`/task <target>` は常にこの advisory を無条件に supersede して
+  rebind できる。別の live managed Binding が保持する Task にも `/task` は
+  強制的に rebind できる（自動 rebind は共有しない）。
 
 ## 使い方
 

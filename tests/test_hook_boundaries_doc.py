@@ -934,3 +934,36 @@ class TestRedactionContract:
         assert not missing, (
             f"以下の manifest entry に redaction_contract がありません: {missing}"
         )
+
+
+# ─── Issue #2827: /task は normal switch の必須手順ではなく escape hatch ────────────
+
+
+class TestSlashTaskIsEscapeHatchNotNormalPath:
+    _DOC_PATHS = (
+        "docs/dev/hook-boundaries.md",
+        "docs/dev/task-context.md",
+        ".claude/skills/task/SKILL.md",
+    )
+    # normal ACTIVE Task 切替に /task を必須とする旧 normative 表現。
+    _REMOVED_PHRASES = (
+        "唯一の明示的経路",
+        "唯一の手動 rebind 経路",
+        "先に `/task` を入力しなければならない",
+        "use `/task <target>` to explicitly switch",
+    )
+
+    def test_normal_switch_does_not_require_slash_task_first(self) -> None:
+        """AC8: normal ACTIVE Task 切替に user が先に /task を入力する要件が無く、/task は escape hatch。"""
+        for relative in self._DOC_PATHS:
+            text = (REPO_ROOT / relative).read_text(encoding="utf-8")
+            for phrase in self._REMOVED_PHRASES:
+                assert phrase not in text, f"{relative} still says {phrase!r}"
+            assert "escape hatch" in text, f"{relative} must describe /task as an escape hatch"
+        skill = (REPO_ROOT / ".claude/skills/task/SKILL.md").read_text(encoding="utf-8")
+        assert "user_prompt_primary_target_rebind" in skill
+        assert "`/task` を先に入力する必要はない" in skill
+        context = (REPO_ROOT / "docs/dev/task-context.md").read_text(encoding="utf-8")
+        assert "user_prompt_observed" in context and "internal_or_unknown" in context
+        boundaries = (REPO_ROOT / "docs/dev/hook-boundaries.md").read_text(encoding="utf-8")
+        assert "`/task` を先に入力することを必須としない" in boundaries

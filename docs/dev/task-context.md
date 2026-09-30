@@ -843,7 +843,8 @@ canonical contract は以下のとおりである。
   停止させない。
 - ACTIVE current Activity + different primary target を検出しても
   `task_context_hook_flows.on_user_prompt_submit` は常に `decision: pass`
-  を返す。current Task/Activity/Binding は一切変更せず、target ref の
+  を返す。Issue #2827 の auto-rebind 適格条件（下記）を満たさない場合、
+  current Task/Activity/Binding は一切変更せず、target ref の
   claim も silent rebind も行わない。
 - mismatch 検出そのもの（mistake-detection capability）は維持する。
   advisory 化は hard-block の撤去であり、observability の撤去ではない --
@@ -864,6 +865,47 @@ canonical hook 責務・fail policy・exit-code contract の正本は
 `docs/dev/hook-boundaries.md` の `hook_boundaries_manifest_v1`
 （`handler_id: hook_entry`, `event: UserPromptSubmit` / `event:
 UserPromptExpansion` の各エントリ）である。
+
+## ordinary user prompt による ACTIVE Task auto-rebind（Issue #2827）
+
+#2562 の Goal「通常の人間操作を増やさない」に合わせ、normal ACTIVE Task 切替には
+operator が先に `/task` を入力する必要はない。`/task <target>` は削除せず、
+低頻度の explicit forced override / escape hatch として残る。
+
+- **rebind の条件**: ordinary な `UserPromptSubmit` が、ACTIVE 専用の primary
+  閉集合（reference form と決定論的な target phrase の同一 clause 内の組、または
+  prompt 全体が単一の explicit reference）を満たす exactly one の primary target
+  （Issue、または local claim 済み PR）を明示し、かつ `input_provenance ==
+  user_prompt_observed` のとき、既存 atomic binder
+  （`service.bind_target_to_binding`）で対象 Task へ rebind する。同一
+  transaction で新規作成した Task だけ initial Activity は `refine`、既存 Task の
+  ACTIVE Activity は維持し、ACTIVE の無い既存 Task を auto-rebind のためだけに
+  `refine` へ再開始しない。`/task`・UNBOUND autobind・terminal・provisional absorb の
+  既存 Activity semantics は変わらない。
+- **provenance（fail-closed、2 値）**: adapter が `user_prompt_observed` |
+  `internal_or_unknown` を生成する。field 欠落・型不正・既知 envelope marker
+  （初期値 `<task-notification>`）一致は `internal_or_unknown` とし、UNBOUND
+  autobind / provisional absorb / terminal rebind / ACTIVE rebind の 4 入口すべてで
+  Task identity を変更しない。実 runtime capture で user prompt と internal completion を
+  構造的に区別できる field は無いため、`prompt_id` 単独を人間の認証とは扱わず、
+  envelope の無い internal 入力（marker の無い peer/teammate message・scheduled
+  prompt・agent が送る herdr pane text）は accepted residual risk である。
+- **他の live managed session の Task は共有しない**: target Task に別 Binding の
+  open managed ExecutionRun があれば、binder の同一 `BEGIN IMMEDIATE` 内で検出して
+  mutation せず `blocked_by_other_live_binding`（advisory・non-blocking）とする。
+  強制したい場合だけ `/task` を使う。
+- **境界**: local claim の無い PR は `unclaimed_pr_local_only` のまま（GitHub 照会も
+  Task 作成もしない）。live claim も Issue/PR 前置語も無い bare `#N` は rebind せず
+  Task も作らない。workflow signal は cross-Task rebind authority を持たず
+  （`task_context_workflow_signals.py` は変更しない）、旧 Task の遅延 signal は
+  新 Task に適用されない。
+- 2.1.196 未満の runtime（`prompt_id` 無し）では全 `UserPromptSubmit` が
+  `internal_or_unknown` となり 4 入口とも mutation なしになる。これは意図的な
+  「mutation を行わない側への劣化」である。
+
+検証: `tests/task-context/test_active_task_prompt_auto_rebind.py` /
+`test_prompt_auto_rebind_workflow_signal.py` と、実 runtime の
+`scripts/task-context/verify_active_task_prompt_auto_rebind.py --leaf <name>`。
 
 ## Repository CI に関する注記（non-blocking）
 
