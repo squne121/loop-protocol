@@ -53,10 +53,13 @@ _OUTCOME_NG_RE = re.compile(
 # issue_kind の安全な文字のみ許可（パストラバーサル対策）
 _ISSUE_KIND_RE = re.compile(r'^[A-Za-z0-9_-]+$')
 
-# fenced code block を除去するための正規表現
-_FENCED_CODE_BLOCK_RE = re.compile(r'```.*?```', re.DOTALL)
-
 _REPO_ROOT = Path(__file__).resolve().parents[4]
+_CREATE_ISSUE_SCRIPTS = _REPO_ROOT / ".claude" / "skills" / "create-issue" / "scripts"
+if str(_CREATE_ISSUE_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_CREATE_ISSUE_SCRIPTS))
+
+import prose_boundary_policy as _pbp  # noqa: E402
+
 _VALIDATE_ISSUE_BODY_SCRIPT = (
     _REPO_ROOT
     / ".claude"
@@ -314,10 +317,12 @@ def resolve_template_dir() -> Path:
 
 
 def _strip_fenced_code_blocks(text: str) -> str:
-    """
-    テキストから fenced code block（``` で囲まれた範囲）を除去して返す。
-    """
-    return _FENCED_CODE_BLOCK_RE.sub('', text)
+    """共有 Markdown block parser に委譲し、code fence のみ除外する。"""
+    return ''.join(
+        block_text
+        for block_text, block_kind in _pbp.iter_markdown_blocks(text)
+        if block_kind != _pbp.BLOCK_KIND_CODE_FENCE
+    )
 
 
 def guard_template(body: str, issue_kind: str, template_dir=None) -> dict:
