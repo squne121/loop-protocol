@@ -89,6 +89,31 @@ def resolve_session_registry_dir() -> pathlib.Path:
     return _default_session_registry_dir()
 
 
+TEAMS_DIR_ENV_VAR = "LOOP_TASK_CONTEXT_TEAMS_DIR"
+
+
+def resolve_claude_config_root() -> pathlib.Path:
+    """Effective Claude Code config root: ``CLAUDE_CONFIG_DIR`` when set
+    (Claude-GPT's launcher-owned isolated root, or any Native invocation that
+    sets it), else the Native default ``~/.claude``. Never a hardcoded
+    ``~/.claude`` when ``CLAUDE_CONFIG_DIR`` is present (Issue #2822)."""
+    claude_config_dir = os.environ.get(CLAUDE_CONFIG_DIR_ENV_VAR, "")
+    if claude_config_dir:
+        return pathlib.Path(claude_config_dir)
+    return pathlib.Path.home() / ".claude"
+
+
+def resolve_teams_dir() -> pathlib.Path:
+    """Directory holding Claude-Code-owned Agent Teams configs
+    (``<config-root>/teams``). ``LOOP_TASK_CONTEXT_TEAMS_DIR`` overrides it
+    (tests only, used as-is). Read-only consumer: nothing here creates or
+    edits a team config (Issue #2822)."""
+    override = os.environ.get(TEAMS_DIR_ENV_VAR, "")
+    if override:
+        return pathlib.Path(override)
+    return resolve_claude_config_root() / "teams"
+
+
 def _iter_session_records(registry_dir: pathlib.Path):
     """Yield every parseable JSON object found under ``registry_dir``.
     Fail-closed: a missing directory, an unreadable file, or invalid JSON

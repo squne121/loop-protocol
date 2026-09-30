@@ -193,6 +193,12 @@ _ORIGIN_UNBOUND_REASON = "unbound"
 _ORIGIN_RESOLUTION_FAILURE_EVENT_TYPE = "workflow:origin_resolution_failed"
 
 
+def _is_hook_origin_subagent_row(row: Any) -> bool:
+    """True for a SubAgent ExecutionRun written by the ``SubagentStart``
+    adapter (Issue #2822): ``run_kind='subagent'`` with no TabBinding."""
+    return row["run_kind"] == "subagent" and row["binding_id"] is None
+
+
 def _classify_origin_candidates(
     candidates: list[Any], origin_session_id: str
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
@@ -217,6 +223,17 @@ def _classify_origin_candidates(
     (a plain ``dict`` or a ``sqlite3.Row`` both work), which lets tests
     exercise this pure classification independently of the SQL fetch.
     """
+    # Issue #2822 reader-side protection: `execution_runs.claude_session_id`
+    # means "this operator's own session" on a managed row but "the
+    # parent/caller session" on a hook-origin SubAgent row (`SubagentStart`
+    # stores the hook's common `session_id` so SendMessage addressability can
+    # be scoped to the caller). Such a row (`run_kind='subagent' AND
+    # binding_id IS NULL` -- hook-origin SubAgents never own a TabBinding)
+    # is never an origin candidate. Deliberately NOT a plain
+    # `run_kind IN managed` filter and NOT `agent_id IS NOT NULL`: subagent
+    # rows that do carry a binding (Issue #2719/#2790 fixtures) must keep
+    # classifying as `origin_run_kind_mismatch`.
+    candidates = [c for c in candidates if not _is_hook_origin_subagent_row(c)]
     if not candidates:
         return None, _outcome("deferred", "origin_run_not_found")
     matched: list[Any] = []
