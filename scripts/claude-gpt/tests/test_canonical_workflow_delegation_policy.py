@@ -925,7 +925,7 @@ def _run_runtime_canary(*canary_args: str) -> tuple[int, dict]:
     """canary を subprocess で起動し (exit code, 結果 JSON) を返す。opt-in は wrapper が明示的に与え、
     ambient environment に依存しない。exit 2 (invalid invocation) と結果分類の欠落は FAIL。"""
     proc = subprocess.run(
-        [sys.executable, str(CANARY_PY), *canary_args, "--no-evidence"],
+        [sys.executable, str(CANARY_PY), *canary_args],
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
@@ -939,6 +939,16 @@ def _run_runtime_canary(*canary_args: str) -> tuple[int, dict]:
         pytest.fail(f"canary の結果 JSON が欠落 (exit={proc.returncode})")
     assert payload.get("schema") == "AUTO_MODE_CANARY_EVIDENCE_V2"
     assert payload.get("exit_classification") in {"pass", "fail", "skip"}, "結果分類の欠落"
+    # sanitized な分類・disposition・digest だけを出力する (raw transcript / prompt は含めない)。
+    summary_keys = (
+        "baseline_outcome", "current_outcome", "comparison_result", "false_deny_resolution_claim",
+        "merge_disposition", "closure_disposition", "baseline_sample_count", "current_sample_count",
+        "comparison_scope", "user_request_digest", "positive", "negative", "exit_code",
+    )
+    for section_name in ("canonical_workflow_delegation", "classifier_semantics"):
+        section = payload.get(section_name)
+        if section:
+            print("CANARY_SUMMARY", json.dumps({k: section.get(k) for k in summary_keys if k in section}))
     return proc.returncode, payload
 
 
