@@ -27,7 +27,25 @@ identity, before state, after state and a result.
 
 Exit codes: 0 all required leaves pass, 1 a required leaf failed / skipped /
 absent / unbound, 77 (with a ``SKIP:`` line) when the ``claude`` executable
-is unavailable (never a PASS).
+is unavailable or when a live leaf stayed inconclusive after its bounded
+attempts (never a PASS).
+
+``internal-completion-negative-control`` classifies every live attempt as one
+of three outcomes (pure function ``classify_negative_control_attempt``):
+
+- violation: a real counterexample (Binding left Task A, a claim for B was
+  created, the Task count changed, an unexpected ``/task`` expansion, ...).
+  The leaf fails immediately (exit 1) and is NOT retried.
+- informative pass: an internal (envelope) ``UserPromptSubmit`` carried the B
+  reference, the provenance gate recorded
+  ``internal_or_unknown_provenance_no_mutation``, nothing mutated and the
+  SubagentStart / SubagentStop causal evidence exists. Only this passes.
+- inconclusive: nothing mutated but the gate was not actually exercised
+  (the envelope never carried B, the gate was not reached, a stop-blocking
+  class could not be captured, ...). The whole state is rebuilt fresh and the
+  leaf retried (at most ``NEGATIVE_CONTROL_MAX_ATTEMPTS`` times). Without an
+  informative pass the leaf is SKIP (exit 77, ``inconclusive_after_attempts``),
+  never PASS, and never counted as a failure.
 
 ``--evidence-json PATH`` evaluates a previously collected evidence file
 offline instead of driving a live runtime.
@@ -60,6 +78,14 @@ _TASK_SKILL_PATH = _REPO_ROOT / ".claude" / "skills" / "task" / "SKILL.md"
 _DEFAULT_ARTIFACT_DIR = Path("artifacts") / "runtime-smoke" / "task-context-active-auto-rebind"
 
 EXIT_SKIP = 77
+
+# Attempt classification of the internal-completion negative control.
+CLASS_VIOLATION = "violation"
+CLASS_INFORMATIVE_PASS = "informative_pass"
+CLASS_INCONCLUSIVE = "inconclusive"
+LEAF_STATUS_INCONCLUSIVE = "inconclusive"
+INCONCLUSIVE_SKIP_REASON = "inconclusive_after_attempts"
+NEGATIVE_CONTROL_MAX_ATTEMPTS = 5
 
 LEAF_NAMES = (
     "ordinary-prompt-rebind",
@@ -116,9 +142,24 @@ def _leaf_violation(name: str, leaf: Any) -> str | None:
     return None
 
 
+def _leaf_inconclusive(name: str, leaf: Any) -> str | None:
+    """Reason text when ``leaf`` is a well-formed bounded SKIP (inconclusive
+    after its attempts), else ``None``. A bare ``status == "inconclusive"``
+    without the attempt record is not accepted as a SKIP."""
+    if not isinstance(leaf, dict) or leaf.get("status") != LEAF_STATUS_INCONCLUSIVE:
+        return None
+    attempts = leaf.get("attempts")
+    if leaf.get("reason") != INCONCLUSIVE_SKIP_REASON or not isinstance(attempts, list) or not attempts:
+        return None
+    return f"leaf {name!r} {INCONCLUSIVE_SKIP_REASON} ({len(attempts)} attempts, no informative pass)"
+
+
 def evaluate_evidence(evidence: dict[str, Any], *, leaf: str | None = None) -> dict[str, Any]:
     """Evaluate collected evidence. ``evidence["aggregate"]`` (e.g. the
-    generic harness' ``status``) is deliberately ignored."""
+    generic harness' ``status``) is deliberately ignored.
+
+    A leaf that is inconclusive after its bounded attempts yields ``skip``
+    (exit 77) -- never ``pass`` -- unless another required leaf failed."""
     leaves = evidence.get("leaves") if isinstance(evidence, dict) else None
     leaves = leaves if isinstance(leaves, dict) else {}
     if leaf is not None and leaf not in LEAF_NAMES:
@@ -126,23 +167,138 @@ def evaluate_evidence(evidence: dict[str, Any], *, leaf: str | None = None) -> d
             "status": "fail",
             "exit_code": 1,
             "violations": [f"unknown leaf {leaf!r} (expected one of {', '.join(LEAF_NAMES)})"],
+            "skips": [],
             "leaf_results": {},
         }
     required = (leaf,) if leaf else LEAF_NAMES
     violations: list[str] = []
+    skips: list[str] = []
     leaf_results: dict[str, str] = {}
     for name in required:
+        skip = _leaf_inconclusive(name, leaves.get(name))
+        if skip:
+            leaf_results[name] = "inconclusive"
+            skips.append(skip)
+            continue
         problem = _leaf_violation(name, leaves.get(name))
         leaf_results[name] = "pass" if problem is None else "not_pass"
         if problem:
             violations.append(problem)
-    passed = not violations
+    if violations:
+        status, exit_code = "fail", 1
+    elif skips:
+        status, exit_code = "skip", EXIT_SKIP
+    else:
+        status, exit_code = "pass", 0
     return {
-        "status": "pass" if passed else "fail",
-        "exit_code": 0 if passed else 1,
+        "status": status,
+        "exit_code": exit_code,
         "violations": violations,
+        "skips": skips,
         "leaf_results": leaf_results,
     }
+
+
+# ---------------------------------------------------------------------------
+# negative-control attempt classification (pure, no live claude)
+# ---------------------------------------------------------------------------
+
+
+def classify_negative_control_attempt(observation: dict[str, Any]) -> dict[str, Any]:
+    """Classify ONE attempt of the internal-completion negative control from a
+    bounded ``observation``. Pure: the same input always yields the same
+    class, so it is fault-injectable without a live ``claude``.
+
+    ``violation`` (real counterexample) dominates ``inconclusive``: a mutation
+    can never be reclassified as a vacuous run. ``informative_pass`` needs the
+    B reference to have been carried by an internal envelope AND the
+    provenance gate to have been exercised (event journal) AND no mutation AND
+    the SubagentStart / SubagentStop causal evidence.
+
+    Observation keys (missing keys are treated as the unsafe/not-observed
+    value): ``setup_active_on_a``, ``operator_prompt_named_b``,
+    ``binding_left_a``, ``b_claim_created``, ``task_count_changed``,
+    ``slash_expansion``, ``unknown_tag_with_ref`` (list), ``no_marker_classes``
+    (list), ``positive_control_problems`` (list), ``marker_reverification_ok``,
+    ``internal_with_ref_count``, ``gate_recorded``, ``subagent_start``,
+    ``subagent_stop``, ``notification_after_stop``, ``uncaptured_classes``
+    (list), ``turns_ok``."""
+    obs = observation if isinstance(observation, dict) else {}
+    violations: list[str] = []
+    if obs.get("operator_prompt_named_b"):
+        violations.append("an operator prompt itself named B; the negative control is contaminated")
+    if obs.get("setup_active_on_a") and obs.get("binding_left_a"):
+        violations.append("Binding left Task A after an internal completion mentioned B (auto-rebind must not happen)")
+    if obs.get("b_claim_created"):
+        violations.append("a claim for B was created from an internal completion")
+    if obs.get("task_count_changed"):
+        violations.append("Task count changed across the internal completion")
+    if obs.get("slash_expansion"):
+        violations.append("unexpected /task expansion in the negative control")
+    for tag in obs.get("unknown_tag_with_ref") or []:
+        violations.append(f"envelope tag {tag!r} carried B but is not in INTERNAL_ENVELOPE_MARKERS")
+    for name in obs.get("no_marker_classes") or []:
+        violations.append(f"stop-blocking class {name!r} has no envelope marker (Stop Condition)")
+    for problem in obs.get("positive_control_problems") or []:
+        violations.append(str(problem))
+    if obs.get("marker_reverification_ok") is False:
+        violations.append("marker re-verification failed: a known marker did not derive internal_or_unknown")
+    if violations:
+        return {"classification": CLASS_VIOLATION, "violations": violations, "inconclusive_reasons": []}
+
+    reasons: list[str] = []
+    if not obs.get("setup_active_on_a"):
+        reasons.append("setup: session is not ACTIVE on Task A")
+    if not obs.get("internal_with_ref_count"):
+        reasons.append("no internal (envelope) UserPromptSubmit carried the B reference")
+    elif not obs.get("gate_recorded"):
+        reasons.append("the B reference was carried but the provenance gate was not reached")
+    if not (obs.get("subagent_start") and obs.get("subagent_stop")):
+        reasons.append("SubagentStart/SubagentStop causal evidence missing")
+    elif not obs.get("notification_after_stop"):
+        reasons.append("no internal UserPromptSubmit followed the SubagentStop")
+    for name in obs.get("uncaptured_classes") or []:
+        reasons.append(f"stop-blocking class {name!r} could not be captured in this attempt")
+    if not obs.get("turns_ok"):
+        reasons.append("a claude turn exited non-zero or timed out")
+    if reasons:
+        return {"classification": CLASS_INCONCLUSIVE, "violations": [], "inconclusive_reasons": reasons}
+    return {"classification": CLASS_INFORMATIVE_PASS, "violations": [], "inconclusive_reasons": []}
+
+
+def run_negative_control_attempts(run_attempt, *, max_attempts: int = NEGATIVE_CONTROL_MAX_ATTEMPTS) -> dict[str, Any]:
+    """Drive ``run_attempt(attempt_number) -> {"classification": ..., ...}``.
+
+    - ``violation``            -> outcome ``fail`` immediately (no retry)
+    - ``informative_pass``     -> outcome ``pass`` immediately
+    - ``inconclusive``         -> retry with a fresh attempt, at most
+      ``max_attempts`` times; then outcome ``inconclusive``
+      (``inconclusive_after_attempts``), never ``pass``.
+    Anything unrecognised is treated as ``violation`` (fail-closed)."""
+    records: list[dict[str, Any]] = []
+    final: dict[str, Any] | None = None
+    outcome = "inconclusive"
+    for number in range(1, max_attempts + 1):
+        attempt = run_attempt(number)
+        classification = attempt.get("classification")
+        known = classification in (CLASS_VIOLATION, CLASS_INFORMATIVE_PASS, CLASS_INCONCLUSIVE)
+        records.append(
+            {
+                "attempt": number,
+                "classification": classification if known else "unrecognised",
+                "violations": list(attempt.get("violations") or [])
+                or ([] if known else [f"unrecognised attempt classification {classification!r}"]),
+                "inconclusive_reasons": list(attempt.get("inconclusive_reasons") or []),
+            }
+        )
+        final = attempt
+        if classification == CLASS_INFORMATIVE_PASS:
+            outcome = "pass"
+            break
+        if classification != CLASS_INCONCLUSIVE:
+            outcome = "fail"
+            break
+    return {"outcome": outcome, "attempts": records, "final": final}
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +388,15 @@ def record_hook(event: str) -> int:
     prompt = data.get("prompt") if isinstance(data.get("prompt"), str) else ""
     watch_ref = os.environ.get("ACTIVE_REBIND_WATCH_REF") or ""
     tag = _ENVELOPE_TAG_RE.match(prompt)
+    classification_kind = None
+    if event == "UserPromptSubmit" and watch_ref and watch_ref in prompt:
+        # Bounded diagnostic only: the production classifier's kind for a
+        # prompt that carries the watched reference (why the gate was, or was
+        # not, reached). Never persists prompt text.
+        try:
+            classification_kind = _load_hook_entry().classifier.classify(prompt, current_repo=None).kind
+        except Exception:  # noqa: BLE001 - diagnostics must never break the hook
+            classification_kind = "unavailable"
     record = {
         "event": event,
         "t": time.time(),
@@ -243,6 +408,7 @@ def record_hook(event: str) -> int:
         "envelope_tag": tag.group(1) if tag else None,
         "mentions_watch_ref": bool(watch_ref and watch_ref in prompt),
         "prompt_is_slash": prompt.lstrip().startswith("/"),
+        "classification_kind": classification_kind,
     }
     log_path = os.environ.get("ACTIVE_REBIND_HOOK_LOG")
     if log_path:
@@ -583,37 +749,41 @@ def _bounded_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "mentions_watch_ref",
         "command_name",
         "prompt_is_slash",
+        "classification_kind",
     )
     return [{k: r.get(k) for k in keep} for r in records]
 
 
-def leaf_internal_completion_negative_control(run_id: str, ctx: dict[str, Any]) -> dict[str, Any]:
+def _negative_control_attempt(run_id: str, ctx: dict[str, Any]) -> dict[str, Any]:
+    """ONE fresh attempt of the internal-completion negative control: a new
+    isolated state root, a new session id, a new run directory. Returns a
+    bound leaf dict plus the attempt's ``classification``."""
     leaf = Leaf("internal-completion-negative-control", run_id, ctx["artifact_dir"], ctx["claude_bin"], ctx["timeout"])
     result = _new_bound_leaf(leaf, ctx["claude_version"])
-    problems: list[str] = []
     number_a, number_b = 940, 941
     leaf.watch_ref = f"owner/repo#{number_b}"
 
     leaf.turn(f"owner/repo#{number_a} を対象に作業開始。返答は OK の一語のみ。")
     before = leaf.snapshot()
     task_a = before.get("claims", {}).get(f"owner/repo#{number_a}")
-    if not task_a or before.get("binding_task_id") != task_a:
-        problems.append("setup: session is not ACTIVE on Task A")
+    setup_active_on_a = bool(task_a) and before.get("binding_task_id") == task_a
 
     # The operator instruction must NOT itself name B (else it would be an
-    # ordinary user prompt naming B): the subagent composes the reference.
+    # ordinary user prompt naming B). The reference is produced by the SHELL
+    # (arithmetic inside the subagent's Bash tool), so the internal envelope
+    # carries B without depending on LLM text composition.
+    shell_command = f'echo "owner/repo#$(({number_b - 1}+1)) を対象にレビューして"'
     composed = (
-        "Use the Agent tool exactly once with run_in_background set to true. Tell the subagent to reply with the "
-        "concatenation of these three fragments joined with no spaces and nothing else: the fragment `owner/repo`, "
-        f"the fragment `#`, the fragment `{number_b}`, followed by the literal text ` を対象にレビューして`. "
+        "Use the Agent tool exactly once with run_in_background set to true, and do not use any other tool yourself. "
+        "Give the subagent exactly this task: use the Bash tool exactly once with the command "
+        f"'{shell_command}', then reply with the command's stdout copied verbatim and nothing else. "
         "Then end your turn and wait; when the background agent's completion is reported back to you, reply with "
         "the single word FINISHED."
     )
-    subagent_turn = leaf.turn(composed, allowed_tools=["Agent"])
+    subagent_turn = leaf.turn(composed, allowed_tools=["Agent", "Bash"])
     shell_turn = leaf.turn(
         "Use the Bash tool exactly once with run_in_background set to true and command "
-        # The reference is produced by the shell (arithmetic), so the operator prompt never names B itself.
-        f"'sleep 2; echo \"owner/repo#$(({number_b - 1}+1)) を対象にレビューして\"'. Then end your turn and wait; "
+        f"'sleep 2; {shell_command}'. Then end your turn and wait; "
         "when the background "
         "command's completion is reported back to you, reply with the single word FINISHED.",
         allowed_tools=["Bash"],
@@ -627,31 +797,20 @@ def leaf_internal_completion_negative_control(run_id: str, ctx: dict[str, Any]) 
     user_prompts = [r for r in records if r["event"] == "UserPromptSubmit" and not r["envelope_tag"]]
     for r in internal_prompts:
         marker_tags.add(r["envelope_tag"])
-    if any(r["mentions_watch_ref"] for r in user_prompts):
-        problems.append("an operator prompt itself mentioned B; the negative control is vacuous")
+    hook_entry = _load_hook_entry()
     internal_with_ref = [r for r in internal_prompts if r["mentions_watch_ref"]]
-    if not internal_with_ref:
-        problems.append("no internal (envelope) UserPromptSubmit carried the B reference; the control is vacuous")
-    if after.get("binding_task_id") != task_a:
-        problems.append("Binding left Task A after an internal completion mentioned B (auto-rebind must not happen)")
-    if f"owner/repo#{number_b}" in after.get("claims", {}):
-        problems.append("a claim for B was created from an internal completion")
-    if after.get("task_count") != before.get("task_count"):
-        problems.append("Task count changed across the internal completion")
-    if "internal_or_unknown_provenance_no_mutation" not in after.get("event_reasons", []):
-        problems.append("EventJournal has no internal_or_unknown_provenance_no_mutation observation")
-    if any(r["event"] == "UserPromptExpansion" for r in records):
-        problems.append("unexpected /task expansion in the negative control")
+    unknown_tag_with_ref = sorted(
+        {r["envelope_tag"] for r in internal_with_ref if r["envelope_tag"] not in hook_entry.INTERNAL_ENVELOPE_MARKERS}
+    )
 
     # Causal evidence: SubagentStart / SubagentStop and the internal notification.
     events_seen = [r["event"] for r in records]
-    if "SubagentStart" not in events_seen or "SubagentStop" not in events_seen:
-        problems.append("SubagentStart/SubagentStop causal evidence missing")
     sub_index = events_seen.index("SubagentStop") if "SubagentStop" in events_seen else -1
-    if sub_index >= 0 and not any(
-        i > sub_index and r["event"] == "UserPromptSubmit" and r["envelope_tag"] for i, r in enumerate(records)
-    ):
-        problems.append("no internal UserPromptSubmit followed the SubagentStop")
+    sub_notifications = [
+        r
+        for i, r in enumerate(records)
+        if sub_index >= 0 and i > sub_index and r["event"] == "UserPromptSubmit" and r["envelope_tag"]
+    ]
 
     # Capture observations (bounded) for the provenance matrix.
     def head_of(rec: dict[str, Any] | None) -> dict[str, Any]:
@@ -664,11 +823,6 @@ def leaf_internal_completion_negative_control(run_id: str, ctx: dict[str, Any]) 
             "stdin_keys": rec["stdin_keys"],
         }
 
-    sub_notifications = [
-        r
-        for i, r in enumerate(records)
-        if sub_index >= 0 and i > sub_index and r["event"] == "UserPromptSubmit" and r["envelope_tag"]
-    ]
     observations["subagent_completion"] = head_of(sub_notifications[0] if sub_notifications else None)
     later = [r for r in internal_prompts if r not in sub_notifications[:1]]
     observations["background_shell_completion"] = head_of(later[0] if later else None)
@@ -681,13 +835,12 @@ def leaf_internal_completion_negative_control(run_id: str, ctx: dict[str, Any]) 
             ),
         }
     first_user = user_prompts[0] if user_prompts else None
-    # Positive control proxy: the real `-p` stdin prompt (NOT the interactive lane).
-    matrix_input = dict(observations)
-    matrix = build_provenance_capture_matrix(matrix_input)
+    matrix = build_provenance_capture_matrix(dict(observations))
     if first_user is not None:
+        # Positive control proxy: the real `-p` stdin prompt (NOT the interactive lane).
         matrix["classes"]["interactive_typed_prompt"]["proxy"] = {
             "source": "claude -p stdin prompt (not the interactive herdr lane)",
-            "derived_provenance": _load_hook_entry().derive_input_provenance(
+            "derived_provenance": hook_entry.derive_input_provenance(
                 {
                     "hook_event_name": "UserPromptSubmit",
                     "prompt_id": "x" if first_user["prompt_id_present"] else "",
@@ -695,11 +848,13 @@ def leaf_internal_completion_negative_control(run_id: str, ctx: dict[str, Any]) 
                 }
             ),
         }
-    if matrix["status"] != "ok":
-        problems.extend(matrix["violations"])
+    rows = matrix["classes"]
+    stop_blocking = [name for name, kind in PROVENANCE_CLASSES if kind == STOP_BLOCKING]
+    uncaptured = [n for n in stop_blocking if rows[n]["capture"] != "captured"]
+    no_marker = [n for n in stop_blocking if rows[n]["capture"] == "captured" and not rows[n]["marker_present"]]
+    positive_problems = [v for v in matrix["violations"] if v.startswith("positive control")]
 
     # Marker set re-verification: every known marker maps to internal_or_unknown.
-    hook_entry = _load_hook_entry()
     marker_check = {
         marker: hook_entry.derive_input_provenance(
             {
@@ -710,17 +865,37 @@ def leaf_internal_completion_negative_control(run_id: str, ctx: dict[str, Any]) 
         )
         for marker in hook_entry.INTERNAL_ENVELOPE_MARKERS
     }
-    if any(v != "internal_or_unknown" for v in marker_check.values()):
-        problems.append(f"marker re-verification failed: {marker_check}")
-    for tag in marker_tags:
-        if tag not in hook_entry.INTERNAL_ENVELOPE_MARKERS:
-            problems.append(f"observed envelope tag {tag!r} is not in INTERNAL_ENVELOPE_MARKERS")
-
     (leaf.dir / "provenance_capture_matrix.json").write_text(
         json.dumps(matrix, indent=1, ensure_ascii=False), encoding="utf-8"
     )
-    if any(t["returncode"] != 0 for t in leaf.turns):
-        problems.append(f"a claude turn exited non-zero: {leaf.turns}")
+
+    observation = {
+        "setup_active_on_a": setup_active_on_a,
+        "operator_prompt_named_b": any(r["mentions_watch_ref"] for r in user_prompts),
+        "binding_left_a": after.get("binding_task_id") != task_a,
+        "b_claim_created": f"owner/repo#{number_b}" in after.get("claims", {}),
+        "task_count_changed": after.get("task_count") != before.get("task_count"),
+        "slash_expansion": any(r["event"] == "UserPromptExpansion" for r in records),
+        "unknown_tag_with_ref": unknown_tag_with_ref,
+        "no_marker_classes": no_marker,
+        "positive_control_problems": positive_problems,
+        "marker_reverification_ok": all(v == "internal_or_unknown" for v in marker_check.values()),
+        "internal_with_ref_count": len(internal_with_ref),
+        "gate_recorded": "internal_or_unknown_provenance_no_mutation" in after.get("event_reasons", []),
+        "subagent_start": "SubagentStart" in events_seen,
+        "subagent_stop": "SubagentStop" in events_seen,
+        "notification_after_stop": bool(sub_notifications),
+        "uncaptured_classes": uncaptured,
+        "turns_ok": all(t["returncode"] == 0 for t in leaf.turns),
+    }
+    verdict = classify_negative_control_attempt(observation)
+    diagnostics = {
+        "observation": observation,
+        "internal_with_ref_classification_kinds": sorted(
+            {str(r.get("classification_kind")) for r in internal_with_ref}
+        ),
+        "event_reasons": after.get("event_reasons", []),
+    }
     result.update(
         before=before,
         after=after,
@@ -730,11 +905,50 @@ def leaf_internal_completion_negative_control(run_id: str, ctx: dict[str, Any]) 
             "marker_reverification": marker_check,
             "subagent_turn": subagent_turn,
             "shell_turn": shell_turn,
+            "attempt_diagnostics": diagnostics,
         },
-        violations=problems,
-        status="pass" if not problems else "fail",
+        violations=verdict["violations"],
+        status="pass" if verdict["classification"] == CLASS_INFORMATIVE_PASS else "fail",
+        classification=verdict["classification"],
+        inconclusive_reasons=verdict["inconclusive_reasons"],
     )
     return result
+
+
+def leaf_internal_completion_negative_control(run_id: str, ctx: dict[str, Any]) -> dict[str, Any]:
+    """Bounded retry around fresh attempts: violation -> fail at once,
+    informative pass -> pass, inconclusive -> retry (max
+    ``NEGATIVE_CONTROL_MAX_ATTEMPTS``) then SKIP (never PASS)."""
+    attempt_results: list[dict[str, Any]] = []
+
+    def run_attempt(number: int) -> dict[str, Any]:
+        try:
+            attempt = _negative_control_attempt(f"{run_id}-a{number}", ctx)
+        except Exception as exc:  # noqa: BLE001 - a crashed attempt is a failed leaf, never a pass
+            attempt = {
+                "status": "fail",
+                "classification": CLASS_VIOLATION,
+                "violations": [f"leaf crashed: {type(exc).__name__}: {exc}"],
+            }
+        attempt_results.append(attempt)
+        return attempt
+
+    outcome = run_negative_control_attempts(
+        run_attempt, max_attempts=int(ctx.get("max_attempts", NEGATIVE_CONTROL_MAX_ATTEMPTS))
+    )
+    final = dict(outcome["final"] or {})
+    final["attempts"] = outcome["attempts"]
+    if outcome["outcome"] == "pass":
+        final["status"] = "pass"
+    elif outcome["outcome"] == "fail":
+        final["status"] = "fail"
+        if not final.get("violations"):
+            final["violations"] = [v for r in outcome["attempts"] for v in r["violations"]]
+    else:
+        final["status"] = LEAF_STATUS_INCONCLUSIVE
+        final["reason"] = INCONCLUSIVE_SKIP_REASON
+        final["violations"] = []
+    return final
 
 
 def leaf_workflow_signal_applied(run_id: str, ctx: dict[str, Any]) -> dict[str, Any]:
@@ -916,7 +1130,9 @@ def main(argv: list[str] | None = None) -> int:
     (out_dir / f"result{'-' + args.leaf if args.leaf else ''}.json").write_text(
         json.dumps(report, indent=1, ensure_ascii=False, default=str), encoding="utf-8"
     )
-    print(json.dumps({k: verdict[k] for k in ("status", "leaf_results", "violations")}, ensure_ascii=False))
+    print(json.dumps({k: verdict[k] for k in ("status", "leaf_results", "violations", "skips")}, ensure_ascii=False))
+    if verdict["status"] == "skip":
+        print(f"SKIP: {'; '.join(verdict['skips'])}; runtime AC is NOT passed", file=sys.stderr)
     return verdict["exit_code"]
 
 

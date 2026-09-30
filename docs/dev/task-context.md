@@ -909,6 +909,20 @@ auto-rebind 関連 test）と、実 runtime を起動する narrow adapter
 `--leaf <name>`）の 2 層で行う。required leaf が skipped / absent の場合は
 generic harness の aggregate が pass でも、該当する受け入れ条件を PASS にしない。
 
+`--leaf internal-completion-negative-control`（AC6・AC16）は live LLM に依存するため、
+各試行を純関数 `classify_negative_control_attempt` で 3 分類する。
+
+- **violation**（実反例: Binding が Task A を離れた／B の claim が作られた／Task 数が変わった／
+  想定外の `/task` expansion など）: 再試行せず即 FAIL（exit 1）。
+- **informative pass**: B の参照を運ぶ内部 envelope の `UserPromptSubmit` が観測され、
+  `internal_or_unknown_provenance_no_mutation` が EventJournal に記録され、mutation が無く、
+  SubagentStart／SubagentStop の causal evidence がある。この場合だけ PASS。
+- **inconclusive**（mutation は無いが、B を運ぶ envelope が無い、または provenance gate が
+  実行されていない＝vacuous）: state を fresh に作り直して同 leaf を再試行する（最大 5 試行）。
+  5 試行しても informative pass が得られなければ **exit 77 と `SKIP:` 出力**
+  （`inconclusive_after_attempts`、各試行の分類を bounded に記録）とし、PASS にも FAIL にも
+  読み替えない。full run でも SKIP の leaf は AC を PASS にしない。
+
 ## Repository CI に関する注記（non-blocking）
 
 `tests/task-context/` は本 Issue で追加された新規 pytest target

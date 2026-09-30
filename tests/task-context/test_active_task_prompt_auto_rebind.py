@@ -628,6 +628,285 @@ def test_skipped_required_leaf_never_passes_even_when_aggregate_passes(tmp_path)
 
 
 # ---------------------------------------------------------------------------
+# AC6/AC16 (offline part): internal-completion negative control classification.
+# Pure fault injection -- no live `claude`. violation -> fail (no retry),
+# vacuous (inconclusive) -> retry, 5 x inconclusive -> SKIP 77 (never PASS),
+# informative -> pass.
+# ---------------------------------------------------------------------------
+
+
+def _informative_observation(**overrides):
+    obs = {
+        "setup_active_on_a": True,
+        "operator_prompt_named_b": False,
+        "binding_left_a": False,
+        "b_claim_created": False,
+        "task_count_changed": False,
+        "slash_expansion": False,
+        "unknown_tag_with_ref": [],
+        "no_marker_classes": [],
+        "positive_control_problems": [],
+        "marker_reverification_ok": True,
+        "internal_with_ref_count": 1,
+        "gate_recorded": True,
+        "subagent_start": True,
+        "subagent_stop": True,
+        "notification_after_stop": True,
+        "uncaptured_classes": [],
+        "turns_ok": True,
+    }
+    obs.update(overrides)
+    return obs
+
+
+def test_negative_control_informative_observation_classifies_as_informative_pass():
+    adapter = _load_adapter()
+    verdict = adapter.classify_negative_control_attempt(_informative_observation())
+    assert verdict["classification"] == adapter.CLASS_INFORMATIVE_PASS
+    assert verdict["violations"] == [] and verdict["inconclusive_reasons"] == []
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"binding_left_a": True},
+        {"b_claim_created": True},
+        {"task_count_changed": True},
+        {"slash_expansion": True},
+        {"operator_prompt_named_b": True},
+        {"unknown_tag_with_ref": ["<other-envelope>"]},
+        {"no_marker_classes": ["background_shell_completion"]},
+        {"positive_control_problems": ["positive control 'interactive_typed_prompt' derived internal_or_unknown"]},
+        {"marker_reverification_ok": False},
+    ],
+)
+def test_negative_control_real_counterexample_is_violation_even_when_gate_evidence_is_missing(override):
+    adapter = _load_adapter()
+    # A counterexample dominates: even a run that is ALSO vacuous (no carrier,
+    # gate not recorded) is a violation, never reclassified as inconclusive.
+    vacuous = {"internal_with_ref_count": 0, "gate_recorded": False, "subagent_stop": False}
+    for extra in ({}, vacuous):
+        verdict = adapter.classify_negative_control_attempt(_informative_observation(**override, **extra))
+        assert verdict["classification"] == adapter.CLASS_VIOLATION
+        assert verdict["violations"] and verdict["inconclusive_reasons"] == []
+
+
+def test_negative_control_binding_move_is_not_a_violation_when_setup_never_reached_a():
+    adapter = _load_adapter()
+    verdict = adapter.classify_negative_control_attempt(
+        _informative_observation(setup_active_on_a=False, binding_left_a=True)
+    )
+    assert verdict["classification"] == adapter.CLASS_INCONCLUSIVE
+    assert any("not ACTIVE on Task A" in r for r in verdict["inconclusive_reasons"])
+
+
+@pytest.mark.parametrize(
+    ("override", "reason_fragment"),
+    [
+        ({"internal_with_ref_count": 0, "gate_recorded": False}, "no internal (envelope)"),
+        ({"gate_recorded": False}, "provenance gate was not reached"),
+        ({"subagent_start": False}, "SubagentStart/SubagentStop"),
+        ({"subagent_stop": False}, "SubagentStart/SubagentStop"),
+        ({"notification_after_stop": False}, "followed the SubagentStop"),
+        ({"uncaptured_classes": ["background_shell_completion"]}, "could not be captured"),
+        ({"setup_active_on_a": False}, "not ACTIVE on Task A"),
+        ({"turns_ok": False}, "exited non-zero"),
+    ],
+)
+def test_negative_control_vacuous_run_without_mutation_is_inconclusive(override, reason_fragment):
+    adapter = _load_adapter()
+    verdict = adapter.classify_negative_control_attempt(_informative_observation(**override))
+    assert verdict["classification"] == adapter.CLASS_INCONCLUSIVE
+    assert verdict["violations"] == []
+    assert any(reason_fragment in r for r in verdict["inconclusive_reasons"])
+
+
+def test_negative_control_missing_or_garbage_observation_never_classifies_as_pass():
+    adapter = _load_adapter()
+    for observation in ({}, None, "x", {"gate_recorded": True}):
+        verdict = adapter.classify_negative_control_attempt(observation)
+        assert verdict["classification"] != adapter.CLASS_INFORMATIVE_PASS
+
+
+def _scripted_attempts(adapter, classes):
+    calls = []
+
+    def run_attempt(number):
+        calls.append(number)
+        cls = classes[number - 1]
+        return {
+            "classification": cls,
+            "violations": ["injected counterexample"] if cls == adapter.CLASS_VIOLATION else [],
+            "inconclusive_reasons": ["injected vacuous run"] if cls == adapter.CLASS_INCONCLUSIVE else [],
+        }
+
+    return run_attempt, calls
+
+
+def test_negative_control_retry_policy_violation_stops_immediately_without_retry():
+    adapter = _load_adapter()
+    run_attempt, calls = _scripted_attempts(adapter, [adapter.CLASS_VIOLATION] + [adapter.CLASS_INFORMATIVE_PASS] * 4)
+    outcome = adapter.run_negative_control_attempts(run_attempt)
+    assert outcome["outcome"] == "fail" and calls == [1]
+    assert outcome["attempts"][0]["violations"] == ["injected counterexample"]
+
+
+def test_negative_control_retry_policy_vacuous_attempts_retry_until_informative_pass():
+    adapter = _load_adapter()
+    vacuous = adapter.CLASS_INCONCLUSIVE
+    run_attempt, calls = _scripted_attempts(adapter, [vacuous, vacuous, adapter.CLASS_INFORMATIVE_PASS])
+    outcome = adapter.run_negative_control_attempts(run_attempt)
+    assert outcome["outcome"] == "pass" and calls == [1, 2, 3]
+    assert [a["classification"] for a in outcome["attempts"]] == [vacuous, vacuous, adapter.CLASS_INFORMATIVE_PASS]
+
+    # A violation after vacuous attempts still fails at once.
+    run_attempt, calls = _scripted_attempts(adapter, [vacuous, adapter.CLASS_VIOLATION, vacuous])
+    assert adapter.run_negative_control_attempts(run_attempt)["outcome"] == "fail" and calls == [1, 2]
+
+
+def test_negative_control_retry_policy_first_informative_pass_is_not_repeated():
+    adapter = _load_adapter()
+    run_attempt, calls = _scripted_attempts(adapter, [adapter.CLASS_INFORMATIVE_PASS])
+    assert adapter.run_negative_control_attempts(run_attempt)["outcome"] == "pass" and calls == [1]
+
+
+def test_negative_control_five_inconclusive_attempts_are_bounded_and_never_pass():
+    adapter = _load_adapter()
+    assert adapter.NEGATIVE_CONTROL_MAX_ATTEMPTS == 5
+    run_attempt, calls = _scripted_attempts(adapter, [adapter.CLASS_INCONCLUSIVE] * 8)
+    outcome = adapter.run_negative_control_attempts(run_attempt)
+    assert outcome["outcome"] == "inconclusive" and calls == [1, 2, 3, 4, 5]
+    assert len(outcome["attempts"]) == 5
+
+
+def test_negative_control_unrecognised_attempt_classification_fails_closed():
+    adapter = _load_adapter()
+    outcome = adapter.run_negative_control_attempts(lambda n: {"classification": "surprise"})
+    assert outcome["outcome"] == "fail" and len(outcome["attempts"]) == 1
+    assert outcome["attempts"][0]["violations"]
+
+
+def _leaf_with_scripted_attempts(adapter, monkeypatch, classes):
+    seen = []
+
+    def fake_attempt(run_id, ctx):
+        seen.append(run_id)
+        cls = classes[len(seen) - 1]
+        bound = _bound_leaf(status="pass" if cls == adapter.CLASS_INFORMATIVE_PASS else "fail")
+        bound.update(
+            classification=cls,
+            violations=["injected counterexample"] if cls == adapter.CLASS_VIOLATION else [],
+            inconclusive_reasons=["injected vacuous run"] if cls == adapter.CLASS_INCONCLUSIVE else [],
+        )
+        return bound
+
+    monkeypatch.setattr(adapter, "_negative_control_attempt", fake_attempt)
+    leaf = adapter.leaf_internal_completion_negative_control("run", {})
+    return leaf, seen
+
+
+def test_negative_control_leaf_five_vacuous_attempts_become_skip_exit_77_not_pass(monkeypatch):
+    adapter = _load_adapter()
+    leaf, seen = _leaf_with_scripted_attempts(adapter, monkeypatch, [adapter.CLASS_INCONCLUSIVE] * 5)
+    assert leaf["status"] == adapter.LEAF_STATUS_INCONCLUSIVE and leaf["reason"] == "inconclusive_after_attempts"
+    assert seen == [f"run-a{n}" for n in range(1, 6)], "each retry rebuilds fresh state under its own run id"
+    assert [a["classification"] for a in leaf["attempts"]] == ["inconclusive"] * 5
+
+    evidence = {"leaves": {"internal-completion-negative-control": leaf}}
+    single = adapter.evaluate_evidence(evidence, leaf="internal-completion-negative-control")
+    assert single["status"] == "skip" and single["exit_code"] == adapter.EXIT_SKIP == 77
+    assert single["leaf_results"] == {"internal-completion-negative-control": "inconclusive"}
+
+
+def test_negative_control_leaf_violation_is_exit_1_after_a_single_attempt(monkeypatch):
+    adapter = _load_adapter()
+    leaf, seen = _leaf_with_scripted_attempts(adapter, monkeypatch, [adapter.CLASS_VIOLATION])
+    assert leaf["status"] == "fail" and seen == ["run-a1"]
+    verdict = adapter.evaluate_evidence(
+        {"leaves": {"internal-completion-negative-control": leaf}}, leaf="internal-completion-negative-control"
+    )
+    assert verdict["status"] == "fail" and verdict["exit_code"] == 1
+
+
+def test_negative_control_leaf_informative_pass_after_vacuous_attempts_passes(monkeypatch):
+    adapter = _load_adapter()
+    classes = [adapter.CLASS_INCONCLUSIVE, adapter.CLASS_INCONCLUSIVE, adapter.CLASS_INFORMATIVE_PASS]
+    leaf, seen = _leaf_with_scripted_attempts(adapter, monkeypatch, classes)
+    assert leaf["status"] == "pass" and len(seen) == 3
+    verdict = adapter.evaluate_evidence(
+        {"leaves": {"internal-completion-negative-control": leaf}}, leaf="internal-completion-negative-control"
+    )
+    assert verdict["status"] == "pass" and verdict["exit_code"] == 0
+
+
+def test_inconclusive_skip_never_passes_a_full_run_and_never_masks_a_failed_leaf():
+    adapter = _load_adapter()
+    skipped = {
+        "status": "inconclusive",
+        "reason": "inconclusive_after_attempts",
+        "attempts": [{"attempt": n, "classification": "inconclusive"} for n in range(1, 6)],
+    }
+    leaves = {name: _bound_leaf() for name in adapter.LEAF_NAMES}
+    leaves["internal-completion-negative-control"] = skipped
+    full = adapter.evaluate_evidence({"aggregate": {"status": "pass"}, "leaves": leaves}, leaf=None)
+    assert full["status"] == "skip" and full["exit_code"] == 77
+
+    # Another required leaf failing wins: the run is a failure, not a SKIP.
+    leaves["slash-task-override"] = {"status": "fail", "violations": ["x"]}
+    failed = adapter.evaluate_evidence({"aggregate": {"status": "pass"}, "leaves": leaves}, leaf=None)
+    assert failed["status"] == "fail" and failed["exit_code"] == 1
+
+    # A bare "inconclusive" without the bounded attempt record is not an accepted SKIP.
+    for bare in ({"status": "inconclusive"}, {"status": "inconclusive", "reason": "inconclusive_after_attempts"}):
+        leaves = {name: _bound_leaf() for name in adapter.LEAF_NAMES}
+        leaves["internal-completion-negative-control"] = bare
+        verdict = adapter.evaluate_evidence({"leaves": leaves}, leaf="internal-completion-negative-control")
+        assert verdict["status"] == "fail" and verdict["exit_code"] == 1
+
+
+def test_inconclusive_evidence_emits_skip_line_and_exit_77_from_main(tmp_path, capsys):
+    adapter = _load_adapter()
+    skipped = {
+        "status": "inconclusive",
+        "reason": "inconclusive_after_attempts",
+        "attempts": [{"attempt": n, "classification": "inconclusive"} for n in range(1, 6)],
+    }
+    evidence_path = tmp_path / "evidence.json"
+    evidence_path.write_text(json.dumps({"run_id": "r", "leaves": {"internal-completion-negative-control": skipped}}))
+    code = adapter.main(
+        [
+            "--leaf",
+            "internal-completion-negative-control",
+            "--evidence-json",
+            str(evidence_path),
+            "--artifact-dir",
+            str(tmp_path / "out"),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 77
+    assert captured.err.startswith("SKIP:") and "inconclusive_after_attempts" in captured.err
+    assert json.loads(captured.out)["status"] == "skip"
+
+
+def test_record_hook_records_bounded_classification_kind_without_prompt_text(tmp_path, monkeypatch):
+    import io
+
+    adapter = _load_adapter()
+    log = tmp_path / "hooks.jsonl"
+    prompt = "<task-notification>\n<result>owner/repo#941 を対象にレビューして</result>\n</task-notification>"
+    stdin = json.dumps({"session_id": "s", "prompt_id": "p", "prompt": prompt, "hook_event_name": "UserPromptSubmit"})
+    monkeypatch.setattr("sys.stdin", io.StringIO(stdin))
+    monkeypatch.setenv("ACTIVE_REBIND_HOOK_LOG", str(log))
+    monkeypatch.setenv("ACTIVE_REBIND_WATCH_REF", "owner/repo#941")
+    assert adapter.record_hook("UserPromptSubmit") == 0
+    record = json.loads(log.read_text().splitlines()[0])
+    assert record["envelope_tag"] == "<task-notification>" and record["mentions_watch_ref"] is True
+    assert record["classification_kind"] in {"EXPLICIT", "INFERRED", "REFERENCE_ONLY", "NONE", "AMBIGUOUS"}
+    assert "を対象にレビューして" not in log.read_text()
+
+
+# ---------------------------------------------------------------------------
 # AC18: atomicity / idempotency / fault injection
 # ---------------------------------------------------------------------------
 
