@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -107,6 +108,11 @@ _PUBLIC_EVIDENCE_SHA_LENGTHS = {
     ("resolved_executable_sha256",): 64,
     ("mutation_boundary", "settings_digest_sha256"): 64,
     ("settings_provenance", "digest_sha256"): 64,
+    # Issue #2839: ``--approval-profile`` を使った run に限り evidence に載る
+    # ``approval_carrier`` の公開 hash (git の commit / blob hash と overlay の sha256)。
+    ("approval_carrier", "repo_head"): 40,
+    ("approval_carrier", "overlay_sha256"): 64,
+    ("approval_carrier", "fixture_git_blob_hash"): 40,
 }
 
 # Issue #2421: ``resolved_executable`` must never persist a raw absolute
@@ -795,6 +801,89 @@ def _task_context_env_pairs(
     return pairs
 
 
+_APPROVAL_CONTRACT_MODULE_NAME = "runtime_vc_approval_contract_for_runner"
+
+
+def _load_approval_contract():
+    """Issue #2839: 兄弟 module ``runtime_vc_approval_contract.py`` を file path で読み込む。
+
+    approval carrier の registry / overlay / precondition の唯一の定義はその module にあり、
+    runner はここで読み込んだ定数を使うだけである (二重定義しない)。共有 pytest session で
+    同名 module と衝突しないよう、一意な module 名で ``sys.modules`` に登録する。
+    """
+    module = sys.modules.get(_APPROVAL_CONTRACT_MODULE_NAME)
+    if module is not None:
+        return module
+    path = Path(__file__).resolve().parent / "runtime_vc_approval_contract.py"
+    spec = importlib.util.spec_from_file_location(_APPROVAL_CONTRACT_MODULE_NAME, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_APPROVAL_CONTRACT_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def select_native_observation_settings_json(
+    *, include_user_prompt_expansion_hook: bool = False,
+    include_hook_chain_evidence_hooks: bool = False,
+) -> str:
+    """Issue #2839 (PR #2844 OWNER fix_delta): native adapter が子 ``claude -p`` へ渡す固定
+    observation overlay (``--settings`` の JSON) を選択して返す唯一の関数。
+
+    ``run_structured_claude()`` と、approval carrier の overlay を組み立てる ``main()`` の
+    両方がこの関数を使うため、carrier は runner が実際に選択した overlay (hook-chain 用の
+    PreToolUse / Stop を含む) の同じ内容へ ``autoMode`` を足す形で合成される。
+    caller 由来の JSON / 文字列は受け取らない。"""
+    # Issue #2498 AC4: purely additive -- the extended settings JSON
+    # (adding a "UserPromptExpansion" hook registration) is used ONLY
+    # when the caller opted into ``--expect-skill-command``. Every
+    # pre-existing native-adapter caller (``include_user_prompt_
+    # expansion_hook`` defaults to ``False``) keeps getting the exact,
+    # byte-identical ``_CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON``
+    # this repository's own regression test pins to ``{"SubagentStart",
+    # "SubagentStop"}``.
+    settings_json = (
+        _CLAUDE_SPAWN_HOOK_OBSERVABILITY_WITH_USER_PROMPT_EXPANSION_SETTINGS_JSON
+        if include_user_prompt_expansion_hook
+        else _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON
+    )
+    # Issue #2663 AC1/AC2/AC3: purely additive, opt-in observation-only
+    # hook registration used ONLY when the caller passes
+    # ``--require-hook-chain-evidence``. This does NOT parse from a
+    # settings JSON re-derived at call time -- it mutates the SAME fixed
+    # constant dict (via json.loads/json.dumps) so every pre-existing
+    # caller (``include_hook_chain_evidence_hooks`` defaults to
+    # ``False``) keeps getting the exact, byte-identical settings_json
+    # selected above. The two ADDED groups are bounded and closed (no
+    # caller-supplied command/path/marker/config is ever accepted):
+    # - ``PreToolUse`` (matcher "Bash"): an additive ``cat`` observer
+    #   hook that echoes its own stdin verbatim, giving
+    #   ``evaluate_all_matching_hooks_observed`` a self-identifying
+    #   signature (Issue #2663 AC2) to positively exclude the observer
+    #   itself from the current-project-settings PreToolUse/Bash cohort
+    #   it is comparing against.
+    # - ``Stop`` (no matcher): the same additive ``cat`` observer
+    #   pattern, giving ``evaluate_sibling_side_effect_inventory``
+    #   (Issue #2663 AC3) the real ``stop_hook_active`` boolean the
+    #   runtime's own Stop hook payload carries, used ONLY to recognize
+    #   the documented valid-no-change condition -- never to read or
+    #   persist the surrounding raw hook payload (e.g.
+    #   ``last_assistant_message``, ``transcript_path``).
+    if include_hook_chain_evidence_hooks:
+        settings_obj = json.loads(settings_json)
+        hooks_obj = settings_obj.setdefault("hooks", {})
+        hooks_obj["PreToolUse"] = [
+            {
+                "matcher": _HOOK_CHAIN_EVIDENCE_TOOL,
+                "hooks": [{"type": "command", "command": "cat"}],
+            }
+        ]
+        hooks_obj["Stop"] = [{"hooks": [{"type": "command", "command": "cat"}]}]
+        settings_json = json.dumps(settings_obj)
+    return settings_json
+
+
 def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
                            max_turns: int, claude_bin: str = "claude",
                            claude_agent_name: str | None = None,
@@ -805,8 +894,15 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
                            include_hook_chain_evidence_hooks: bool = False,
                            task_context_scope: str | None = None,
                            task_context_state_root: str | None = None,
+                           approval_settings_json: str | None = None,
+                           approval_child_env: dict[str, str] | None = None,
                            ) -> tuple[int | None, str, str, bool]:
-    """Issue #2174 AC1 fix_delta (OWNER REQUEST_CHANGES
+    """Issue #2839: ``approval_settings_json`` / ``approval_child_env`` は
+    ``--approval-profile`` 使用時にだけ main() が渡す、registry 由来の固定 overlay と、
+    検証済みの値で明示的に組み立てた子 env である。どちらも既定 ``None`` で、未指定の
+    呼び出しの argv と env は変更前と byte-identical に保たれる。
+
+    Issue #2174 AC1 fix_delta (OWNER REQUEST_CHANGES
     https://github.com/squne121/loop-protocol/issues/2174#issuecomment-5302215173):
     ``claude_adapter`` is the ONLY input that decides launcher-specific argv
     shape / env-var injection -- never ``bool(claude_bin)`` alone (the prior
@@ -858,55 +954,33 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
     # ``--settings <JSON>`` flag unchanged (AC6 backward compatibility).
     launch_env = None
     if claude_adapter == "claude-gpt":
+        if approval_settings_json is not None or approval_child_env is not None:
+            # Issue #2839: launcher は ``--settings`` を policy-weakening flag として拒否する
+            # ため、carrier は native adapter 専用である (呼び出し側の precondition の二重防御)。
+            raise ValueError("approval carrier requires the native adapter")
         launch_env = os.environ.copy()
         launch_env["CLAUDE_GPT_RUNTIME_SMOKE_HOOKS"] = "subagent-start-stop"
     else:
-        # Issue #2498 AC4: purely additive -- the extended settings JSON
-        # (adding a "UserPromptExpansion" hook registration) is used ONLY
-        # when the caller opted into ``--expect-skill-command``. Every
-        # pre-existing native-adapter caller (``include_user_prompt_
-        # expansion_hook`` defaults to ``False``) keeps getting the exact,
-        # byte-identical ``_CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON``
-        # this repository's own regression test pins to ``{"SubagentStart",
-        # "SubagentStop"}``.
-        settings_json = (
-            _CLAUDE_SPAWN_HOOK_OBSERVABILITY_WITH_USER_PROMPT_EXPANSION_SETTINGS_JSON
-            if include_user_prompt_expansion_hook
-            else _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON
+        settings_json = select_native_observation_settings_json(
+            include_user_prompt_expansion_hook=include_user_prompt_expansion_hook,
+            include_hook_chain_evidence_hooks=include_hook_chain_evidence_hooks,
         )
-        # Issue #2663 AC1/AC2/AC3: purely additive, opt-in observation-only
-        # hook registration used ONLY when the caller passes
-        # ``--require-hook-chain-evidence``. This does NOT parse from a
-        # settings JSON re-derived at call time -- it mutates the SAME fixed
-        # constant dict (via json.loads/json.dumps) so every pre-existing
-        # caller (``include_hook_chain_evidence_hooks`` defaults to
-        # ``False``) keeps getting the exact, byte-identical settings_json
-        # selected above. The two ADDED groups are bounded and closed (no
-        # caller-supplied command/path/marker/config is ever accepted):
-        # - ``PreToolUse`` (matcher "Bash"): an additive ``cat`` observer
-        #   hook that echoes its own stdin verbatim, giving
-        #   ``evaluate_all_matching_hooks_observed`` a self-identifying
-        #   signature (Issue #2663 AC2) to positively exclude the observer
-        #   itself from the current-project-settings PreToolUse/Bash cohort
-        #   it is comparing against.
-        # - ``Stop`` (no matcher): the same additive ``cat`` observer
-        #   pattern, giving ``evaluate_sibling_side_effect_inventory``
-        #   (Issue #2663 AC3) the real ``stop_hook_active`` boolean the
-        #   runtime's own Stop hook payload carries, used ONLY to recognize
-        #   the documented valid-no-change condition -- never to read or
-        #   persist the surrounding raw hook payload (e.g.
-        #   ``last_assistant_message``, ``transcript_path``).
-        if include_hook_chain_evidence_hooks:
-            settings_obj = json.loads(settings_json)
-            hooks_obj = settings_obj.setdefault("hooks", {})
-            hooks_obj["PreToolUse"] = [
-                {
-                    "matcher": _HOOK_CHAIN_EVIDENCE_TOOL,
-                    "hooks": [{"type": "command", "command": "cat"}],
-                }
-            ]
-            hooks_obj["Stop"] = [{"hooks": [{"type": "command", "command": "cat"}]}]
-            settings_json = json.dumps(settings_obj)
+        if approval_settings_json is not None:
+            # Issue #2839: carrier の overlay は、上で選択した観測 overlay と同じ内容に
+            # ``autoMode`` だけを足したものでなければならない。それ以外 (観測 hooks の欠落や
+            # 任意 key の混入) は fail-closed で拒否し、``--settings`` は常に 1 個だけ渡す。
+            approval_obj = json.loads(approval_settings_json)
+            if (
+                not isinstance(approval_obj, dict)
+                or approval_obj.pop("autoMode", None) is None
+                or approval_obj != json.loads(settings_json)
+            ):
+                raise ValueError(
+                    "approval overlay must equal the selected observation overlay plus autoMode"
+                )
+            settings_json = approval_settings_json
+        if approval_child_env is not None:
+            launch_env = dict(approval_child_env)
         argv += ["--settings", settings_json]
         if include_hook_chain_evidence_hooks:
             # Issue #2663 AC2 live-trial fix, corrected by PR #2668
@@ -3497,6 +3571,136 @@ def _read_claude_agent_transcript_content(
     return result
 
 
+# Issue #2848 fix-delta: ``tool_use_result.status`` values that mean an Agent
+# invocation has been launched but has not yet reached a terminal state. A
+# report-less envelope with one of these statuses is a genuinely intermediate
+# notification and is NOT a terminal failure; any other non-``completed``
+# status (``failed``, ``completed_with_errors``, unknown ...) is.
+_CLAUDE_AGENT_INTERMEDIATE_STATUSES = frozenset(
+    {"async_launched", "running", "in_progress", "pending"}
+)
+
+
+def _claude_agent_invocation_evidence(
+    stdout: str,
+    agent_id: str | None,
+    *,
+    session_id: str | None = None,
+    prompt_id: str | None = None,
+) -> dict:
+    """Issue #2848 fix-delta: per-``Agent``-invocation (``tool_use_id``)
+    result consistency, evaluated independently of whether any envelope
+    carries a ``handbackReport``. Shared by
+    ``_claude_agent_tool_invocation_correlated`` and
+    ``_claude_agent_handback_report_text`` so neither can be satisfied by
+    "the first convenient result" while another result of the SAME
+    invocation contradicts it.
+
+    An invocation is *expected* when at least one ``tool_result`` envelope
+    (whose ``tool_use_id`` ties to an earlier ``Agent`` ``tool_use`` in the
+    same session/prompt scope) carries ``tool_use_result.agentId ==
+    agent_id``. Every envelope of an expected invocation is then examined
+    (envelopes of other ``tool_use_id`` values are unrelated and ignored):
+
+    - a different ``agentId`` on the same invocation is a contradiction;
+    - ``is_error: True`` is a contradiction, with or without a report;
+    - a ``status`` that is neither ``completed`` nor a known intermediate
+      status is a terminal failure, hence a contradiction, with or without
+      a report;
+    - an envelope carrying a ``handbackReport`` key must be ``completed``,
+      not errored, and have a non-empty string ``text``, otherwise it is a
+      contradiction (an intermediate status with a report is inconsistent);
+    - a ``completed`` non-errored envelope without a report, and a
+      report-less intermediate envelope, are neutral.
+
+    Returns ``{"correlated": bool, "contradiction": bool,
+    "success_seen": bool, "report_texts": list[str]}``. ``success_seen``
+    means some ``agentId``-matching envelope was ``completed`` and not
+    errored. Identical successful duplicates are not a contradiction."""
+    evidence: dict = {
+        "correlated": False,
+        "contradiction": False,
+        "success_seen": False,
+        "report_texts": [],
+    }
+    if not agent_id:
+        return evidence
+    pending_agent_tool_use_ids: set[str] = set()
+    envelopes: list[tuple[str, dict, dict]] = []
+    for payload in _iter_claude_stream_events(stdout):
+        payload_session_id = payload.get("session_id")
+        if not isinstance(payload_session_id, str) or not payload_session_id:
+            payload_session_id = payload.get("sessionId")
+        payload_prompt_id = payload.get("prompt_id")
+        if session_id and isinstance(payload_session_id, str) and payload_session_id:
+            if payload_session_id != session_id:
+                continue
+        if prompt_id and isinstance(payload_prompt_id, str) and payload_prompt_id:
+            if payload_prompt_id != prompt_id:
+                continue
+
+        message = payload.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        if payload.get("type") == "assistant":
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                if block.get("name") != _CLAUDE_SPAWN_TOOL_NAME:
+                    continue
+                tool_use_id = block.get("id")
+                if isinstance(tool_use_id, str) and tool_use_id:
+                    pending_agent_tool_use_ids.add(tool_use_id)
+        elif payload.get("type") == "user":
+            tool_use_result = payload.get("tool_use_result")
+            if not isinstance(tool_use_result, dict):
+                tool_use_result = {}
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                tool_use_id = block.get("tool_use_id")
+                if not isinstance(tool_use_id, str) or tool_use_id not in pending_agent_tool_use_ids:
+                    continue
+                envelopes.append((tool_use_id, tool_use_result, block))
+
+    expected_ids = {
+        tool_use_id
+        for tool_use_id, tool_use_result, _block in envelopes
+        if tool_use_result.get("agentId") == agent_id
+    }
+    if not expected_ids:
+        return evidence
+    evidence["correlated"] = True
+    for tool_use_id, tool_use_result, block in envelopes:
+        if tool_use_id not in expected_ids:
+            continue
+        envelope_agent_id = tool_use_result.get("agentId")
+        if envelope_agent_id is not None and envelope_agent_id != agent_id:
+            evidence["contradiction"] = True
+            continue
+        status = tool_use_result.get("status")
+        is_error = block.get("is_error") is True
+        completed = status == "completed" and not is_error
+        if is_error or (
+            isinstance(status, str)
+            and status != "completed"
+            and status not in _CLAUDE_AGENT_INTERMEDIATE_STATUSES
+        ):
+            evidence["contradiction"] = True
+            continue
+        if "handbackReport" in tool_use_result:
+            report = tool_use_result.get("handbackReport")
+            text = report.get("text") if isinstance(report, dict) else None
+            if not completed or not isinstance(text, str) or not text.strip():
+                evidence["contradiction"] = True
+                continue
+            evidence["report_texts"].append(text)
+        if completed and envelope_agent_id == agent_id:
+            evidence["success_seen"] = True
+    return evidence
+
+
 def _claude_agent_tool_invocation_correlated(
     stdout: str,
     agent_id: str | None,
@@ -3511,7 +3715,7 @@ def _claude_agent_tool_invocation_correlated(
     additionally requiring that tool call to have occurred within the SAME
     ``session_id``/``prompt_id`` as the correlated Start/Stop pair when
     those values are known, and reporting separately whether the matched
-    tool_result reached a TERMINAL, SUCCESSFUL state.
+    invocation reached a TERMINAL, SUCCESSFUL state.
 
     Mirrors the existing ``tool_use_id`` correlation pattern already used by
     ``extract_claude_canonical_read_receipt`` for the ``Read`` tool: an
@@ -3523,69 +3727,61 @@ def _claude_agent_tool_invocation_correlated(
     Returns ``{"tool_invocation_id_correlated": bool,
     "terminal_tool_result_success": bool}``. The first field is ``True`` as
     soon as an agentId-matching tool_result is found for ``agent_id`` (in
-    the same session/prompt scope, when those were supplied) -- unchanged
-    contract from the pre-P0-3 field. The second field additionally
-    requires that matched envelope's ``tool_use_result.status ==
-    "completed"`` and its ``tool_result`` content block not be
-    ``is_error: True`` (Issue #2183 PR #2220 P0-3: "terminal かつ成功した
-    tool result が存在すること" -- an error or still-pending tool result
-    must never count as causal evidence of a successfully completed
-    child). Fails closed to ``{False, False}`` on any missing/unmatched id
-    or session/prompt mismatch -- never a guess."""
-    result = {"tool_invocation_id_correlated": False, "terminal_tool_result_success": False}
-    if not agent_id:
-        return result
-    pending_agent_tool_use_ids: set[str] = set()
-    for payload in _iter_claude_stream_events(stdout):
-        payload_session_id = payload.get("session_id")
-        if not isinstance(payload_session_id, str) or not payload_session_id:
-            payload_session_id = payload.get("sessionId")
-        payload_prompt_id = payload.get("prompt_id")
-        if session_id and isinstance(payload_session_id, str) and payload_session_id:
-            if payload_session_id != session_id:
-                continue
-        if prompt_id and isinstance(payload_prompt_id, str) and payload_prompt_id:
-            if payload_prompt_id != prompt_id:
-                continue
+    the same session/prompt scope, when those were supplied). The second
+    field requires (Issue #2848 fix-delta: evaluated over EVERY result of
+    that ``tool_use_id`` via ``_claude_agent_invocation_evidence``, not just
+    the first) that some matching envelope be ``status == "completed"``
+    and not ``is_error: True`` AND that no result of the same invocation
+    contradict it (terminal failure, ``is_error``, conflicting ``agentId``).
+    Fails closed to ``{False, False}`` on any missing/unmatched id or
+    session/prompt mismatch -- never a guess."""
+    evidence = _claude_agent_invocation_evidence(
+        stdout, agent_id, session_id=session_id, prompt_id=prompt_id
+    )
+    return {
+        "tool_invocation_id_correlated": evidence["correlated"],
+        "terminal_tool_result_success": (
+            evidence["correlated"] and evidence["success_seen"] and not evidence["contradiction"]
+        ),
+    }
 
-        if payload.get("type") == "assistant":
-            message = payload.get("message")
-            content = message.get("content") if isinstance(message, dict) else None
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if not isinstance(block, dict) or block.get("type") != "tool_use":
-                    continue
-                if block.get("name") != _CLAUDE_SPAWN_TOOL_NAME:
-                    continue
-                tool_use_id = block.get("id")
-                if isinstance(tool_use_id, str) and tool_use_id:
-                    pending_agent_tool_use_ids.add(tool_use_id)
-        elif payload.get("type") == "user":
-            message = payload.get("message")
-            content = message.get("content") if isinstance(message, dict) else None
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if not isinstance(block, dict) or block.get("type") != "tool_result":
-                    continue
-                tool_use_id = block.get("tool_use_id")
-                if not isinstance(tool_use_id, str) or tool_use_id not in pending_agent_tool_use_ids:
-                    continue
-                tool_use_result = payload.get("tool_use_result")
-                if isinstance(tool_use_result, dict) and tool_use_result.get("agentId") == agent_id:
-                    result["tool_invocation_id_correlated"] = True
-                    is_error = block.get("is_error")
-                    if tool_use_result.get("status") == "completed" and is_error is not True:
-                        result["terminal_tool_result_success"] = True
-                    return result
-    return result
+
+def _claude_agent_handback_report_text(
+    stdout: str,
+    agent_id: str | None,
+    *,
+    session_id: str | None = None,
+    prompt_id: str | None = None,
+) -> str | None:
+    """Issue #2848: the child's own final report text as delivered by the
+    Agent tool's ``tool_use_result.handbackReport.text``, used as an
+    ADDITIONAL marker-provenance input only when the correlated
+    ``SubagentStop`` payload carries no ``last_assistant_message`` (observed
+    missing on the measured Claude Code 2.1.285 execution path; the
+    ``handbackReport`` was still present there).
+
+    Shares ``_claude_agent_invocation_evidence`` with
+    ``_claude_agent_tool_invocation_correlated``. Returns the text only when
+    the invocation has no contradiction (terminal failure / ``is_error`` /
+    conflicting ``agentId`` on ANY result of the same ``tool_use_id``,
+    with or without a ``handbackReport``) and every valid report agrees on
+    the same non-empty text. Fails closed to ``None`` otherwise."""
+    evidence = _claude_agent_invocation_evidence(
+        stdout, agent_id, session_id=session_id, prompt_id=prompt_id
+    )
+    texts = evidence["report_texts"]
+    if not evidence["correlated"] or evidence["contradiction"]:
+        return None
+    if not texts or len(set(texts)) != 1:
+        return None
+    return texts[0]
 
 
 def _marker_provenance_verified(
     expected_markers: list[str] | None,
     last_assistant_message: str | None,
     transcript_content: str | None,
+    handback_report_text: str | None = None,
 ) -> tuple[bool, bool]:
     """Issue #2183 AC11/AC12 / PR #2220 P0-2 fix-delta (further refined by
     the P1-1-vs-``last_assistant_message``-primacy fix-delta below): whether
@@ -3633,9 +3829,22 @@ def _marker_provenance_verified(
     (no ``last_assistant_message``-alone fast path applies when there was
     no marker claim to satisfy from it in the first place), preserving the
     pre-existing requirement that a correlated Stop with no expected
-    markers still needs a genuinely verified transcript file (AC11)."""
+    markers still needs a genuinely verified transcript file (AC11).
+
+    Issue #2848: ``handback_report_text`` is the correlated Agent tool
+    ``handbackReport.text`` (see ``_claude_agent_handback_report_text``),
+    consulted ONLY when ``last_assistant_message`` is absent/empty (it was
+    missing on the measured Claude Code 2.1.285 execution path).
+    Like ``last_assistant_message`` it is the child's own final report, so
+    when it ALONE covers every expected marker the result is
+    ``(True, False)`` (no transcript fallback). Otherwise the pre-existing
+    logic below is unchanged. When ``last_assistant_message`` is present
+    this parameter is ignored entirely."""
     if expected_markers and last_assistant_message:
         if all(marker in last_assistant_message for marker in expected_markers):
+            return True, False
+    if expected_markers and not last_assistant_message and handback_report_text:
+        if all(marker in handback_report_text for marker in expected_markers):
             return True, False
     child_texts: list[str] = []
     if last_assistant_message:
@@ -3760,10 +3969,30 @@ def subagent_causal_evidence_verdict(
         tool_invocation_id_correlated = tool_correlation["tool_invocation_id_correlated"]
         terminal_tool_result_success = tool_correlation["terminal_tool_result_success"]
 
+        # Issue #2848: only when the correlated Stop carries no
+        # ``last_assistant_message`` (missing on the measured Claude Code
+        # 2.1.285 execution path), consult the
+        # correlated Agent tool ``handbackReport.text`` as an additional
+        # provenance input. When ``last_assistant_message`` is present
+        # nothing below differs from the pre-#2848 behaviour.
+        handback_report_text: str | None = None
+        if expected_markers and not stop["last_assistant_message"]:
+            handback_report_text = _claude_agent_handback_report_text(
+                stdout, agent_id, session_id=stop["session_id"], prompt_id=stop["prompt_id"]
+            )
+
         marker_provenance_verified, marker_provenance_transcript_fallback_used = (
             _marker_provenance_verified(
-                expected_markers, stop["last_assistant_message"], transcript_content
+                expected_markers,
+                stop["last_assistant_message"],
+                transcript_content,
+                handback_report_text,
             )
+        )
+        marker_provenance_handback_report_used = bool(
+            handback_report_text
+            and marker_provenance_verified
+            and not marker_provenance_transcript_fallback_used
         )
 
         # P1-1-vs-primacy fix-delta (Issue #2183 PR #2220 OWNER P0-2
@@ -3798,6 +4027,7 @@ def subagent_causal_evidence_verdict(
                     marker_provenance_transcript_fallback_used
                 ),
                 "last_assistant_message": stop["last_assistant_message"],
+                "marker_provenance_handback_report_used": marker_provenance_handback_report_used,
                 "qualifies": qualifies,
             }
         )
@@ -3825,7 +4055,9 @@ def subagent_causal_evidence_verdict(
         marker_provenance_transcript_fallback_used = chosen[
             "marker_provenance_transcript_fallback_used"
         ]
+        marker_provenance_handback_report_used = chosen["marker_provenance_handback_report_used"]
     else:
+        marker_provenance_handback_report_used = False
         agent_id = None
         agent_transcript_path = None
         agent_transcript_verified = False
@@ -3853,7 +4085,7 @@ def subagent_causal_evidence_verdict(
         else:
             causal_evidence_source = CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
 
-    return {
+    verdict = {
         "agent_id": agent_id,
         "subagent_start_observed": subagent_start_observed,
         "subagent_stop_observed": subagent_stop_observed,
@@ -3877,6 +4109,14 @@ def subagent_causal_evidence_verdict(
             len(fully_qualifying) if len(fully_qualifying) > 1 else None
         ),
     }
+    # Issue #2848: additive audit field, emitted ONLY when marker provenance
+    # was actually satisfied from the Agent tool ``handbackReport.text``
+    # (``last_assistant_message`` was missing on the measured Claude Code
+    # 2.1.285 execution path).
+    # Absent otherwise, so every pre-#2848 verdict shape is unchanged.
+    if marker_provenance_handback_report_used:
+        verdict["marker_provenance_handback_report_used"] = True
+    return verdict
 
 
 def classify_claude_child_completion(stdout: str, spawn_agent_id: str | None) -> dict:
@@ -6629,6 +6869,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--approval-profile",
+        choices=list(_load_approval_contract().approval_profile_ids()),
+        default=None,
+        help=(
+            "Issue #2839: opt-in approval carrier. closed enum の profile id だけを受け付け "
+            "(任意の JSON / 文字列 / path は受け付けない)、registry 由来の固定 overlay "
+            "(autoMode.allow に \"$defaults\" と固定 rule 1 件) を、当該 invocation の "
+            "--settings にだけ載せる。native adapter かつ structured mode 専用で、"
+            "--expect-skill-command / --require-hook-chain-evidence / "
+            "--hermetic-agent-definition とは併用できない。precondition (fixture の実体と "
+            "CLAUDE_GPT_HOME / CLAUDE_GPT_REPAIR_INSTALLER_URL の束縛) が不成立なら子 "
+            "session を起動せず fail-closed で終了する。未指定なら従来と byte-identical。"
+        ),
+    )
+    parser.add_argument(
         "--hermetic-agent-definition",
         action="store_true",
         help=(
@@ -6761,6 +7016,42 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.additional_prompt and args.runtime != "claude":
         parser.error("--additional-prompt requires --runtime claude")
+    # Issue #2839: opt-in approval carrier。子 session を起動する前に precondition を
+    # 決定論的に検証し、不成立なら fail-closed で終了する (PASS / SKIP にはしない)。
+    approval_mod = None
+    approval_verified = None
+    approval_overlay_json = None
+    approval_child_env = None
+    if args.approval_profile:
+        approval_mod = _load_approval_contract()
+        if args.runtime != "claude":
+            parser.error("--approval-profile requires --runtime claude")
+        approval_verified = approval_mod.verify_approval_carrier_preconditions(
+            args.approval_profile,
+            worktree=os.path.abspath(args.worktree),
+            env=os.environ,
+            claude_adapter=args.claude_adapter,
+            mode=args.mode,
+            incompatible_flags={
+                "expect_skill_command": bool(args.expect_skill_command),
+                "hermetic_agent_definition": bool(args.hermetic_agent_definition),
+            },
+        )
+        if not approval_verified["ok"]:
+            parser.error(
+                f"--approval-profile precondition failed: {approval_verified['reason_code']}"
+            )
+        # Issue #2839 (PR #2844 OWNER fix_delta): runner が実際に選択する観測 overlay
+        # (--require-hook-chain-evidence 時は PreToolUse / Stop を含む) に carrier の
+        # ``autoMode`` を足す。overlay を作り直さず、``--settings`` は 1 個のまま。
+        approval_overlay_json = approval_mod.build_approval_overlay_json(
+            args.approval_profile,
+            select_native_observation_settings_json(
+                include_user_prompt_expansion_hook=bool(args.expect_skill_command),
+                include_hook_chain_evidence_hooks=bool(args.require_hook_chain_evidence),
+            ),
+        )
+        approval_child_env = approval_mod.build_approval_child_env(os.environ, approval_verified)
     # Issue #2219 fix_delta iteration 1 (Option B): the interactive lane's
     # own turn count is 1 (the initial --prompt-file turn) plus however many
     # --additional-prompt entries were supplied -- there is no --max-turns
@@ -7141,6 +7432,8 @@ def main(argv: list[str] | None = None) -> int:
                     include_hook_chain_evidence_hooks=bool(args.require_hook_chain_evidence),
                     task_context_scope=args.task_context_scope,
                     task_context_state_root=args.task_context_state_root,
+                    approval_settings_json=approval_overlay_json,
+                    approval_child_env=approval_child_env,
                 )
                 capability_decision, capability_reason = classify_claude_structured_outcome(
                     rc, out, err, timed_out
@@ -7150,6 +7443,22 @@ def main(argv: list[str] | None = None) -> int:
                 # --settings flag forwarded via a hermetic combination),
                 # never a synthesized/guessed classification.
                 schema_summary["claude_adapter"] = args.claude_adapter
+                if approval_verified is not None:
+                    # Issue #2839: run 後に fixture の内容 hash を再計算し、変わっていたら PASS
+                    # にしない (子 session が承認済み fixture を書き換えた場合の検出)。
+                    fixture_hash_after_run = approval_mod.fixture_content_blob_hash(
+                        str(worktree), approval_verified["fixture_relpath"]
+                    )
+                    schema_summary["approval_carrier"] = approval_mod.build_approval_carrier_evidence(
+                        approval_verified,
+                        overlay_json=approval_overlay_json,
+                        fixture_hash_after_run=fixture_hash_after_run,
+                    )
+                    if not schema_summary["approval_carrier"]["fixture_unchanged"]:
+                        errors.append(
+                            "approval carrier: fixture installer content changed during the run"
+                        )
+                        exit_code = EXIT_FAIL
                 schema_summary["claude_gpt_launcher_receipt"] = (
                     extract_claude_gpt_launcher_receipt(err)
                     if args.claude_adapter == "claude-gpt"
