@@ -553,6 +553,158 @@ def start_execution_run(
     return get_execution_run(conn, run_id)
 
 
+def record_subagent_start(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str | None = None,
+    activity_id: str | None = None,
+    claude_session_id: str | None = None,
+    agent_id: str | None = None,
+) -> tuple[dict[str, Any] | None, bool]:
+    """Idempotent, session-scoped ``SubagentStart`` bookkeeping (Issue #2822
+    AC4 refire contract + OWNER Finding 4). Returns ``(run, created)``.
+
+    Claude Code fires ``SubagentStart`` not only when an Agent is launched but
+    also on subagent resume and whenever an in-process teammate processes a
+    new message, so the same ``(session, agent_id)`` can be reported again
+    while its run is still open:
+
+    - ``agent_id`` given and an *open* ``run_kind='subagent'`` row already
+      carries it **for the same** ``claude_session_id`` -> no-op, return the
+      existing row (``created=False``). No ``IntegrityError`` from
+      ``ux_execution_runs_open_subagent_agent_id``.
+    - ``agent_id`` given and only *ended* rows carry it -> ``ended_at`` is
+      never touched (no re-open); a new run row is inserted.
+    - ``agent_id`` given, a *bound* caller session, and an open row with that
+      agent_id belongs to a **different** session (or is an unbound legacy
+      row) -> fail-safe non-fatal no-op: ``(None, False)``. The other row is
+      neither rewritten nor taken over, and no row is inserted (the
+      pre-existing partial unique index would reject it anyway). Claude Code
+      documents ``agent_id`` only as a "unique identifier" and does not
+      promise cross-session uniqueness, so the repository contract scopes
+      identity to ``(claude_session_id, agent_id)``.
+    - ``claude_session_id`` NULL (legacy / unbound caller) -> the previous
+      agent_id-only open-row match is kept for compatibility.
+    - no ``agent_id`` -> always a new row (unchanged legacy behavior; a
+      SubAgent that supplies no identity cannot be deduplicated).
+
+    ``claude_session_id`` is stored on the row as the *parent/caller* session
+    (hook common ``session_id``), never as an operator session -- see
+    ``docs/dev/task-context.md`` and the reader-side protection in
+    ``task_context_workflow_signals._classify_origin_candidates``.
+
+    Check + insert share one ``BEGIN IMMEDIATE`` transaction, so two
+    concurrent refires cannot both pass the open-row check."""
+    try:
+        with db.write_transaction(conn):
+            if agent_id is not None:
+                existing = conn.execute(
+                    "SELECT id, claude_session_id FROM execution_runs "
+                    "WHERE run_kind = 'subagent' AND agent_id = ? AND ended_at IS NULL "
+                    "ORDER BY started_at DESC LIMIT 1",
+                    (agent_id,),
+                ).fetchone()
+                if existing is not None:
+                    if claude_session_id is None or existing["claude_session_id"] == claude_session_id:
+                        return get_execution_run(conn, existing["id"]), False
+                    return None, False
+            run_id = _start_execution_run_tx(
+                conn,
+                run_kind="subagent",
+                task_id=task_id,
+                activity_id=activity_id,
+                claude_session_id=claude_session_id,
+                agent_id=agent_id,
+            )
+    except errors.ConflictError:
+        # Belt and braces: a concurrent writer claimed the same open agent_id
+        # between the check and the insert. Never leak out of the hook.
+        return None, False
+    return get_execution_run(conn, run_id), True
+
+
+_ADDRESSABLE_NAME_MAX_LEN = 128
+
+
+def is_valid_addressable_name(name: object) -> bool:
+    """Bounded, printable, non-empty ``str`` only (address metadata, never
+    free text): at most 128 characters and no control characters."""
+    return (
+        isinstance(name, str)
+        and 0 < len(name) <= _ADDRESSABLE_NAME_MAX_LEN
+        and name.isprintable()
+        and name == name.strip()
+    )
+
+
+def record_subagent_addressable_name(
+    conn: sqlite3.Connection,
+    *,
+    claude_session_id: str | None,
+    agent_id: str | None,
+    name: object,
+    task_id: str | None = None,
+    activity_id: str | None = None,
+) -> str:
+    """Bind the ``Agent`` tool ``name`` to the SubAgent ExecutionRun(s) of
+    exactly ``(claude_session_id, agent_id)`` (Issue #2822, written by the
+    ``PostToolUse:Agent`` adapter). Returns a diagnostic reason code.
+
+    Claude Code does not guarantee the relative order of ``SubagentStart``
+    and ``PostToolUse:Agent`` (they are separate hook processes fired at
+    almost the same instant), so the binding must not depend on it:
+
+    - A ``run_kind='subagent'`` row of ``(claude_session_id, agent_id)``
+      already exists (``SubagentStart`` won the race): its ``addressable_name``
+      is updated (ended or not; a refire history of one agent_id is one
+      identity).
+    - No such row yet (``PostToolUse`` won the race): exactly one **ended**
+      row carrying the name is inserted (``binding_id`` NULL, parent
+      Task/Activity as resolved by the caller, ``ended_at`` = insert time),
+      inside the same ``BEGIN IMMEDIATE`` transaction as the existence check.
+      Being ended it can never leak as an open run nor collide with
+      ``ux_execution_runs_open_subagent_agent_id``. The ``SubagentStart``
+      that arrives afterwards finds no open row and follows its normal
+      dedupe contract (a new open row; ``ended_at`` of the ended row is never
+      touched), so the two hooks converge on the same addressable identity.
+    - An *open* row with this ``agent_id`` belongs to a different session (or
+      is an unbound legacy row): nothing is written and nothing is taken
+      over -- identity is scoped to ``(claude_session_id, agent_id)`` and the
+      destination stays ASK (fail-safe).
+
+    Other sessions' rows are never touched. Invalid input is a no-op."""
+    if not claude_session_id or not agent_id or not is_valid_addressable_name(name):
+        return "addressable_name_not_recorded_invalid_input"
+    with db.write_transaction(conn):
+        cursor = conn.execute(
+            "UPDATE execution_runs SET addressable_name = ? "
+            "WHERE run_kind = 'subagent' AND claude_session_id = ? AND agent_id = ?",
+            (name, claude_session_id, agent_id),
+        )
+        if cursor.rowcount:
+            return "addressable_name_recorded"
+        foreign_open = conn.execute(
+            "SELECT 1 FROM execution_runs WHERE run_kind = 'subagent' AND agent_id = ? "
+            "AND ended_at IS NULL LIMIT 1",
+            (agent_id,),
+        ).fetchone()
+        if foreign_open is not None:
+            return "addressable_name_agent_id_open_in_other_session"
+        run_id = _start_execution_run_tx(
+            conn,
+            run_kind="subagent",
+            task_id=task_id,
+            activity_id=activity_id,
+            claude_session_id=claude_session_id,
+            agent_id=agent_id,
+        )
+        conn.execute(
+            "UPDATE execution_runs SET addressable_name = ?, ended_at = ? WHERE id = ?",
+            (name, now_iso(), run_id),
+        )
+    return "addressable_name_recorded_ended_row"
+
+
 def _set_execution_run_session_tx(conn: sqlite3.Connection, run_id: str, claude_session_id: str) -> None:
     """Transaction-internal counterpart of ``set_execution_run_session`` (PR
     #2731 review fix_delta Finding 3 follow-up factoring -- see
@@ -1012,6 +1164,88 @@ def find_open_execution_runs(
         params.append(claude_session_id)
     sql = "SELECT * FROM execution_runs WHERE " + " AND ".join(conditions) + " ORDER BY started_at DESC"
     rows = db.execute_readonly(conn, sql, tuple(params)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def find_addressable_subagent_runs(
+    conn: sqlite3.Connection,
+    *,
+    claude_session_id: str | None,
+    agent_id: str | None = None,
+    name: str | None = None,
+) -> list[dict[str, Any]]:
+    """The single addressability lookup for ``SendMessage`` (Issue #2822).
+
+    Returns ``run_kind='subagent'`` rows the *caller* session may address,
+    most-recently started first. Exactly one of ``agent_id`` / ``name``:
+
+    - ``agent_id``: rows bound to the caller's own ``claude_session_id``,
+      **ended or not** -- Claude Code resumes a completed / stopped SubAgent
+      when it is sent a message, so an ended ExecutionRun does not make an
+      agent unaddressable; plus legacy rows with ``claude_session_id IS NULL``
+      (written before session binding existed) only while still **open** --
+      exactly the previous ``find_open_execution_runs(agent_id=...)``
+      behavior.
+    - ``name``: only rows bound to the caller's own ``claude_session_id``
+      whose ``addressable_name`` (recorded from the ``Agent`` tool ``name``
+      by ``PostToolUse:Agent``) equals ``name``, ended or not. Legacy /
+      unbound rows never grant name addressability.
+
+    A row bound to a *different* session is never returned. When the caller
+    session is unknown (``None`` / empty) only the legacy open agent_id rows
+    can match. Several rows for one ``agent_id`` (refire history) are one
+    addressable identity, not a collision -- callers dedupe by ``agent_id``
+    (a collision is *distinct* agent_ids sharing a name)."""
+    if bool(agent_id) == bool(name):
+        return []
+    if name:
+        if not claude_session_id:
+            return []
+        sql = (
+            "SELECT * FROM execution_runs WHERE run_kind = 'subagent' AND agent_id IS NOT NULL "
+            "AND claude_session_id = ? AND addressable_name = ? ORDER BY started_at DESC"
+        )
+        return [dict(r) for r in db.execute_readonly(conn, sql, (claude_session_id, name)).fetchall()]
+    legacy = "(claude_session_id IS NULL AND ended_at IS NULL)"
+    if claude_session_id:
+        where = f"(claude_session_id = ? OR {legacy})"
+        params: tuple[Any, ...] = (agent_id, claude_session_id)
+    else:
+        where = legacy
+        params = (agent_id,)
+    sql = (
+        "SELECT * FROM execution_runs WHERE run_kind = 'subagent' AND agent_id = ? AND "
+        + where
+        + " ORDER BY started_at DESC"
+    )
+    return [dict(r) for r in db.execute_readonly(conn, sql, params).fetchall()]
+
+
+def find_open_subagent_runs_for_stop(
+    conn: sqlite3.Connection,
+    *,
+    claude_session_id: str | None,
+    agent_id: str,
+) -> list[dict[str, Any]]:
+    """Open ``run_kind='subagent'`` rows a ``SubagentStop(agent_id)`` from
+    ``claude_session_id`` may end (Issue #2822 OWNER Finding 4): the same
+    session's own open rows; only when there are none, legacy unbound
+    (``claude_session_id IS NULL``) open rows for back-compat. Another
+    session's open row with the same agent_id is never returned. An unbound
+    caller keeps the previous agent_id-only match."""
+    if claude_session_id is None:
+        return find_open_execution_runs(conn, run_kind="subagent", agent_id=agent_id)
+    own = find_open_execution_runs(
+        conn, run_kind="subagent", agent_id=agent_id, claude_session_id=claude_session_id
+    )
+    if own:
+        return own
+    rows = db.execute_readonly(
+        conn,
+        "SELECT * FROM execution_runs WHERE run_kind = 'subagent' AND agent_id = ? "
+        "AND ended_at IS NULL AND claude_session_id IS NULL ORDER BY started_at DESC",
+        (agent_id,),
+    ).fetchall()
     return [dict(r) for r in rows]
 
 

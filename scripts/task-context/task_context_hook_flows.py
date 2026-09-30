@@ -50,6 +50,7 @@ import task_context_errors as errors  # noqa: E402
 import task_context_service as service  # noqa: E402
 import task_context_session_registry as session_registry  # noqa: E402
 import task_context_target_kind as target_kind  # noqa: E402
+import task_context_team_config as team_config  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # small shared helpers
@@ -857,9 +858,37 @@ def on_subagent_start(conn, payload: dict[str, Any]) -> dict[str, Any]:
     claude_session_id = payload.get("claude_session_id")
     agent_id = payload.get("agent_id") or None
     task_id, activity_id = _parent_task_activity_for_session(conn, claude_session_id)
-    run = service.start_execution_run(
-        conn, run_kind="subagent", task_id=task_id, activity_id=activity_id, agent_id=agent_id
+    # Issue #2822: `claude_session_id` on a hook-origin subagent row is the
+    # *parent/caller* session (the hook's common `session_id`), used only to
+    # scope SendMessage addressability. `binding_id` stays NULL, which is what
+    # keeps managed-origin resolution from ever treating this row as an
+    # operator origin (see `task_context_workflow_signals`).
+    run, created = service.record_subagent_start(
+        conn,
+        task_id=task_id,
+        activity_id=activity_id,
+        claude_session_id=claude_session_id,
+        agent_id=agent_id,
     )
+    if run is None:
+        # An open row with this agent_id already belongs to a different
+        # session (or an unbound legacy row): identity is scoped to
+        # (claude_session_id, agent_id), so that row is neither rewritten
+        # nor taken over. Fail-safe, non-fatal no-op -- this session's
+        # SendMessage to it stays ASK.
+        return {
+            "decision": "pass",
+            "reason_code": "subagent_start_agent_id_open_in_other_session",
+            "agent_id": agent_id,
+        }
+    if not created:
+        # Resume / teammate-new-message refire of an already-open run: no-op.
+        return {
+            "decision": "pass",
+            "reason_code": "subagent_start_refire_noop",
+            "execution_run_id": run["id"],
+            "agent_id": agent_id,
+        }
     _record(
         conn,
         event_type="hook:SubagentStart",
@@ -892,7 +921,12 @@ def on_subagent_stop(conn, payload: dict[str, Any]) -> dict[str, Any]:
     task_id, activity_id = _parent_task_activity_for_session(conn, claude_session_id)
 
     if agent_id is not None:
-        matching = service.find_open_execution_runs(conn, run_kind="subagent", agent_id=agent_id)
+        # Issue #2822 (OWNER Finding 4): resolve the stop target within the
+        # caller's own session so one session's Stop can never end another
+        # session's open run that happens to share an agent_id.
+        matching = service.find_open_subagent_runs_for_stop(
+            conn, claude_session_id=claude_session_id, agent_id=agent_id
+        )
         if not matching:
             return {"decision": "pass", "reason_code": "no_open_subagent_run_for_agent_id", "agent_id": agent_id}
         target_run_id = matching[0]["id"]
@@ -930,6 +964,41 @@ def on_subagent_stop(conn, payload: dict[str, Any]) -> dict[str, Any]:
         "execution_run_id": run["id"],
         "agent_id": agent_id,
     }
+
+
+# ---------------------------------------------------------------------------
+# PostToolUse:Agent -- addressable name of an ordinary named SubAgent
+# (Issue #2822). Claude Code exposes the `Agent` tool's `name` only in the
+# tool_input and the SubAgent's own `agent_id` only in the tool_response
+# (`agentId`); SubagentStart carries neither the name nor the tool_use link.
+# This hook is the one place both are visible together, so it binds them onto
+# the ExecutionRun that SubagentStart recorded. Hook order is NOT guaranteed:
+# SubagentStart and PostToolUse:Agent run as separate processes fired at almost
+# the same instant, so when PostToolUse wins the race it inserts one *ended*
+# named row (never an open one) that a later SubagentStart dedupes against. It
+# never touches another session's rows.
+# ---------------------------------------------------------------------------
+
+
+def on_post_tool_use(conn, payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("tool_name") != "Agent":
+        return {"decision": "pass", "reason_code": "observability_only"}
+    claude_session_id = payload.get("claude_session_id")
+    try:
+        task_id, activity_id = _parent_task_activity_for_session(conn, claude_session_id)
+        reason_code = service.record_subagent_addressable_name(
+            conn,
+            claude_session_id=claude_session_id,
+            agent_id=payload.get("agent_id"),
+            name=payload.get("agent_name"),
+            task_id=task_id,
+            activity_id=activity_id,
+        )
+    except errors.TaskContextError:
+        # Non-fatal: a hook failure must never break the Agent tool call.
+        # The destination simply stays unrecorded (SendMessage -> ASK).
+        return {"decision": "pass", "reason_code": "addressable_name_not_recorded_error"}
+    return {"decision": "pass", "reason_code": reason_code}
 
 
 # ---------------------------------------------------------------------------
@@ -987,6 +1056,11 @@ def _record_pre_tool_use_guard_event(
     )
 
 
+# Claude Code's reserved SendMessage address for the main (parent)
+# conversation; it cannot be used as an agent id or SubAgent name.
+RESERVED_MAIN_CONVERSATION_ADDRESS = "main"
+
+
 def _on_pre_tool_use_send_message(conn, payload: dict[str, Any]) -> dict[str, Any]:
     """Issue #2566 fix_delta P1-B iteration 2 (operator finding, OWNER PR
     #2691 review, 2026-09-21): independent investigation of Claude Code's
@@ -1029,14 +1103,68 @@ def _on_pre_tool_use_send_message(conn, payload: dict[str, Any]) -> dict[str, An
     peer_session_found = False
     peer_task_id: str | None = None
     if to:
-        # `to` matching an *open* SubAgent ExecutionRun's own `agent_id`
-        # (already tracked via SubagentStart, Issue #2564) covers both an
-        # in-session SubAgent and an Agent Teams teammate represented the
-        # same way -- never a new peer registry, just the existing
-        # ExecutionRun bookkeeping.
-        if service.find_open_execution_runs(conn, run_kind="subagent", agent_id=to):
+        caller_session_id = payload.get("claude_session_id")
+        # Issue #2822 addressability decision table (Claude Code, not Task
+        # Context, owns what is addressable; this only mirrors the
+        # identities Claude Code exposes to hooks):
+        #   (a) `to` is the agent_id of a SubAgent recorded for *this caller
+        #       session* (ended or not -- a completed SubAgent can be resumed
+        #       by SendMessage; legacy session-less rows only while open) ->
+        #       in-session SubAgent.
+        #   (b) `to` is the `name` an ordinary SubAgent of *this caller
+        #       session* was spawned with (`PreToolUse/PostToolUse:Agent`
+        #       tool_input `name`, bound to the SubagentStart row by
+        #       `PostToolUse:Agent`; ended or not). Exactly one distinct
+        #       agent_id must carry the name (history rows of one agent_id
+        #       are one identity); two or more distinct agent_ids -> ASK
+        #       (Claude Code's own resolution of the collision is not
+        #       observable from hooks). Rows of another session, unbound
+        #       legacy rows, and `agent_type` never grant name addressability.
+        #   (c) `to` is the name of a teammate in this session's Claude-owned
+        #       team config `members[]` (experimental flag on, schema ok,
+        #       read-only, fail-closed) -> in-session teammate.
+        #   For (b)/(c): if the same name also resolves to an independent
+        #   session, or (b) and (c) both claim it, that is an identity
+        #   collision -> ASK (never PASS).
+        #   (e) `to == "main"` from inside a SubAgent (`caller_agent_id` set) and
+        #       no independent session registered as `main` -> the parent
+        #       conversation (reserved address) -> in-session.
+        #   (d) anything else -> independent-session resolution below.
+        registry_session_id = session_registry.resolve_session_name_to_claude_session_id(to)
+        lane_decided = False
+        if (
+            to == RESERVED_MAIN_CONVERSATION_ADDRESS
+            and payload.get("caller_agent_id")
+            and registry_session_id is None
+        ):
+            # Issue #2822 (D2): `main` is Claude Code's reserved address for the
+            # parent (main) conversation -- it can never be an agent id or a
+            # SubAgent name. A SubAgent (hook input carries `agent_id`) replying
+            # to it is ordinary in-session communication. The lead itself
+            # (no `agent_id`) and an independent session that registered the
+            # name `main` (registry hit) keep the previous classification.
             is_in_session_subagent = True
+            lane_decided = True
+        elif service.find_addressable_subagent_runs(conn, claude_session_id=caller_session_id, agent_id=to):
+            is_in_session_subagent = True
+            lane_decided = True
         else:
+            named_agent_ids = {
+                row["agent_id"]
+                for row in service.find_addressable_subagent_runs(
+                    conn, claude_session_id=caller_session_id, name=to
+                )
+            }
+            teammate_addressable, _teammate_reason = team_config.resolve_teammate_by_name(to, caller_session_id)
+            if named_agent_ids or teammate_addressable:
+                lane_decided = True
+                unambiguous = (len(named_agent_ids) == 1 and not teammate_addressable) or (
+                    not named_agent_ids and teammate_addressable
+                )
+                if unambiguous and registry_session_id is None:
+                    is_in_session_subagent = True
+                # else: identity collision -> stays unresolved (unknown -> ASK)
+        if not lane_decided:
             peer_binding = None
             # Name-based resolution against Claude Code's own on-disk
             # session registry (read-only; see docstring above and
@@ -1045,7 +1173,7 @@ def _on_pre_tool_use_send_message(conn, payload: dict[str, Any]) -> dict[str, An
             # `sessionId` up as a Binding -- an unresolved name (no match,
             # or a collision) falls through to the legacy direct fallback
             # below rather than being guessed at.
-            resolved_session_id = session_registry.resolve_session_name_to_claude_session_id(to)
+            resolved_session_id = registry_session_id
             if resolved_session_id:
                 try:
                     peer_binding = service.get_binding_by_current_session(conn, resolved_session_id)
@@ -1191,6 +1319,7 @@ EVENT_HANDLERS = {
     "SubagentStart": on_subagent_start,
     "SubagentStop": on_subagent_stop,
     "PreToolUse": on_pre_tool_use,
+    "PostToolUse": on_post_tool_use,
     "Stop": on_stop,
     "StopFailure": on_stop_failure,
     "SessionEnd": on_session_end,

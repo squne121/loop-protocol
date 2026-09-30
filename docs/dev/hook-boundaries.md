@@ -275,6 +275,43 @@ hook_boundaries_manifest_v1:
       task blocker にしてはならない（AC2）。
       hook failure は diagnostic artifact 欠落として記録・報告される（AC10）。
 
+  - handler_id: hook_entry
+    event: PostToolUse
+    matcher: "Agent"
+    command: "python3"
+    args:
+      - "${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py"
+      - "PostToolUse"
+    timeout: 5
+    classification: telemetry
+    fail_policy: fail_open
+    script_exit_contract:
+      normal: 0
+      internal_producer_failure: 0
+    claude_event_semantics:
+      event: PostToolUse
+      exit_2_effect: cannot_block_completed_tool_call
+      other_nonzero_effect: non_blocking_error_or_stderr_visible
+    stdout_contract: silent
+    stderr_contract: silent
+    redaction_contract:
+      no_raw_command: true
+      no_raw_secret_like_value: true
+      no_raw_transcript: true
+      no_manifest_body_on_stdout: true
+    agent_action:
+      on_any: proceed
+    notes: >
+      Issue #2822: 通常の named SubAgent の addressable name を記録する Task Context bookkeeping。
+      `Agent` tool の `tool_input.name` と `tool_response.agentId`（ordinary 形式のみ）、および
+      hook 共通 `session_id` が揃う時だけ、`SubagentStart` が既に記録した
+      `(claude_session_id, agent_id)` 一致の `run_kind='subagent'` 行へ `addressable_name`
+      を書き込む。一致行が無い場合は何も作らない no-op（`SendMessage` は ASK のまま）。
+      teammate 形式の `tool_response`（`agent_id` / `team_name` を持つもの）や name 欠落も no-op。
+      完了済みの tool call は block できず、adapter は常に exit 0・stdout 無出力
+      （`PostToolUse` の `exit_2_effect: cannot_block_completed_tool_call`）。prompt /
+      description / message body は転送も保存もしない（AC7）。
+
   - handler_id: ci_test_performance_advisory
     event: PreToolUse
     matcher: "Bash|Write|Edit|MultiEdit"
@@ -887,7 +924,7 @@ Stop / StopFailure / SubagentStop / PostToolUse で実際に動作する `sessio
 | `session_manifest_coordinator.sh`（StopFailure） | telemetry | 継続 |
 | `session_manifest_coordinator.sh`（SubagentStop） | telemetry | 継続 |
 | `session_manifest_debounce.mjs` | telemetry | 継続 |
-| `hook_entry.py`（SessionStart/UserPromptSubmit/CwdChanged/SubagentStart/SessionEnd/Stop/StopFailure/SubagentStop） | telemetry | 継続（`main()` はこれらの event で非ゼロを返す分岐を持たない。Issue #2625: UserPromptSubmit の different-primary-target mismatch は advisory のみで、prompt submission は停止しない） |
+| `hook_entry.py`（SessionStart/UserPromptSubmit/CwdChanged/SubagentStart/SessionEnd/Stop/StopFailure/SubagentStop、および PostToolUse matcher: Agent） | telemetry | 継続（`main()` はこれらの event で非ゼロを返す分岐を持たない。Issue #2625: UserPromptSubmit の different-primary-target mismatch は advisory のみで、prompt submission は停止しない） |
 | `hook_entry.py`（UserPromptExpansion, matcher: task） | blocker（`command_name == "task"` の target validation / persistence failure、および adapter 自身の transport failure / invalid envelope のみ。`command_name != "task"` は常に exit 0） | **`/task` command 自体を停止**（他 Skill/command の expansion は一切妨げない。Issue #2625: `/task` の state-changing authority は UserPromptSubmit の raw 文字列 special-case からこのイベントへ移った） |
 
 ### local_main_branch_guard の gh CLI コマンド 5 分類（#1124）
