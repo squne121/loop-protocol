@@ -866,7 +866,7 @@ canonical hook 責務・fail policy・exit-code contract の正本は
 （`handler_id: hook_entry`, `event: UserPromptSubmit` / `event:
 UserPromptExpansion` の各エントリ）である。
 
-## ordinary user prompt による ACTIVE Task auto-rebind（Issue #2827）
+## 通常のユーザー prompt による ACTIVE Task の自動 rebind（Issue #2827）
 
 #2562 の Goal「通常の人間操作を増やさない」に合わせ、normal ACTIVE Task 切替には
 operator が先に `/task` を入力する必要はない。`/task <target>` は削除せず、
@@ -903,9 +903,11 @@ operator が先に `/task` を入力する必要はない。`/task <target>` は
   `internal_or_unknown` となり 4 入口とも mutation なしになる。これは意図的な
   「mutation を行わない側への劣化」である。
 
-検証: `tests/task-context/test_active_task_prompt_auto_rebind.py` /
-`test_prompt_auto_rebind_workflow_signal.py` と、実 runtime の
-`scripts/task-context/verify_active_task_prompt_auto_rebind.py --leaf <name>`。
+この挙動の検証は、決定論的な pytest（`tests/task-context/` 配下の
+auto-rebind 関連 test）と、実 runtime を起動する narrow adapter
+（`scripts/task-context/verify_active_task_prompt_auto_rebind.py` の
+`--leaf <name>`）の 2 層で行う。required leaf が skipped / absent の場合は
+generic harness の aggregate が pass でも、該当する受け入れ条件を PASS にしない。
 
 ## Repository CI に関する注記（non-blocking）
 

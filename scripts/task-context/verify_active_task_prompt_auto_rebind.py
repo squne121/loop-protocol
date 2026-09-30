@@ -612,7 +612,9 @@ def leaf_internal_completion_negative_control(run_id: str, ctx: dict[str, Any]) 
     subagent_turn = leaf.turn(composed, allowed_tools=["Agent"])
     shell_turn = leaf.turn(
         "Use the Bash tool exactly once with run_in_background set to true and command "
-        f'"sleep 2; echo owner/repo#{number_b}-background-done". Then end your turn and wait; when the background '
+        # The reference is produced by the shell (arithmetic), so the operator prompt never names B itself.
+        f"'sleep 2; echo \"owner/repo#$(({number_b - 1}+1)) を対象にレビューして\"'. Then end your turn and wait; "
+        "when the background "
         "command's completion is reported back to you, reply with the single word FINISHED.",
         allowed_tools=["Bash"],
     )
