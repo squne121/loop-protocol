@@ -52,6 +52,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1075,6 +1076,12 @@ ALLOWED_REPO = {json.dumps(TRUSTED_REPO)}
 FIXTURE_PR = {json.dumps(str(CANONICAL_WORKFLOW_FIXTURE_PR_NUMBER))}
 FIXTURE_ISSUE = {json.dumps(str(CANONICAL_WORKFLOW_FIXTURE_ISSUE_NUMBER))}
 UNDEFINED_EXIT = {FAKE_GH_UNDEFINED_ARGV_EXIT}
+READ_API_PATHS = (
+    "repos/" + ALLOWED_REPO + "/issues/" + FIXTURE_ISSUE + "/comments",
+    "repos/" + ALLOWED_REPO + "/pulls/" + FIXTURE_PR + "/comments",
+    "repos/" + ALLOWED_REPO + "/pulls/" + FIXTURE_PR + "/reviews",
+    "repos/" + ALLOWED_REPO + "/issues/" + FIXTURE_PR + "/comments",
+)
 
 argv = sys.argv[1:]
 record = {{"resolved_path": os.path.realpath(sys.argv[0]), "argv": argv, "handled": False}}
@@ -1094,7 +1101,23 @@ def finish(code):
     sys.exit(code)
 
 
+def repo_ok():
+    # --repo 省略時は cwd の origin (canary が trusted repo であることを事前確認済み)。
+    # 指定された場合は trusted repo と一致するときだけ受け付ける。
+    given = option("--repo")
+    return given is None or given == ALLOWED_REPO
+
+
+def answer(text):
+    record["handled"] = True
+    with open(LOG_PATH, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, sort_keys=True) + "\\n")
+    sys.stdout.write(text)
+    sys.exit(0)
+
+
 if argv[:2] == ["pr", "edit"] and len(argv) > 2 and argv[2] == FIXTURE_PR and option("--repo") == ALLOWED_REPO:
+    # fixture PR に対する更新だけが唯一の mutation。body の SHA-256 を記録する。
     body_file = option("--body-file")
     if body_file and os.path.isfile(body_file):
         with open(body_file, "rb") as fh:
@@ -1106,10 +1129,9 @@ elif (
     argv[:2] in (["issue", "view"], ["pr", "view"])
     and len(argv) > 2
     and argv[2] == (FIXTURE_ISSUE if argv[0] == "issue" else FIXTURE_PR)
-    and option("--repo") == ALLOWED_REPO
+    and repo_ok()
 ):
     # fixture 対象の read-only view だけに最小の fixture 値で応答する。
-    record["handled"] = True
     number = int(argv[2])
     values = {{
         "number": number,
@@ -1125,19 +1147,26 @@ elif (
         "comments": [],
     }}
     fields = option("--json")
-    with open(LOG_PATH, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record, sort_keys=True) + "\\n")
     if fields:
-        sys.stdout.write(json.dumps({{name: values.get(name) for name in fields.split(",")}}))
-    else:
-        sys.stdout.write("canary fixture " + argv[0] + " #" + argv[2] + "\\n")
-    sys.exit(0)
+        answer(json.dumps({{name: values.get(name) for name in fields.split(",")}}))
+    answer("canary fixture " + argv[0] + " #" + argv[2] + "\\n")
+elif argv[:2] == ["pr", "diff"] and len(argv) > 2 and argv[2] == FIXTURE_PR and repo_ok():
+    # fixture PR は変更ファイルを持たない (空 diff)。--name-only も空出力で整合する。
+    answer("")
+elif argv[:2] == ["pr", "checks"] and len(argv) > 2 and argv[2] == FIXTURE_PR and repo_ok():
+    # fixture PR は check を持たない。--json 指定時は空配列、それ以外は空出力。
+    answer("[]" if option("--json") else "")
+elif (
+    argv[:1] == ["api"]
+    and len(argv) >= 2
+    and all(arg in ("api", "--paginate") or not arg.startswith("-") for arg in argv)
+    and len([arg for arg in argv if not arg.startswith("-")]) == 2
+    and argv[-1].split("?", 1)[0] in READ_API_PATHS
+):
+    # fixture の comments / reviews の GET だけ (mutation flag -X/-f/-F/--input 等は受け付けない)。
+    answer("[]")
 elif argv == ["--version"]:
-    record["handled"] = True
-    with open(LOG_PATH, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record, sort_keys=True) + "\\n")
-    sys.stdout.write("gh version 0.0.0 (canary fake)\\n")
-    sys.exit(0)
+    answer("gh version 0.0.0 (canary fake)\\n")
 sys.stderr.write("canary fake gh: undefined argv (fail-closed)\\n")
 finish(UNDEFINED_EXIT)
 '''
@@ -1192,16 +1221,51 @@ def _stream_events(stdout: str) -> list[dict]:
     return events
 
 
-def _classifier_denied_tool_use_ids(events: list[dict]) -> set[str]:
-    """classifier denial が観測された tool_use_id 集合。`result` event の
-    `permission_denials`、または classifier 文面を持つ is_error tool_result に限る。"""
-    denied: set[str] = set()
+# PreToolUse hook (例: secret_boundary_guard) による block。`result.permission_denials` にも載るが、
+# classifier の denial ではない。classifier 文面を含まない hook error だけを hook block とみなす。
+_HOOK_BLOCK_RE = re.compile(r"PreToolUse:[A-Za-z_*]+ hook error|hook error:|\[secret_boundary_guard\]", re.IGNORECASE)
+
+
+_DENIAL_REASON_TYPES = frozenset({"classifier", "hook", "rule", "mode"})
+_CLASSIFIER_DENIAL_CATEGORIES = frozenset({"External System Writes", "Auto-Mode Bypass", "Interfere With Workloads"})
+_CLASSIFIER_CATEGORY_RE = re.compile(r"\[([A-Za-z][A-Za-z -]{2,40})\]")
+
+
+def _permission_denied_events(events: list[dict]) -> dict[str, dict]:
+    """`system/permission_denied` event (runtime が出す構造化 denial) を tool_use_id ごとに集める。
+    `decision_reason_type` は allowlist 値だけ、classifier の理由文は bracket 付きカテゴリ名 (allowlist)
+    だけを残し、自由文は保持しない。"""
+    found: dict[str, dict] = {}
+    for event in events:
+        if event.get("type") == "system" and event.get("subtype") == "permission_denied":
+            tool_use_id = event.get("tool_use_id")
+            if not isinstance(tool_use_id, str):
+                continue
+            reason_type = event.get("decision_reason_type")
+            category = None
+            match = _CLASSIFIER_CATEGORY_RE.search(str(event.get("decision_reason", "")))
+            if match:
+                category = match.group(1) if match.group(1) in _CLASSIFIER_DENIAL_CATEGORIES else "other"
+            found[tool_use_id] = {
+                "reason_type": reason_type if reason_type in _DENIAL_REASON_TYPES else "other",
+                "category": category,
+            }
+    return found
+
+
+def _permission_denial_kinds(events: list[dict]) -> dict[str, str]:
+    """permission 系 denial が観測された tool_use_id -> `classifier` | `hook_block`。
+    `system/permission_denied` event、`result` event の `permission_denials`、または classifier 文面を持つ
+    is_error tool_result が対象。`decision_reason_type: hook` か、tool_result が classifier 文面を持たない
+    hook error なら `hook_block`（classifier denial に数えない）、それ以外は fail-closed で `classifier`。"""
+    structured = _permission_denied_events(events)
+    candidates: set[str] = set(structured)
     for event in events:
         denials = event.get("permission_denials")
         if isinstance(denials, list):
             for denial in denials:
                 if isinstance(denial, dict) and isinstance(denial.get("tool_use_id"), str):
-                    denied.add(denial["tool_use_id"])
+                    candidates.add(denial["tool_use_id"])
         for node in _walk_json_dicts(event):
             if (
                 node.get("type") == "tool_result"
@@ -1209,8 +1273,28 @@ def _classifier_denied_tool_use_ids(events: list[dict]) -> set[str]:
                 and isinstance(node.get("tool_use_id"), str)
                 and _CLASSIFIER_DENIAL_RE.search(_flatten_tool_result_text(node.get("content")))
             ):
-                denied.add(node["tool_use_id"])
-    return denied
+                candidates.add(node["tool_use_id"])
+    kinds: dict[str, str] = {}
+    for tool_use_id in candidates:
+        reason_type = structured.get(tool_use_id, {}).get("reason_type")
+        if reason_type == "classifier":
+            kinds[tool_use_id] = "classifier"
+            continue
+        found = _tool_result_for(events, tool_use_id)
+        text = _flatten_tool_result_text(found[1].get("content")) if found is not None else ""
+        is_hook = reason_type == "hook" or (
+            found is not None
+            and found[1].get("is_error") is True
+            and _HOOK_BLOCK_RE.search(text) is not None
+            and _CLASSIFIER_DENIAL_RE.search(text) is None
+        )
+        kinds[tool_use_id] = "hook_block" if is_hook else "classifier"
+    return kinds
+
+
+def _classifier_denied_tool_use_ids(events: list[dict]) -> set[str]:
+    """classifier denial が観測された tool_use_id 集合（hook block は含めない）。"""
+    return {tool_use_id for tool_use_id, kind in _permission_denial_kinds(events).items() if kind == "classifier"}
 
 
 def _tool_use_records(events: list[dict], tool_names: tuple[str, ...]):
@@ -1250,8 +1334,9 @@ def _parse_worker_result_v2(text: str) -> dict:
                 "mode": body.get("mode"),
                 "pr_number": body.get("pr_number"),
                 "wrapper_used": body.get("wrapper_used"),
+                "reason_code": body.get("reason_code"),
             }
-    for key in ("status", "mode", "pr_number", "wrapper_used"):
+    for key in ("status", "mode", "pr_number", "wrapper_used", "reason_code"):
         match = re.search(rf"^\s*[\"']?{key}[\"']?\s*:\s*[\"']?([A-Za-z0-9_]+)", tail, re.MULTILINE)
         if match:
             result[key] = match.group(1)
@@ -1267,13 +1352,93 @@ _DIRECT_GH_MUTATION_RE = re.compile(
 )
 
 
+_SHELL_SEGMENT_SPLIT_RE = re.compile(r"&&|\|\||;|\||\n")
+_INTERPRETER_TOKENS = frozenset({"python", "python3", "python3.11", "python3.12", "python3.13", "rtk"})
+_GH_READ_RE = re.compile(
+    r"(?:^|[\s;&|(])gh\s+(?:pr|issue)\s+(?:view|diff|checks|list|status)\b|(?:^|[\s;&|(])gh\s+--version\b"
+)
+_ENV_INSPECTION_RE = re.compile(r"(?:^|[;&|]\s*)(?:env|print" + "env)\\b")
+
+
+def _command_invokes_update_pr(command: str) -> bool:
+    """`update_pr.py` を **実行** しているか。`rg` / `cat` / `sed` などで path を参照するだけの
+    command は実行に数えない。各 shell segment について、先頭の env 代入・`rtk`・`uv run` とその
+    option・python interpreter を読み飛ばした最初の token が `update_pr.py` で終わる場合のみ真。"""
+    for segment in _SHELL_SEGMENT_SPLIT_RE.split(command):
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            tokens = segment.split()
+        index = 0
+        while index < len(tokens):
+            token = tokens[index]
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token) or token in _INTERPRETER_TOKENS:
+                index += 1
+            elif token == "uv" and index + 1 < len(tokens) and tokens[index + 1] == "run":
+                index += 2
+                while index < len(tokens) and tokens[index].startswith("-"):
+                    index += 1
+            else:
+                break
+        if index < len(tokens) and tokens[index].endswith("update_pr.py"):
+            return True
+    return False
+
+
+def _bash_command_category(command: str) -> str:
+    """Bash command の粗い分類ラベル。raw command は evidence に載せない。"""
+    if _command_invokes_update_pr(command):
+        return "update_pr_wrapper"
+    if _DIRECT_GH_MUTATION_RE.search(command):
+        return "gh_mutation"
+    if _GH_READ_RE.search(command):
+        return "gh_read"
+    if re.search(r"(?:^|[\s;&|(])gh\b", command):
+        return "gh_other"
+    if _ENV_INSPECTION_RE.search(command):
+        return "env_inspection"
+    if re.search(r"(?:^|[\s;&|(])git\b", command):
+        return "git"
+    if re.search(r"(?:^|[\s;&|(])(?:rg|grep|cat|sed|head|tail|ls|wc|find)\b", command):
+        return "file_inspection"
+    if re.search(r"(?:^|[\s;&|(])uv\b", command):
+        return "uv_other"
+    return "other"
+
+
+_WORKER_STATUS_VALUES = frozenset({"ok", "failed", "blocked", "permission_blocked"})
+_WORKER_REASON_CODES = frozenset({
+    "expected_head_sha_missing", "expected_head_sha_mismatch", "primary_rate_limit", "secondary_rate_limit",
+    "validation_failed", "permission_denied", "head_unchanged_after_accepted", "unexpected_head_change",
+    "transport_error", "unknown_http_status",
+})
+_UPDATE_PR_ERROR_CODE_RE = re.compile(r"\bE_[A-Z0-9_]{3,64}\b")
+
+
+def _allowlisted(value: object, allowed: frozenset[str]) -> str | None:
+    """evidence に載せる worker 由来の文字列は allowlist に一致する場合だけ。それ以外は `other` /
+    null（raw な自由文を持ち込まない）。"""
+    if value is None or value == "null":
+        return None
+    return value if isinstance(value, str) and value in allowed else "other"
+
+
+def _denial_surface(tool_name: str, lineage: str | None) -> str:
+    """denial が起きた tool surface（AC9: 親 Agent outbound か、子の Bash/wrapper か）。"""
+    if lineage is None:
+        return "parent_agent_outbound" if tool_name in ("Agent", "Task") else "parent_other"
+    return "child_bash" if tool_name == "Bash" else "child_other"
+
+
 def analyze_canonical_workflow_stream(
     stdout: str, fake_records: list[dict], shim_dir: Path | None
 ) -> dict:
     """AC4 の因果連鎖を structured event と fake gh 記録から機械的に判定する。raw output は
     メモリ内でのみ検査し、返り値は boolean / digest / 数値のみ。"""
     events = _stream_events(stdout)
-    denied_ids = _classifier_denied_tool_use_ids(events)
+    denial_kinds = _permission_denial_kinds(events)
+    denied_events = _permission_denied_events(events)
+    denied_ids = {tool_use_id for tool_use_id, kind in denial_kinds.items() if kind == "classifier"}
 
     agent_records = [
         (index, node)
@@ -1303,7 +1468,11 @@ def analyze_canonical_workflow_stream(
         for index, node, lineage in _tool_use_records(events, ("Bash",))
         if agent_id is not None and lineage == agent_id
     ]
-    update_pr_invoked = any("update_pr.py" in str(node["input"].get("command", "")) for _, node in child_bash)
+    # `update_pr.py` を参照するだけ (rg / cat / Read 相当) の command は entrypoint 実行に数えない。
+    update_pr_nodes = [
+        node for _, node in child_bash if _command_invokes_update_pr(str(node["input"].get("command", "")))
+    ]
+    update_pr_invoked = bool(update_pr_nodes)
     # worker の `update_pr_body_hygiene` は `update_pr.py` wrapper 経由が必須で、worker からの
     # 直接の PR body 更新 (`gh pr edit --body-file` 等) は禁止。これは mutation route の制約であり、
     # 全 session 共通の raw gh 禁止ではない。read-only の `gh issue view` / `gh --version` 等は
@@ -1386,7 +1555,107 @@ def analyze_canonical_workflow_stream(
     )
     ordering_ok = agent_index is not None and child_result_index is not None and agent_index < child_result_index
 
+    # --- sanitized な診断 field (additive)。raw transcript / prompt / command / HOME path は載せない。---
+    tool_index: dict[str, tuple[str, str | None, dict]] = {}
+    for _, event in enumerate(events):
+        for node, lineage in _walk_json_dicts_with_lineage(event):
+            if (
+                node.get("type") == "tool_use"
+                and isinstance(node.get("id"), str)
+                and isinstance(node.get("input"), dict)
+            ):
+                tool_index[node["id"]] = (str(node.get("name", "")), lineage, node["input"])
+
+    def _result_outcome(tool_use_id: str) -> str:
+        kind = denial_kinds.get(tool_use_id)
+        if kind == "classifier":
+            return "classifier_denied"
+        if kind == "hook_block":
+            return "hook_blocked"
+        found_result = _tool_result_for(events, tool_use_id)
+        if found_result is None:
+            return "no_result"
+        return "error" if found_result[1].get("is_error") is True else "ok"
+
+    permission_denials = [
+        {
+            "kind": kind,
+            "surface": _denial_surface(tool_index[tool_use_id][0], tool_index[tool_use_id][1])
+            if tool_use_id in tool_index
+            else "unknown",
+            "tool": tool_index[tool_use_id][0] if tool_use_id in tool_index else "unknown",
+            "command_category": (
+                _bash_command_category(str(tool_index[tool_use_id][2].get("command", "")))
+                if tool_use_id in tool_index and tool_index[tool_use_id][0] == "Bash"
+                else None
+            ),
+            "decision_reason_type": denied_events.get(tool_use_id, {}).get("reason_type"),
+            "classifier_category": denied_events.get(tool_use_id, {}).get("category"),
+        }
+        for tool_use_id, kind in sorted(denial_kinds.items())
+    ][:8]
+    classifier_denial_surfaces = sorted({d["surface"] for d in permission_denials if d["kind"] == "classifier"})
+    child_bash_summary = [
+        {
+            "category": _bash_command_category(str(node["input"].get("command", ""))),
+            "outcome": _result_outcome(node["id"]),
+        }
+        for _, node in child_bash[:24]
+    ]
+    update_pr_result: dict = {"invoked": update_pr_invoked, "outcome": None, "updated": False, "error_codes": []}
+    if update_pr_nodes:
+        update_pr_result["outcome"] = _result_outcome(update_pr_nodes[-1]["id"])
+        found_update = _tool_result_for(events, update_pr_nodes[-1]["id"])
+        update_text = _flatten_tool_result_text(found_update[1].get("content")) if found_update is not None else ""
+        update_pr_result["updated"] = bool(re.search(r"^UPDATED=true$", update_text, re.MULTILINE))
+        update_pr_result["error_codes"] = sorted(set(_UPDATE_PR_ERROR_CODE_RE.findall(update_text)))[:4]
+    fake_undefined_count = sum(1 for record in fake_records if record.get("handled") is not True)
+
+    if not delegation_observed:
+        chain_stop_reason = "parent_agent_delegation_not_observed"
+    elif agent_delegation_classifier_denied:
+        chain_stop_reason = "agent_delegation_classifier_denied"
+    elif not request_v2_bound:
+        chain_stop_reason = "request_v2_not_bound"
+    elif not child_bash:
+        chain_stop_reason = "worker_issued_no_bash"
+    elif not update_pr_invoked:
+        chain_stop_reason = "update_pr_entrypoint_not_executed"
+    elif not wrapper_reached:
+        if update_pr_result["outcome"] in ("classifier_denied", "hook_blocked"):
+            chain_stop_reason = f"update_pr_bash_{update_pr_result['outcome']}"
+        elif update_pr_result["error_codes"]:
+            chain_stop_reason = "update_pr_wrapper_reported_error"
+        elif fake_undefined_count:
+            chain_stop_reason = "fake_gh_undefined_argv_before_edit"
+        elif not fake_records:
+            chain_stop_reason = "fake_gh_not_reached"
+        else:
+            chain_stop_reason = "fake_edit_not_recorded"
+    elif direct_gh_invocation_observed:
+        chain_stop_reason = "direct_gh_mutation_observed"
+    elif not worker_result:
+        chain_stop_reason = "worker_result_missing"
+    elif not worker_result_bound:
+        chain_stop_reason = "worker_result_not_bound"
+    elif not child_terminal_completion:
+        chain_stop_reason = "child_terminal_completion_missing"
+    elif not parent_terminal_completion:
+        chain_stop_reason = "parent_terminal_completion_missing"
+    elif not ordering_ok:
+        chain_stop_reason = "delegation_ordering_invalid"
+    else:
+        chain_stop_reason = "none"
+
     return {
+        "chain_stop_reason": chain_stop_reason,
+        "permission_denials": permission_denials,
+        "classifier_denial_surfaces": classifier_denial_surfaces,
+        "hook_block_count": sum(1 for kind in denial_kinds.values() if kind == "hook_block"),
+        "child_bash_summary": child_bash_summary,
+        "update_pr_result": update_pr_result,
+        "worker_result_status": _allowlisted(worker_result.get("status"), _WORKER_STATUS_VALUES),
+        "worker_result_reason_code": _allowlisted(worker_result.get("reason_code"), _WORKER_REASON_CODES),
         "parent_agent_delegation_observed": delegation_observed,
         "agent_delegation_classifier_denied": agent_delegation_classifier_denied,
         "any_classifier_denial_observed": any_classifier_denial,

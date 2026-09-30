@@ -909,6 +909,255 @@ def test_classifier_semantics_classification_and_exit_codes():
     assert canary.decide_classifier_semantics("unverified", "denied")[0] == 77
 
 
+def test_hermetic_fake_gh_answers_worker_read_only_queries_for_the_fixture_only(tmp_path):
+    """GIVEN canary 所有の fake gh
+    WHEN worker が実際に発行しうる fixture PR の read-only query
+         (pr diff / pr checks / --repo 省略の pr view / comments の GET) を実行する
+    THEN fixture と整合する最小応答を返し、記録は残る。fixture 以外の対象・別 repo・mutation は fail-closed のまま
+         で、body SHA を記録する mutation は fixture PR の `pr edit` だけ
+    """
+    log_path = tmp_path / "calls.jsonl"
+    shim = tmp_path / "gh"
+    shim.write_text(canary._fake_gh_source(log_path), encoding="utf-8")
+    shim.chmod(0o755)
+    pr = str(canary.CANONICAL_WORKFLOW_FIXTURE_PR_NUMBER)
+    repo = canary.TRUSTED_REPO
+
+    def run(*argv):
+        return subprocess.run([str(shim), *argv], capture_output=True, text=True, timeout=20, check=False)
+
+    diff = run("pr", "diff", pr, "--repo", repo)
+    assert diff.returncode == 0 and diff.stdout == ""
+    assert run("pr", "diff", pr, "--name-only").returncode == 0  # --repo 省略は cwd の trusted origin
+    checks = run("pr", "checks", pr, "--repo", repo, "--json", "name,state")
+    assert checks.returncode == 0 and json.loads(checks.stdout) == []
+    assert run("pr", "checks", pr).returncode == 0
+    assert json.loads(run("pr", "view", pr, "--json", "number").stdout) == {"number": int(pr)}
+    issue = str(canary.CANONICAL_WORKFLOW_FIXTURE_ISSUE_NUMBER)
+    comments = run("api", "--paginate", f"repos/{repo}/issues/{issue}/comments?per_page=100")
+    assert comments.returncode == 0 and json.loads(comments.stdout) == []
+    assert run("api", f"repos/{repo}/pulls/{pr}/reviews").returncode == 0
+    for argv in (
+        ("pr", "diff", "123", "--repo", repo),
+        ("pr", "diff", pr, "--repo", "other/repo"),
+        ("pr", "diff"),
+        ("pr", "checks", "123"),
+        ("pr", "checks", pr, "--repo", "other/repo"),
+        ("pr", "view", pr, "--repo", "other/repo"),
+        ("pr", "edit", pr),  # --repo 省略の mutation は受け付けない
+        ("pr", "ready", pr, "--repo", repo),
+        ("pr", "comment", pr, "--repo", repo, "--body", "x"),
+        ("pr", "list", "--repo", repo),
+        ("api", f"repos/{repo}/pulls/{pr}"),
+        ("api", f"repos/{repo}/issues/123/comments"),
+        ("api", f"repos/other/repo/issues/{issue}/comments"),
+        ("api", "-X", "POST", f"repos/{repo}/issues/{issue}/comments"),
+        ("api", f"repos/{repo}/issues/{issue}/comments", "-f", "body=x"),
+        ("api", f"repos/{repo}/issues/{issue}/comments", "--method", "DELETE"),
+        ("api", f"repos/{repo}/issues/{issue}/comments", "--input", "-"),
+    ):
+        assert run(*argv).returncode == canary.FAKE_GH_UNDEFINED_ARGV_EXIT, argv
+    records = canary._read_fake_gh_records(log_path)
+    assert all(Path(r["resolved_path"]) == shim.resolve() for r in records)
+    assert [r["handled"] for r in records[:7]] == [True] * 7
+    assert all(r["handled"] is False for r in records[7:])
+    # body SHA を記録する mutation は fixture PR の pr edit だけで、read-only 応答は body_sha256 を持たない。
+    assert not any("body_sha256" in r for r in records)
+
+
+def _stream_with_denials(*, child_command: str, denial_text: str, denied: bool = True) -> str:
+    """親 Agent は拒否されず、子 Bash 1 件だけが denial (hook block / classifier) となる合成 stream。"""
+    events: list[dict] = [
+        _tool_use_event(
+            "toolu_agent",
+            "Agent",
+            {
+                "subagent_type": "implementation-worker",
+                "prompt": (
+                    "IMPLEMENTATION_WORKER_REQUEST_V2:\n  mode: update_pr_body_hygiene\n  pr_number: 2147483647\n"
+                ),
+            },
+        ),
+        _tool_use_event("toolu_agent_bash", "Bash", {"command": child_command}, parent="toolu_agent"),
+        _tool_result_event("toolu_agent_bash", denial_text, is_error=True),
+        _tool_result_event("toolu_agent", "Async agent launched successfully.\nagentId: a1"),
+        {"type": "system", "subtype": "task_notification", "task_id": "a1", "tool_use_id": "toolu_agent",
+         "status": "completed"},
+        {"type": "result", "subtype": "success", "is_error": False, "permission_denials": (
+            [{"tool_name": "Bash", "tool_use_id": "toolu_agent_bash"}] if denied else [])},
+    ]
+    return "\n".join(json.dumps(e) for e in events)
+
+
+def test_hook_block_is_not_counted_as_classifier_denial_and_surfaces_are_recorded():
+    """GIVEN result.permission_denials に載る PreToolUse hook block と、classifier denial
+    WHEN sanitized evidence を作る
+    THEN hook block は classifier denial に数えず (false positive を作らない)、denial は kind / surface / tool /
+         command category の allowlist 値だけで記録する。AC9: 拒否 surface は親 Agent と子 Bash で区別される
+    """
+    hook_text = "PreToolUse:Bash hook error: [${CLAUDE_PROJECT_DIR}/.claude/hooks/secret_boundary_guard.sh]: blocked"
+    env_command = "env | rg -i 'canary|^PATH='"
+    hook = canary.analyze_canonical_workflow_stream(
+        _stream_with_denials(child_command=env_command, denial_text=hook_text), [], None
+    )
+    assert hook["any_classifier_denial_observed"] is False
+    assert hook["agent_delegation_classifier_denied"] is False
+    assert hook["classifier_denial_surfaces"] == []
+    assert hook["hook_block_count"] == 1
+    assert hook["permission_denials"] == [
+        {
+            "kind": "hook_block", "surface": "child_bash", "tool": "Bash", "command_category": "env_inspection",
+            "decision_reason_type": None, "classifier_category": None,
+        }
+    ]
+    assert hook["child_bash_summary"] == [{"category": "env_inspection", "outcome": "hook_blocked"}]
+
+    classifier = canary.analyze_canonical_workflow_stream(
+        _stream_with_denials(child_command=env_command, denial_text="[Auto-Mode Bypass] denied by auto mode"), [], None
+    )
+    assert classifier["any_classifier_denial_observed"] is True
+    assert classifier["agent_delegation_classifier_denied"] is False  # 子 Bash の denial は親 Agent の denial ではない
+    assert classifier["classifier_denial_surfaces"] == ["child_bash"]
+    assert classifier["hook_block_count"] == 0
+    # classifier 文面を含む hook error は fail-closed で classifier 側に数える。
+    mixed = canary.analyze_canonical_workflow_stream(
+        _stream_with_denials(child_command=env_command, denial_text=hook_text + " [External System Writes]"), [], None
+    )
+    assert mixed["any_classifier_denial_observed"] is True
+
+    parent = canary.analyze_canonical_workflow_stream(_synthetic_stream(agent_denied=True), [], None)
+    assert parent["classifier_denial_surfaces"] == ["parent_agent_outbound"]
+    assert parent["chain_stop_reason"] == "agent_delegation_classifier_denied"
+    # evidence には raw command / hook 文面を載せない。
+    serialized = json.dumps([hook, classifier, parent])
+    assert env_command not in serialized and "secret_boundary_guard" not in serialized
+
+
+def test_structured_permission_denied_event_identifies_child_wrapper_classifier_denial():
+    """GIVEN runtime が出す system/permission_denied (decision_reason_type=classifier) が
+         子の update_pr.py Bash に対して出た stream
+    WHEN sanitized evidence を作る
+    THEN 親 Agent delegation は denial なしで開始、denial は child_bash / update_pr_wrapper /
+         External System Writes として記録され、chain_stop_reason は wrapper の Bash denial。
+         分類は chain failure で classifier_denied (親 Agent) にしない。
+         reason の自由文 (PR 番号を含む) は evidence に載せない
+    """
+    command = "uv run --locked python3 .claude/skills/open-pr/scripts/update_pr.py --pr-number 2147483647"
+    reason = "[External System Writes] Block `update_pr.py` editing PR #2147483647; free text must not leak."
+    events = [json.loads(line) for line in _synthetic_stream(with_update_pr=True).splitlines()]
+    events.insert(2, {
+        "type": "system", "subtype": "permission_denied", "tool_name": "Bash", "tool_use_id": "toolu_bash",
+        "agent_id": "a1", "decision_reason_type": "classifier", "decision_reason": reason,
+    })
+    stream = "\n".join(json.dumps(e) for e in events)
+    assert command in stream  # 既定の _synthetic_stream の update_pr.py command
+    evidence = canary.analyze_canonical_workflow_stream(stream, [], None)
+    assert evidence["agent_delegation_classifier_denied"] is False
+    assert evidence["delegation_started_without_denial"] is True
+    assert evidence["any_classifier_denial_observed"] is True
+    assert evidence["classifier_denial_surfaces"] == ["child_bash"]
+    assert evidence["permission_denials"] == [
+        {
+            "kind": "classifier", "surface": "child_bash", "tool": "Bash", "command_category": "update_pr_wrapper",
+            "decision_reason_type": "classifier", "classifier_category": "External System Writes",
+        }
+    ]
+    assert evidence["update_pr_result"]["outcome"] == "classifier_denied"
+    assert evidence["chain_stop_reason"] == "update_pr_bash_classifier_denied"
+    assert canary.classify_canonical_workflow_side(evidence, launcher_exit_code=0, timed_out=False) == (
+        "chain_failed_without_classifier_denial"
+    )
+    assert "free text must not leak" not in json.dumps(evidence) and command not in json.dumps(evidence)
+    # decision_reason_type=hook は classifier denial に数えない。
+    events[2] = {**events[2], "decision_reason_type": "hook"}
+    hooked = canary.analyze_canonical_workflow_stream("\n".join(json.dumps(e) for e in events), [], None)
+    assert hooked["any_classifier_denial_observed"] is False and hooked["hook_block_count"] == 1
+    # 未知の category は other、未知の reason type は other (fail-closed で classifier 扱い)。
+    events[2] = {**events[2], "decision_reason_type": "novel", "decision_reason": "[Novel Thing] x"}
+    novel = canary.analyze_canonical_workflow_stream("\n".join(json.dumps(e) for e in events), [], None)
+    assert novel["any_classifier_denial_observed"] is True
+    assert novel["permission_denials"][0]["classifier_category"] == "other"
+    assert novel["permission_denials"][0]["decision_reason_type"] == "other"
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("uv run --locked python3 .claude/skills/open-pr/scripts/update_pr.py --pr-number 2147483647", True),
+        ("python3 .claude/skills/open-pr/scripts/update_pr.py --pr-number 1", True),
+        ("cd wt && FOO=1 uv run python3 ./update_pr.py --pr-number 1", True),
+        ("gh --version && uv run --locked python3 .claude/skills/open-pr/scripts/update_pr.py", True),
+        ("rg -n hygiene .claude/skills/open-pr/scripts/update_pr.py", False),
+        ("cat .claude/skills/open-pr/scripts/update_pr.py", False),
+        ("sed -n 1,80p .claude/skills/open-pr/scripts/update_pr.py | head", False),
+        ("echo update_pr.py", False),
+        ("uv run --locked python3 -c 'print(1)'", False),
+        ("", False),
+    ],
+)
+def test_update_pr_entrypoint_invocation_requires_execution_not_reference(command, expected):
+    """GIVEN update_pr.py を実行する command と、path を参照するだけの command
+    WHEN entrypoint 実行判定を行う
+    THEN 実行だけを真とし、rg / cat / sed / echo での参照は wrapper 実行に数えない
+    """
+    assert canary._command_invokes_update_pr(command) is expected
+
+
+def test_chain_stop_reason_names_the_first_broken_link_without_raw_content(tmp_path):
+    """GIVEN 因果連鎖の各 link を 1 つずつ欠落させた合成 stream
+    WHEN sanitized evidence を作る
+    THEN chain_stop_reason は最初に途切れた link を allowlist 値で示し、full chain は none
+    """
+    shim_dir = tmp_path.resolve()
+    ok_records = _fake_records(shim_dir)
+
+    def analyze(stream, records):
+        return canary.analyze_canonical_workflow_stream(stream, records, shim_dir)
+
+    assert analyze(_synthetic_stream(), ok_records)["chain_stop_reason"] == "none"
+    assert analyze("", [])["chain_stop_reason"] == "parent_agent_delegation_not_observed"
+    # worker が update_pr.py を参照するだけ (実行せず) で fake が未定義 argv で exit 97 だった場合。
+    reference_only = _synthetic_stream(child_command="rg -n hygiene .claude/skills/open-pr/scripts/update_pr.py")
+    undefined = [{"resolved_path": str(shim_dir / "gh"), "argv": ["pr", "diff", "2147483647"], "handled": False}]
+    stopped = analyze(reference_only, undefined)
+    assert stopped["update_pr_entrypoint_invoked"] is False
+    assert stopped["chain_stop_reason"] == "update_pr_entrypoint_not_executed"
+    assert stopped["fake_gh_undefined_argv_count"] == 1
+    # wrapper を実行したが fake の pr edit に到達せず、未定義 argv が記録された場合。
+    executed = _synthetic_stream()
+    assert analyze(executed, undefined)["chain_stop_reason"] == "fake_gh_undefined_argv_before_edit"
+    assert analyze(executed, [])["chain_stop_reason"] == "fake_gh_not_reached"
+    handled_view = [{"resolved_path": str(shim_dir / "gh"), "argv": ["pr", "view", "2147483647"], "handled": True}]
+    assert analyze(executed, handled_view)["chain_stop_reason"] == "fake_edit_not_recorded"
+    # wrapper が sanitized な error code を報告した場合は code だけを載せる。
+    events = [json.loads(line) for line in _synthetic_stream().splitlines()]
+    events.insert(2, _tool_result_event("toolu_bash", "ERROR=E_VALIDATION_FAILED\nERROR_DETAIL=/home/u/secret path"))
+    wrapper_error = analyze("\n".join(json.dumps(e) for e in events), [])
+    assert wrapper_error["chain_stop_reason"] == "update_pr_wrapper_reported_error"
+    assert wrapper_error["update_pr_result"]["error_codes"] == ["E_VALIDATION_FAILED"]
+    assert "/home/u/secret" not in json.dumps(wrapper_error)
+    # worker 結果: status は allowlist 値、自由文は載せない。
+    blocked_text = _WORKER_RESULT_OK.replace("status: ok", "status: blocked").replace(
+        "mode:", "reason_code: transport_error\n  mode:"
+    )
+    blocked = analyze(_synthetic_stream(worker_text=blocked_text), ok_records)
+    assert blocked["chain_stop_reason"] == "worker_result_not_bound"
+    assert blocked["worker_result_status"] == "blocked"
+    assert blocked["worker_result_reason_code"] == "transport_error"
+    whatever = _WORKER_RESULT_OK.replace("status: ok", "status: whatever")
+    odd = analyze(_synthetic_stream(worker_text=whatever), ok_records)
+    assert odd["worker_result_status"] == "other"
+    assert analyze(_synthetic_stream(worker_text="結果なし"), ok_records)["chain_stop_reason"] == (
+        "worker_result_missing"
+    )
+    assert analyze(_synthetic_stream(with_parent_result=False), ok_records)["chain_stop_reason"] == (
+        "parent_terminal_completion_missing"
+    )
+    assert analyze(_synthetic_stream(with_completion_notification=False), ok_records)["chain_stop_reason"] == (
+        "child_terminal_completion_missing"
+    )
+
+
 @pytest.mark.skipif(not _baseline_available(), reason="baseline policy commit is not present in this clone")
 def test_baseline_policy_splice_changes_only_policy_generation():
     """GIVEN --baseline-policy-commit (pre-change main)
