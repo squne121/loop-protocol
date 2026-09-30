@@ -361,6 +361,16 @@ class TestBaseHeadHookTopologyDelta:
             "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py", "PreToolUse"],
             "timeout": 5,
         },
+        # Issue #2822: 通常 named SubAgent の addressable name を
+        # `PostToolUse` (matcher: Agent) で記録する Task Context bookkeeping。
+        # SendMessage 宛先 resolver が name を agent_id に対応付けるために必要
+        # （telemetry / fail_open、常に exit 0）。
+        ("hook_entry", "PostToolUse"): {
+            "matcher": "Agent",
+            "command": "python3",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/task_context/hook_entry.py", "PostToolUse"],
+            "timeout": 5,
+        },
         ("hook_entry_bash_herdr", "PreToolUse"): {
             "matcher": "Bash",
             "command": "python3",
