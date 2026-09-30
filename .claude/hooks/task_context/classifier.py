@@ -197,19 +197,44 @@ def _clause_index(spans: list[tuple[int, int]], position: int) -> int:
     return len(spans) - 1 if spans else 0
 
 
+# Issue #2827 marker-local segments: a clause that contains a Japanese
+# reference-only marker is split further at `、` and ASCII `,`. Only a
+# reference in the same segment as the marker is demoted. This is deliberately
+# separate from ``_CLAUSE_DELIMITERS`` (used by ``_clause_spans``): adding `、`
+# there would also change ACTIVE target-phrase pairing and creation/reply
+# exclusion, which must keep the generic clause semantics.
+_MARKER_SEGMENT_DELIMITERS = frozenset("、,")
+
+
+def _marker_segment_spans(text: str, clause: tuple[int, int]) -> list[tuple[int, int]]:
+    start, end = clause
+    spans: list[tuple[int, int]] = []
+    segment_start = start
+    for index in range(start, end):
+        if text[index] in _MARKER_SEGMENT_DELIMITERS:
+            spans.append((segment_start, index + 1))
+            segment_start = index + 1
+    if segment_start < end:
+        spans.append((segment_start, end))
+    return spans
+
+
 def _primary_occurrences(authority_text: str, occurrences: list[_Occurrence]) -> list[_Occurrence]:
     """Drop the occurrences demoted by a Japanese reference-only marker: a
-    reference is demoted only when its own clause contains ``参考`` or
-    ``関連資料``. Occurrences in other clauses stay primary candidates."""
+    reference is demoted only when it shares a marker-local segment (its clause
+    split at `、` / `,`) with ``参考`` or ``関連資料``. References in other
+    segments or clauses stay primary candidates."""
     spans = _clause_spans(authority_text)
-    marker_clauses = {
-        index
-        for index, (start, end) in enumerate(spans)
-        if any(marker in authority_text[start:end] for marker in _JA_REFERENCE_ONLY_MARKERS)
-    }
-    if not marker_clauses:
+    marker_segments: list[tuple[int, int]] = []
+    for clause in spans:
+        if not any(marker in authority_text[clause[0] : clause[1]] for marker in _JA_REFERENCE_ONLY_MARKERS):
+            continue
+        for segment in _marker_segment_spans(authority_text, clause):
+            if any(marker in authority_text[segment[0] : segment[1]] for marker in _JA_REFERENCE_ONLY_MARKERS):
+                marker_segments.append(segment)
+    if not marker_segments:
         return list(occurrences)
-    return [o for o in occurrences if _clause_index(spans, o.start) not in marker_clauses]
+    return [o for o in occurrences if not any(start <= o.start < end for start, end in marker_segments)]
 
 
 def _has_reference_only_marker(text: str) -> bool:

@@ -225,6 +225,53 @@ def test_japanese_marker_demotes_only_same_clause_reference_and_keeps_other_clau
     assert classifier.classify("Issue #3 を参考に実装して", current_repo=REPO).kind == classifier.KIND_REFERENCE_ONLY
 
 
+def test_japanese_marker_after_comma_demotes_only_marker_reference():
+    # (a) `、` is not a clause delimiter, but the marker binds only its own segment.
+    comma = classifier.classify("Issue #2827 を対象にレビューして、関連資料: #2826", current_repo=REPO)
+    assert comma.kind == classifier.KIND_INFERRED
+    assert comma.target.ref_number == 2827
+    assert comma.targets == (comma.target,)
+    # ASCII comma behaves the same way.
+    ascii_comma = classifier.classify("Issue #2827 を対象にレビューして, 関連資料: #2826", current_repo=REPO)
+    assert ascii_comma.kind == classifier.KIND_INFERRED and ascii_comma.target.ref_number == 2827
+    # (b) clause delimiter `。` (existing behavior).
+    period = classifier.classify("Issue #2827 を対象にレビューして。関連資料: #2826", current_repo=REPO)
+    assert period.kind == classifier.KIND_INFERRED and period.target.ref_number == 2827
+    # (c) marker-first reference stays REFERENCE_ONLY (#2826 is the only reference).
+    marker_first = classifier.classify("参考: #2826。現在の作業を続けて", current_repo=REPO)
+    assert marker_first.kind == classifier.KIND_REFERENCE_ONLY
+    assert marker_first.target.ref_number == 2826
+    # The marker-side reference (#2826) is the one demoted, in either order.
+    marker_before = classifier.classify("関連資料: #2826、Issue #2827 を対象にレビューして", current_repo=REPO)
+    assert marker_before.kind == classifier.KIND_INFERRED and marker_before.target.ref_number == 2827
+    # (e) two actual primaries remain AMBIGUOUS; the marker reference (#12) is not among them.
+    ambiguous = classifier.classify(
+        "Issue #10 と Issue #11 を対象にレビューして、関連資料: #12", current_repo=REPO
+    )
+    assert ambiguous.kind == classifier.KIND_AMBIGUOUS
+    assert sorted(t.ref_number for t in ambiguous.targets) == [10, 11]
+    # A marker and its reference in the same segment still demote (no over-split).
+    same_segment = classifier.classify("Issue #3 を参考に実装して、テストも足して", current_repo=REPO)
+    assert same_segment.kind == classifier.KIND_REFERENCE_ONLY
+    # The generic clause semantics are unchanged: `、` does not end a clause.
+    assert classifier._clause_spans("A、B。C") == [(0, 4), (4, 5)]
+
+
+def test_japanese_marker_after_comma_keeps_active_projection_primary():
+    # (a) ACTIVE projection keeps #2827 eligible across `、` (target phrase pairing is clause-generic).
+    projection = _projection("Issue #2827 を対象にレビューして、関連資料: #2826")
+    assert projection["active_rebind_primary_eligible"] is True
+    assert projection["active_rebind_target_ref_number"] == 2827
+    # Target phrase pairing stays clause-generic: `、` must not split the clause
+    # (a `、` clause delimiter would drop the target phrase from #2827's clause).
+    comma_phrase = _projection("Issue #2827 の不具合を、対象にレビューして、関連資料: #2826")
+    assert comma_phrase["active_rebind_primary_eligible"] is True
+    assert comma_phrase["active_rebind_target_ref_number"] == 2827
+    # (d) a reference demoted by the marker stays ineligible.
+    assert not _eligible("Issue #3 を参考に実装して")
+    assert not _eligible("参考: #2826。現在の作業を続けて")
+
+
 def test_creation_or_reply_object_reference_is_not_primary_for_active_rebind():
     excluded = [
         "Issue #2830 を対象に follow-up を起票して",
