@@ -30,7 +30,7 @@ a v1 consumer — see "Scope Growth Guard" in the Issue body):
 
 from __future__ import annotations
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 # ---------------------------------------------------------------------------
 # v1 DDL (PRAGMA user_version target = 1)
@@ -403,8 +403,23 @@ DDL_V3: list[str] = [
     """,
 ]
 
+# v4 (Issue #2822) is intentionally additive: exactly one bounded nullable
+# column on ``execution_runs``. ``addressable_name`` stores the ``name`` an
+# ordinary SubAgent was spawned with (``Agent`` tool_input ``name``, observed
+# by the ``PostToolUse:Agent`` hook) purely so ``SendMessage`` destination
+# resolution can recognise a name Claude Code itself accepts. It is scoped by
+# ``(claude_session_id, agent_id)`` on the row, is never a message body /
+# transcript / prompt, and existing rows simply keep it NULL (legacy rows keep
+# resolving by agent_id only).
+DDL_V4: list[str] = [
+    """
+    ALTER TABLE execution_runs ADD COLUMN addressable_name TEXT
+    """,
+]
+
 MIGRATIONS: dict[int, list[str]] = {
     1: DDL_V1,
     2: DDL_V2,
     3: DDL_V3,
+    4: DDL_V4,
 }
