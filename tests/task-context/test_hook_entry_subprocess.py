@@ -29,7 +29,13 @@ _REPO_ROOT = pathlib.Path(config.__file__).resolve().parents[2]
 _HOOK_ENTRY = _REPO_ROOT / ".claude" / "hooks" / "task_context" / "hook_entry.py"
 
 
-def _run_hook(event, hook_input, *, state_root, env_extra=None, timeout=10):
+def _run_hook(event, hook_input, *, state_root, env_extra=None, timeout=10, add_provenance=True):
+    if event == "UserPromptSubmit" and add_provenance:
+        # Issue #2827: a real Claude Code `UserPromptSubmit` stdin carries
+        # `hook_event_name` and a non-empty `prompt_id`; the adapter derives
+        # `input_provenance` from them (fail-closed when absent). Seed stdin
+        # in these tests therefore mirrors the real key set.
+        hook_input = {"hook_event_name": "UserPromptSubmit", "prompt_id": "prompt-seed-1", **hook_input}
     env = dict(os.environ)
     # This test suite may itself be running inside a real live Herdr Tab
     # (HERDR_TAB_ID/HERDR_PANE_ID set in the ambient environment) -- always
@@ -123,7 +129,7 @@ def test_given_different_primary_target_while_active_when_user_prompt_submit_inv
 
     mismatch = _run_hook(
         "UserPromptSubmit",
-        {"session_id": "s1", "prompt": "actually switch to owner/other#2", "cwd": str(state_root)},
+        {"session_id": "s1", "prompt": "owner/other#2 looks related", "cwd": str(state_root)},
         state_root=state_root,
         env_extra=env_extra,
     )

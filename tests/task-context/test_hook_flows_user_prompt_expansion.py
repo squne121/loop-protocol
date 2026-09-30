@@ -30,7 +30,12 @@ def _start_session(tab_id: str, session_id: str, *, source: str = "startup") -> 
 
 
 def _submit(session_id: str, tab_id: str, **fields):
-    payload = {"herdr_tab_id": tab_id, "claude_session_id": session_id, **fields}
+    payload = {
+        "herdr_tab_id": tab_id,
+        "claude_session_id": session_id,
+        "input_provenance": "user_prompt_observed",
+        **fields,
+    }
     return hook_flows.on_user_prompt_submit(conn_holder["conn"], payload)
 
 

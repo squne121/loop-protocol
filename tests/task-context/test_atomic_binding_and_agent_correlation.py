@@ -162,6 +162,7 @@ def test_given_two_subagents_started_when_first_stops_by_agent_id_then_second_re
         {
             "herdr_tab_id": "tab-1",
             "claude_session_id": "s1",
+            "input_provenance": "user_prompt_observed",
             "classification_kind": "EXPLICIT",
             "target_repo": "owner/repo",
             "target_ref_kind": "issue",
@@ -204,6 +205,7 @@ def test_given_ambiguous_subagent_stop_without_agent_id_when_two_open_then_neith
         {
             "herdr_tab_id": "tab-1",
             "claude_session_id": "s1",
+            "input_provenance": "user_prompt_observed",
             "classification_kind": "EXPLICIT",
             "target_repo": "owner/repo",
             "target_ref_kind": "issue",
