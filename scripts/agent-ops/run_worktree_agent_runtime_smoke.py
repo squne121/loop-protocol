@@ -3497,119 +3497,62 @@ def _read_claude_agent_transcript_content(
     return result
 
 
-def _claude_agent_tool_invocation_correlated(
+# Issue #2848 fix-delta: ``tool_use_result.status`` values that mean an Agent
+# invocation has been launched but has not yet reached a terminal state. A
+# report-less envelope with one of these statuses is a genuinely intermediate
+# notification and is NOT a terminal failure; any other non-``completed``
+# status (``failed``, ``completed_with_errors``, unknown ...) is.
+_CLAUDE_AGENT_INTERMEDIATE_STATUSES = frozenset(
+    {"async_launched", "running", "in_progress", "pending"}
+)
+
+
+def _claude_agent_invocation_evidence(
     stdout: str,
     agent_id: str | None,
     *,
     session_id: str | None = None,
     prompt_id: str | None = None,
 ) -> dict:
-    """Issue #2183 AC3 / PR #2220 P0-3 fix-delta: whether the runtime's own
-    tool-invocation-ID correlation channel ties the observed ``agent_id``
-    back to a specific ``Agent`` tool call this run itself made, rather than
-    any bare hook-channel identity floating unattached in the stream --
-    additionally requiring that tool call to have occurred within the SAME
-    ``session_id``/``prompt_id`` as the correlated Start/Stop pair when
-    those values are known, and reporting separately whether the matched
-    tool_result reached a TERMINAL, SUCCESSFUL state.
+    """Issue #2848 fix-delta: per-``Agent``-invocation (``tool_use_id``)
+    result consistency, evaluated independently of whether any envelope
+    carries a ``handbackReport``. Shared by
+    ``_claude_agent_tool_invocation_correlated`` and
+    ``_claude_agent_handback_report_text`` so neither can be satisfied by
+    "the first convenient result" while another result of the SAME
+    invocation contradicts it.
 
-    Mirrors the existing ``tool_use_id`` correlation pattern already used by
-    ``extract_claude_canonical_read_receipt`` for the ``Read`` tool: an
-    ``Agent`` ``tool_use`` block's own ``id`` is matched against a
-    ``tool_result`` block's ``tool_use_id`` in the SAME already-captured
-    stream, and the matched ``tool_result``'s ``tool_use_result.agentId``
-    must equal ``agent_id`` exactly.
+    An invocation is *expected* when at least one ``tool_result`` envelope
+    (whose ``tool_use_id`` ties to an earlier ``Agent`` ``tool_use`` in the
+    same session/prompt scope) carries ``tool_use_result.agentId ==
+    agent_id``. Every envelope of an expected invocation is then examined
+    (envelopes of other ``tool_use_id`` values are unrelated and ignored):
 
-    Returns ``{"tool_invocation_id_correlated": bool,
-    "terminal_tool_result_success": bool}``. The first field is ``True`` as
-    soon as an agentId-matching tool_result is found for ``agent_id`` (in
-    the same session/prompt scope, when those were supplied) -- unchanged
-    contract from the pre-P0-3 field. The second field additionally
-    requires that matched envelope's ``tool_use_result.status ==
-    "completed"`` and its ``tool_result`` content block not be
-    ``is_error: True`` (Issue #2183 PR #2220 P0-3: "terminal かつ成功した
-    tool result が存在すること" -- an error or still-pending tool result
-    must never count as causal evidence of a successfully completed
-    child). Fails closed to ``{False, False}`` on any missing/unmatched id
-    or session/prompt mismatch -- never a guess."""
-    result = {"tool_invocation_id_correlated": False, "terminal_tool_result_success": False}
+    - a different ``agentId`` on the same invocation is a contradiction;
+    - ``is_error: True`` is a contradiction, with or without a report;
+    - a ``status`` that is neither ``completed`` nor a known intermediate
+      status is a terminal failure, hence a contradiction, with or without
+      a report;
+    - an envelope carrying a ``handbackReport`` key must be ``completed``,
+      not errored, and have a non-empty string ``text``, otherwise it is a
+      contradiction (an intermediate status with a report is inconsistent);
+    - a ``completed`` non-errored envelope without a report, and a
+      report-less intermediate envelope, are neutral.
+
+    Returns ``{"correlated": bool, "contradiction": bool,
+    "success_seen": bool, "report_texts": list[str]}``. ``success_seen``
+    means some ``agentId``-matching envelope was ``completed`` and not
+    errored. Identical successful duplicates are not a contradiction."""
+    evidence: dict = {
+        "correlated": False,
+        "contradiction": False,
+        "success_seen": False,
+        "report_texts": [],
+    }
     if not agent_id:
-        return result
+        return evidence
     pending_agent_tool_use_ids: set[str] = set()
-    for payload in _iter_claude_stream_events(stdout):
-        payload_session_id = payload.get("session_id")
-        if not isinstance(payload_session_id, str) or not payload_session_id:
-            payload_session_id = payload.get("sessionId")
-        payload_prompt_id = payload.get("prompt_id")
-        if session_id and isinstance(payload_session_id, str) and payload_session_id:
-            if payload_session_id != session_id:
-                continue
-        if prompt_id and isinstance(payload_prompt_id, str) and payload_prompt_id:
-            if payload_prompt_id != prompt_id:
-                continue
-
-        if payload.get("type") == "assistant":
-            message = payload.get("message")
-            content = message.get("content") if isinstance(message, dict) else None
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if not isinstance(block, dict) or block.get("type") != "tool_use":
-                    continue
-                if block.get("name") != _CLAUDE_SPAWN_TOOL_NAME:
-                    continue
-                tool_use_id = block.get("id")
-                if isinstance(tool_use_id, str) and tool_use_id:
-                    pending_agent_tool_use_ids.add(tool_use_id)
-        elif payload.get("type") == "user":
-            message = payload.get("message")
-            content = message.get("content") if isinstance(message, dict) else None
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if not isinstance(block, dict) or block.get("type") != "tool_result":
-                    continue
-                tool_use_id = block.get("tool_use_id")
-                if not isinstance(tool_use_id, str) or tool_use_id not in pending_agent_tool_use_ids:
-                    continue
-                tool_use_result = payload.get("tool_use_result")
-                if isinstance(tool_use_result, dict) and tool_use_result.get("agentId") == agent_id:
-                    result["tool_invocation_id_correlated"] = True
-                    is_error = block.get("is_error")
-                    if tool_use_result.get("status") == "completed" and is_error is not True:
-                        result["terminal_tool_result_success"] = True
-                    return result
-    return result
-
-
-def _claude_agent_handback_report_text(
-    stdout: str,
-    agent_id: str | None,
-    *,
-    session_id: str | None = None,
-    prompt_id: str | None = None,
-) -> str | None:
-    """Issue #2848: the child's own final report text as delivered by the
-    Agent tool's ``tool_use_result.handbackReport.text``, used as an
-    ADDITIONAL marker-provenance input only when the correlated
-    ``SubagentStop`` payload carries no ``last_assistant_message`` (Claude
-    Code 2.1.285 dropped that key; ``handbackReport`` is unchanged).
-
-    Reuses the same ``Agent`` tool_use / tool_result correlation and
-    session/prompt scoping as ``_claude_agent_tool_invocation_correlated``.
-    Returns the text only when EVERY matching envelope for ``agent_id`` is
-    consistent: ``tool_use_result.agentId == agent_id``,
-    ``status == "completed"``, the ``tool_result`` block is not
-    ``is_error: True`` and ``handbackReport.text`` is a non-empty string,
-    and all such envelopes agree on the same text. Fails closed to ``None``
-    on a missing/malformed report, an agentId mismatch (no envelope for
-    ``agent_id``), a non-terminal or errored envelope carrying a
-    ``handbackReport``, or conflicting duplicate reports."""
-    if not agent_id:
-        return None
-    pending_agent_tool_use_ids: set[str] = set()
-    texts: list[str] = []
-    contradictory = False
+    envelopes: list[tuple[str, dict, dict]] = []
     for payload in _iter_claude_stream_events(stdout):
         payload_session_id = payload.get("session_id")
         if not isinstance(payload_session_id, str) or not payload_session_id:
@@ -3637,28 +3580,125 @@ def _claude_agent_handback_report_text(
                     pending_agent_tool_use_ids.add(tool_use_id)
         elif payload.get("type") == "user":
             tool_use_result = payload.get("tool_use_result")
-            if not isinstance(tool_use_result, dict) or tool_use_result.get("agentId") != agent_id:
-                continue
+            if not isinstance(tool_use_result, dict):
+                tool_use_result = {}
             for block in content:
                 if not isinstance(block, dict) or block.get("type") != "tool_result":
                     continue
                 tool_use_id = block.get("tool_use_id")
                 if not isinstance(tool_use_id, str) or tool_use_id not in pending_agent_tool_use_ids:
                     continue
-                if "handbackReport" not in tool_use_result:
-                    continue
-                report = tool_use_result.get("handbackReport")
-                text = report.get("text") if isinstance(report, dict) else None
-                if (
-                    tool_use_result.get("status") != "completed"
-                    or block.get("is_error") is True
-                    or not isinstance(text, str)
-                    or not text.strip()
-                ):
-                    contradictory = True
-                    continue
-                texts.append(text)
-    if contradictory or not texts or len(set(texts)) != 1:
+                envelopes.append((tool_use_id, tool_use_result, block))
+
+    expected_ids = {
+        tool_use_id
+        for tool_use_id, tool_use_result, _block in envelopes
+        if tool_use_result.get("agentId") == agent_id
+    }
+    if not expected_ids:
+        return evidence
+    evidence["correlated"] = True
+    for tool_use_id, tool_use_result, block in envelopes:
+        if tool_use_id not in expected_ids:
+            continue
+        envelope_agent_id = tool_use_result.get("agentId")
+        if envelope_agent_id is not None and envelope_agent_id != agent_id:
+            evidence["contradiction"] = True
+            continue
+        status = tool_use_result.get("status")
+        is_error = block.get("is_error") is True
+        completed = status == "completed" and not is_error
+        if is_error or (
+            isinstance(status, str)
+            and status != "completed"
+            and status not in _CLAUDE_AGENT_INTERMEDIATE_STATUSES
+        ):
+            evidence["contradiction"] = True
+            continue
+        if "handbackReport" in tool_use_result:
+            report = tool_use_result.get("handbackReport")
+            text = report.get("text") if isinstance(report, dict) else None
+            if not completed or not isinstance(text, str) or not text.strip():
+                evidence["contradiction"] = True
+                continue
+            evidence["report_texts"].append(text)
+        if completed and envelope_agent_id == agent_id:
+            evidence["success_seen"] = True
+    return evidence
+
+
+def _claude_agent_tool_invocation_correlated(
+    stdout: str,
+    agent_id: str | None,
+    *,
+    session_id: str | None = None,
+    prompt_id: str | None = None,
+) -> dict:
+    """Issue #2183 AC3 / PR #2220 P0-3 fix-delta: whether the runtime's own
+    tool-invocation-ID correlation channel ties the observed ``agent_id``
+    back to a specific ``Agent`` tool call this run itself made, rather than
+    any bare hook-channel identity floating unattached in the stream --
+    additionally requiring that tool call to have occurred within the SAME
+    ``session_id``/``prompt_id`` as the correlated Start/Stop pair when
+    those values are known, and reporting separately whether the matched
+    invocation reached a TERMINAL, SUCCESSFUL state.
+
+    Mirrors the existing ``tool_use_id`` correlation pattern already used by
+    ``extract_claude_canonical_read_receipt`` for the ``Read`` tool: an
+    ``Agent`` ``tool_use`` block's own ``id`` is matched against a
+    ``tool_result`` block's ``tool_use_id`` in the SAME already-captured
+    stream, and the matched ``tool_result``'s ``tool_use_result.agentId``
+    must equal ``agent_id`` exactly.
+
+    Returns ``{"tool_invocation_id_correlated": bool,
+    "terminal_tool_result_success": bool}``. The first field is ``True`` as
+    soon as an agentId-matching tool_result is found for ``agent_id`` (in
+    the same session/prompt scope, when those were supplied). The second
+    field requires (Issue #2848 fix-delta: evaluated over EVERY result of
+    that ``tool_use_id`` via ``_claude_agent_invocation_evidence``, not just
+    the first) that some matching envelope be ``status == "completed"``
+    and not ``is_error: True`` AND that no result of the same invocation
+    contradict it (terminal failure, ``is_error``, conflicting ``agentId``).
+    Fails closed to ``{False, False}`` on any missing/unmatched id or
+    session/prompt mismatch -- never a guess."""
+    evidence = _claude_agent_invocation_evidence(
+        stdout, agent_id, session_id=session_id, prompt_id=prompt_id
+    )
+    return {
+        "tool_invocation_id_correlated": evidence["correlated"],
+        "terminal_tool_result_success": (
+            evidence["correlated"] and evidence["success_seen"] and not evidence["contradiction"]
+        ),
+    }
+
+
+def _claude_agent_handback_report_text(
+    stdout: str,
+    agent_id: str | None,
+    *,
+    session_id: str | None = None,
+    prompt_id: str | None = None,
+) -> str | None:
+    """Issue #2848: the child's own final report text as delivered by the
+    Agent tool's ``tool_use_result.handbackReport.text``, used as an
+    ADDITIONAL marker-provenance input only when the correlated
+    ``SubagentStop`` payload carries no ``last_assistant_message`` (observed
+    missing on the measured Claude Code 2.1.285 execution path; the
+    ``handbackReport`` was still present there).
+
+    Shares ``_claude_agent_invocation_evidence`` with
+    ``_claude_agent_tool_invocation_correlated``. Returns the text only when
+    the invocation has no contradiction (terminal failure / ``is_error`` /
+    conflicting ``agentId`` on ANY result of the same ``tool_use_id``,
+    with or without a ``handbackReport``) and every valid report agrees on
+    the same non-empty text. Fails closed to ``None`` otherwise."""
+    evidence = _claude_agent_invocation_evidence(
+        stdout, agent_id, session_id=session_id, prompt_id=prompt_id
+    )
+    texts = evidence["report_texts"]
+    if not evidence["correlated"] or evidence["contradiction"]:
+        return None
+    if not texts or len(set(texts)) != 1:
         return None
     return texts[0]
 
@@ -3719,8 +3759,8 @@ def _marker_provenance_verified(
 
     Issue #2848: ``handback_report_text`` is the correlated Agent tool
     ``handbackReport.text`` (see ``_claude_agent_handback_report_text``),
-    consulted ONLY when ``last_assistant_message`` is absent/empty --
-    Claude Code 2.1.285 omits that key from the ``SubagentStop`` payload.
+    consulted ONLY when ``last_assistant_message`` is absent/empty (it was
+    missing on the measured Claude Code 2.1.285 execution path).
     Like ``last_assistant_message`` it is the child's own final report, so
     when it ALONE covers every expected marker the result is
     ``(True, False)`` (no transcript fallback). Otherwise the pre-existing
@@ -3856,7 +3896,8 @@ def subagent_causal_evidence_verdict(
         terminal_tool_result_success = tool_correlation["terminal_tool_result_success"]
 
         # Issue #2848: only when the correlated Stop carries no
-        # ``last_assistant_message`` (Claude Code 2.1.285), consult the
+        # ``last_assistant_message`` (missing on the measured Claude Code
+        # 2.1.285 execution path), consult the
         # correlated Agent tool ``handbackReport.text`` as an additional
         # provenance input. When ``last_assistant_message`` is present
         # nothing below differs from the pre-#2848 behaviour.
@@ -3996,7 +4037,8 @@ def subagent_causal_evidence_verdict(
     }
     # Issue #2848: additive audit field, emitted ONLY when marker provenance
     # was actually satisfied from the Agent tool ``handbackReport.text``
-    # (Claude Code 2.1.285 SubagentStop has no ``last_assistant_message``).
+    # (``last_assistant_message`` was missing on the measured Claude Code
+    # 2.1.285 execution path).
     # Absent otherwise, so every pre-#2848 verdict shape is unchanged.
     if marker_provenance_handback_report_used:
         verdict["marker_provenance_handback_report_used"] = True
