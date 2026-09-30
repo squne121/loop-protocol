@@ -717,7 +717,9 @@ carrier が与える authority の出所は、repository でレビューされ�
 
 - profile は closed enum で、初期値は `repair_proxy_hermetic_fixture` の 1 件だけである。
 - 固定 overlay は、runner の基底 overlay 定数（hooks と `permissions.deny`）に `autoMode.allow` として `"$defaults"` と固定 rule 1 件を足したものである。broad allow は含めず、`soft_deny` / `hard_deny` / `environment` の key は overlay に含めない。
-- carrier は native adapter かつ structured mode 専用で、`--expect-skill-command`・`--require-hook-chain-evidence`・`--hermetic-agent-definition` とは併用できない（第二の `--settings` や overlay の派生 variant の合成規則を定義しないため fail-closed とする）。
+- 固定 rule の文言は実装に即して次の内容を述べる。永続的な install 先は `CLAUDE_GPT_HOME` が指す fixture home（worktree 配下の `artifacts/runtime-smoke/` 以下）に限定される。repair の処理中は、ローカルの一時 file と一時 directory を作成して削除し、install 後にローカルで検証する。installer の取得元は repository 管理下の fixture（`file://`）であり、network installer は使わない。実際の user 領域の claude-gpt home は変更しない。「すべての書き込みが fixture home 配下に限られる」とは述べない。rule は module 定数であり、caller 由来の値は補間されない。
+- carrier は native adapter かつ structured mode 専用である。`--require-hook-chain-evidence` とは併用できる。runner が実際に選択した固定 observation overlay（hook-chain 用の `PreToolUse` / `Stop` を含む）の同じ object に carrier の `autoMode` を足し、子 session へ渡す `--settings` は 1 個だけとする。`SubagentStart` / `SubagentStop`、hook-chain の `PreToolUse` / `Stop`、`permissions.deny`、`crossSessionInbound`、`--setting-sources project` はそのまま保持される。選択された overlay に `autoMode` だけを足したもの以外の overlay は、子の起動前に拒否される。
+- 上記の合成は `--require-hook-chain-evidence` に限った狭い規則であり、汎用の overlay 合成 framework ではない。`--expect-skill-command`（overlay の派生 variant を使う）と `--hermetic-agent-definition`（別の settings file を使う）とは引き続き併用できず、合成規則を定義しないため fail-closed とする。
 - runner は子 session の起動前に、fixture installer の実体（regular file、symlink 不可、worktree 配下、git 追跡済み、未コミット変更なし）、`CLAUDE_GPT_REPAIR_INSTALLER_URL` の完全一致、`CLAUDE_GPT_HOME` の配置（worktree 配下の `artifacts/runtime-smoke/` 以下、symlink と `..` による逸脱なし）、override 変数の未設定を決定論的に検証し、不成立なら子 session を起動せず fail-closed で終了する。
 - 子 session の env は、検証済みの値で runner が明示的に組み立てて渡す。
 - audit として、evidence に `approval_carrier`（`profile_id`、`repo_head`、`overlay_sha256`、`fixture_git_blob_hash`、`fixture_unchanged`、検証済み precondition の要約）を記録する。flag を使わない run の argv と evidence は変わらない。
@@ -736,17 +738,23 @@ carrier の実 classifier に対する効果は、classifier の run-to-run vari
 uv run --locked python3 scripts/agent-ops/runtime_vc_approval_contract.py --issue-body-file <file>
 ```
 
-判定は次の順に評価し、最初に該当した行で確定する。行 (7a) は、宣言に無い、または registry に無い `--approval-profile` 値を持つ runner 行を `executable` と誤判定しないための補完である。
+carrier の適用は Issue 全体ではなく、VC の runner invocation（runner 行）ごとに判定する。承認に関係する invocation とは、signature（`CLAUDE_GPT_REPAIR_INSTALLER_URL=` の env prefix）を持つ、または `--approval-profile` を持つ runner 行である。承認に関係しない runner 行には、この checker 独自の shell 書式制限を課さない。片方の VC にだけ carrier が付いていても、別の承認対象 VC の付け忘れは検出される。
+
+command 行の解析は、サポートする小さな shell grammar に限った quote-aware な字句解析で行う（`shlex` の全面的な shell 解釈には依存しない）。引用符の種別を保持するため、二重引用符内および bare の `$PWD` は展開として受け付け、単引用符内および backslash escape の `$PWD` は literal（展開されない）として扱う。したがって `CLAUDE_GPT_HOME="$PWD/artifacts/..."` は有効だが、`CLAUDE_GPT_HOME='$PWD/artifacts/...'` は有効な fixture home として扱わない。`--claude-adapter "claude-gpt"` や `--mode "interactive"` のように引用符付きで書かれた flag 値も、引用符を外した値として判定する。`--expect-marker "A && B"` のように引用符内にある `&&` などは command 連結ではない。
+
+判定は次の順に評価し、最初に該当した行で確定する。行 (4a)・(6a)・(7a) は、承認が届かない、または run 時に拒否される契約を `executable` と誤判定しないための補完である。
 
 | 行 | 条件 | 結果 |
 |---|---|---|
-| 0 | runner 行に解釈できない構文（`;`・`&&`・`\|`・`bash -c`・`$PWD` 以外の変数展開など）がある | `non_executable` |
+| 0 | 承認に関係する runner 行に解釈できない構文（引用符の外の `;`・`&&`・`\|`・`>`・`<`、`bash -c`、`eval`、command substitution、`$PWD` 以外の変数展開など）がある | `non_executable` |
 | 1 | 宣言が無く、flag も承認が必要な signature（`repair_proxy.sh` 実行、`CLAUDE_GPT_REPAIR_INSTALLER_URL=` の env prefix）も無い | `not_applicable` |
 | 2 | 宣言が無いが flag または signature がある | `non_executable` |
 | 3 | 宣言が空・重複・未知の id を含む | `non_executable` |
 | 4 | 宣言された id に対応する runner 行が無い | `non_executable` |
+| 4a | signature を持つ runner 行に `--approval-profile` が無い（carrier の付け忘れ） | `non_executable` |
 | 5 | flag を持つ runner 行が AC に紐づかない | `non_executable` |
 | 6 | flag が `--claude-adapter claude-gpt` と併用されている | `non_executable` |
+| 6a | flag が structured 以外の `--mode` と併用されている | `non_executable` |
 | 7 | flag があるのに必須の env prefix が欠落または不一致 | `non_executable` |
 | 7a | flag の値が宣言に無い、または registry に無い | `non_executable` |
 | 8 | 上記のいずれにも該当しない | `executable` |

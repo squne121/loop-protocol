@@ -824,6 +824,66 @@ def _load_approval_contract():
     return module
 
 
+def select_native_observation_settings_json(
+    *, include_user_prompt_expansion_hook: bool = False,
+    include_hook_chain_evidence_hooks: bool = False,
+) -> str:
+    """Issue #2839 (PR #2844 OWNER fix_delta): native adapter が子 ``claude -p`` へ渡す固定
+    observation overlay (``--settings`` の JSON) を選択して返す唯一の関数。
+
+    ``run_structured_claude()`` と、approval carrier の overlay を組み立てる ``main()`` の
+    両方がこの関数を使うため、carrier は runner が実際に選択した overlay (hook-chain 用の
+    PreToolUse / Stop を含む) の同じ内容へ ``autoMode`` を足す形で合成される。
+    caller 由来の JSON / 文字列は受け取らない。"""
+    # Issue #2498 AC4: purely additive -- the extended settings JSON
+    # (adding a "UserPromptExpansion" hook registration) is used ONLY
+    # when the caller opted into ``--expect-skill-command``. Every
+    # pre-existing native-adapter caller (``include_user_prompt_
+    # expansion_hook`` defaults to ``False``) keeps getting the exact,
+    # byte-identical ``_CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON``
+    # this repository's own regression test pins to ``{"SubagentStart",
+    # "SubagentStop"}``.
+    settings_json = (
+        _CLAUDE_SPAWN_HOOK_OBSERVABILITY_WITH_USER_PROMPT_EXPANSION_SETTINGS_JSON
+        if include_user_prompt_expansion_hook
+        else _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON
+    )
+    # Issue #2663 AC1/AC2/AC3: purely additive, opt-in observation-only
+    # hook registration used ONLY when the caller passes
+    # ``--require-hook-chain-evidence``. This does NOT parse from a
+    # settings JSON re-derived at call time -- it mutates the SAME fixed
+    # constant dict (via json.loads/json.dumps) so every pre-existing
+    # caller (``include_hook_chain_evidence_hooks`` defaults to
+    # ``False``) keeps getting the exact, byte-identical settings_json
+    # selected above. The two ADDED groups are bounded and closed (no
+    # caller-supplied command/path/marker/config is ever accepted):
+    # - ``PreToolUse`` (matcher "Bash"): an additive ``cat`` observer
+    #   hook that echoes its own stdin verbatim, giving
+    #   ``evaluate_all_matching_hooks_observed`` a self-identifying
+    #   signature (Issue #2663 AC2) to positively exclude the observer
+    #   itself from the current-project-settings PreToolUse/Bash cohort
+    #   it is comparing against.
+    # - ``Stop`` (no matcher): the same additive ``cat`` observer
+    #   pattern, giving ``evaluate_sibling_side_effect_inventory``
+    #   (Issue #2663 AC3) the real ``stop_hook_active`` boolean the
+    #   runtime's own Stop hook payload carries, used ONLY to recognize
+    #   the documented valid-no-change condition -- never to read or
+    #   persist the surrounding raw hook payload (e.g.
+    #   ``last_assistant_message``, ``transcript_path``).
+    if include_hook_chain_evidence_hooks:
+        settings_obj = json.loads(settings_json)
+        hooks_obj = settings_obj.setdefault("hooks", {})
+        hooks_obj["PreToolUse"] = [
+            {
+                "matcher": _HOOK_CHAIN_EVIDENCE_TOOL,
+                "hooks": [{"type": "command", "command": "cat"}],
+            }
+        ]
+        hooks_obj["Stop"] = [{"hooks": [{"type": "command", "command": "cat"}]}]
+        settings_json = json.dumps(settings_obj)
+    return settings_json
+
+
 def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
                            max_turns: int, claude_bin: str = "claude",
                            claude_agent_name: str | None = None,
@@ -901,56 +961,23 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
         launch_env = os.environ.copy()
         launch_env["CLAUDE_GPT_RUNTIME_SMOKE_HOOKS"] = "subagent-start-stop"
     else:
-        # Issue #2498 AC4: purely additive -- the extended settings JSON
-        # (adding a "UserPromptExpansion" hook registration) is used ONLY
-        # when the caller opted into ``--expect-skill-command``. Every
-        # pre-existing native-adapter caller (``include_user_prompt_
-        # expansion_hook`` defaults to ``False``) keeps getting the exact,
-        # byte-identical ``_CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON``
-        # this repository's own regression test pins to ``{"SubagentStart",
-        # "SubagentStop"}``.
-        settings_json = (
-            _CLAUDE_SPAWN_HOOK_OBSERVABILITY_WITH_USER_PROMPT_EXPANSION_SETTINGS_JSON
-            if include_user_prompt_expansion_hook
-            else _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON
+        settings_json = select_native_observation_settings_json(
+            include_user_prompt_expansion_hook=include_user_prompt_expansion_hook,
+            include_hook_chain_evidence_hooks=include_hook_chain_evidence_hooks,
         )
-        # Issue #2663 AC1/AC2/AC3: purely additive, opt-in observation-only
-        # hook registration used ONLY when the caller passes
-        # ``--require-hook-chain-evidence``. This does NOT parse from a
-        # settings JSON re-derived at call time -- it mutates the SAME fixed
-        # constant dict (via json.loads/json.dumps) so every pre-existing
-        # caller (``include_hook_chain_evidence_hooks`` defaults to
-        # ``False``) keeps getting the exact, byte-identical settings_json
-        # selected above. The two ADDED groups are bounded and closed (no
-        # caller-supplied command/path/marker/config is ever accepted):
-        # - ``PreToolUse`` (matcher "Bash"): an additive ``cat`` observer
-        #   hook that echoes its own stdin verbatim, giving
-        #   ``evaluate_all_matching_hooks_observed`` a self-identifying
-        #   signature (Issue #2663 AC2) to positively exclude the observer
-        #   itself from the current-project-settings PreToolUse/Bash cohort
-        #   it is comparing against.
-        # - ``Stop`` (no matcher): the same additive ``cat`` observer
-        #   pattern, giving ``evaluate_sibling_side_effect_inventory``
-        #   (Issue #2663 AC3) the real ``stop_hook_active`` boolean the
-        #   runtime's own Stop hook payload carries, used ONLY to recognize
-        #   the documented valid-no-change condition -- never to read or
-        #   persist the surrounding raw hook payload (e.g.
-        #   ``last_assistant_message``, ``transcript_path``).
-        if include_hook_chain_evidence_hooks:
-            settings_obj = json.loads(settings_json)
-            hooks_obj = settings_obj.setdefault("hooks", {})
-            hooks_obj["PreToolUse"] = [
-                {
-                    "matcher": _HOOK_CHAIN_EVIDENCE_TOOL,
-                    "hooks": [{"type": "command", "command": "cat"}],
-                }
-            ]
-            hooks_obj["Stop"] = [{"hooks": [{"type": "command", "command": "cat"}]}]
-            settings_json = json.dumps(settings_obj)
         if approval_settings_json is not None:
-            # Issue #2839: registry 由来の固定 overlay に差し替える。基底の overlay 定数だけが
-            # 対象で、overlay の派生 variant を使う flag との併用は main() の precondition が
-            # 起動前に拒否している。
+            # Issue #2839: carrier の overlay は、上で選択した観測 overlay と同じ内容に
+            # ``autoMode`` だけを足したものでなければならない。それ以外 (観測 hooks の欠落や
+            # 任意 key の混入) は fail-closed で拒否し、``--settings`` は常に 1 個だけ渡す。
+            approval_obj = json.loads(approval_settings_json)
+            if (
+                not isinstance(approval_obj, dict)
+                or approval_obj.pop("autoMode", None) is None
+                or approval_obj != json.loads(settings_json)
+            ):
+                raise ValueError(
+                    "approval overlay must equal the selected observation overlay plus autoMode"
+                )
             settings_json = approval_settings_json
         if approval_child_env is not None:
             launch_env = dict(approval_child_env)
@@ -6841,7 +6868,6 @@ def main(argv: list[str] | None = None) -> int:
             mode=args.mode,
             incompatible_flags={
                 "expect_skill_command": bool(args.expect_skill_command),
-                "require_hook_chain_evidence": bool(args.require_hook_chain_evidence),
                 "hermetic_agent_definition": bool(args.hermetic_agent_definition),
             },
         )
@@ -6849,8 +6875,15 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(
                 f"--approval-profile precondition failed: {approval_verified['reason_code']}"
             )
+        # Issue #2839 (PR #2844 OWNER fix_delta): runner が実際に選択する観測 overlay
+        # (--require-hook-chain-evidence 時は PreToolUse / Stop を含む) に carrier の
+        # ``autoMode`` を足す。overlay を作り直さず、``--settings`` は 1 個のまま。
         approval_overlay_json = approval_mod.build_approval_overlay_json(
-            args.approval_profile, _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON
+            args.approval_profile,
+            select_native_observation_settings_json(
+                include_user_prompt_expansion_hook=bool(args.expect_skill_command),
+                include_hook_chain_evidence_hooks=bool(args.require_hook_chain_evidence),
+            ),
         )
         approval_child_env = approval_mod.build_approval_child_env(os.environ, approval_verified)
     # Issue #2219 fix_delta iteration 1 (Option B): the interactive lane's

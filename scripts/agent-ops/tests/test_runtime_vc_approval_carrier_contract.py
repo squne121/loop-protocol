@@ -159,6 +159,12 @@ def test_overlay_bounded_allow_single_rule(contract, runner):
     assert profile.fixture_relpath in rule
     assert "file://" in rule and "artifacts/runtime-smoke/" in rule
     assert "no network installer" in rule
+    # 書き込み先の説明は実装に即する: 永続 install 先だけが fixture home 配下で、処理中の一時
+    # file / directory の作成と削除を含む。実際の user 領域の claude-gpt home は変更しない。
+    assert "persistent install destination" in rule
+    assert "temporary files and directories" in rule
+    assert "is never modified" in rule
+    assert "writes only under" not in rule
 
 
 def test_overlay_defaults_preserved(contract, runner):
@@ -324,7 +330,7 @@ def test_precondition_fail_closed_cases(contract, tmp_path, case):
     assert verified["reason_code"] == reason, (case, verified)
 
 
-@pytest.mark.parametrize("flag", ["expect_skill_command", "require_hook_chain_evidence", "hermetic_agent_definition"])
+@pytest.mark.parametrize("flag", ["expect_skill_command", "hermetic_agent_definition"])
 def test_precondition_fail_closed_incompatible_flag(contract, tmp_path, flag):
     _, worktree = _standin_repo(tmp_path, contract)
     verified = _verify(contract, worktree, _good_env(contract, worktree), incompatible_flags={flag: True})
@@ -332,9 +338,16 @@ def test_precondition_fail_closed_incompatible_flag(contract, tmp_path, flag):
 
 
 def test_precondition_fail_closed_incompatible_flag_list_is_closed(contract):
-    assert contract.INCOMPATIBLE_RUNNER_FLAGS == (
-        "expect_skill_command", "require_hook_chain_evidence", "hermetic_agent_definition",
-    )
+    # --require-hook-chain-evidence は PR #2844 の OWNER review で併用可へ訂正した (固定 overlay の
+    # 同一 object に autoMode を足す)。overlay の派生 variant / hermetic settings は fail-closed のまま。
+    assert contract.INCOMPATIBLE_RUNNER_FLAGS == ("expect_skill_command", "hermetic_agent_definition")
+
+
+def test_precondition_fail_closed_hook_chain_evidence_flag_is_compatible(contract, tmp_path):
+    _, worktree = _standin_repo(tmp_path, contract)
+    verified = _verify(contract, worktree, _good_env(contract, worktree),
+                       incompatible_flags={"require_hook_chain_evidence": True})
+    assert verified["ok"] is True, verified
 
 
 def test_precondition_fail_closed_child_env_exact(contract, tmp_path):
@@ -491,6 +504,108 @@ def test_argv_unchanged_without_profile(contract, runner, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# PR #2844 OWNER fix_delta (P1): --require-hook-chain-evidence との合成
+# ---------------------------------------------------------------------------
+
+# #2810 の現行 AC10 と同じ flag 構成 (consumer command shape)。
+AC10_SHAPE_FLAGS = (
+    "--agent-type", "implementation-worker",
+    "--require-subagent-causal-evidence", "--require-min-subagents", "1",
+    "--require-hook-chain-evidence",
+    "--require-observed-runtime-field", "effective_permission_profile",
+    "--require-clean-postcondition",
+    "--approval-profile", PROFILE_ID,
+)
+
+
+def test_hook_chain_evidence_composition_ac10_shape_reaches_child_with_one_settings(contract, runner, tmp_path):
+    repo, worktree = _standin_repo(tmp_path, contract)
+    argv_marker, env_marker = tmp_path / "argv", tmp_path / "env"
+    fake = tmp_path / "claude"
+    _write_fake_claude(fake, argv_marker, env_marker)
+    env = {**os.environ, **_good_env(contract, worktree)}
+    evidence = tmp_path / "evidence.json"
+    result = _run_runner(repo, worktree, tmp_path, env, *AC10_SHAPE_FLAGS, claude_bin=fake, evidence=evidence)
+    # precondition は通る (parser.error の exit 2 ではない)。fake claude は causal evidence を
+    # 出さないので run 自体の判定は PASS にならなくてよい。ここで見るのは child が受け取る argv。
+    assert result.returncode != 2, result.stderr
+    assert "incompatible_flag" not in result.stderr
+    assert argv_marker.exists(), "child claude must be launched when the AC10-shaped precondition passes"
+    argv = argv_marker.read_text(encoding="utf-8").splitlines()
+    assert argv.count("--settings") == 1
+    assert argv.count("--setting-sources") == 1
+    assert argv[argv.index("--setting-sources") + 1] == "project"
+    settings = json.loads(argv[argv.index("--settings") + 1])
+    # 観測 hooks と carrier の autoMode が同一 settings に共存する。
+    hooks = settings["hooks"]
+    assert set(hooks) == {"SubagentStart", "SubagentStop", "PreToolUse", "Stop"}
+    assert hooks["PreToolUse"][0]["matcher"] == runner._HOOK_CHAIN_EVIDENCE_TOOL
+    assert hooks["PreToolUse"][0]["hooks"] == [{"type": "command", "command": "cat"}]
+    assert hooks["Stop"] == [{"hooks": [{"type": "command", "command": "cat"}]}]
+    rule = contract.get_approval_profile(PROFILE_ID).allow_rule
+    assert settings["autoMode"] == {"allow": ["$defaults", rule]}
+    # 固定値は保持される。
+    assert settings["permissions"] == {"deny": ["SendMessage", "ListAgents"]}
+    assert settings["crossSessionInbound"] == "refuse"
+    # 任意の caller settings は混入しない (許可される key は固定 overlay のものだけ)。
+    assert set(settings) == {"crossSessionInbound", "permissions", "hooks", "autoMode"}
+    for forbidden in ("soft_deny", "hard_deny", "environment"):
+        assert forbidden not in settings["autoMode"]
+    # runner が選択した overlay に autoMode を足しただけである。
+    selected = json.loads(runner.select_native_observation_settings_json(include_hook_chain_evidence_hooks=True))
+    settings.pop("autoMode")
+    assert settings == selected
+    # audit の hash は child が受け取った settings と一致する。
+    carrier = json.loads(evidence.read_text(encoding="utf-8"))["approval_carrier"]
+    assert carrier["overlay_sha256"] == hashlib.sha256(
+        argv[argv.index("--settings") + 1].encode("utf-8")
+    ).hexdigest()
+
+
+def test_overlay_hook_chain_evidence_selected_overlay_default_is_byte_identical(runner):
+    assert runner.select_native_observation_settings_json() == runner._CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON
+
+
+def test_overlay_hook_chain_evidence_composition_rejects_mismatched_overlay(contract, runner, tmp_path):
+    """no_generic_passthrough: run_structured_claude は、選択された overlay + autoMode 以外の
+    approval overlay (観測 hooks の欠落・任意 key の混入) を子の起動前に拒否する。"""
+    base_only = contract.build_approval_overlay_json(PROFILE_ID, _base_overlay(runner))
+    with pytest.raises(ValueError, match="selected observation overlay"):
+        # hook-chain lane を要求しているのに、hook-chain hooks を持たない overlay (置換で hooks を失う)。
+        runner.run_structured_claude(
+            str(tmp_path), "p", 5, 1, approval_settings_json=base_only,
+            include_hook_chain_evidence_hooks=True,
+        )
+    selected = runner.select_native_observation_settings_json(include_hook_chain_evidence_hooks=True)
+    injected = json.loads(contract.build_approval_overlay_json(PROFILE_ID, selected))
+    injected["permissions"]["allow"] = ["Bash(*)"]
+    with pytest.raises(ValueError, match="selected observation overlay"):
+        runner.run_structured_claude(
+            str(tmp_path), "p", 5, 1, approval_settings_json=json.dumps(injected),
+            include_hook_chain_evidence_hooks=True,
+        )
+    with pytest.raises(ValueError, match="selected observation overlay"):
+        runner.run_structured_claude(  # autoMode を持たない overlay は carrier ではない
+            str(tmp_path), "p", 5, 1, approval_settings_json=selected,
+            include_hook_chain_evidence_hooks=True,
+        )
+
+
+@pytest.mark.parametrize("extra", [("--expect-skill-command", "x"), ("--hermetic-agent-definition",)])
+def test_precondition_fail_closed_runner_rejects_other_composition_flags(contract, tmp_path, extra):
+    """generic な overlay 合成には広げない: --expect-skill-command / --hermetic-agent-definition は
+    引き続き carrier と併用できず、child を起動しない。"""
+    repo, worktree = _standin_repo(tmp_path, contract)
+    argv_marker, env_marker = tmp_path / "argv", tmp_path / "env"
+    fake = tmp_path / "claude"
+    _write_fake_claude(fake, argv_marker, env_marker)
+    env = {**os.environ, **_good_env(contract, worktree)}
+    result = _run_runner(repo, worktree, tmp_path, env, "--approval-profile", PROFILE_ID, *extra, claude_bin=fake)
+    assert result.returncode == 2, result.stderr
+    assert not argv_marker.exists()
+
+
+# ---------------------------------------------------------------------------
 # AC6: checker (判定表の行と 1 対 1)
 # ---------------------------------------------------------------------------
 
@@ -533,7 +648,9 @@ def _cases(contract):
     return {
         "row0": (_body(DECL, good + " ; echo hi"), "row0_unparseable_runner_line"),
         "row0_bash_c": (
-            _body(DECL, "# AC9\n$ bash -c 'uv run python3 scripts/agent-ops/run_worktree_agent_runtime_smoke.py'"),
+            # 承認に関係する (carrier flag を含む) invocation が bash -c に包まれている場合は fail-closed。
+            _body(DECL, "# AC9\n$ bash -c 'uv run python3 scripts/agent-ops/run_worktree_agent_runtime_smoke.py "
+                        f"--approval-profile {PROFILE_ID}'"),
             "row0_unparseable_runner_line",
         ),
         "row2_flag": (_body(None, good), "row2_flag_or_signature_without_declaration"),
@@ -595,3 +712,229 @@ def test_non_executable_contract_detected_cli_exit_codes(contract, tmp_path):
     assert run(bad).returncode == 1
     assert run(good).returncode == 0
     assert run(tmp_path / "missing.md").returncode == 2
+
+
+# ---------------------------------------------------------------------------
+# PR #2844 OWNER fix_delta (P2a / P2b): invocation 単位の適用判定と quote-aware parser
+# ---------------------------------------------------------------------------
+
+REL = ".claude/skills/impl-review-loop/tests/fixtures/fake_proxy_installer.sh"
+RUNNER_PATH = "scripts/agent-ops/run_worktree_agent_runtime_smoke.py"
+GOOD_PREFIX = (
+    f"CLAUDE_GPT_HOME=$PWD/artifacts/runtime-smoke/fixture-home-deny "
+    f"CLAUDE_GPT_REPAIR_INSTALLER_URL=file://$PWD/{REL} "
+)
+
+
+def _runner_cmd(ac: str | None, *, prefix: str = GOOD_PREFIX, flags: str = "--mode structured",
+                carrier: str | None = PROFILE_ID) -> str:
+    """runner 1 行 (AC コメント付き) を組み立てる。``flags`` / ``prefix`` は生の shell text。"""
+    head = f"# {ac}\n" if ac else ""
+    tail = f" --approval-profile {carrier}" if carrier else ""
+    return (
+        f"{head}$ {prefix}uv run --locked python3 {RUNNER_PATH} --runtime claude "
+        f'--worktree "$PWD" --prompt-file p.md --output-dir o {flags}{tail}'
+    )
+
+
+def _check(contract, *vcs: str, decl: str | None = DECL) -> dict:
+    return contract.check_runtime_vc_approval_contract(_body(decl, "\n\n".join(vcs)))
+
+
+# --- P2a: invocation 単位 ---------------------------------------------------
+
+
+def test_per_invocation_ac9_ok_ac10_carrier_missing_is_non_executable(contract):
+    ac10 = _runner_cmd("AC10", flags="--mode structured --require-hook-chain-evidence", carrier=None)
+    verdict = _check(contract, _runner_cmd("AC9"), ac10)
+    assert verdict["status"] == "non_executable"
+    assert verdict["row"] == "row4a_signature_runner_line_without_flag"
+
+
+def test_per_invocation_reverse_order_ac9_missing_ac10_ok_is_non_executable(contract):
+    ac9 = _runner_cmd("AC9", carrier=None)
+    verdict = _check(contract, ac9, _runner_cmd("AC10", flags="--mode structured --require-hook-chain-evidence"))
+    assert verdict["status"] == "non_executable"
+    assert verdict["row"] == "row4a_signature_runner_line_without_flag"
+
+
+def test_per_invocation_both_ok_is_executable(contract):
+    ac10 = _runner_cmd("AC10", flags="--mode structured --require-hook-chain-evidence --evidence-json e.json")
+    verdict = _check(contract, _runner_cmd("AC9", flags='--mode structured --expect-marker "A && B"'), ac10)
+    assert verdict == {"status": "executable", "row": "row8_executable", "reason_codes": []}
+
+
+def test_per_invocation_approval_free_runner_line_alongside_carrier_line_is_not_enforced(contract):
+    plain = _runner_cmd("AC1", prefix="", flags='--mode structured --expect-marker "x ; y && z"', carrier=None)
+    verdict = _check(contract, plain, _runner_cmd("AC9"))
+    assert verdict == {"status": "executable", "row": "row8_executable", "reason_codes": []}
+
+
+def test_per_invocation_approval_free_issue_reaches_not_applicable_despite_quoted_operators(contract):
+    plain = _runner_cmd("AC9", prefix="", flags='--mode structured --expect-marker "A && B" --expect-marker "a | b; c"',
+                        carrier=None)
+    verdict = _check(contract, plain, decl=None)
+    assert verdict == {"status": "not_applicable", "row": "row1_not_applicable", "reason_codes": []}
+
+
+def test_per_invocation_irrelevant_line_with_real_shell_syntax_is_not_rejected(contract):
+    # 承認に関係しない invocation には、この checker 独自の shell 書式制限を課さない。
+    for tail in ("&& echo done", "; echo done", "| tee out.log", "> out.log", "$(date)", "`date`"):
+        plain = _runner_cmd("AC9", prefix="", flags=f"--mode structured {tail}", carrier=None)
+        verdict = _check(contract, plain, decl=None)
+        assert verdict["status"] == "not_applicable", (tail, verdict)
+
+
+def test_per_invocation_non_runner_lines_mentioning_the_runner_file_are_ignored(contract):
+    rg_line = f"# AC1\n$ rg -n approval {RUNNER_PATH} && echo ok"
+    pytest_line = "# AC2\n$ uv run --locked pytest scripts/agent-ops/tests/test_run_worktree_agent_runtime_smoke.py -q"
+    assert _check(contract, rg_line, pytest_line, decl=None)["status"] == "not_applicable"
+
+
+def test_per_invocation_signature_without_flag_and_without_declaration_is_row2(contract):
+    verdict = _check(contract, _runner_cmd("AC9", carrier=None), decl=None)
+    assert verdict["row"] == "row2_flag_or_signature_without_declaration"
+
+
+# --- P2b: quote-aware parser ------------------------------------------------
+
+
+def test_quote_aware_double_quoted_pwd_expansion_is_accepted(contract):
+    prefix = (
+        'CLAUDE_GPT_HOME="$PWD/artifacts/runtime-smoke/fixture-home-deny" '
+        f'CLAUDE_GPT_REPAIR_INSTALLER_URL="file://$PWD/{REL}" '
+    )
+    assert _check(contract, _runner_cmd("AC9", prefix=prefix))["status"] == "executable"
+    braced = prefix.replace("$PWD/", "${PWD}/")
+    assert _check(contract, _runner_cmd("AC9", prefix=braced))["status"] == "executable"
+
+
+def test_quote_aware_single_quoted_pwd_is_literal_not_expanded(contract):
+    home_single = (
+        "CLAUDE_GPT_HOME='$PWD/artifacts/runtime-smoke/fixture-home-deny' "
+        f"CLAUDE_GPT_REPAIR_INSTALLER_URL=file://$PWD/{REL} "
+    )
+    verdict = _check(contract, _runner_cmd("AC9", prefix=home_single))
+    assert verdict["status"] == "non_executable"
+    assert verdict["row"] == "row7_env_prefix_missing_or_mismatch"
+    url_single = (
+        "CLAUDE_GPT_HOME=$PWD/artifacts/runtime-smoke/fixture-home-deny "
+        f"CLAUDE_GPT_REPAIR_INSTALLER_URL='file://$PWD/{REL}' "
+    )
+    verdict = _check(contract, _runner_cmd("AC9", prefix=url_single))
+    assert verdict["row"] == "row7_env_prefix_missing_or_mismatch"
+    escaped = GOOD_PREFIX.replace("=$PWD", "=\\$PWD", 1)
+    assert _check(contract, _runner_cmd("AC9", prefix=escaped))["row"] == "row7_env_prefix_missing_or_mismatch"
+
+
+def test_quote_aware_quoted_env_assignment_word_is_not_an_assignment(contract):
+    prefix = '"CLAUDE_GPT_HOME=$PWD/artifacts/runtime-smoke/fixture-home-deny" ' + GOOD_PREFIX.split(" ", 1)[1]
+    assert _check(contract, _runner_cmd("AC9", prefix=prefix))["row"] == "row7_env_prefix_missing_or_mismatch"
+
+
+@pytest.mark.parametrize("adapter", [
+    '--claude-adapter "claude-gpt"', "--claude-adapter 'claude-gpt'", "--claude-adapter=claude-gpt",
+    '--claude-adapter="claude-gpt"', "--claude-adapter claude-gpt",
+])
+def test_quote_aware_claude_adapter_claude_gpt_is_recognized(contract, adapter):
+    verdict = _check(contract, _runner_cmd("AC9", flags=f"--mode structured {adapter} --claude-bin x"))
+    assert verdict["status"] == "non_executable"
+    assert verdict["row"] == "row6_flag_with_claude_gpt_adapter"
+
+
+@pytest.mark.parametrize("mode", [
+    '--mode "interactive"', "--mode 'interactive'", "--mode=interactive", "--mode interactive",
+])
+def test_quote_aware_non_structured_mode_is_recognized_with_carrier(contract, mode):
+    verdict = _check(contract, _runner_cmd("AC9", flags=mode))
+    assert verdict["status"] == "non_executable"
+    assert verdict["row"] == "row6a_flag_with_non_structured_mode"
+
+
+@pytest.mark.parametrize("mode", ['--mode "structured"', "--mode='structured'"])
+def test_quote_aware_quoted_structured_mode_is_accepted(contract, mode):
+    assert _check(contract, _runner_cmd("AC9", flags=mode))["status"] == "executable"
+
+
+def test_quote_aware_quoted_profile_value_is_recognized(contract):
+    line = _runner_cmd("AC9", carrier=None) + f' --approval-profile "{PROFILE_ID}"'
+    assert _check(contract, line)["status"] == "executable"
+    line = _runner_cmd("AC9", carrier=None) + " --approval-profile='typo'"
+    verdict = _check(contract, _runner_cmd("AC9"), line.replace("# AC9", "# AC10"))
+    assert verdict["row"] == "row7a_unknown_or_undeclared_flag_value"
+
+
+def test_quote_aware_quoted_operator_in_relevant_line_is_not_chaining(contract):
+    flags = '--mode structured --expect-marker "A && B" --expect-marker \'x ; y | z\' --expect-marker "eval bash -c"'
+    assert _check(contract, _runner_cmd("AC9", flags=flags))["status"] == "executable"
+
+
+@pytest.mark.parametrize("flags", [
+    "--mode structured ; echo hi", "--mode structured && echo hi", "--mode structured || true",
+    "--mode structured | tee out", "--mode structured > out.log", "--mode structured $(date)",
+    "--mode structured `date`", '--mode structured "$(date)"', "--mode structured --x $HOME",
+    '--mode structured --x "$OTHER"', "--mode structured & sleep 1",
+])
+def test_quote_aware_real_shell_syntax_in_relevant_line_is_fail_closed(contract, flags):
+    verdict = _check(contract, _runner_cmd("AC9", flags=flags))
+    assert verdict["status"] == "non_executable"
+    assert verdict["row"] == "row0_unparseable_runner_line"
+
+
+def test_quote_aware_bash_c_and_eval_in_relevant_line_are_fail_closed(contract):
+    inner = _runner_cmd("AC9").split("\n", 1)[1][2:]
+    bash_c = "# AC9\n$ bash -c " + repr(inner)
+    eval_line = f"# AC9\n$ eval {inner}"
+    for vc in (bash_c, eval_line):
+        verdict = _check(contract, vc)
+        assert verdict["status"] == "non_executable" and verdict["row"] == "row0_unparseable_runner_line", vc
+
+
+def test_quote_aware_bash_c_without_approval_relevance_is_not_rejected(contract):
+    vc = f"# AC9\n$ bash -c 'uv run python3 {RUNNER_PATH} --runtime claude --mode structured'"
+    assert _check(contract, vc, decl=None)["status"] == "not_applicable"
+
+
+def test_quote_aware_command_substitution_in_env_prefix_is_fail_closed_when_relevant(contract):
+    prefix = GOOD_PREFIX.replace("$PWD/artifacts", "$(pwd)/artifacts", 1)
+    verdict = _check(contract, _runner_cmd("AC9", prefix=prefix))
+    assert verdict["row"] == "row0_unparseable_runner_line"
+
+
+def test_quote_aware_lexer_records_quote_provenance(contract):
+    words, unsupported = contract._lex_words(
+        'A="$PWD/x" B=\'$PWD/x\' C=$PWD/x D=\\$PWD/x "quoted flag" \'\' plain'
+    )
+    assert unsupported == []
+    templates = [w["template"] for w in words]
+    pwd = contract._PWD
+    assert templates == [f"A={pwd}/x", "B=$PWD/x", f"C={pwd}/x", "D=$PWD/x", "quoted flag", "", "plain"]
+    assert words[0]["bare_head"] == "A=" and words[1]["bare_head"] == "B="
+    assert words[4]["bare_head"] == ""
+    _, unsupported = contract._lex_words("a ; b && c | d")
+    assert unsupported.count("operator:;") == 1 and "operator:|" in unsupported
+    _, unsupported = contract._lex_words("a 'unterminated")
+    assert "unterminated_single_quote" in unsupported
+
+
+def test_quote_aware_declaration_accepts_quoted_ids_without_strip_hack(contract):
+    for decl in (f"approval_required_actions: ['{PROFILE_ID}']", f'approval_required_actions: ["{PROFILE_ID}"]'):
+        assert _check(contract, _runner_cmd("AC9"), decl=decl)["status"] == "executable", decl
+    for decl in (f"approval_required_actions: ['{PROFILE_ID}\"]", f"approval_required_actions: [{PROFILE_ID},]"):
+        assert _check(contract, _runner_cmd("AC9"), decl=decl)["row"] == "row3_declaration_invalid", decl
+
+
+def test_quote_aware_ac10_consumer_command_shape_is_executable(contract):
+    """#2810 現行 AC10 の command shape (hook-chain evidence 併用) を executable と判定する。"""
+    ac10 = (
+        "# AC10\n$ CLAUDE_GPT_HOME=$PWD/artifacts/runtime-smoke/fixture-home-deny "
+        f"CLAUDE_GPT_REPAIR_INSTALLER_URL=file://$PWD/{REL} "
+        f"uv run --locked python3 {RUNNER_PATH} --runtime claude --mode structured "
+        '--worktree "$PWD" --prompt-file p.md --output-dir o --evidence-json e.json '
+        "--timeout-seconds 300 --max-turns 8 --agent-type implementation-worker "
+        "--require-subagent-causal-evidence --require-min-subagents 1 --require-hook-chain-evidence "
+        "--require-observed-runtime-field effective_permission_profile --require-clean-postcondition "
+        f"--approval-profile {PROFILE_ID}"
+    )
+    ac9 = _runner_cmd("AC9", flags='--mode structured --expect-marker "repair OK && verified"')
+    assert _check(contract, ac9, ac10) == {"status": "executable", "row": "row8_executable", "reason_codes": []}
