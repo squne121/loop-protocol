@@ -50,8 +50,11 @@ _REFERENCE_ONLY_MARKERS = (
 # words (`参照` / `比較` are deliberately NOT markers: they appear in ordinary
 # technical nouns such as `参照カウント` / `比較ロジック`). Unlike the English
 # markers above (whole-prompt substring match, behavior unchanged), a Japanese
-# marker only demotes the references that sit in the SAME clause (see
-# ``_clause_spans``); a reference in another clause stays a primary candidate.
+# marker only demotes the references that sit in the marker's own local
+# segment: a clause is further split on `、` / ASCII `,`, and only references
+# in the same segment as the marker are demoted. A reference in another
+# segment/clause stays a primary candidate. The generic ``_clause_spans``
+# semantics are unchanged (the extra split is marker-specific).
 _JA_REFERENCE_ONLY_MARKERS = ("参考", "関連資料")
 
 _FENCED_CODE_RE = re.compile(r"```.*?```", re.DOTALL)
@@ -251,8 +254,10 @@ def classify(prompt: str, *, current_repo: str | None = None) -> Classification:
     rebind never happens for these, only PASS + advisory).
 
     Issue #2827: Japanese reference-only markers (``参考`` / ``関連資料``)
-    demote only the same-clause references before the primary count is taken;
-    when every reference is demoted the prompt is REFERENCE_ONLY."""
+    demote only the references in the marker's own local segment (a clause
+    further split on `、` / ASCII `,`; the generic ``_clause_spans`` semantics
+    are unchanged) before the primary count is taken; when every reference is
+    demoted the prompt is REFERENCE_ONLY."""
     if prompt is None:
         prompt = ""
 
