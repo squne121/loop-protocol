@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -107,6 +108,11 @@ _PUBLIC_EVIDENCE_SHA_LENGTHS = {
     ("resolved_executable_sha256",): 64,
     ("mutation_boundary", "settings_digest_sha256"): 64,
     ("settings_provenance", "digest_sha256"): 64,
+    # Issue #2839: ``--approval-profile`` を使った run に限り evidence に載る
+    # ``approval_carrier`` の公開 hash (git の commit / blob hash と overlay の sha256)。
+    ("approval_carrier", "repo_head"): 40,
+    ("approval_carrier", "overlay_sha256"): 64,
+    ("approval_carrier", "fixture_git_blob_hash"): 40,
 }
 
 # Issue #2421: ``resolved_executable`` must never persist a raw absolute
@@ -795,6 +801,89 @@ def _task_context_env_pairs(
     return pairs
 
 
+_APPROVAL_CONTRACT_MODULE_NAME = "runtime_vc_approval_contract_for_runner"
+
+
+def _load_approval_contract():
+    """Issue #2839: 兄弟 module ``runtime_vc_approval_contract.py`` を file path で読み込む。
+
+    approval carrier の registry / overlay / precondition の唯一の定義はその module にあり、
+    runner はここで読み込んだ定数を使うだけである (二重定義しない)。共有 pytest session で
+    同名 module と衝突しないよう、一意な module 名で ``sys.modules`` に登録する。
+    """
+    module = sys.modules.get(_APPROVAL_CONTRACT_MODULE_NAME)
+    if module is not None:
+        return module
+    path = Path(__file__).resolve().parent / "runtime_vc_approval_contract.py"
+    spec = importlib.util.spec_from_file_location(_APPROVAL_CONTRACT_MODULE_NAME, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_APPROVAL_CONTRACT_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def select_native_observation_settings_json(
+    *, include_user_prompt_expansion_hook: bool = False,
+    include_hook_chain_evidence_hooks: bool = False,
+) -> str:
+    """Issue #2839 (PR #2844 OWNER fix_delta): native adapter が子 ``claude -p`` へ渡す固定
+    observation overlay (``--settings`` の JSON) を選択して返す唯一の関数。
+
+    ``run_structured_claude()`` と、approval carrier の overlay を組み立てる ``main()`` の
+    両方がこの関数を使うため、carrier は runner が実際に選択した overlay (hook-chain 用の
+    PreToolUse / Stop を含む) の同じ内容へ ``autoMode`` を足す形で合成される。
+    caller 由来の JSON / 文字列は受け取らない。"""
+    # Issue #2498 AC4: purely additive -- the extended settings JSON
+    # (adding a "UserPromptExpansion" hook registration) is used ONLY
+    # when the caller opted into ``--expect-skill-command``. Every
+    # pre-existing native-adapter caller (``include_user_prompt_
+    # expansion_hook`` defaults to ``False``) keeps getting the exact,
+    # byte-identical ``_CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON``
+    # this repository's own regression test pins to ``{"SubagentStart",
+    # "SubagentStop"}``.
+    settings_json = (
+        _CLAUDE_SPAWN_HOOK_OBSERVABILITY_WITH_USER_PROMPT_EXPANSION_SETTINGS_JSON
+        if include_user_prompt_expansion_hook
+        else _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON
+    )
+    # Issue #2663 AC1/AC2/AC3: purely additive, opt-in observation-only
+    # hook registration used ONLY when the caller passes
+    # ``--require-hook-chain-evidence``. This does NOT parse from a
+    # settings JSON re-derived at call time -- it mutates the SAME fixed
+    # constant dict (via json.loads/json.dumps) so every pre-existing
+    # caller (``include_hook_chain_evidence_hooks`` defaults to
+    # ``False``) keeps getting the exact, byte-identical settings_json
+    # selected above. The two ADDED groups are bounded and closed (no
+    # caller-supplied command/path/marker/config is ever accepted):
+    # - ``PreToolUse`` (matcher "Bash"): an additive ``cat`` observer
+    #   hook that echoes its own stdin verbatim, giving
+    #   ``evaluate_all_matching_hooks_observed`` a self-identifying
+    #   signature (Issue #2663 AC2) to positively exclude the observer
+    #   itself from the current-project-settings PreToolUse/Bash cohort
+    #   it is comparing against.
+    # - ``Stop`` (no matcher): the same additive ``cat`` observer
+    #   pattern, giving ``evaluate_sibling_side_effect_inventory``
+    #   (Issue #2663 AC3) the real ``stop_hook_active`` boolean the
+    #   runtime's own Stop hook payload carries, used ONLY to recognize
+    #   the documented valid-no-change condition -- never to read or
+    #   persist the surrounding raw hook payload (e.g.
+    #   ``last_assistant_message``, ``transcript_path``).
+    if include_hook_chain_evidence_hooks:
+        settings_obj = json.loads(settings_json)
+        hooks_obj = settings_obj.setdefault("hooks", {})
+        hooks_obj["PreToolUse"] = [
+            {
+                "matcher": _HOOK_CHAIN_EVIDENCE_TOOL,
+                "hooks": [{"type": "command", "command": "cat"}],
+            }
+        ]
+        hooks_obj["Stop"] = [{"hooks": [{"type": "command", "command": "cat"}]}]
+        settings_json = json.dumps(settings_obj)
+    return settings_json
+
+
 def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
                            max_turns: int, claude_bin: str = "claude",
                            claude_agent_name: str | None = None,
@@ -805,8 +894,15 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
                            include_hook_chain_evidence_hooks: bool = False,
                            task_context_scope: str | None = None,
                            task_context_state_root: str | None = None,
+                           approval_settings_json: str | None = None,
+                           approval_child_env: dict[str, str] | None = None,
                            ) -> tuple[int | None, str, str, bool]:
-    """Issue #2174 AC1 fix_delta (OWNER REQUEST_CHANGES
+    """Issue #2839: ``approval_settings_json`` / ``approval_child_env`` は
+    ``--approval-profile`` 使用時にだけ main() が渡す、registry 由来の固定 overlay と、
+    検証済みの値で明示的に組み立てた子 env である。どちらも既定 ``None`` で、未指定の
+    呼び出しの argv と env は変更前と byte-identical に保たれる。
+
+    Issue #2174 AC1 fix_delta (OWNER REQUEST_CHANGES
     https://github.com/squne121/loop-protocol/issues/2174#issuecomment-5302215173):
     ``claude_adapter`` is the ONLY input that decides launcher-specific argv
     shape / env-var injection -- never ``bool(claude_bin)`` alone (the prior
@@ -858,55 +954,33 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
     # ``--settings <JSON>`` flag unchanged (AC6 backward compatibility).
     launch_env = None
     if claude_adapter == "claude-gpt":
+        if approval_settings_json is not None or approval_child_env is not None:
+            # Issue #2839: launcher は ``--settings`` を policy-weakening flag として拒否する
+            # ため、carrier は native adapter 専用である (呼び出し側の precondition の二重防御)。
+            raise ValueError("approval carrier requires the native adapter")
         launch_env = os.environ.copy()
         launch_env["CLAUDE_GPT_RUNTIME_SMOKE_HOOKS"] = "subagent-start-stop"
     else:
-        # Issue #2498 AC4: purely additive -- the extended settings JSON
-        # (adding a "UserPromptExpansion" hook registration) is used ONLY
-        # when the caller opted into ``--expect-skill-command``. Every
-        # pre-existing native-adapter caller (``include_user_prompt_
-        # expansion_hook`` defaults to ``False``) keeps getting the exact,
-        # byte-identical ``_CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON``
-        # this repository's own regression test pins to ``{"SubagentStart",
-        # "SubagentStop"}``.
-        settings_json = (
-            _CLAUDE_SPAWN_HOOK_OBSERVABILITY_WITH_USER_PROMPT_EXPANSION_SETTINGS_JSON
-            if include_user_prompt_expansion_hook
-            else _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON
+        settings_json = select_native_observation_settings_json(
+            include_user_prompt_expansion_hook=include_user_prompt_expansion_hook,
+            include_hook_chain_evidence_hooks=include_hook_chain_evidence_hooks,
         )
-        # Issue #2663 AC1/AC2/AC3: purely additive, opt-in observation-only
-        # hook registration used ONLY when the caller passes
-        # ``--require-hook-chain-evidence``. This does NOT parse from a
-        # settings JSON re-derived at call time -- it mutates the SAME fixed
-        # constant dict (via json.loads/json.dumps) so every pre-existing
-        # caller (``include_hook_chain_evidence_hooks`` defaults to
-        # ``False``) keeps getting the exact, byte-identical settings_json
-        # selected above. The two ADDED groups are bounded and closed (no
-        # caller-supplied command/path/marker/config is ever accepted):
-        # - ``PreToolUse`` (matcher "Bash"): an additive ``cat`` observer
-        #   hook that echoes its own stdin verbatim, giving
-        #   ``evaluate_all_matching_hooks_observed`` a self-identifying
-        #   signature (Issue #2663 AC2) to positively exclude the observer
-        #   itself from the current-project-settings PreToolUse/Bash cohort
-        #   it is comparing against.
-        # - ``Stop`` (no matcher): the same additive ``cat`` observer
-        #   pattern, giving ``evaluate_sibling_side_effect_inventory``
-        #   (Issue #2663 AC3) the real ``stop_hook_active`` boolean the
-        #   runtime's own Stop hook payload carries, used ONLY to recognize
-        #   the documented valid-no-change condition -- never to read or
-        #   persist the surrounding raw hook payload (e.g.
-        #   ``last_assistant_message``, ``transcript_path``).
-        if include_hook_chain_evidence_hooks:
-            settings_obj = json.loads(settings_json)
-            hooks_obj = settings_obj.setdefault("hooks", {})
-            hooks_obj["PreToolUse"] = [
-                {
-                    "matcher": _HOOK_CHAIN_EVIDENCE_TOOL,
-                    "hooks": [{"type": "command", "command": "cat"}],
-                }
-            ]
-            hooks_obj["Stop"] = [{"hooks": [{"type": "command", "command": "cat"}]}]
-            settings_json = json.dumps(settings_obj)
+        if approval_settings_json is not None:
+            # Issue #2839: carrier の overlay は、上で選択した観測 overlay と同じ内容に
+            # ``autoMode`` だけを足したものでなければならない。それ以外 (観測 hooks の欠落や
+            # 任意 key の混入) は fail-closed で拒否し、``--settings`` は常に 1 個だけ渡す。
+            approval_obj = json.loads(approval_settings_json)
+            if (
+                not isinstance(approval_obj, dict)
+                or approval_obj.pop("autoMode", None) is None
+                or approval_obj != json.loads(settings_json)
+            ):
+                raise ValueError(
+                    "approval overlay must equal the selected observation overlay plus autoMode"
+                )
+            settings_json = approval_settings_json
+        if approval_child_env is not None:
+            launch_env = dict(approval_child_env)
         argv += ["--settings", settings_json]
         if include_hook_chain_evidence_hooks:
             # Issue #2663 AC2 live-trial fix, corrected by PR #2668
@@ -6795,6 +6869,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--approval-profile",
+        choices=list(_load_approval_contract().approval_profile_ids()),
+        default=None,
+        help=(
+            "Issue #2839: opt-in approval carrier. closed enum の profile id だけを受け付け "
+            "(任意の JSON / 文字列 / path は受け付けない)、registry 由来の固定 overlay "
+            "(autoMode.allow に \"$defaults\" と固定 rule 1 件) を、当該 invocation の "
+            "--settings にだけ載せる。native adapter かつ structured mode 専用で、"
+            "--expect-skill-command / --require-hook-chain-evidence / "
+            "--hermetic-agent-definition とは併用できない。precondition (fixture の実体と "
+            "CLAUDE_GPT_HOME / CLAUDE_GPT_REPAIR_INSTALLER_URL の束縛) が不成立なら子 "
+            "session を起動せず fail-closed で終了する。未指定なら従来と byte-identical。"
+        ),
+    )
+    parser.add_argument(
         "--hermetic-agent-definition",
         action="store_true",
         help=(
@@ -6927,6 +7016,42 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.additional_prompt and args.runtime != "claude":
         parser.error("--additional-prompt requires --runtime claude")
+    # Issue #2839: opt-in approval carrier。子 session を起動する前に precondition を
+    # 決定論的に検証し、不成立なら fail-closed で終了する (PASS / SKIP にはしない)。
+    approval_mod = None
+    approval_verified = None
+    approval_overlay_json = None
+    approval_child_env = None
+    if args.approval_profile:
+        approval_mod = _load_approval_contract()
+        if args.runtime != "claude":
+            parser.error("--approval-profile requires --runtime claude")
+        approval_verified = approval_mod.verify_approval_carrier_preconditions(
+            args.approval_profile,
+            worktree=os.path.abspath(args.worktree),
+            env=os.environ,
+            claude_adapter=args.claude_adapter,
+            mode=args.mode,
+            incompatible_flags={
+                "expect_skill_command": bool(args.expect_skill_command),
+                "hermetic_agent_definition": bool(args.hermetic_agent_definition),
+            },
+        )
+        if not approval_verified["ok"]:
+            parser.error(
+                f"--approval-profile precondition failed: {approval_verified['reason_code']}"
+            )
+        # Issue #2839 (PR #2844 OWNER fix_delta): runner が実際に選択する観測 overlay
+        # (--require-hook-chain-evidence 時は PreToolUse / Stop を含む) に carrier の
+        # ``autoMode`` を足す。overlay を作り直さず、``--settings`` は 1 個のまま。
+        approval_overlay_json = approval_mod.build_approval_overlay_json(
+            args.approval_profile,
+            select_native_observation_settings_json(
+                include_user_prompt_expansion_hook=bool(args.expect_skill_command),
+                include_hook_chain_evidence_hooks=bool(args.require_hook_chain_evidence),
+            ),
+        )
+        approval_child_env = approval_mod.build_approval_child_env(os.environ, approval_verified)
     # Issue #2219 fix_delta iteration 1 (Option B): the interactive lane's
     # own turn count is 1 (the initial --prompt-file turn) plus however many
     # --additional-prompt entries were supplied -- there is no --max-turns
@@ -7307,6 +7432,8 @@ def main(argv: list[str] | None = None) -> int:
                     include_hook_chain_evidence_hooks=bool(args.require_hook_chain_evidence),
                     task_context_scope=args.task_context_scope,
                     task_context_state_root=args.task_context_state_root,
+                    approval_settings_json=approval_overlay_json,
+                    approval_child_env=approval_child_env,
                 )
                 capability_decision, capability_reason = classify_claude_structured_outcome(
                     rc, out, err, timed_out
@@ -7316,6 +7443,22 @@ def main(argv: list[str] | None = None) -> int:
                 # --settings flag forwarded via a hermetic combination),
                 # never a synthesized/guessed classification.
                 schema_summary["claude_adapter"] = args.claude_adapter
+                if approval_verified is not None:
+                    # Issue #2839: run 後に fixture の内容 hash を再計算し、変わっていたら PASS
+                    # にしない (子 session が承認済み fixture を書き換えた場合の検出)。
+                    fixture_hash_after_run = approval_mod.fixture_content_blob_hash(
+                        str(worktree), approval_verified["fixture_relpath"]
+                    )
+                    schema_summary["approval_carrier"] = approval_mod.build_approval_carrier_evidence(
+                        approval_verified,
+                        overlay_json=approval_overlay_json,
+                        fixture_hash_after_run=fixture_hash_after_run,
+                    )
+                    if not schema_summary["approval_carrier"]["fixture_unchanged"]:
+                        errors.append(
+                            "approval carrier: fixture installer content changed during the run"
+                        )
+                        exit_code = EXIT_FAIL
                 schema_summary["claude_gpt_launcher_receipt"] = (
                     extract_claude_gpt_launcher_receipt(err)
                     if args.claude_adapter == "claude-gpt"

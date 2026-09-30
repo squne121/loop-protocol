@@ -51,6 +51,13 @@ def _build_repo_with_worktree(tmp_path: Path, *, include_runner_script: bool = F
         script_dst.parent.mkdir(parents=True, exist_ok=True)
         script_dst.write_text(SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
         _git("add", str(script_dst.relative_to(repo)), cwd=repo)
+        # Issue #2839: runner は同じ directory の兄弟 module
+        # (runtime_vc_approval_contract.py) を file path で読み込むため、runner を
+        # 実 layout どおりに再現するこの fixture でも一緒に配置する。
+        sibling_src = SCRIPT.parent / "runtime_vc_approval_contract.py"
+        sibling_dst = script_dst.parent / sibling_src.name
+        sibling_dst.write_text(sibling_src.read_text(encoding="utf-8"), encoding="utf-8")
+        _git("add", str(sibling_dst.relative_to(repo)), cwd=repo)
     _git("commit", "-m", "seed", cwd=repo)
 
     worktree = repo / ".claude" / "worktrees" / "issue-0000-fixture"
