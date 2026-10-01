@@ -25,7 +25,12 @@ conn_holder = {}
 
 
 def _submit(session_id: str, tab_id: str, **fields):
-    payload = {"herdr_tab_id": tab_id, "claude_session_id": session_id, **fields}
+    payload = {
+        "herdr_tab_id": tab_id,
+        "claude_session_id": session_id,
+        "input_provenance": "user_prompt_observed",
+        **fields,
+    }
     return hook_flows.on_user_prompt_submit(conn_holder["conn"], payload)
 
 
@@ -294,10 +299,21 @@ def test_given_bound_task_and_explicit_unclaimed_pr_url_when_submitted_then_no_l
     )
     hook_entry._apply_user_prompt_submit_fields(
         target_fields,
-        {"prompt": "Review https://github.com/owner/repo/pull/99", "cwd": "/unused"},
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "prompt_id": "prompt-1",
+            "prompt": "Review https://github.com/owner/repo/pull/99",
+            "cwd": "/unused",
+        },
     )
     assert target_fields == {
+        "input_provenance": "user_prompt_observed",
         "classification_kind": "EXPLICIT",
+        "active_rebind_primary_eligible": True,
+        "active_rebind_target_repo": "owner/repo",
+        "active_rebind_target_ref_kind": "pr",
+        "active_rebind_target_ref_number": 99,
+        "active_rebind_ref_form": "explicit",
         "target_repo": "owner/repo",
         "target_ref_kind": "pr",
         "target_ref_number": 99,

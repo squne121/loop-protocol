@@ -135,6 +135,29 @@ def _task_command_failure_message(reason_code: str) -> str:
     return f"[task-context] /task failed: {reason_code}. {detail}"
 
 
+# Issue #2827: reason codes for which the service left the ACTIVE Task
+# identity untouched although the prompt named a different primary target.
+_UNMUTATED_ADVISORY_REASON_CODES = frozenset(
+    {
+        "different_primary_target_active",
+        "blocked_by_other_live_binding",
+        "active_rebind_projection_mismatch",
+        "active_rebind_bare_ref_unclaimed",
+    }
+)
+
+
+def _unmutated_advisory_message(reason_code: str) -> str:
+    """Issue #2827: the advisory printed when a prompt did not switch the
+    ACTIVE Task. `/task <target>` is described as the explicit forced
+    override (escape hatch), never as a step the operator must take first."""
+    return (
+        f"[task-context] advisory: Task は自動では切り替わりませんでした ({reason_code})。"
+        "Claude の処理はそのまま継続します。強制的に切り替えるには "
+        "`/task <target>`（escape hatch）を使ってください。"
+    )
+
+
 def _read_stdin_json() -> dict:
     raw = sys.stdin.read()
     if not raw.strip():
@@ -243,8 +266,53 @@ def _build_base_payload(event: str, hook_input: dict) -> dict:
     }
 
 
+# Issue #2827: closed set of internal-envelope markers. A `UserPromptSubmit`
+# whose prompt (after leading whitespace) starts with one of these was injected
+# by Claude Code itself (e.g. a backgrounded subagent / shell completion
+# notification), not typed by the operator. The initial member is the marker
+# observed in a real Claude Code 2.1.284 runtime capture; the set may only be
+# extended with real capture evidence, and this constant is the ONE place it is
+# defined (the AC6 negative-control leaf re-verifies every member).
+INTERNAL_ENVELOPE_MARKERS = ("<task-notification>",)
+
+PROVENANCE_USER_PROMPT_OBSERVED = "user_prompt_observed"
+PROVENANCE_INTERNAL_OR_UNKNOWN = "internal_or_unknown"
+
+
+def derive_input_provenance(hook_input: object) -> str:
+    """Issue #2827 (fail-closed, two values only): ``user_prompt_observed``
+    only when ``hook_event_name == "UserPromptSubmit"``, ``prompt_id`` is a
+    non-empty string, ``prompt`` is a string and the prompt (after leading
+    whitespace) does not start with a known internal envelope marker.
+    Anything else (missing/mistyped field, unparseable stdin, marker match)
+    is ``internal_or_unknown``.
+
+    This is a bounded ``operator_asserted``-style signal, NOT proof of a
+    physical human: a real capture found no structural field separating a
+    typed prompt from an internal completion, so ``prompt_id`` alone or a
+    transcript tail is never treated as authority, and there is no runtime
+    version branch."""
+    if not isinstance(hook_input, dict):
+        return PROVENANCE_INTERNAL_OR_UNKNOWN
+    if hook_input.get("hook_event_name") != "UserPromptSubmit":
+        return PROVENANCE_INTERNAL_OR_UNKNOWN
+    prompt_id = hook_input.get("prompt_id")
+    if not isinstance(prompt_id, str) or not prompt_id:
+        return PROVENANCE_INTERNAL_OR_UNKNOWN
+    prompt = hook_input.get("prompt")
+    if not isinstance(prompt, str):
+        return PROVENANCE_INTERNAL_OR_UNKNOWN
+    stripped = prompt.lstrip()
+    if any(stripped.startswith(marker) for marker in INTERNAL_ENVELOPE_MARKERS):
+        return PROVENANCE_INTERNAL_OR_UNKNOWN
+    return PROVENANCE_USER_PROMPT_OBSERVED
+
+
 def _apply_user_prompt_submit_fields(payload: dict, hook_input: dict) -> None:
+    payload["input_provenance"] = derive_input_provenance(hook_input)
     prompt = hook_input.get("prompt") or ""
+    if not isinstance(prompt, str):
+        prompt = ""
     # fix_delta 6: only pay for a `git remote get-url origin` subprocess call
     # when the raw prompt actually contains a pattern whose classification
     # would consult `current_repo` (bare `#N` / `/task #N` / `/task issue N`
@@ -255,6 +323,10 @@ def _apply_user_prompt_submit_fields(payload: dict, hook_input: dict) -> None:
     )
     classification = classifier.classify(prompt, current_repo=current_repo)
     payload["classification_kind"] = classification.kind
+    # Issue #2827: ACTIVE-only projection, kept apart from the legacy
+    # `classification_kind` / `target_*` fields above (UNBOUND autobind,
+    # provisional absorb and terminal rebind keep reading only those).
+    payload.update(classifier.active_rebind_projection(prompt, classification, current_repo=current_repo))
 
     if classification.kind == classifier.KIND_SLASH_TASK:
         target, ad_hoc_title = classifier.parse_slash_task_target(
@@ -595,14 +667,9 @@ def main(argv: list[str]) -> int:
         # advisory is surfaced whenever that reason_code is present --
         # `decision == "block"` is only the defensive regression case.
         reason_code = data.get("reason_code")
-        if reason_code == "different_primary_target_active" or decision == "block":
+        if reason_code in _UNMUTATED_ADVISORY_REASON_CODES or decision == "block":
             reason_code = reason_code or "different_primary_target_active"
-            print(
-                "[task-context] advisory: this prompt appears to target a different "
-                f"ACTIVE Task/Activity ({reason_code}). Continuing -- Task Context no longer "
-                "blocks ordinary prompts for this; use `/task <target>` to explicitly switch.",
-                file=sys.stderr,
-            )
+            print(_unmutated_advisory_message(reason_code), file=sys.stderr)
         return 0
 
     if event == "UserPromptExpansion":

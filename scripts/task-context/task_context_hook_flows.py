@@ -488,6 +488,137 @@ _NO_MUTATION_REASON_CODES = {
 }
 
 
+# Issue #2827: the ONLY provenance value that may reach a Task identity
+# mutation. Any other value, a missing key, or a non-string is treated as
+# ``internal_or_unknown`` (fail-closed).
+_PROVENANCE_USER_PROMPT_OBSERVED = "user_prompt_observed"
+_ACTIVE_REBIND_REF_FORMS = ("explicit", "prefixed", "bare")
+_ACTIVE_REBIND_REF_KINDS = ("issue", "pr")
+
+
+def _is_user_prompt_observed(payload: dict[str, Any]) -> bool:
+    return payload.get("input_provenance") == _PROVENANCE_USER_PROMPT_OBSERVED
+
+
+def _active_rebind_projection(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Validate and extract the ACTIVE-only projection. Returns ``None`` when
+    the projection is structurally invalid (wrong types / unknown values)."""
+    repo = payload.get("active_rebind_target_repo")
+    ref_kind = payload.get("active_rebind_target_ref_kind")
+    ref_number = payload.get("active_rebind_target_ref_number")
+    ref_form = payload.get("active_rebind_ref_form")
+    if not (isinstance(repo, str) and repo):
+        return None
+    if ref_kind not in _ACTIVE_REBIND_REF_KINDS:
+        return None
+    if not isinstance(ref_number, int) or isinstance(ref_number, bool):
+        return None
+    if ref_form not in _ACTIVE_REBIND_REF_FORMS:
+        return None
+    return {"repo": repo, "ref_kind": ref_kind, "ref_number": ref_number, "ref_form": ref_form}
+
+
+def _active_advisory(
+    conn,
+    *,
+    reason_code: str,
+    binding_id: str,
+    current_task_id: str | None,
+    current_activity_id: str | None,
+    current_run_id: str | None,
+) -> dict[str, Any]:
+    """Non-mutating, non-blocking ACTIVE-branch outcome: the current
+    Task/Activity/Binding are left untouched and only a bounded EventJournal
+    observation is recorded (Issue #2625 AC1/AC2, unchanged by Issue #2827)."""
+    _record(
+        conn,
+        event_type="hook:UserPromptSubmit",
+        task_id=current_task_id,
+        activity_id=current_activity_id,
+        binding_id=binding_id,
+        execution_run_id=current_run_id,
+        reason_code=reason_code,
+        status="pass",
+    )
+    return {"decision": "pass", "reason_code": reason_code, "advisory": True}
+
+
+def _on_active_different_primary(
+    conn,
+    payload: dict[str, Any],
+    *,
+    binding_id: str,
+    current_task_id: str | None,
+    current_activity_id: str | None,
+    current_run_id: str | None,
+    live_claim: dict[str, Any] | None,
+    legacy_kind: str,
+) -> dict[str, Any]:
+    """Issue #2827: ACTIVE current Activity + a different target.
+
+    Auto-rebinds (through the existing atomic ``bind_target_to_binding``,
+    never a second rebind implementation) only when the ACTIVE-only
+    projection says the prompt named exactly one primary target in the
+    closed set. Everything else keeps the Issue #2625 advisory contract:
+    ``decision: pass``, no Binding/Activity/claim mutation."""
+    advisory_kwargs = {
+        "binding_id": binding_id,
+        "current_task_id": current_task_id,
+        "current_activity_id": current_activity_id,
+        "current_run_id": current_run_id,
+    }
+    if payload.get("active_rebind_primary_eligible") is not True:
+        return _active_advisory(conn, reason_code="different_primary_target_active", **advisory_kwargs)
+
+    projection = _active_rebind_projection(payload)
+    legacy_target = (
+        payload.get("target_repo"),
+        payload.get("target_ref_kind"),
+        payload.get("target_ref_number"),
+    )
+    if (
+        projection is None
+        or legacy_kind not in ("EXPLICIT", "INFERRED")
+        or (projection["repo"], projection["ref_kind"], projection["ref_number"]) != legacy_target
+    ):
+        return _active_advisory(conn, reason_code="active_rebind_projection_mismatch", **advisory_kwargs)
+
+    # The projection (not the legacy fields) is the ACTIVE branch's authority
+    # from here on. `live_claim` above was resolved from the legacy fields,
+    # which the check just proved identical to the projection.
+    if projection["ref_form"] == "bare" and live_claim is None:
+        # A bare `#N` (no Issue/PR prefix) is only a rebind target when a
+        # local live claim resolves it; never create a Task for it.
+        return _active_advisory(conn, reason_code="active_rebind_bare_ref_unclaimed", **advisory_kwargs)
+
+    rebound = service.bind_target_to_binding(
+        conn,
+        binding_id=binding_id,
+        execution_run_id=current_run_id,
+        repo=projection["repo"],
+        ref_kind=projection["ref_kind"],
+        ref_number=projection["ref_number"],
+        reason_code="user_prompt_primary_target_rebind",
+        activity_kind_for_new_task="refine",
+        refuse_when_other_binding_holds_task=True,
+        record_identity_transition=True,
+    )
+    if rebound.get("blocked_by_other_live_binding"):
+        # Another live managed session already holds the target Task: keep
+        # the current Binding (`/task` remains the forced override).
+        result = _active_advisory(conn, reason_code="blocked_by_other_live_binding", **advisory_kwargs)
+        result["blocked_by_other_live_binding"] = True
+        return result
+    return {
+        "decision": "pass",
+        "reason_code": "user_prompt_primary_target_rebind",
+        "task_id": rebound["task_id"],
+        "activity_id": rebound["activity_id"],
+        "task_created": rebound.get("task_created", False),
+        **_projection_fields(rebound),
+    }
+
+
 def on_user_prompt_submit(conn, payload: dict[str, Any]) -> dict[str, Any]:
     herdr_tab_id = payload.get("herdr_tab_id")
     claude_session_id = payload.get("claude_session_id")
@@ -536,6 +667,24 @@ def on_user_prompt_submit(conn, payload: dict[str, Any]) -> dict[str, Any]:
     live_claim = service.find_live_claim(conn, target_repo, target_ref_kind, target_ref_number)
     if target_ref_kind == "pr" and live_claim is None:
         return {"decision": "pass", "reason_code": "unclaimed_pr_local_only"}
+
+    # Issue #2827: fail-closed provenance gate covering all four Task
+    # identity mutation entries below (UNBOUND autobind, 0-ref provisional
+    # absorb, terminal rebind, ACTIVE different-primary rebind). Anything but
+    # an observed user prompt -- internal completion, missing/unknown
+    # provenance -- never mutates; Claude's prompt processing continues.
+    if not _is_user_prompt_observed(payload):
+        _record(
+            conn,
+            event_type="hook:UserPromptSubmit",
+            task_id=current_task_id,
+            activity_id=current_activity_id,
+            binding_id=binding_id,
+            execution_run_id=current_run_id,
+            reason_code="internal_or_unknown_provenance_no_mutation",
+            status="pass",
+        )
+        return {"decision": "pass", "reason_code": "internal_or_unknown_provenance_no_mutation"}
 
     if current_task_id is None:
         bound = service.bind_target_to_binding(
@@ -605,27 +754,23 @@ def on_user_prompt_submit(conn, payload: dict[str, Any]) -> dict[str, Any]:
             **_projection_fields(advanced),
         }
 
-    # Issue #2625 AC1/AC2/AC9 (supersedes Issue #2564 AC4's hard block):
-    # ACTIVE current Activity + different high-confidence primary target is
-    # advisory-only. Claude prompt processing always continues (decision:
-    # pass); current Task/Activity/Binding are left completely untouched
-    # (no mutation above this point in this branch, no silent rebind, no
-    # target-ref claim created); the mismatch is recorded to EventJournal as
-    # a *required*, non-blocking observation (status="pass", never
-    # status="block" -- this is an advisory record, not a hard-block
-    # state). Producer workflows are never rolled back because of this
-    # advisory (AC9) -- there is nothing here that could roll anything back.
-    _record(
+    # Issue #2625 AC1/AC2/AC9 (supersedes Issue #2564 AC4's hard block): an
+    # ACTIVE current Activity + different target never blocks the prompt
+    # (decision: pass) and never rolls back a producer workflow (AC9).
+    # Issue #2827: a prompt that names exactly one primary target in the
+    # ACTIVE-only closed set, with observed user-prompt provenance (gated
+    # above), now rebinds to that target's Task through the existing atomic
+    # binder; every other case keeps the Issue #2625 advisory (no mutation).
+    return _on_active_different_primary(
         conn,
-        event_type="hook:UserPromptSubmit",
-        task_id=current_task_id,
-        activity_id=current_activity_id,
+        payload,
         binding_id=binding_id,
-        execution_run_id=current_run_id,
-        reason_code="different_primary_target_active",
-        status="pass",
+        current_task_id=current_task_id,
+        current_activity_id=current_activity_id,
+        current_run_id=current_run_id,
+        live_claim=live_claim,
+        legacy_kind=kind,
     )
-    return {"decision": "pass", "reason_code": "different_primary_target_active", "advisory": True}
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,7 @@ def test_given_cwd_changed_when_locator_changes_then_only_runtime_location_updat
         {
             "herdr_tab_id": "tab-1",
             "claude_session_id": "s1",
+            "input_provenance": "user_prompt_observed",
             "classification_kind": "EXPLICIT",
             "target_repo": "owner/repo",
             "target_ref_kind": "issue",
@@ -56,6 +57,7 @@ def test_given_subagent_start_and_stop_when_processed_then_rolled_up_under_paren
         {
             "herdr_tab_id": "tab-1",
             "claude_session_id": "s1",
+            "input_provenance": "user_prompt_observed",
             "classification_kind": "EXPLICIT",
             "target_repo": "owner/repo",
             "target_ref_kind": "issue",

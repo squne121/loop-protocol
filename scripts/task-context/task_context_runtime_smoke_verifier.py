@@ -412,11 +412,20 @@ def assert_wrong_primary_target_advisory(
     claim_before: list[dict[str, Any]],
     claim_after: list[dict[str, Any]],
 ) -> WrongPrimaryTargetEvidence:
-    """AC7: a wrong-primary-target ``UserPromptSubmit`` against an ACTIVE
-    synthetic Task must be observed as advisory (never a hard block), and
-    must leave the isolated DB's Binding/Activity/claim rows unchanged.
-    ``hook_result`` is the real ``task-contextctl hook UserPromptSubmit``
-    result envelope's ``data`` observed for this real prompt turn."""
+    """AC7: a ``UserPromptSubmit`` that must NOT switch the ACTIVE synthetic
+    Task -- an internal event (e.g. a SubAgent completion envelope) or a
+    prompt that is not an eligible primary -- must be observed as advisory
+    (never a hard block), and must leave the isolated DB's Binding/Activity/
+    claim rows unchanged. ``hook_result`` is the real ``task-contextctl hook
+    UserPromptSubmit`` result envelope's ``data`` observed for this real turn.
+
+    Issue #2827: this is the *no-mutation* postcondition only. It is NOT the
+    postcondition of an eligible ordinary user prompt naming a different
+    primary target -- that turn now rebinds and is checked by
+    ``assert_user_prompt_primary_target_rebind`` below. The two are kept
+    separate so a single "unchanged" assertion cannot be applied to a user
+    prompt (which must change the Task) or to an internal event (which must
+    not)."""
     violations: list[str] = []
     if hook_result.get("decision") != "pass":
         violations.append(
@@ -430,6 +439,68 @@ def assert_wrong_primary_target_advisory(
         violations.append("activity row changed across the wrong-primary-target turn")
     if claim_before != claim_after:
         violations.append("task_ref_claims changed across the wrong-primary-target turn")
+    return WrongPrimaryTargetEvidence(status="fail" if violations else "pass", violations=violations)
+
+
+def assert_internal_event_no_rebind(
+    hook_result: dict[str, Any],
+    *,
+    binding_before: dict[str, Any] | None,
+    binding_after: dict[str, Any] | None,
+    activity_before: dict[str, Any] | None,
+    activity_after: dict[str, Any] | None,
+    claim_before: list[dict[str, Any]],
+    claim_after: list[dict[str, Any]],
+) -> WrongPrimaryTargetEvidence:
+    """Issue #2827: postcondition for an internal event (SubAgent /
+    background-shell completion envelope) that mentions a different primary
+    target. It must be recorded as ``internal_or_unknown`` provenance
+    (``internal_or_unknown_provenance_no_mutation``) and leave every
+    Binding/Activity/claim row unchanged."""
+    evidence = assert_wrong_primary_target_advisory(
+        {**hook_result, "advisory": True},
+        binding_before=binding_before,
+        binding_after=binding_after,
+        activity_before=activity_before,
+        activity_after=activity_after,
+        claim_before=claim_before,
+        claim_after=claim_after,
+    )
+    violations = list(evidence.violations)
+    if hook_result.get("reason_code") != "internal_or_unknown_provenance_no_mutation":
+        violations.append(
+            f"reason_code={hook_result.get('reason_code')!r}, expected 'internal_or_unknown_provenance_no_mutation'"
+        )
+    return WrongPrimaryTargetEvidence(status="fail" if violations else "pass", violations=violations)
+
+
+def assert_user_prompt_primary_target_rebind(
+    hook_result: dict[str, Any],
+    *,
+    task_before: str | None,
+    task_after: str | None,
+    claim_owner_of_target: str | None,
+    old_claim_before: list[dict[str, Any]],
+    old_claim_after: list[dict[str, Any]],
+) -> WrongPrimaryTargetEvidence:
+    """Issue #2827: postcondition for an eligible ordinary user prompt that
+    names a different primary target. The Binding's Task must move to the
+    target's claim owner (the new Task's owner of the target ref), via the
+    ``user_prompt_primary_target_rebind`` reason, without releasing or
+    changing the previous Task's claims (the old Task is not deleted)."""
+    violations: list[str] = []
+    if hook_result.get("decision") != "pass":
+        violations.append(f"decision={hook_result.get('decision')!r}, expected 'pass'")
+    if hook_result.get("reason_code") != "user_prompt_primary_target_rebind":
+        violations.append(
+            f"reason_code={hook_result.get('reason_code')!r}, expected 'user_prompt_primary_target_rebind'"
+        )
+    if not task_after or task_after == task_before:
+        violations.append("Binding's Task did not change across the eligible user prompt")
+    if claim_owner_of_target != task_after:
+        violations.append("the target ref's claim owner is not the Binding's Task after the turn")
+    if old_claim_before != old_claim_after:
+        violations.append("the previous Task's claims changed (the old Task must be left intact)")
     return WrongPrimaryTargetEvidence(status="fail" if violations else "pass", violations=violations)
 
 
