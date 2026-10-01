@@ -76,8 +76,20 @@ def _hook_response(
     return _echo(payload)
 
 
-def _stop_payload(mode: object = "auto", *, agent_id: str = "child-1", include_mode: bool = True) -> dict:
-    payload: dict = {"agent_id": agent_id, "agent_type": "general-purpose"}
+def _stop_payload(
+    mode: object = "auto",
+    *,
+    agent_id: str = "child-1",
+    include_mode: bool = True,
+    hook_event_name: str = "SubagentStop",
+) -> dict:
+    # The native hook stdin payload carries ``hook_event_name`` (the extractor
+    # requires ``SubagentStop`` inside the same decoded object).
+    payload: dict = {
+        "hook_event_name": hook_event_name,
+        "agent_id": agent_id,
+        "agent_type": "general-purpose",
+    }
     if include_mode:
         payload["permission_mode"] = mode
     return payload
@@ -388,3 +400,194 @@ def test_given_no_require_flag_when_permission_mode_present_then_no_observation_
     assert "unavailable_required_runtime_observation_reasons" not in summary
     assert "required_runtime_observations" not in summary
     assert "unavailable_required_runtime_observations" not in summary
+
+
+def _hook_response_raw(
+    hook_event: str, *, stdout: str | None = None, output: str | None = None
+) -> str:
+    """A native-shaped ``system/hook_response`` line with RAW per-channel text
+    (not necessarily a JSON object) for channel-eligibility fixtures."""
+    payload: dict = {
+        "type": "system",
+        "subtype": "hook_response",
+        "hook_event": hook_event,
+        "hook_name": hook_event,
+        "session_id": "fixture-session",
+    }
+    if stdout is not None:
+        payload["stdout"] = stdout
+    if output is not None:
+        payload["output"] = output
+    return _echo(payload)
+
+
+_FIELDS_RECORD = {
+    "value": "auto",
+    "source_event": "system/hook_response",
+    "source_hook_event": "SubagentStop",
+    "source_field": "permission_mode",
+}
+
+
+def _assert_observed_auto(result, summary):
+    assert result.returncode == 0, result.stderr
+    assert _summary_dict(summary, "observed_runtime_fields") == {"permission_mode": _FIELDS_RECORD}
+
+
+def _assert_unobserved(result, summary, reasons: set[str]):
+    assert result.returncode == 77, result.stderr
+    assert _summary_dict(summary, "observed_runtime_fields") == {}
+    got = _summary_dict(summary, "unavailable_required_runtime_observation_reasons")
+    assert set(got) == {"permission_mode"}
+    assert got["permission_mode"] in reasons
+
+
+_REQUIRE = ("--require-observed-runtime-field", "permission_mode")
+
+
+def test_given_split_fields_across_channels_when_each_channel_incomplete_then_not_observed(
+    repo_with_worktree, tmp_path
+):
+    # P2-1: stdout carries only permission_mode, output carries only agent_id.
+    # Fields must never be composed across channels.
+    repo, worktree = repo_with_worktree
+    body = _fake_body(
+        _hook_response_raw(
+            "SubagentStop",
+            stdout=json.dumps({"hook_event_name": "SubagentStop", "permission_mode": "auto"}),
+            output=json.dumps({"hook_event_name": "SubagentStop", "agent_id": "child-1"}),
+        )
+    )
+    result, summary = _run_smoke(repo, worktree, tmp_path, body, *_REQUIRE)
+    _assert_unobserved(result, summary, {"field_absent"})
+
+
+def test_given_split_fields_without_event_name_when_composed_then_not_observed(
+    repo_with_worktree, tmp_path
+):
+    # The literal P2-1 reproduction from the review comment.
+    repo, worktree = repo_with_worktree
+    body = _fake_body(
+        _hook_response_raw(
+            "SubagentStop",
+            stdout=json.dumps({"permission_mode": "auto"}),
+            output=json.dumps({"agent_id": "child-1"}),
+        )
+    )
+    result, summary = _run_smoke(repo, worktree, tmp_path, body, *_REQUIRE)
+    _assert_unobserved(result, summary, {"field_absent"})
+
+
+def test_given_inner_hook_event_name_is_subagentstart_when_outer_is_subagentstop_then_not_observed(
+    repo_with_worktree, tmp_path
+):
+    # P2-2 (1): the outer stream event is SubagentStop but the decoded payload
+    # says SubagentStart.
+    repo, worktree = repo_with_worktree
+    body = _fake_body(
+        _hook_response("SubagentStop", inner=_stop_payload("auto", hook_event_name="SubagentStart"))
+    )
+    result, summary = _run_smoke(repo, worktree, tmp_path, body, *_REQUIRE)
+    _assert_unobserved(result, summary, {"field_absent"})
+
+
+def test_given_inner_hook_event_name_missing_when_otherwise_valid_then_not_observed(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    payload = _stop_payload("auto")
+    del payload["hook_event_name"]
+    body = _fake_body(_hook_response("SubagentStop", inner=payload))
+    result, summary = _run_smoke(repo, worktree, tmp_path, body, *_REQUIRE)
+    _assert_unobserved(result, summary, {"field_absent"})
+
+
+@pytest.mark.parametrize("channel", ["stdout", "output"])
+def test_given_prose_prefixed_json_in_channel_when_only_source_then_not_observed(
+    repo_with_worktree, tmp_path, channel
+):
+    # P2-2 (2): ordinary hook handler log text containing a JSON object is not
+    # a native stdin echo, so it must never become an observation.
+    repo, worktree = repo_with_worktree
+    log_line = 'Worker said: {"permission_mode":"auto","agent_id":"child-1"}'
+    full_line = "Worker said: " + json.dumps(_stop_payload("auto"))
+    for index, text in enumerate((log_line, full_line)):
+        body = _fake_body(_hook_response_raw("SubagentStop", **{channel: text}))
+        result, summary = _run_smoke(
+            repo, worktree, tmp_path, body, *_REQUIRE, name=f"prose-{channel}-{index}"
+        )
+        _assert_unobserved(result, summary, {"field_absent"})
+
+
+def test_given_valid_echo_plus_unrelated_log_text_when_other_channel_then_valid_echo_observed(
+    repo_with_worktree, tmp_path
+):
+    # P2-2 (3): an unrelated ordinary log on one channel neither poisons nor
+    # replaces a valid native echo on the other.
+    repo, worktree = repo_with_worktree
+    for index, (stdout, output) in enumerate(
+        (
+            ("handler log: starting cleanup", json.dumps(_stop_payload("auto"))),
+            (json.dumps(_stop_payload("auto")), 'Worker said: {"permission_mode":"default"}'),
+        )
+    ):
+        body = _fake_body(_hook_response_raw("SubagentStop", stdout=stdout, output=output))
+        result, summary = _run_smoke(repo, worktree, tmp_path, body, *_REQUIRE, name=f"mixed-{index}")
+        _assert_observed_auto(result, summary)
+
+
+def test_given_valid_echo_plus_unrelated_noise_event_when_stream_then_valid_echo_observed(
+    repo_with_worktree, tmp_path
+):
+    repo, worktree = repo_with_worktree
+    body = _fake_body(
+        _hook_response_raw("SubagentStop", stdout="not json at all"),
+        _hook_response("SubagentStop", inner=_stop_payload("auto")),
+    )
+    result, summary = _run_smoke(repo, worktree, tmp_path, body, *_REQUIRE)
+    _assert_observed_auto(result, summary)
+
+
+def test_given_valid_echo_only_on_stdout_then_observed(repo_with_worktree, tmp_path):
+    # P2-2 (4)
+    repo, worktree = repo_with_worktree
+    body = _fake_body(_hook_response("SubagentStop", stdout_inner=_stop_payload("auto")))
+    result, summary = _run_smoke(repo, worktree, tmp_path, body, *_REQUIRE)
+    _assert_observed_auto(result, summary)
+
+
+def test_given_valid_echo_only_on_output_then_observed(repo_with_worktree, tmp_path):
+    # P2-2 (5)
+    repo, worktree = repo_with_worktree
+    body = _fake_body(_hook_response("SubagentStop", output_inner=_stop_payload("auto")))
+    result, summary = _run_smoke(repo, worktree, tmp_path, body, *_REQUIRE)
+    _assert_observed_auto(result, summary)
+
+
+def test_given_same_valid_echo_on_both_channels_then_observed(repo_with_worktree, tmp_path):
+    # P2-2 (6)
+    repo, worktree = repo_with_worktree
+    body = _fake_body(_hook_response("SubagentStop", inner=_stop_payload("auto")))
+    result, summary = _run_smoke(repo, worktree, tmp_path, body, *_REQUIRE)
+    _assert_observed_auto(result, summary)
+
+
+def test_given_valid_stdout_and_native_shaped_out_of_enum_output_then_invalid_or_conflicting(
+    repo_with_worktree, tmp_path
+):
+    # An out-of-enum value on a native-shaped candidate stays a conflict even
+    # when the other channel is a valid candidate.
+    repo, worktree = repo_with_worktree
+    body = _fake_body(
+        _hook_response(
+            "SubagentStop",
+            stdout_inner=_stop_payload("auto"),
+            output_inner=_stop_payload("bogus"),
+        )
+    )
+    result, summary = _run_smoke(repo, worktree, tmp_path, body, *_REQUIRE)
+    _assert_unobserved(result, summary, {"invalid_or_conflicting_value"})
+    assert (
+        _summary_dict(summary, "unavailable_required_runtime_observation_reasons")["permission_mode"]
+        == "invalid_or_conflicting_value"
+    )

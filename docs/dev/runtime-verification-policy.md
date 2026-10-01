@@ -772,7 +772,8 @@ checker は現時点でどの gate にも自動では結線されていない。
 - event: `type == "system"` かつ `subtype == "hook_response"` かつ `hook_event == "SubagentStop"`
 - field: その event の hook stdin payload（runner の固定 `--settings` overlay にある `command: "cat"` hook が `stdout` / `output` に echo した JSON）の `permission_mode`。取得経路は `extract_claude_hook_lifecycle_events()` と同じである。
 - 値: 文字列で、`default` / `plan` / `acceptEdits` / `auto` / `dontAsk` / `bypassPermissions` のいずれか（公式 hooks reference の列挙）
-- 整合: `agent_id` が非空であること。同一 event の `stdout` / `output` が両方 `permission_mode` を持つ場合は値が一致すること。採用できる観測が複数ある場合は値がすべて一致すること。
+- 候補の適格性: `stdout` / `output` の各 channel を、前後に文章の付かない純粋な JSON object 文字列として厳密に decode する（native の `cat` echo は純粋な JSON object である）。decode した 1 つの object の中で、`hook_event_name == "SubagentStop"`、非空の文字列 `agent_id`、列挙内の `permission_mode` が揃って初めて候補になる。`stdout` の不足を `output` で補完するような、channel をまたぐ field の合成はしない。hook handler の通常ログ（`Worker said: {...}` のような前置き付き出力）、非 JSON、`hook_event_name` が `SubagentStop` でない object は候補にならず、conflict でもなく無視する。
+- 整合: 候補が得られた後に、同一 event の `stdout` / `output` の候補で値と `agent_id` が一致すること、採用できる観測が複数ある場合は値がすべて一致すること。
 
 ### 証明する範囲と証明しない範囲
 
@@ -788,7 +789,8 @@ checker は現時点でどの gate にも自動では結線されていない。
 - assistant / user / result event の本文や tool 出力に現れた同名 JSON
 - `SubagentStop` 以外の hook event、`subtype` が `hook_response` でない event
 - settings の再読込、`--agent-type` 等の static declaration、worker の自己申告
-- 文字列以外の型、列挙外の値、`agent_id` が空の payload
+- 文字列以外の型、列挙外の値（native 形の候補が持つ場合は `invalid_or_conflicting_value`）、`agent_id` が空の payload
+- 前置き文章付きの JSON、`hook_event_name` が `SubagentStop` でない payload、field が channel に分散している payload（各 channel 単独では候補にならない）
 - `stdout` と `output` で値が異なる event、複数の `SubagentStop` event 間で値が矛盾する場合
 
 fail-closed 規約: 抽出できなかった場合に推測・補完・fake fixture・declaration で PASS にしない。SKIP への変更は「unavailable が空でない」かつ元の exit code が 0 の場合に限り、runtime 失敗（非 0 終了、causal evidence gate の FAIL 等）の exit code は上書きしない。`--require-observed-runtime-field` 指定時だけ `summary.md` に `observed_runtime_fields` と `unavailable_required_runtime_observation_reasons` を記録する。理由は `permission_mode` が `no_subagentstop_hook_event` / `field_absent` / `invalid_or_conflicting_value`、未対応 field が `no_native_extractor` である。
@@ -804,7 +806,7 @@ fail-closed 規約: 抽出できなかった場合に推測・補完・fake fixt
 | runtime 起動失敗 | claude の起動・認証・timeout 等で runtime 自体が失敗している（exit 1 または別の SKIP 理由）。`permission_mode` の観測可否は判定できない |
 | 対象 hook event 不発火 | `SubagentStop` の `system/hook_response` event が stream に無い（reason: `no_subagentstop_hook_event`） |
 | event はあるが field 無し | `SubagentStop` event はあるが payload に `permission_mode` が無い（reason: `field_absent`） |
-| field はあるが parser 不成立 | payload に `permission_mode` はあるが、型不正・列挙外・channel / event 間の矛盾・`agent_id` 欠落で採用できない（reason: `invalid_or_conflicting_value`）。raw stream の値と parser の判定を突き合わせる |
+| field はあるが parser 不成立 | payload に `permission_mode` はあるが、native 形の候補で型不正・列挙外・channel / event 間の矛盾がある（reason: `invalid_or_conflicting_value`）。`agent_id` 欠落・`hook_event_name` 不一致・前置き付き出力は候補にならず無視するため `field_absent` になる。raw stream の値と parser の判定を突き合わせる |
 | parser と観測が一致 | 採用基準を満たす値が `observed_runtime_fields` に記録され、raw stream の値と一致する |
 
 ## 関連ドキュメント
