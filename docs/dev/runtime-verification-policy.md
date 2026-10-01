@@ -761,6 +761,54 @@ command 行の解析は、サポートする小さな shell grammar に限った
 
 checker は現時点でどの gate にも自動では結線されていない。`approval_required_actions` を宣言する Issue の refinement で、operator または refinement loop がこの手順を手動で実行する。`baseline_vc_preflight.py` などへの結線は、それらを所有する Issue の merge 後に別途判断する。
 
+## 15. Runtime Observation: permission_mode（SubagentStop の payload から観測する値の扱い、Issue #2854）
+
+`scripts/agent-ops/run_worktree_agent_runtime_smoke.py` の `--require-observed-runtime-field permission_mode` が、何を観測済みとして扱うかを定める。`permission_mode` 以外の field（`effective_permission_profile` / `loaded_skill` / `executor` / `mutation`）には native 由来の extractor が無く、従来どおり unsupported のままである。
+
+### 抽出元 event / field
+
+観測として採用するのは、native stream-json 上の次の event だけである。
+
+- event: `type == "system"` かつ `subtype == "hook_response"` かつ `hook_event == "SubagentStop"`
+- field: その event の hook stdin payload（runner の固定 `--settings` overlay にある `command: "cat"` hook が `stdout` / `output` に echo した JSON）の `permission_mode`。取得経路は `extract_claude_hook_lifecycle_events()` と同じである。
+- 値: 文字列で、`default` / `plan` / `acceptEdits` / `auto` / `dontAsk` / `bypassPermissions` のいずれか（公式 hooks reference の列挙）
+- 候補の適格性: `stdout` / `output` の各 channel を、前後に文章の付かない純粋な JSON object 文字列として厳密に decode する（native の `cat` echo は純粋な JSON object である）。decode した 1 つの object の中で、`hook_event_name == "SubagentStop"`、非空の文字列 `agent_id`、列挙内の `permission_mode` が揃って初めて候補になる。`stdout` の不足を `output` で補完するような、channel をまたぐ field の合成はしない。hook handler の通常ログ（`Worker said: {...}` のような前置き付き出力）、非 JSON、`hook_event_name` が `SubagentStop` でない object は候補にならず、conflict でもなく無視する。
+- 整合: 候補が得られた後に、同一 event の `stdout` / `output` の候補で値と `agent_id` が一致すること、採用できる観測が複数ある場合は値がすべて一致すること。
+
+### 証明する範囲と証明しない範囲
+
+- 証明する: native runtime が、特定の `SubagentStop` hook event の payload で報告した permission mode の値。
+- 証明しない: 対象操作（repair 等）が実際に実行されたこと、deny / hook / permission の評価結果が実際に発生したこと、allow / deny / ask rule を含む完全な effective permission profile、evidence と対象 session / SubAgent / invocation の対応の全体。
+- runner は `--permission-mode` を claude CLI へ渡さない。観測される値は Claude Code の既定値または設定に由来し、親 session の mode と同一とは限らない。
+- `effective_permission_profile` は unsupported のままである。`permission_mode` の観測を `effective_permission_profile` の観測、alias、代替として扱ってはならない。
+
+### 採用しない入力と fail-closed 規約
+
+次は観測として採用せず、`permission_mode` を unavailable（exit 77、SKIP）にする。
+
+- assistant / user / result event の本文や tool 出力に現れた同名 JSON
+- `SubagentStop` 以外の hook event、`subtype` が `hook_response` でない event
+- settings の再読込、`--agent-type` 等の static declaration、worker の自己申告
+- 文字列以外の型、列挙外の値（native 形の候補が持つ場合は `invalid_or_conflicting_value`）、`agent_id` が空の payload
+- 前置き文章付きの JSON、`hook_event_name` が `SubagentStop` でない payload、field が channel に分散している payload（各 channel 単独では候補にならない）
+- `stdout` と `output` で値が異なる event、複数の `SubagentStop` event 間で値が矛盾する場合
+
+fail-closed 規約: 抽出できなかった場合に推測・補完・fake fixture・declaration で PASS にしない。SKIP への変更は「unavailable が空でない」かつ元の exit code が 0 の場合に限り、runtime 失敗（非 0 終了、causal evidence gate の FAIL 等）の exit code は上書きしない。`--require-observed-runtime-field` 指定時だけ `summary.md` に `observed_runtime_fields` と `unavailable_required_runtime_observation_reasons` を記録する。理由は `permission_mode` が `no_subagentstop_hook_event` / `field_absent` / `invalid_or_conflicting_value`、未対応 field が `no_native_extractor` である。
+
+### unconfirmed の記録規則
+
+実 Claude Code の smoke で `permission_mode` を観測できなかった場合（exit 77）、その Claude Code version / mode / 起動経路では permission_mode は `unconfirmed` として記録する。`unconfirmed` は PASS ではなく、実装修正の完了でも #2810 の達成でもない。version・起動条件・exit code・`unavailable_required_runtime_observation_reasons` を PR 本文の Runtime Verification Evidence に引用し、推測や declaration で補完せず停止する。
+
+### 観測できなかった場合の 5 区分の切り分け
+
+| 区分 | 判定の目安 |
+|---|---|
+| runtime 起動失敗 | claude の起動・認証・timeout 等で runtime 自体が失敗している（exit 1 または別の SKIP 理由）。`permission_mode` の観測可否は判定できない |
+| 対象 hook event 不発火 | `SubagentStop` の `system/hook_response` event が stream に無い（reason: `no_subagentstop_hook_event`） |
+| event はあるが field 無し | `SubagentStop` event はあるが payload に `permission_mode` が無い（reason: `field_absent`） |
+| field はあるが parser 不成立 | payload に `permission_mode` はあるが、native 形の候補で型不正・列挙外・channel / event 間の矛盾がある（reason: `invalid_or_conflicting_value`）。`agent_id` 欠落・`hook_event_name` 不一致・前置き付き出力は候補にならず無視するため `field_absent` になる。raw stream の値と parser の判定を突き合わせる |
+| parser と観測が一致 | 採用基準を満たす値が `observed_runtime_fields` に記録され、raw stream の値と一致する |
+
 ## 関連ドキュメント
 
 - `docs/dev/session-recording-policy.md` — session 記録 Kill Switch policy（`session_recording_policy/v1` SSOT）。`secrets_mode` 遷移時の session 記録制御・Kill Switch 手順・checkpoint visibility 検証を定める
