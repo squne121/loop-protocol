@@ -107,6 +107,25 @@ def test_generated_settings_defaults_present_and_valid_json():
     assert len(auto_mode["allow"]) >= 2
 
 
+def test_canonical_workflow_delegation_context_is_additive_after_existing_narrow_labels():
+    """GIVEN Issue #2843 の canonical workflow delegation context
+    WHEN generated autoMode の environment/allow を確認する
+    THEN 既存 narrow label は index 1 のまま (native GitHub 操作の許可と transaction-local
+    restriction 文言を保持)、delegation context は index 2 に追加され、permissions.allow や
+    classifyAllShell は増えない。詳細は test_canonical_workflow_delegation_policy.py (AC2/AC7/AC9)
+    """
+    result = _run_sh_function("claude_gpt_auto_mode_standalone_json")
+    assert result.returncode == 0, result.stderr
+    auto_mode = json.loads(result.stdout)["autoMode"]
+    assert set(auto_mode) == {"environment", "allow", "hard_deny"}
+    assert len(auto_mode["environment"]) == 3 and len(auto_mode["allow"]) == 3
+    assert "transaction-local restriction" in auto_mode["allow"][1]
+    assert "non-force task-branch push" in auto_mode["allow"][1]
+    assert "canonical workflow delegation" in auto_mode["environment"][2]
+    assert "canonical workflow delegation" in auto_mode["allow"][2]
+    assert "全 session 共通の raw gh 禁止ではない" in auto_mode["allow"][2]
+
+
 def test_generated_settings_not_written_to_project_settings():
     """GIVEN project の .claude/settings.json / .claude/settings.local.json
     WHEN autoMode キーを検索する
