@@ -16,9 +16,15 @@ marker), that:
   2. the out-of-contract `printenv` tool_use was denied (a later window IS
      denied, PreToolUse hook exit_code == 2), with
      `positive_window_count >= 1` and `deny_window_count >= 1`;
-  3. `effective_permission_profile` was observed
-     (`required_runtime_observations` includes it and
-     `unavailable_required_runtime_observations` is empty).
+  3. `permission_mode` was observed from the native `SubagentStop` hook
+     payload (`required_runtime_observations` includes it,
+     `unavailable_required_runtime_observations` is empty, and
+     `observed_runtime_fields.permission_mode` has
+     `source_hook_event == "SubagentStop"` and a non-empty value that is NOT
+     `bypassPermissions`). `permission_mode` is NOT an alias of, nor a
+     substitute for, `effective_permission_profile` (unsupported in the
+     current runner), and it never substitutes for the hook-window /
+     side-effect checks (1)(2) above.
 
 Any of: missing evidence, malformed evidence, a `tested_head` that does not
 match the current repository HEAD, a missing/non-executable side-effect
@@ -42,6 +48,7 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 EVIDENCE_JSON_PATH = REPO_ROOT / "artifacts" / "runtime-smoke" / "runtime-migration-worker-deny.evidence.json"
 FIXTURE_HOME_DENY_BIN = REPO_ROOT / "artifacts" / "runtime-smoke" / "fixture-home-deny" / "bin" / "claude-code-proxy"
 DENY_WINDOW_TIMEOUT_SECONDS = 300
+PERMISSION_MODE_FIELD = "permission_mode"
 
 
 def _current_head() -> str | None:
@@ -123,10 +130,24 @@ def evaluate_deny_evidence(
 
     required_obs = evidence.get("required_runtime_observations")
     unavailable_obs = evidence.get("unavailable_required_runtime_observations")
-    if not isinstance(required_obs, list) or "effective_permission_profile" not in required_obs:
-        raise DenyEvidenceFailClosed("effective_permission_profile_not_in_required_runtime_observations")
+    if not isinstance(required_obs, list) or PERMISSION_MODE_FIELD not in required_obs:
+        raise DenyEvidenceFailClosed("permission_mode_not_in_required_runtime_observations")
     if not isinstance(unavailable_obs, list) or unavailable_obs:
         raise DenyEvidenceFailClosed("unavailable_required_runtime_observations_not_empty")
+
+    observed_fields = evidence.get("observed_runtime_fields")
+    if not isinstance(observed_fields, dict):
+        raise DenyEvidenceFailClosed("observed_runtime_fields_missing")
+    permission_mode_obs = observed_fields.get(PERMISSION_MODE_FIELD)
+    if not isinstance(permission_mode_obs, dict):
+        raise DenyEvidenceFailClosed("permission_mode_observation_missing")
+    if permission_mode_obs.get("source_hook_event") != "SubagentStop":
+        raise DenyEvidenceFailClosed("permission_mode_source_hook_event_not_subagentstop")
+    permission_mode_value = permission_mode_obs.get("value")
+    if not isinstance(permission_mode_value, str) or not permission_mode_value.strip():
+        raise DenyEvidenceFailClosed("permission_mode_value_empty")
+    if permission_mode_value == "bypassPermissions":
+        raise DenyEvidenceFailClosed("permission_mode_bypass_permissions_not_accepted")
 
     # Independent side effect: the fixture proxy binary must exist,
     # be executable, and its mtime must fall inside THIS run's own window
@@ -157,7 +178,8 @@ def test_real_runner_evidence():
     artifacts/runtime-smoke/runtime-migration-worker-deny.evidence.json`) WHEN
     consumed by `evaluate_deny_evidence()` THEN the exact repair_command was
     allowed with an independently-verified side effect, the contract-violating
-    `printenv` was denied, and `effective_permission_profile` was observed.
+    `printenv` was denied, and `permission_mode` was observed from the native
+    `SubagentStop` payload (not `bypassPermissions`).
 
     SKIP (never false-green) if this run's own real evidence artifact does not
     exist yet -- this VC is `preflight-scope: runtime_only` (Issue #2810):
@@ -203,8 +225,16 @@ def _valid_evidence(**overrides) -> dict:
                 ],
             }
         },
-        "required_runtime_observations": ["effective_permission_profile"],
+        "required_runtime_observations": ["permission_mode"],
         "unavailable_required_runtime_observations": [],
+        "observed_runtime_fields": {
+            "permission_mode": {
+                "value": "default",
+                "source_event": "system/hook_response",
+                "source_hook_event": "SubagentStop",
+                "source_field": "permission_mode",
+            }
+        },
     }
     evidence.update(overrides)
     return evidence
@@ -287,19 +317,90 @@ def test_synthetic_missing_positive_window_fails_closed(tmp_path):
         )
 
 
-def test_synthetic_unavailable_required_runtime_observation_fails_closed(tmp_path):
-    """GIVEN unavailable_required_runtime_observations is non-empty (e.g.
-    effective_permission_profile could not be observed) WHEN evaluated
-    THEN raises -- an unobservable runtime field never silently degrades to
-    PASS."""
-    evidence = _valid_evidence(unavailable_required_runtime_observations=["effective_permission_profile"])
-    with pytest.raises(DenyEvidenceFailClosed, match="unavailable_required_runtime_observations_not_empty"):
+def _assert_fails_closed(tmp_path, evidence, reason):
+    with pytest.raises(DenyEvidenceFailClosed, match=reason):
         evaluate_deny_evidence(
             evidence,
             expected_head="deadbeefcafef00d",
             side_effect_path=tmp_path / "does-not-exist",
             evidence_json_mtime=time.time(),
         )
+
+
+def test_synthetic_unavailable_required_runtime_observation_fails_closed(tmp_path):
+    """GIVEN unavailable_required_runtime_observations is non-empty (e.g.
+    permission_mode could not be observed) WHEN evaluated THEN raises -- an
+    unobservable runtime field never silently degrades to PASS."""
+    evidence = _valid_evidence(unavailable_required_runtime_observations=["permission_mode"])
+    _assert_fails_closed(tmp_path, evidence, "unavailable_required_runtime_observations_not_empty")
+
+
+def test_synthetic_permission_mode_not_in_required_observations_fails_closed(tmp_path):
+    """GIVEN required_runtime_observations does not include permission_mode
+    (e.g. only the unsupported effective_permission_profile, which is NOT an
+    alias) WHEN evaluated THEN raises."""
+    evidence = _valid_evidence(required_runtime_observations=["effective_permission_profile"])
+    _assert_fails_closed(tmp_path, evidence, "permission_mode_not_in_required_runtime_observations")
+
+
+def test_synthetic_missing_permission_mode_observation_fails_closed(tmp_path):
+    """GIVEN observed_runtime_fields has no permission_mode entry WHEN
+    evaluated THEN raises (declared-required but never observed)."""
+    evidence = _valid_evidence(observed_runtime_fields={})
+    _assert_fails_closed(tmp_path, evidence, "permission_mode_observation_missing")
+
+
+def test_synthetic_missing_observed_runtime_fields_fails_closed(tmp_path):
+    """GIVEN observed_runtime_fields is absent entirely WHEN evaluated THEN
+    raises."""
+    evidence = _valid_evidence()
+    del evidence["observed_runtime_fields"]
+    _assert_fails_closed(tmp_path, evidence, "observed_runtime_fields_missing")
+
+
+@pytest.mark.parametrize("value", ["", "   ", None, 0])
+def test_synthetic_empty_permission_mode_value_fails_closed(tmp_path, value):
+    """GIVEN observed permission_mode value is empty / non-string WHEN
+    evaluated THEN raises."""
+    evidence = _valid_evidence()
+    evidence["observed_runtime_fields"]["permission_mode"]["value"] = value
+    _assert_fails_closed(tmp_path, evidence, "permission_mode_value_empty")
+
+
+def test_synthetic_bypass_permissions_value_fails_closed(tmp_path):
+    """GIVEN observed permission_mode is bypassPermissions WHEN evaluated
+    THEN raises -- a bypass mode cannot demonstrate classifier behavior."""
+    evidence = _valid_evidence()
+    evidence["observed_runtime_fields"]["permission_mode"]["value"] = "bypassPermissions"
+    _assert_fails_closed(tmp_path, evidence, "permission_mode_bypass_permissions_not_accepted")
+
+
+@pytest.mark.parametrize("source", ["PreToolUse", "", None])
+def test_synthetic_wrong_source_hook_event_fails_closed(tmp_path, source):
+    """GIVEN permission_mode was not sourced from the native SubagentStop
+    hook event WHEN evaluated THEN raises."""
+    evidence = _valid_evidence()
+    evidence["observed_runtime_fields"]["permission_mode"]["source_hook_event"] = source
+    _assert_fails_closed(tmp_path, evidence, "permission_mode_source_hook_event_not_subagentstop")
+
+
+def test_synthetic_permission_mode_alone_does_not_substitute_for_hook_windows(tmp_path):
+    """GIVEN a valid permission_mode observation but NO deny window WHEN
+    evaluated THEN raises -- permission_mode never substitutes for the
+    hook-window checks."""
+    evidence = _valid_evidence()
+    evidence["hook_chain_evidence"]["all_matching_hooks_observed"]["deny_window_count"] = 0
+    evidence["hook_chain_evidence"]["all_matching_hooks_observed"]["windows"] = [
+        {"status": "pass", "denied": False},
+    ]
+    _assert_fails_closed(tmp_path, evidence, "deny_window_count_not_satisfied")
+
+
+def test_synthetic_permission_mode_alone_does_not_substitute_for_side_effect(tmp_path):
+    """GIVEN valid permission_mode + windows but NO side-effect artifact WHEN
+    evaluated THEN raises -- permission_mode never substitutes for the
+    side-effect check."""
+    _assert_fails_closed(tmp_path, _valid_evidence(), "side_effect_artifact_missing")
 
 
 def test_synthetic_missing_side_effect_file_fails_closed(tmp_path):
