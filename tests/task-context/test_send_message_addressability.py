@@ -68,6 +68,7 @@ def _bind(conn, *, tab: str, session: str, ref_number: int, repo: str = "owner/r
         {
             "herdr_tab_id": tab,
             "claude_session_id": session,
+            "input_provenance": "user_prompt_observed",
             "classification_kind": "EXPLICIT",
             "target_repo": repo,
             "target_ref_kind": "issue",

@@ -70,6 +70,7 @@ def test_given_bound_session_when_queried_then_full_projection_returned(state_ro
         {
             "herdr_tab_id": "tab-1",
             "claude_session_id": "s1",
+            "input_provenance": "user_prompt_observed",
             "classification_kind": "EXPLICIT",
             "target_repo": "owner/repo",
             "target_ref_kind": "issue",

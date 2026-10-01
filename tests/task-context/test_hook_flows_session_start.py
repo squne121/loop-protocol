@@ -62,6 +62,7 @@ def test_given_clear_when_session_start_then_task_activity_binding_preserved(con
         {
             "herdr_tab_id": "tab-2",
             "claude_session_id": "s1",
+            "input_provenance": "user_prompt_observed",
             "classification_kind": "EXPLICIT",
             "target_repo": "owner/repo",
             "target_ref_kind": "issue",
@@ -90,6 +91,7 @@ def test_given_quit_then_startup_when_session_start_then_suspended_binding_resto
         {
             "herdr_tab_id": "tab-3",
             "claude_session_id": "s1",
+            "input_provenance": "user_prompt_observed",
             "classification_kind": "EXPLICIT",
             "target_repo": "owner/repo",
             "target_ref_kind": "issue",
@@ -158,6 +160,7 @@ def test_given_fork_session_when_task_expanded_with_target_then_bootstrap_rebind
         {
             "herdr_tab_id": "tab-6",
             "claude_session_id": "parent-s1",
+            "input_provenance": "user_prompt_observed",
             "classification_kind": "EXPLICIT",
             "target_repo": "owner/parent-repo",
             "target_ref_kind": "issue",
@@ -239,6 +242,7 @@ def test_given_bound_session_when_compact_then_binding_task_activity_execution_r
         {
             "herdr_tab_id": "tab-7",
             "claude_session_id": "s1",
+            "input_provenance": "user_prompt_observed",
             "classification_kind": "EXPLICIT",
             "target_repo": "owner/repo",
             "target_ref_kind": "issue",

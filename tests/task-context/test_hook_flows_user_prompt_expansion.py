@@ -30,7 +30,12 @@ def _start_session(tab_id: str, session_id: str, *, source: str = "startup") -> 
 
 
 def _submit(session_id: str, tab_id: str, **fields):
-    payload = {"herdr_tab_id": tab_id, "claude_session_id": session_id, **fields}
+    payload = {
+        "herdr_tab_id": tab_id,
+        "claude_session_id": session_id,
+        "input_provenance": "user_prompt_observed",
+        **fields,
+    }
     return hook_flows.on_user_prompt_submit(conn_holder["conn"], payload)
 
 
@@ -263,3 +268,41 @@ def test_given_write_failure_inside_atomic_transaction_when_task_expanded_then_r
     assert all(
         json.loads(row["metadata_json"]).get("reason_code") != "slash_task_rebind" for row in rebind_rows
     ), "失敗した/taskからslash_task_rebindイベントが記録されてはならない"
+
+
+def test_slash_task_forces_override_even_when_other_binding_holds_target(conn):
+    """Issue #2827 AC20: the ordinary-prompt auto-rebind refuses a Task another
+    live managed Binding holds, but the user-typed `/task` stays the forced
+    override (escape hatch) and still rebinds to it."""
+    conn_holder["conn"] = conn
+    _start_session("tab-2", "s2")
+    holder = _submit(
+        "s2", "tab-2", classification_kind="EXPLICIT", target_repo="owner/repo", target_ref_kind="issue",
+        target_ref_number=20,
+    )
+    binding_a = _start_session("tab-1", "s1")
+    first = _submit(
+        "s1", "tab-1", classification_kind="EXPLICIT", target_repo="owner/repo", target_ref_kind="issue",
+        target_ref_number=10,
+    )
+    assert first["reason_code"] == "autobind"
+
+    # The ordinary prompt path is refused (advisory, nothing mutated) ...
+    ordinary = _submit(
+        "s1", "tab-1", classification_kind="INFERRED", target_repo="owner/repo", target_ref_kind="issue",
+        target_ref_number=20, active_rebind_primary_eligible=True, active_rebind_target_repo="owner/repo",
+        active_rebind_target_ref_kind="issue", active_rebind_target_ref_number=20,
+        active_rebind_ref_form="prefixed",
+    )
+    assert ordinary["reason_code"] == "blocked_by_other_live_binding"
+    assert service.get_current_task_activity_for_binding(conn, binding_a)[0] == first["task_id"]
+
+    # ... while `/task` forces the override onto the same Task.
+    forced = _expand(
+        "s1", "tab-1", slash_task_target_repo="owner/repo", slash_task_target_ref_kind="issue",
+        slash_task_target_ref_number=20,
+    )
+    assert forced["decision"] == "pass"
+    assert forced["reason_code"] == "slash_task_rebind"
+    assert forced["task_id"] == holder["task_id"]
+    assert service.get_current_task_activity_for_binding(conn, binding_a)[0] == holder["task_id"]

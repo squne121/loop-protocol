@@ -386,6 +386,54 @@ def test_given_binding_mutated_across_mismatch_turn_when_asserted_then_fails():
 
 
 # ---------------------------------------------------------------------------
+# Issue #2827: user prompt and internal event are separate postconditions
+# ---------------------------------------------------------------------------
+
+
+def _no_change_args():
+    return dict(
+        binding_before={"id": "b1"},
+        binding_after={"id": "b1"},
+        activity_before={"id": "a1"},
+        activity_after={"id": "a1"},
+        claim_before=[{"id": "c1"}],
+        claim_after=[{"id": "c1"}],
+    )
+
+
+def test_given_internal_event_no_mutation_when_asserted_then_pass_and_a_user_prompt_rebind_result_fails():
+    internal = {"decision": "pass", "reason_code": "internal_or_unknown_provenance_no_mutation"}
+    assert verifier.assert_internal_event_no_rebind(internal, **_no_change_args()).status == "pass"
+    # A rebind result must never satisfy the internal-event postcondition.
+    rebound = {"decision": "pass", "reason_code": "user_prompt_primary_target_rebind"}
+    assert verifier.assert_internal_event_no_rebind(rebound, **_no_change_args()).status == "fail"
+    # Nor may an internal event that mutated the Binding pass.
+    mutated = dict(_no_change_args(), binding_after={"id": "b2"})
+    assert verifier.assert_internal_event_no_rebind(internal, **mutated).status == "fail"
+
+
+def test_given_user_prompt_rebind_when_asserted_then_pass_and_an_unchanged_turn_fails():
+    args = dict(
+        task_before="task-a",
+        task_after="task-b",
+        claim_owner_of_target="task-b",
+        old_claim_before=[{"id": "c1"}],
+        old_claim_after=[{"id": "c1"}],
+    )
+    result = {"decision": "pass", "reason_code": "user_prompt_primary_target_rebind"}
+    assert verifier.assert_user_prompt_primary_target_rebind(result, **args).status == "pass"
+    # The old "everything unchanged" turn is NOT a valid user-prompt postcondition any more.
+    unchanged = dict(args, task_after="task-a", claim_owner_of_target="task-b")
+    assert verifier.assert_user_prompt_primary_target_rebind(result, **unchanged).status == "fail"
+    advisory = {"decision": "pass", "reason_code": "different_primary_target_active", "advisory": True}
+    assert verifier.assert_user_prompt_primary_target_rebind(advisory, **args).status == "fail"
+    # The old Task's claims must be left intact.
+    assert (
+        verifier.assert_user_prompt_primary_target_rebind(result, **dict(args, old_claim_after=[])).status == "fail"
+    )
+
+
+# ---------------------------------------------------------------------------
 # AC8: /clear causal evidence assertion (pure function, synthetic observed
 # values)
 # ---------------------------------------------------------------------------

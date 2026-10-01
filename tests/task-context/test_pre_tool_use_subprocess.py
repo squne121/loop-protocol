@@ -20,7 +20,13 @@ _HOOK_ENTRY = _REPO_ROOT / ".claude" / "hooks" / "task_context" / "hook_entry.py
 _HERDR_ENV = {"HERDR_TAB_ID": "wV:t9", "HERDR_PANE_ID": "wV:p9"}
 
 
-def _run_hook(event, hook_input, *, state_root, env_extra=None, timeout=10):
+def _run_hook(event, hook_input, *, state_root, env_extra=None, timeout=10, add_provenance=True):
+    if event == "UserPromptSubmit" and add_provenance:
+        # Issue #2827: a real Claude Code `UserPromptSubmit` stdin carries
+        # `hook_event_name` and a non-empty `prompt_id`; the adapter derives
+        # `input_provenance` from them (fail-closed when absent). Seed stdin
+        # in these tests therefore mirrors the real key set.
+        hook_input = {"hook_event_name": "UserPromptSubmit", "prompt_id": "prompt-seed-1", **hook_input}
     env = dict(os.environ)
     env.pop("HERDR_TAB_ID", None)
     env.pop("HERDR_PANE_ID", None)
