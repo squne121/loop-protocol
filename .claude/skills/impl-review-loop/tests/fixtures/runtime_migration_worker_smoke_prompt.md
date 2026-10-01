@@ -62,6 +62,10 @@ section exactly:
   - Also print the RUNTIME_MIGRATION_RESULT_V1 marker block exactly as specified in
     implementation-worker.md's apply_runtime_migration_fix_delta mode section, with status: ok
     on success.
+  - In your final response text, also print these two literal marker lines, each on its own line
+    and verbatim (the runner matches them by literal substring): on success
+    `RUNTIME_MIGRATION_RESULT_V1 status=ok` and `rerun_required.verification=true` (use the
+    actual status value instead of `ok` if the repair did not succeed).
 
 Expected result: RUNTIME_MIGRATION_RESULT_V1 with status: ok, and rerun_required.verification:
 true.
@@ -74,16 +78,23 @@ paraphrase, or omit any of those literal strings.
 <!-- この段落は SubAgent の最終応答をそのまま転記する要件を説明する日本語注記である。 -->
 
 Do not modify any repository-tracked file yourself. Do not run any command other than what you
-instruct the SubAgent to run via the Task tool, except exactly one read-only Bash call, which is
-the ONLY permitted way for you to obtain the placeholder values (run it BEFORE launching the
-SubAgent, exactly once, and do not run it again):
-<!-- この段落は親 agent が実行してよい値取得コマンドが 1 回限りであることを説明する日本語注記である。 -->
+instruct the SubAgent to run via the Task tool, except exactly two plain read-only Bash calls,
+which are the ONLY permitted way for you to obtain the placeholder values (run each of them
+BEFORE launching the SubAgent, as two separate Bash calls, exactly once each, and do not run
+either again):
+<!-- この段落は親 agent が実行してよい値取得コマンドが plain な read-only 2 回（各 1 回限り）であることを説明する日本語注記である。 -->
 
 ```
-git rev-parse HEAD; printf '%s\n' "$CLAUDE_GPT_HOME"
+git rev-parse HEAD
 ```
 
-Fill `repo_head` from the first output line and `expected_claude_gpt_home` (and the matching
-`claude_gpt_home_absolute_path`) from the second output line (an absolute path). Do NOT use
-`printenv`, `env`, `export -p` or `set` yourself to read `CLAUDE_GPT_HOME`.
-<!-- この段落は親 agent が値取得に使ってよい唯一の read-only コマンドと使用禁止コマンドを説明する日本語注記である。 -->
+```
+pwd
+```
+
+Fill `repo_head` from the `git rev-parse HEAD` output. Derive `expected_claude_gpt_home` (and the
+matching `claude_gpt_home_absolute_path`) as `<pwd output>/artifacts/runtime-smoke/fixture-home`
+(an absolute path; the harness sets `CLAUDE_GPT_HOME` to exactly this fixture-only directory, and
+the worker's pre-repair-check machine-verifies that the effective `CLAUDE_GPT_HOME` equals it).
+Do NOT use `printenv`, `env`, `export -p` or `set` yourself to read `CLAUDE_GPT_HOME`.
+<!-- この段落は親 agent が git rev-parse HEAD と pwd から値を導出する方法と、使用禁止コマンドを説明する日本語注記である。 -->

@@ -396,6 +396,22 @@ rerun_required:
   pr_review: true
 ```
 
+上記 YAML ブロックに **置き換えず追加で**、worker の最終応答テキストは次の 2 行の literal
+単一行マーカーを、それぞれ独立した 1 行として一字一句そのまま含めなければならない
+（`<ok|failed|blocked|permission_blocked>` は実際の status 値 1 つに置換する）。runtime smoke
+harness は `--expect-marker` を最終応答テキストに対する literal substring 一致で照合する
+ため、YAML ブロックの `status: ok` / `verification: true` だけでは
+`RUNTIME_MIGRATION_RESULT_V1 status=ok` / `rerun_required.verification=true` に一致せず
+provenance 検証が失敗する（#2810 AC9）:
+
+```text
+RUNTIME_MIGRATION_RESULT_V1 status=<ok|failed|blocked|permission_blocked>
+rerun_required.verification=true
+```
+
+成功時の最終応答には、したがって `RUNTIME_MIGRATION_RESULT_V1 status=ok` と
+`rerun_required.verification=true` が literal に現れる。
+
 ## Allowed Paths Compliance（AC 準拠の報告）
 
 PR 起票時に `IMPLEMENT_RESULT_V1.allowed_paths_compliance: true/false` を報告する。ただしこの self-report は **advisory（参考情報）** であり、canonical な Allowed Paths 判定は review_subagent（pr-review-judge）が `git diff` から独立に再計算する `ALLOWED_PATHS_GATE_RESULT_V1` に基づく。

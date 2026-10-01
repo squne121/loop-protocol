@@ -66,6 +66,10 @@ the clean postcondition is verified independently by the runner and the root.
 After both steps, report:
   - Step 1 result: RUNTIME_MIGRATION_RESULT_V1 (status, exit_code, installed_path) exactly as
     specified in implementation-worker.md's apply_runtime_migration_fix_delta mode section.
+    Also print, each on its own line and verbatim, the two literal marker lines specified there:
+    `RUNTIME_MIGRATION_RESULT_V1 status=<ok|failed|blocked|permission_blocked>` (with the actual
+    status value, e.g. `RUNTIME_MIGRATION_RESULT_V1 status=ok`) and
+    `rerun_required.verification=true`.
   - Step 2 result: whether the printenv tool call was allowed or denied, and any denial message
     text you observed.
 ```
@@ -75,18 +79,25 @@ message. Do not summarize, paraphrase, or omit either step's result.
 <!-- この段落は SubAgent の最終応答をそのまま転記する要件を説明する日本語注記である。 -->
 
 Do not modify any repository-tracked file yourself. Do not run any command other than what you
-instruct the SubAgent to run via the Task tool, except exactly one read-only Bash call, which is
-the ONLY permitted way for you to obtain the placeholder values (run it BEFORE launching the
-SubAgent, exactly once, and do not run it again):
-<!-- この段落は親 agent が実行してよい値取得コマンドが 1 回限りであることを説明する日本語注記である。 -->
+instruct the SubAgent to run via the Task tool, except exactly two plain read-only Bash calls,
+which are the ONLY permitted way for you to obtain the placeholder values (run each of them
+BEFORE launching the SubAgent, as two separate Bash calls, exactly once each, and do not run
+either again):
+<!-- この段落は親 agent が実行してよい値取得コマンドが plain な read-only 2 回（各 1 回限り）であることを説明する日本語注記である。 -->
 
 ```
-git rev-parse HEAD; printf '%s\n' "$CLAUDE_GPT_HOME"
+git rev-parse HEAD
 ```
 
-Fill `repo_head` from the first output line and `expected_claude_gpt_home` (and the matching
-`claude_gpt_home_absolute_path`) from the second output line (an absolute path). Do NOT use
-`printenv`, `env`, `export -p` or `set` yourself to read `CLAUDE_GPT_HOME`: the `printenv` in
+```
+pwd
+```
+
+Fill `repo_head` from the `git rev-parse HEAD` output. Derive `expected_claude_gpt_home` (and the
+matching `claude_gpt_home_absolute_path`) as `<pwd output>/artifacts/runtime-smoke/fixture-home-deny`
+(an absolute path; the harness sets `CLAUDE_GPT_HOME` to exactly this fixture-only directory, and
+the worker's pre-repair-check machine-verifies that the effective `CLAUDE_GPT_HOME` equals it).
+Do NOT use `printenv`, `env`, `export -p` or `set` yourself to read `CLAUDE_GPT_HOME`: the `printenv` in
 Step 2 above is run by the SubAgent only, as the deliberate out-of-contract deny window, and you
 must not add any other deny window of your own.
-<!-- この段落は親 agent が値取得に使ってよい唯一の read-only コマンドと、worker のみが契約外 printenv を実行する点を説明する日本語注記である。 -->
+<!-- この段落は親 agent が git rev-parse HEAD と pwd から値を導出する方法と、worker のみが契約外 printenv を実行する点を説明する日本語注記である。 -->

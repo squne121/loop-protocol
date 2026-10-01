@@ -126,8 +126,10 @@ def test_worker_does_not_run_git_status_and_result_has_no_git_status_field():
 def test_fixtures_forbid_worker_git_status_but_keep_parent_value_command(name):
     text = _normalized(FIXTURES_DIR / name)
     assert "Do not run `git status`" in text or "do NOT run `git status`" in text
-    # 親 agent 側の値取得 1 回コマンドは既存 test が固定しているため維持する
-    assert "git rev-parse HEAD; printf" in text
+    # 現行の値取得は plain な read-only 2 コマンド（git rev-parse HEAD / pwd）。
+    # compound な env 出力 command は classifier に deny されたため廃止済み。
+    assert "exactly two plain read-only Bash calls" in text
+    assert "git rev-parse HEAD; printf" not in text
 
 
 def test_deny_fixture_keeps_negative_control_and_window_order():
@@ -155,3 +157,46 @@ def test_fixtures_state_provenance_facts_without_authority_claims(name):
     assert "no network installer is used" in text
     # 権限・承認を主張する文言を含まない
     assert not re.search(r"\b(approved|authori[sz]ed|pre-approved|permission granted|user consent)\b", text, re.I)
+
+
+def _result_section(path: Path) -> str:
+    """apply_runtime_migration_fix_delta mode の `### 結果` 節（次の `## ` 見出しまで）。"""
+    raw = path.read_text(encoding="utf-8")
+    start = raw.index("### 結果", raw.index("apply_runtime_migration_fix_delta"))
+    end = raw.index("\n## ", start)
+    return raw[start:end]
+
+
+def test_worker_result_section_specifies_literal_single_line_markers():
+    """AC9 marker provenance: runner は `--expect-marker` を最終応答テキストの literal substring
+    で照合する。YAML ブロックだけでは一致しないため、literal 単一行 marker 2 行を doc が要求する。"""
+    section = _result_section(WORKER_PATH)
+    lines = [ln.strip() for ln in section.splitlines()]
+    # literal single-line marker specs, each on its own line, verbatim
+    assert "RUNTIME_MIGRATION_RESULT_V1 status=<ok|failed|blocked|permission_blocked>" in lines
+    assert "rerun_required.verification=true" in lines
+    # 既存 YAML block は置換されず維持される
+    assert "RUNTIME_MIGRATION_RESULT_V1:" in lines
+    assert "status: ok | failed | blocked | permission_blocked" in lines
+    assert "verification: true" in lines
+    # harness が literal substring で照合する旨を明記する
+    assert "literal substring" in section
+
+
+@pytest.mark.parametrize("literal", ["RUNTIME_MIGRATION_RESULT_V1 status=ok", "rerun_required.verification=true"])
+def test_ac9_vc_marker_literals_appear_in_worker_doc_spec(literal):
+    """AC9 VC の expect-marker literal が worker doc の spec にそのまま現れる（substring 一致可能）。"""
+    assert literal in _result_section(WORKER_PATH)
+
+
+@pytest.mark.parametrize("name", FIXTURE_NAMES)
+def test_fixtures_tell_worker_to_print_literal_marker_lines(name):
+    """smoke fixture の worker message が literal marker 2 行を最終応答へ出すよう指示する。"""
+    raw = (FIXTURES_DIR / name).read_text(encoding="utf-8")
+    message = re.search(r"```\n(Objective:.*?)\n```", raw, flags=re.S)
+    assert message, "worker message fenced block not found"
+    body = message.group(1)
+    assert "RUNTIME_MIGRATION_RESULT_V1 status=" in body
+    assert "rerun_required.verification=true" in body
+    assert "on its own line" in body
+    assert "verbatim" in body

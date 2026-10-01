@@ -274,16 +274,33 @@ def test_smoke_fixture_requests_use_the_fixed_evidence_ref_format_and_pre_check(
 @pytest.mark.parametrize(
     "fixture", ["runtime_migration_worker_smoke_prompt.md", "runtime_migration_worker_deny_smoke_prompt.md"]
 )
-def test_smoke_fixture_parent_value_acquisition_uses_only_printf_command(fixture):
+def test_smoke_fixture_parent_value_acquisition_uses_two_plain_readonly_commands(fixture):
     """GIVEN a smoke prompt WHEN the parent agent must obtain repo_head / CLAUDE_GPT_HOME
-    THEN the single permitted command is the printf form, and the parent is told not to use
-    printenv / env / export -p / set (avoids an extra deny window)."""
-    text = _normalized((FIXTURES_DIR / fixture).read_text(encoding="utf-8"))
-    assert """git rev-parse HEAD; printf '%s\\n' "$CLAUDE_GPT_HOME\"""" in text
+    THEN the permitted commands are exactly two separate plain read-only Bash calls
+    (`git rev-parse HEAD` and `pwd`), the parent derives expected_claude_gpt_home from the
+    `pwd` output, and the parent is told not to use printenv / env / export -p / set
+    (avoids an extra deny window)."""
+    raw = (FIXTURES_DIR / fixture).read_text(encoding="utf-8")
+    text = _normalized(raw)
+    assert "exactly two plain read-only Bash calls" in text
     assert "ONLY permitted way for you to obtain the placeholder values" in text
     assert "Do NOT use `printenv`, `env`, `export -p` or `set` yourself" in text
-    # the legacy exception that allowed only `git rev-parse HEAD` must be gone
+    # the parent's value-acquisition block is the tail after the SubAgent message fence;
+    # it must contain exactly the two plain commands, each in its own fenced block
+    tail = raw[raw.index("Do not modify any repository-tracked file yourself.") :]
+    fenced = re.findall(r"```\n(.*?)\n```", tail, flags=re.S)
+    assert fenced == ["git rev-parse HEAD", "pwd"], fenced
+    # the old compound env-printing command (classifier-denied at runtime) must be gone
+    assert "git rev-parse HEAD; printf" not in text
+    assert 'printf \'%s\\n\' "$CLAUDE_GPT_HOME"' not in text
+    # legacy single-call exceptions must be gone
     assert "except one read-only `git rev-parse HEAD`" not in text
+    assert "except exactly one read-only Bash call" not in text
+    # CLAUDE_GPT_HOME is derived from pwd, never read from the environment by the parent
+    expected_home = (
+        "fixture-home-deny" if "deny" in fixture else "fixture-home"
+    )
+    assert f"`<pwd output>/artifacts/runtime-smoke/{expected_home}`" in text
 
 
 def test_deny_fixture_keeps_worker_side_printenv_deny_window():
