@@ -1184,7 +1184,8 @@ elif (
         answer(json.dumps({{"currentBranch": None, "createdBy": [pr_json], "needsReview": []}}))
     answer(
         "Relevant pull requests in " + ALLOWED_REPO + "\\n\\nCreated by you\\n  #" + FIXTURE_PR
-        + " canary fixture [canary-fixture]\\n\\nRequesting a code review from you\\n  You have no pull requests to review\\n"
+        + " canary fixture [canary-fixture]\\n\\nRequesting a code review from you\\n"
+        + "  You have no pull requests to review\\n"
     )
 elif (
     argv[:1] == ["api"]
