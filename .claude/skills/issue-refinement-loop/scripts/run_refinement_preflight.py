@@ -7272,7 +7272,7 @@ def consume_trusted_anchor_contract_patch_plan(
     # conflated with the unsafe raw freeform append fallback.
     if any(
         isinstance(op, dict) and op.get("op", op.get("kind")) == "append"
-        and not is_safe_contract_patch_append(op)
+        and not is_safe_contract_patch_append(op, anchor_body=anchor_body)
         for op in _raw_operations
     ):
         return {
@@ -7390,7 +7390,7 @@ def consume_trusted_anchor_contract_patch_plan(
             isinstance(item, dict)
             and item.get("directive_markers")
             and item.get("extracted_directives")
-            and not derive_contract_patch_operations([item])
+            and not derive_contract_patch_operations([item], source_body=anchor_body)
             for item in evidence_list
         ):
             return {
@@ -7764,7 +7764,7 @@ def _satisfied_trusted_directive_noop_patch_plan(
     )
     if not normalized.get("accepted"):
         return None
-    operations = derive_contract_patch_operations([evidence])
+    operations = derive_contract_patch_operations([evidence], source_body=anchor_body)
     if not operations:
         return None
     candidate = build_section_aware_candidate_body(

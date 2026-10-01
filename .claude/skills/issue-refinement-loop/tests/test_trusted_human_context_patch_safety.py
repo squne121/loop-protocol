@@ -5,7 +5,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import run_refinement_preflight as preflight  # noqa: E402
-from scope_signal_delta import derive_contract_patch_operations  # noqa: E402
+from scope_signal_delta import derive_contract_patch_operations, extract_directive_items  # noqa: E402
 
 REPO = "squne121/loop-protocol"
 ISSUE = 2827
@@ -17,10 +17,10 @@ OWNER = "\n".join(f"- {n}. この作業の背景と例を確認して修正し�
 OWNER += "\n- Allowed Paths を調整してください: [Claude Code](https://code.claude.com/docs/en/hooks)"
 
 
-def _consumer(plan, state, calls, known_context=None):
+def _consumer(plan, state, calls, known_context=None, *, anchor_body=OWNER):
     def fetch():
         return ({"body": state["body"], "updatedAt": "2026-09-29T00:00:00Z"},
-                {"id": 5891092074, "body": OWNER, "html_url": URL, "author_association": "OWNER"})
+                {"id": 5891092074, "body": anchor_body, "html_url": URL, "author_association": "OWNER"})
 
     def apply(_issue, body, _readiness):
         calls.append("write")
@@ -29,9 +29,9 @@ def _consumer(plan, state, calls, known_context=None):
 
     return preflight.consume_trusted_anchor_contract_patch_plan(
         repo=REPO, issue_number=ISSUE,
-        issue={"body": BODY, "updatedAt": "2026-09-29T00:00:00Z"},
+        issue={"body": state["body"], "updatedAt": "2026-09-29T00:00:00Z"},
         anchor_url=URL, anchor_payload={"id": 5891092074, "author_association": "OWNER"},
-        anchor_body=OWNER, contract_patch_plan={"operations": plan},
+        anchor_body=anchor_body, contract_patch_plan={"operations": plan},
         callbacks={"fetch_current": fetch, "candidate_readiness": lambda _body: {"status": "go"},
                    "apply_transaction": apply},
         known_context=known_context,
@@ -54,6 +54,75 @@ def test_given_only_revised_ac_marker_when_raw_prose_is_extracted_then_no_append
     assert derive_contract_patch_operations([evidence])[0]["text"] == (
         "- AC19: 明示的に番号付けした受け入れ条件"
     )
+
+
+def test_given_sectioned_owner_comment_when_extracted_then_stop_vc_ac_and_paths_are_preserved():
+    comment = """## Revised Acceptance Criteria
+- [ ] AC19: verify one outcome
+  and check the readback remains stable.
+
+## Stop Conditions
+- Stop if an unknown authority changes the Issue.
+
+## Verification Commands
+- $ uv run --locked pytest tests/example.py
+
+## Allowed Paths
+- `scripts/agent-guards/skill_runtime_exec.py`
+- `docs/dev/workflow.md`
+
+## In Scope
+- Preserve structured updates
+
+## Out of Scope
+- No permission widening
+"""
+    evidence = {"directive_markers": ["revised ac", "stop condition", "verification command", "allowed paths"],
+                "extracted_directives": extract_directive_items(comment)}
+    operations = derive_contract_patch_operations([evidence], source_body=comment)
+    assert [(op["section"], op["text"]) for op in operations] == [
+        ("Acceptance Criteria", "- [ ] AC19: verify one outcome\n  and check the readback remains stable."),
+        ("Stop Conditions", "- Stop if an unknown authority changes the Issue."),
+        ("Verification Commands", "- $ uv run --locked pytest tests/example.py"),
+        ("Allowed Paths", "- `scripts/agent-guards/skill_runtime_exec.py`"),
+        ("Allowed Paths", "- `docs/dev/workflow.md`"),
+        ("In Scope", "- Preserve structured updates"),
+        ("Out of Scope", "- No permission widening"),
+    ]
+
+
+def test_given_mixed_valid_and_invalid_structured_directives_when_derived_then_no_partial_plan():
+    comment = """## Revised Acceptance Criteria
+- [ ] AC19: safe
+
+## Stop Conditions
+- Forbidden write: `../../escape.py`
+
+## Verification Commands
+- $ uv run --locked pytest tests/example.py
+"""
+    evidence = {"directive_markers": ["revised ac", "stop condition", "verification command"],
+                "extracted_directives": extract_directive_items(comment)}
+    assert derive_contract_patch_operations([evidence], source_body=comment) == []
+
+
+def test_given_real_comment_extraction_when_consumer_runs_then_all_sections_written():
+    comment = """## Revised AC
+- [ ] AC19: structured acceptance
+## Stop Conditions
+- Stop if new authority is required.
+## Verification Commands
+- $ uv run --locked pytest tests/example.py
+"""
+    evidence = {"directive_markers": ["revised ac", "stop condition", "verification command"],
+                "extracted_directives": extract_directive_items(comment)}
+    operations = derive_contract_patch_operations([evidence], source_body=comment)
+    state = {"body": BODY + "\n## Stop Conditions\n\n- existing\n\n## Verification Commands\n\n- $ true\n"}
+    calls = []
+    result = _consumer(operations, state, calls, anchor_body=comment)
+    assert result["status"] == "applied" and result["writes"] == 1 and calls == ["write"]
+    for op in operations:
+        assert op["text"] in state["body"]
 
 
 def test_given_unstructured_plan_when_consumer_runs_then_no_write_and_body_unchanged():

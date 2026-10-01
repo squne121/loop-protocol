@@ -20,10 +20,31 @@ REAL = "scripts/agent-guards/skill_runtime_exec.py"
     "http://example.org/docs/en/hooks",
     "www.example.org/docs/en/hooks",
     "[guide](https://example.org/docs/en/(hooks))",
-    "https://example.org/docs/en/(hooks)",
+    "[guide](https://example.org/docs/en/\\)hooks) and unrelated prose",
+    "[guide](https://example.org/docs/en/\\(hooks))",
+    "[guide](https://example.org/docs/en/(hooks))",
+    "[guide]:\n  https://example.org/docs/en/hooks",
+    "[guide]:\n  <https://example.org/docs/en/hooks>",
+    "[guide](<https://example.org/docs/en/hooks>)",
+    "<https://example.org/docs/en/(hooks)>",
 ])
 def test_given_url_destination_when_paths_extracted_then_only_adjacent_repo_paths_remain(link):
     text = f"Allowed Paths に `{REAL}` を追加する。{link} また `{REAL}` を確認する。"
+    assert _extract_path_literals_from_text(text) == [REAL]
+
+
+def test_given_escaped_closing_parenthesis_when_url_contains_repository_suffix_then_no_fake_path():
+    link = "[guide](https://example.org/docs/en/\\)hooks/docs/en/hooks)"
+    assert _extract_path_literals_from_text(f"`{REAL}` {link} `{REAL}`") == [REAL]
+
+
+def test_given_escaped_opening_parenthesis_when_url_contains_repository_suffix_then_no_fake_path():
+    link = "[guide](https://example.org/docs/en/\\(hooks/docs/en/hooks)"
+    assert _extract_path_literals_from_text(f"{link} `{REAL}`") == [REAL]
+
+
+def test_given_reference_destination_on_following_line_then_repo_path_after_link_survives():
+    text = f"[docs]:\n  https://example.org/docs/en/hooks\nAllowed Paths に `{REAL}` を追加"
     assert _extract_path_literals_from_text(text) == [REAL]
 
 

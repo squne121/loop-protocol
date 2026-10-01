@@ -685,7 +685,7 @@ _NON_QUOTED_GROUP = (
 
 _URL_START_RE = re.compile(r"(?<![\w/])(?:https?://|www\.)", re.IGNORECASE)
 _LINK_OPEN_RE = re.compile(r"\]\(\s*")
-_REFERENCE_DESTINATION_RE = re.compile(r"(?m)^[ \t]{0,3}\[[^\]\n]+\]:[ \t]*")
+_REFERENCE_DESTINATION_RE = re.compile(r"(?m)^[ \t]{0,3}\[[^\]\n]+\]:[ \t]*(?:\n[ \t]{0,3})?")
 _ANGLE_PATH_DESTINATION_RE = re.compile(r"<(?:(?:\.claude|docs|src|scripts|tests|\.github)/)[^>\n]+>")
 
 
@@ -709,6 +709,11 @@ def _without_link_destinations(text: str) -> str:
         end = start
         while end < len(text) and text[end] not in "\n\r":
             ch = text[end]
+            if ch == "\\" and end + 1 < len(text) and text[end + 1] not in "\n\r":
+                # CommonMark backslash-escaped punctuation is literal URL
+                # content, not a nesting delimiter (notably \\) and \\().
+                end += 2
+                continue
             if ch == "(":
                 depth += 1
             elif ch == ")":
@@ -738,6 +743,9 @@ def _without_link_destinations(text: str) -> str:
         end = match.end()
         depth = 0
         while end < len(text) and not text[end].isspace() and text[end] not in "<>`":
+            if text[end] == "\\" and end + 1 < len(text) and text[end + 1] not in "\n\r":
+                end += 2
+                continue
             if text[end] == "(":
                 depth += 1
             elif text[end] == ")":
@@ -1471,96 +1479,203 @@ _MARKER_TO_CONTRACT_SECTION = {
 }
 
 
-def is_safe_contract_patch_append(operation: dict) -> bool:
-    """Only structured, section-specific append text may reach a transaction.
+_COMMENT_SECTION_HEADINGS = {
+    "revised acceptance criteria": "Acceptance Criteria",
+    "revised ac": "Acceptance Criteria",
+    "acceptance criteria": "Acceptance Criteria",
+    "stop condition": "Stop Conditions",
+    "stop conditions": "Stop Conditions",
+    "verification command": "Verification Commands",
+    "verification commands": "Verification Commands",
+    "allowed paths": "Allowed Paths",
+    "allowed paths expansion": "Allowed Paths",
+    "in scope": "In Scope",
+    "out of scope": "Out of Scope",
+}
+_AC_LINE_RE = re.compile(r"-\s+(?:\[[ xX]\]\s*)?AC[0-9]+\s*:\s*\S.*", re.IGNORECASE)
+_STOP_DIRECTIVE_RE = re.compile(r"Stop Condition\s*を追加してください\s*:\s*(\S.*)", re.IGNORECASE)
+_VC_DIRECTIVE_RE = re.compile(r"Verification Commands?\s*:\s*((?:-\s+|\$\s+)\S.*)", re.IGNORECASE)
 
-    This does not change scope-reframe/editor eligibility or synthesize
-    investigation-derived operations. It rejects an already-built unsafe
-    plan as well as preventing the producer from emitting one.
+
+def _structured_comment_items(body: str) -> list[tuple[str | None, str, str]]:
+    """Associate the *actual* bullet with its H2 section without changing evidence keys.
+
+    Only indented continuation lines of a bullet are retained. Unrelated
+    paragraphs and bullets outside recognized sections do not become patches.
     """
+    canonical = _canonicalize_cf_html_envelope(body)
+    if canonical is None:
+        return []
+    items: list[tuple[str | None, str, str]] = []
+    current: str | None = None
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+    for line in (canonical or "").splitlines():
+        if in_fence:
+            if _is_fence_closer(line, fence_char, fence_len):
+                in_fence = False
+            continue
+        opener = _parse_fence_opener(line)
+        if opener:
+            fence_char, fence_len = opener
+            in_fence = True
+            continue
+        heading = _parse_heading(line)
+        if heading is not None:
+            current = _COMMENT_SECTION_HEADINGS.get(heading.lower())
+            continue
+        stripped = line.strip()
+        bullet = _BULLET_LINE_RE.fullmatch(line)
+        if bullet:
+            content = stripped[2:].strip() if stripped.startswith(("- ", "* ")) else stripped[
+                _ORDERED_LIST_ITEM_PREFIX_RE.match(stripped).end():
+            ].strip()
+            items.append((current, content, ""))
+        elif items and current == items[-1][0] and line.startswith(("  ", "\t")) and stripped:
+            section, content, continuation = items[-1]
+            items[-1] = (section, content, continuation + "\n" + line)
+    return items
+
+
+def _single_revised_ac_bullet(anchor_body: str | None, text: str) -> bool:
+    """Preserve the pre-existing one-bullet Revised AC directive (including CF_HTML)."""
+    if not anchor_body:
+        return False
+    canonical = _canonicalize_cf_html_envelope(anchor_body)
+    if canonical is None:
+        return False
+    match = re.fullmatch(
+        r"\s*##\s+Revised (?:Acceptance Criteria|AC)[ \t]*\n"
+        r"(?:[ \t]*\n)*[ \t]*-\s+([^\r\n]+)[ \t]*",
+        canonical,
+        re.IGNORECASE,
+    )
+    return bool(match and match.group(1).strip() == text)
+
+
+def is_safe_contract_patch_append(operation: dict, *, anchor_body: str | None = None) -> bool:
+    """Validate a bounded section-bound append independent of producer claims."""
     if not isinstance(operation, dict) or operation.get("op", operation.get("kind")) != "append":
         return False
     section, text = operation.get("section"), operation.get("text")
-    if not isinstance(text, str) or not text.strip() or "\n" in text:
+    if not isinstance(text, str) or not text.strip() or "\x00" in text or "\r" in text:
+        return False
+    lines = text.split("\n")
+    if len(lines) > 1 and (section != "Acceptance Criteria" or not all(
+        line.startswith(("  ", "\t")) and line.strip() and not line.lstrip().startswith("##")
+        for line in lines[1:]
+    )):
         return False
     if section == "Allowed Paths":
-        match = re.fullmatch(r"- `([^`]+)`", text)
+        match = re.fullmatch(r"- `([^`\n]+)`", text)
         return bool(match and _normalize_exact_repository_path_literal(match.group(1)) == match.group(1))
     if section == "Acceptance Criteria":
-        return bool(re.fullmatch(r"-\s+(?:\[[ xX]\]\s*)?AC[0-9]+\s*:.+", text, re.IGNORECASE))
+        return bool(_AC_LINE_RE.fullmatch(lines[0]) or (
+            len(lines) == 1 and _single_revised_ac_bullet(anchor_body, text)
+        ))
     if section == "Stop Conditions":
+        # A traversal/absolute/backslash literal is never silently copied as
+        # a legitimate directive even when other structured operations exist.
+        if any(_is_unsafe_path_literal(token) for token in re.findall(r"`([^`]+)`", text)):
+            return False
         return bool(re.fullmatch(r"-\s+\S.+", text))
     if section == "Verification Commands":
-        return bool(re.fullmatch(r"(?:-\s+|\$\s+)\S.+", text))
+        return bool(re.fullmatch(r"(?:-\s+)?\$\s+\S.+|(?:-\s+)(?:uv|pnpm|python3|node|git|rg)\s+\S.+", text))
+    if section in {"In Scope", "Out of Scope"}:
+        return bool(re.fullmatch(r"-\s+\S.+", text))
     return False
 
 
-def derive_contract_patch_operations(evidence_list: list) -> list:
-    """Derive section-bound operations from normalized directives.
+def derive_contract_patch_operations(evidence_list: list, *, source_body: str | None = None) -> list:
+    """Map explicit, section-bound OWNER bullets to the existing append wire shape.
 
-    ``CONTRACT_PATCH_PLAN_V1`` deliberately retains its existing ``append``
-    wire grammar.  The consumer below turns these entries into transaction-
-    local desired section state; keeping that detail out of the plan avoids a
-    schema migration while preventing the former sections × directives fanout.
+    If any recognized directive fails normalization, discard the *whole* plan:
+    partial success could record an applied mutation while losing Stop/VC or an
+    authorization-bearing path. Background prose with no mapping is ignored.
     """
-    operations = []
+    operations: list[dict] = []
     for index, evidence in enumerate(evidence_list):
+        if not isinstance(evidence, dict):
+            continue
         markers = evidence.get("directive_markers") or []
         directives = evidence.get("extracted_directives") or []
-        if not markers:
+        if not markers or not isinstance(directives, list):
             continue
-        # An unlabelled explanation is not a section-bound operation. A
-        # comment-level marker elsewhere in the OWNER text must not turn
-        # every unrelated bullet into a raw Acceptance Criteria append.
-        for text in directives:
+        if source_body is not None:
+            records = _structured_comment_items(source_body)
+            if [record[1] for record in records] != directives:
+                return []  # An evidence/body mismatch cannot authorize a patch.
+        else:
+            records = [(None, item, "") for item in directives]
+        for explicit_section, item, continuation in records:
+            if not isinstance(item, str):
+                return []
+            text = item.strip()
             lowered = text.lower()
-            if "allowed path" in lowered:
-                marker = "allowed paths"
-            elif "verification command" in lowered:
-                marker = "verification command"
-            elif "stop condition" in lowered:
-                marker = "stop condition"
-            elif "precondition" in lowered or "前提条件" in text:
-                marker = "precondition"
-            elif re.match(r"(?:-\s*)?(?:\[[ xX]\]\s*)?AC[0-9]+\s*:", text, re.IGNORECASE):
-                marker = "revised acceptance criteria"
-            elif markers and set(markers) <= {"revised ac", "revised acceptance criteria"}:
-                # Both spellings describe the same explicit section; preserve
-                # that legacy single-section directive without enabling the
-                # freeform multi-section fallback.
-                marker = "revised ac" if "revised ac" in markers else "revised acceptance criteria"
+            inline_sections = [
+                name for name, matches in (
+                    ("Allowed Paths", "allowed path" in lowered),
+                    ("Verification Commands", "verification command" in lowered),
+                    ("Stop Conditions", "stop condition" in lowered),
+                    ("Acceptance Criteria", bool(re.match(r"(?:-\s*)?(?:\[[ xX]\]\s*)?AC[0-9]+\s*:", text, re.I))),
+                ) if matches
+            ]
+            if len(inline_sections) > 1 and (explicit_section is None or explicit_section not in inline_sections):
+                return []  # A mixed, ambiguous section request is not a partial plan.
+            section = explicit_section or (inline_sections[0] if len(inline_sections) == 1 else None)
+            if section is None and set(markers) <= {"revised ac", "revised acceptance criteria"}:
+                section = "Acceptance Criteria"
+            if section is None:
+                continue
+            marker = {
+                "Acceptance Criteria": "revised ac" if "revised ac" in markers else "revised acceptance criteria",
+                "Stop Conditions": "stop condition",
+                "Verification Commands": "verification command",
+                "Allowed Paths": "allowed paths",
+                "In Scope": "in scope",
+                "Out of Scope": "out of scope",
+            }[section]
+            if section == "Allowed Paths":
+                paths = _extract_path_literals_from_text(text)
+                if not paths:
+                    return []
+                for path in paths:
+                    operations.append({
+                        "section": section, "op": "append", "text": f"- `{path}`",
+                        "rationale": "Exact Allowed Paths delta extracted from trusted review comment",
+                        "source_evidence_index": index,
+                    })
+                continue
+            if section == "Stop Conditions" and _STOP_DIRECTIVE_RE.fullmatch(text):
+                normalized = f"- {text}"
+            elif section == "Verification Commands" and (match := _VC_DIRECTIVE_RE.fullmatch(text)):
+                normalized = match.group(1)
+            elif section == "Acceptance Criteria" and _AC_LINE_RE.fullmatch(f"- {text}"):
+                normalized = f"- {text}"
+            elif section in {"Stop Conditions", "Verification Commands", "In Scope", "Out of Scope"}:
+                normalized = f"- {text}"
             else:
-                continue
-            if marker == "allowed paths":
-                # Never append untrusted prose to the authorization-bearing
-                # Allowed Paths section.  A mixed or malformed directive
-                # produces no operation; classification separately routes it
-                # to human escalation before a transaction can be prepared.
-                for path in _extract_path_literals_from_text(text):
-                    operations.append(
-                        {
-                            "section": _MARKER_TO_CONTRACT_SECTION[marker],
-                            "op": "append",
-                            "text": f"- `{path}`",
-                            "rationale": "Exact Allowed Paths delta extracted from trusted review comment",
-                            "source_evidence_index": index,
-                        }
-                    )
-                continue
-            normalized_text = text
-            if not text.startswith("- ") and re.match(
-                r"(?:\[[ xX]\]\s*)?AC[0-9]+\s*:", text, re.IGNORECASE
-            ):
-                normalized_text = f"- {text}"
+                normalized = text
+            normalized += continuation
             operation = {
-                "section": _MARKER_TO_CONTRACT_SECTION[marker],
-                "op": "append",
-                "text": normalized_text,
+                "section": section, "op": "append", "text": normalized,
                 "rationale": f"Directive extracted from trusted review comment ({marker})",
                 "source_evidence_index": index,
             }
-            if is_safe_contract_patch_append(operation):
-                operations.append(operation)
+            # #2333 legacy one-bullet Revised AC without an AC number is safe
+            # only when the *entire* canonical comment is that one heading and
+            # bullet. For the old evidence-only API, require real evidence
+            # provenance; the consumer checks the freshly supplied anchor body.
+            legacy_single = (
+                source_body is None and section == "Acceptance Criteria"
+                and not text.startswith("-") and len(records) == 1
+                and set(markers) <= {"revised ac", "revised acceptance criteria"}
+                and evidence.get("schema_version") == "SCOPE_DELTA_AUTHORITY_EVIDENCE_V1"
+            )
+            if not legacy_single and not is_safe_contract_patch_append(operation, anchor_body=source_body):
+                return []
+            operations.append(operation)
     return operations
 
 
