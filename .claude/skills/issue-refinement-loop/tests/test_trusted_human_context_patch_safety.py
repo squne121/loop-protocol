@@ -5,7 +5,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import run_refinement_preflight as preflight  # noqa: E402
-from scope_signal_delta import derive_contract_patch_operations, extract_directive_items  # noqa: E402
+from scope_signal_delta import derive_contract_patch_operations, extract_directive_items, extract_sections  # noqa: E402
 
 REPO = "squne121/loop-protocol"
 ISSUE = 2827
@@ -148,6 +148,60 @@ def test_given_sectioned_owner_comment_when_extracted_then_stop_vc_ac_and_paths_
         ("In Scope", "- Preserve structured updates"),
         ("Out of Scope", "- No permission widening"),
     ]
+
+
+def test_given_mixed_inline_sections_under_revised_ac_when_derived_and_consumed_then_each_section_updated():
+    comment = ("## Revised Acceptance Criteria\n"
+               "- AC19: 明示的に番号付けした受け入れ条件\n"
+               "- Stop condition: 必須テストが失敗した場合は停止する。\n"
+               "- Verification command: `uv run --locked pytest tests/test_example.py`\n")
+    items = extract_directive_items(comment)
+    assert len(items) == 3
+    evidence = {"directive_markers": ["revised acceptance criteria", "stop condition", "verification command"],
+                "extracted_directives": items}
+    operations = derive_contract_patch_operations([evidence], source_body=comment)
+    assert [(op["section"], op["text"]) for op in operations] == [
+        ("Acceptance Criteria", "- AC19: 明示的に番号付けした受け入れ条件"),
+        ("Stop Conditions", "- Stop condition: 必須テストが失敗した場合は停止する。"),
+        ("Verification Commands", "- uv run --locked pytest tests/test_example.py"),
+    ]
+    original = BODY + "\n## Stop Conditions\n\n- existing\n\n## Verification Commands\n\n- $ true\n"
+    state, calls = {"body": original}, []
+    result = _consumer(operations, state, calls, anchor_body=comment)
+    assert (result["status"], result["writes"], calls) == ("applied", 1, ["write"])
+    sections = extract_sections(state["body"])
+    for op in operations:
+        assert op["text"] in sections[op["section"]].splitlines()
+        assert all(op["text"] not in content.splitlines() for name, content in sections.items()
+                   if name != op["section"])
+
+
+def test_given_mixed_inline_sections_with_unsafe_item_when_derived_then_whole_plan_rejected():
+    comment = ("## Revised Acceptance Criteria\n"
+               "- AC19: safe\n"
+               "- Stop condition: `../../escape.py` must be written.\n"
+               "- Verification command: `uv run --locked pytest tests/test_example.py`\n")
+    evidence = {"directive_markers": ["revised acceptance criteria", "stop condition", "verification command"],
+                "extracted_directives": extract_directive_items(comment)}
+    assert derive_contract_patch_operations([evidence], source_body=comment) == []
+    original = BODY + "\n## Stop Conditions\n\n- existing\n\n## Verification Commands\n\n- $ true\n"
+    state, calls = {"body": original}, []
+    result = _consumer([], state, calls, anchor_body=comment,
+                       known_context={"scope_delta_authority_evidence": [evidence],
+                                      "human_context_comment_urls": [URL]})
+    assert (result["status"], result["failure"], result["writes"]) == (
+        "blocked", "unsafe_unstructured_patch_operation", 0)
+    assert state["body"] == original and calls == []
+
+
+def test_given_mixed_inline_sections_with_raw_prose_when_derived_then_whole_plan_rejected():
+    comment = ("## Revised Acceptance Criteria\n"
+               "- AC19: safe\n"
+               "- Stop condition: stop on failure.\n"
+               "- Verification command: do whatever seems appropriate\n")
+    evidence = {"directive_markers": ["revised acceptance criteria", "stop condition", "verification command"],
+                "extracted_directives": extract_directive_items(comment)}
+    assert derive_contract_patch_operations([evidence], source_body=comment) == []
 
 
 def test_given_mixed_valid_and_invalid_structured_directives_when_derived_then_no_partial_plan():

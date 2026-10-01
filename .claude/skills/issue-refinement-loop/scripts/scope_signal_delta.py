@@ -1495,6 +1495,14 @@ _COMMENT_SECTION_HEADINGS = {
 _AC_LINE_RE = re.compile(r"-\s+(?:\[[ xX]\]\s*)?AC[0-9]+\s*:\s*\S.*", re.IGNORECASE)
 _STOP_DIRECTIVE_RE = re.compile(r"Stop Condition\s*を追加してください\s*:\s*(\S.*)", re.IGNORECASE)
 _VC_DIRECTIVE_RE = re.compile(r"Verification Commands?\s*:\s*((?:-\s+|\$\s+)\S.*)", re.IGNORECASE)
+# A single inline, backtick-quoted command is a structured VC item only when
+# its entire payload is one bounded argv-like command (no shell metacharacters).
+_VC_BACKTICK_DIRECTIVE_RE = re.compile(
+    r"Verification Commands?\s*:\s*`(?P<command>(?:uv|pnpm|python3|node|git|rg)"
+    r"(?:[ \t]+[A-Za-z0-9_./:=+@-]+)+)`",
+    re.IGNORECASE,
+)
+_INLINE_SECTION_LABEL_RE = re.compile(r"(?:Stop Conditions?|Verification Commands?)\s*:", re.IGNORECASE)
 
 
 def _structured_comment_items(body: str) -> list[tuple[str | None, str, str]]:
@@ -1618,6 +1626,13 @@ def derive_contract_patch_operations(evidence_list: list, *, source_body: str | 
             if len(inline_sections) > 1 and (explicit_section is None or explicit_section not in inline_sections):
                 return []  # A mixed, ambiguous section request is not a partial plan.
             section = explicit_section or (inline_sections[0] if len(inline_sections) == 1 else None)
+            # A Revised AC H2 is context, not an override for a different
+            # explicitly labelled bullet. Numbered ACs above still stay ACs,
+            # even if their prose happens to mention Stop/VC.
+            if (explicit_section == "Acceptance Criteria" and len(inline_sections) == 1
+                    and inline_sections[0] in {"Stop Conditions", "Verification Commands"}
+                    and _INLINE_SECTION_LABEL_RE.match(text)):
+                section = inline_sections[0]
             if section is None and set(markers) <= {"revised ac", "revised acceptance criteria"}:
                 section = "Acceptance Criteria"
             if section is None:
@@ -1643,6 +1658,8 @@ def derive_contract_patch_operations(evidence_list: list, *, source_body: str | 
                 continue
             if section == "Stop Conditions" and _STOP_DIRECTIVE_RE.fullmatch(text):
                 normalized = f"- {text}"
+            elif section == "Verification Commands" and (match := _VC_BACKTICK_DIRECTIVE_RE.fullmatch(text)):
+                normalized = f"- {match.group('command')}"
             elif section == "Verification Commands" and (match := _VC_DIRECTIVE_RE.fullmatch(text)):
                 normalized = match.group(1)
             elif section == "Acceptance Criteria" and _AC_LINE_RE.fullmatch(f"- {text}"):
