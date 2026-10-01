@@ -81,8 +81,21 @@ _UNSPECIFIED_AGENT_TYPE = "unspecified"
 # for any agent other than `web-researcher`. See PR #2409 OWNER
 # adversarial review comment.
 _REQUIRED_RUNTIME_OBSERVATION_FIELDS = frozenset(
-    {"effective_permission_profile", "loaded_skill", "executor", "mutation"}
+    {"effective_permission_profile", "loaded_skill", "executor", "mutation", "permission_mode"}
 )
+
+# Issue #2854: the only ``--require-observed-runtime-field`` value that has a
+# native extractor (``extract_claude_subagentstop_permission_mode``). Every
+# other field in ``_REQUIRED_RUNTIME_OBSERVATION_FIELDS`` stays unsupported.
+_PERMISSION_MODE_FIELD = "permission_mode"
+# Closed set listed by the official Claude Code hooks reference.
+_PERMISSION_MODE_VALUES = frozenset(
+    {"default", "plan", "acceptEdits", "auto", "dontAsk", "bypassPermissions"}
+)
+_OBSERVATION_REASON_NO_SUBAGENTSTOP_EVENT = "no_subagentstop_hook_event"
+_OBSERVATION_REASON_FIELD_ABSENT = "field_absent"
+_OBSERVATION_REASON_INVALID_OR_CONFLICTING = "invalid_or_conflicting_value"
+_OBSERVATION_REASON_NO_NATIVE_EXTRACTOR = "no_native_extractor"
 
 EXIT_OK = 0
 EXIT_FAIL = 1
@@ -2432,6 +2445,74 @@ def extract_claude_hook_lifecycle_events(stdout: str) -> list[dict]:
 
         events.append(entry)
     return events
+
+
+def extract_claude_subagentstop_permission_mode(stdout: str) -> dict:
+    """Issue #2854: independently extract ``permission_mode`` from the native
+    stream-json ``SubagentStop`` hook event ONLY.
+
+    Adopted observation: a stream line with ``type == "system"``,
+    ``subtype == "hook_response"`` and ``hook_event == "SubagentStop"`` whose
+    hook stdin payload (echoed on the ``stdout`` / ``output`` channels, the
+    same acquisition path as ``extract_claude_hook_lifecycle_events``)
+    carries a non-empty ``agent_id`` and a ``permission_mode`` string from the
+    closed official set. Anything else (assistant/user/result text, other
+    hook events, wrong type, out-of-enum value, ``stdout`` vs ``output``
+    disagreement, disagreement across multiple events) is never an
+    observation -- fail closed.
+
+    Returns ``{"observed": bool, "value": str | None, "reason": str | None}``.
+    ``reason`` is ``None`` when observed, otherwise one of
+    ``no_subagentstop_hook_event`` / ``field_absent`` /
+    ``invalid_or_conflicting_value``.
+
+    ``permission_mode`` only proves the mode the runtime reported on that
+    event; it is NOT an ``effective_permission_profile`` observation."""
+    stop_event_count = 0
+    invalid = False
+    adopted_values: list[str] = []
+    for payload in _iter_claude_stream_events(stdout):
+        if (
+            payload.get("type") != "system"
+            or payload.get("subtype") != "hook_response"
+            or payload.get("hook_event") != "SubagentStop"
+        ):
+            continue
+        stop_event_count += 1
+        channels: list[dict] = []
+        for key in ("stdout", "output"):
+            raw_text = payload.get(key)
+            if not isinstance(raw_text, str) or not raw_text.strip():
+                continue
+            parsed = _parse_embedded_json_object(raw_text)
+            if parsed is not None:
+                channels.append(parsed)
+
+        agent_ids = {
+            c.get("agent_id") for c in channels if isinstance(c.get("agent_id"), str) and c.get("agent_id")
+        }
+        present = [c[_PERMISSION_MODE_FIELD] for c in channels if _PERMISSION_MODE_FIELD in c]
+        if not present:
+            continue
+        values = set()
+        event_invalid = False
+        for value in present:
+            if isinstance(value, str) and value in _PERMISSION_MODE_VALUES:
+                values.add(value)
+            else:
+                event_invalid = True
+        if event_invalid or len(values) != 1 or len(agent_ids) != 1:
+            invalid = True
+            continue
+        adopted_values.append(next(iter(values)))
+
+    if invalid or len(set(adopted_values)) > 1:
+        return {"observed": False, "value": None, "reason": _OBSERVATION_REASON_INVALID_OR_CONFLICTING}
+    if adopted_values:
+        return {"observed": True, "value": adopted_values[0], "reason": None}
+    if stop_event_count == 0:
+        return {"observed": False, "value": None, "reason": _OBSERVATION_REASON_NO_SUBAGENTSTOP_EVENT}
+    return {"observed": False, "value": None, "reason": _OBSERVATION_REASON_FIELD_ABSENT}
 
 
 # ---------------------------------------------------------------------------
@@ -7890,13 +7971,37 @@ def main(argv: list[str] | None = None) -> int:
 
             required_observations = sorted(set(args.require_observed_runtime_field))
             if required_observations:
-                # These four fields have no independently extractable Codex
-                # event in this runner.  Record that precise capability gap;
-                # declarations or local re-reads must never fill it in.
-                unavailable = required_observations
+                # Issue #2854: only ``permission_mode`` has a native extractor
+                # (SubagentStop ``system/hook_response`` payload). The other
+                # fields have no independently extractable event in this
+                # runner; record that precise capability gap. Declarations or
+                # local re-reads must never fill it in, and ``permission_mode``
+                # is never an alias for ``effective_permission_profile``.
+                observed_runtime_fields: dict[str, dict] = {}
+                unavailable_reasons: dict[str, str] = {}
+                for field in required_observations:
+                    if field != _PERMISSION_MODE_FIELD:
+                        unavailable_reasons[field] = _OBSERVATION_REASON_NO_NATIVE_EXTRACTOR
+                        continue
+                    if args.runtime != "claude":
+                        unavailable_reasons[field] = _OBSERVATION_REASON_NO_SUBAGENTSTOP_EVENT
+                        continue
+                    extracted = extract_claude_subagentstop_permission_mode(out)
+                    if extracted["observed"]:
+                        observed_runtime_fields[field] = {
+                            "value": extracted["value"],
+                            "source_event": "system/hook_response",
+                            "source_hook_event": "SubagentStop",
+                            "source_field": _PERMISSION_MODE_FIELD,
+                        }
+                    else:
+                        unavailable_reasons[field] = extracted["reason"]
+                unavailable = sorted(unavailable_reasons)
                 schema_summary["required_runtime_observations"] = required_observations
                 schema_summary["unavailable_required_runtime_observations"] = unavailable
-                if exit_code == EXIT_OK:
+                schema_summary["observed_runtime_fields"] = observed_runtime_fields
+                schema_summary["unavailable_required_runtime_observation_reasons"] = unavailable_reasons
+                if unavailable and exit_code == EXIT_OK:
                     errors.append(
                         "required runtime observations unavailable: " + ", ".join(unavailable)
                     )
