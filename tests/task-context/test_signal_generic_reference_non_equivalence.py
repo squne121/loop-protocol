@@ -40,10 +40,21 @@ def test_given_explicit_pr_prompt_when_submit_fields_are_built_then_hot_path_doe
     )
     hook_entry._apply_user_prompt_submit_fields(
         payload,
-        {"prompt": "Review https://github.com/squne121/loop-protocol/pull/21", "cwd": "/unused"},
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "prompt_id": "prompt-1",
+            "prompt": "Review https://github.com/squne121/loop-protocol/pull/21",
+            "cwd": "/unused",
+        },
     )
     assert payload == {
+        "input_provenance": "user_prompt_observed",
         "classification_kind": classifier.KIND_EXPLICIT,
+        "active_rebind_primary_eligible": True,
+        "active_rebind_target_repo": "squne121/loop-protocol",
+        "active_rebind_target_ref_kind": "pr",
+        "active_rebind_target_ref_number": 21,
+        "active_rebind_ref_form": "explicit",
         "target_repo": "squne121/loop-protocol",
         "target_ref_kind": "pr",
         "target_ref_number": 21,

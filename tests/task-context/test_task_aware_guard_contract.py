@@ -109,6 +109,7 @@ def test_given_ordinary_prompt_from_relayed_approval_when_processed_then_task_ac
         {
             "herdr_tab_id": "tab-1",
             "claude_session_id": "s1",
+            "input_provenance": "user_prompt_observed",
             "classification_kind": "EXPLICIT",
             "target_repo": "owner/repo",
             "target_ref_kind": "issue",
@@ -153,6 +154,7 @@ def test_given_agent_teams_lifecycle_event_names_when_dispatched_then_generic_pa
         {
             "herdr_tab_id": "tab-1",
             "claude_session_id": "s1",
+            "input_provenance": "user_prompt_observed",
             "classification_kind": "EXPLICIT",
             "target_repo": "owner/repo",
             "target_ref_kind": "issue",

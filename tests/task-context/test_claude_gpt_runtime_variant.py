@@ -80,6 +80,7 @@ def test_given_native_run_cleanly_ended_when_resuming_under_claude_gpt_variant_t
         {
             "herdr_tab_id": "switch-tab-1",
             "claude_session_id": "n1",
+            "input_provenance": "user_prompt_observed",
             "classification_kind": "EXPLICIT",
             "target_repo": "owner/repo",
             "target_ref_kind": "issue",
@@ -121,6 +122,7 @@ def test_given_stale_open_native_run_when_restarting_under_claude_gpt_variant_th
         {
             "herdr_tab_id": "switch-tab-2",
             "claude_session_id": "n1",
+            "input_provenance": "user_prompt_observed",
             "classification_kind": "EXPLICIT",
             "target_repo": "owner/repo",
             "target_ref_kind": "issue",
@@ -163,6 +165,7 @@ def test_given_claude_gpt_run_ended_when_resuming_under_native_variant_then_task
         {
             "herdr_tab_id": "switch-tab-3",
             "claude_session_id": "g1",
+            "input_provenance": "user_prompt_observed",
             "classification_kind": "EXPLICIT",
             "target_repo": "owner/repo",
             "target_ref_kind": "issue",
