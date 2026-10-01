@@ -3,7 +3,10 @@ In Scope). No DB, no subprocess -- pure text-processing unit tests."""
 
 from __future__ import annotations
 
+import re
+
 import classifier
+import pytest
 
 
 def test_given_plain_prompt_with_no_ref_when_classified_then_none():
@@ -241,9 +244,12 @@ def test_japanese_marker_after_comma_demotes_only_marker_reference():
     marker_first = classifier.classify("参考: #2826。現在の作業を続けて", current_repo=REPO)
     assert marker_first.kind == classifier.KIND_REFERENCE_ONLY
     assert marker_first.target.ref_number == 2826
-    # The marker-side reference (#2826) is the one demoted, in either order.
+    # Issue #2850 (OWNER decision, Option 1): marker-first bounded reference list. Every
+    # reference-led segment right after the marker is a list element, so BOTH references are
+    # recognized and neither is a primary candidate (REFERENCE_ONLY).
     marker_before = classifier.classify("関連資料: #2826、Issue #2827 を対象にレビューして", current_repo=REPO)
-    assert marker_before.kind == classifier.KIND_INFERRED and marker_before.target.ref_number == 2827
+    assert marker_before.kind == classifier.KIND_REFERENCE_ONLY
+    assert sorted(t.ref_number for t in marker_before.targets) == [2826, 2827]
     # (e) two actual primaries remain AMBIGUOUS; the marker reference (#12) is not among them.
     ambiguous = classifier.classify(
         "Issue #10 と Issue #11 を対象にレビューして、関連資料: #12", current_repo=REPO
@@ -372,3 +378,243 @@ def test_active_projection_reference_forms_and_whole_prompt_rule():
     # Code / quoted / blockquote text is not authority.
     assert not _eligible("`Issue #6 を実装して`")
     assert not _eligible("> Issue #6 を実装して")
+
+
+# ---------------------------------------------------------------------------
+# Issue #2850 (absorbs #2855): ASCII number boundary, `Issue#12` closed-prefix
+# adjacency, and the marker-bound reference list. The two fixes interact (fixing
+# only the boundary turns `参考: #10、#11を実装して` into a wrong primary #11), so
+# the combinations are pinned together. Pure text tests, no DB / subprocess.
+# ---------------------------------------------------------------------------
+
+_SHAPE_KEYS = (
+    "active_rebind_primary_eligible",
+    "active_rebind_target_repo",
+    "active_rebind_target_ref_kind",
+    "active_rebind_target_ref_number",
+    "active_rebind_ref_form",
+)
+
+
+def _shape(prompt: str) -> tuple:
+    """(kind, targets as (repo, ref_kind, ref_number), ACTIVE projection) of ``prompt``."""
+    result = classifier.classify(prompt, current_repo=REPO)
+    targets = tuple((t.repo, t.ref_kind, t.ref_number) for t in result.targets)
+    projection = classifier.active_rebind_projection(prompt, result, current_repo=REPO)
+    return result.kind, targets, tuple(projection.get(key) for key in _SHAPE_KEYS)
+
+
+_CJK_ADJACENT_TO_SPACED = [
+    # (no-space form, spaced form)
+    ("Issue #12を対象にレビューして", "Issue #12 を対象にレビューして"),
+    ("#12を実装して", "#12 を実装して"),
+    ("PR #34をレビューして", "PR #34 をレビューして"),
+    ("owner/repo#12を対象に作業開始", "owner/repo#12 を対象に作業開始"),
+]
+
+
+@pytest.mark.parametrize(("adjacent", "spaced"), _CJK_ADJACENT_TO_SPACED)
+def test_given_cjk_char_after_reference_when_classified_then_same_as_spaced_form(adjacent, spaced):
+    # classify() and active_rebind_projection() both agree with the spaced form.
+    adjacent_shape = _shape(adjacent)
+    assert adjacent_shape[0] != classifier.KIND_NONE, adjacent
+    assert adjacent_shape == _shape(spaced), adjacent
+    # Concrete anchors so a symmetric regression (both forms NONE) cannot pass.
+    assert adjacent_shape[1], adjacent
+    # A full URL already worked (separate regex) and stays EXPLICIT.
+    url = classifier.classify("https://github.com/owner/repo/issues/12を対象にレビューして", current_repo=REPO)
+    assert url.kind == classifier.KIND_EXPLICIT
+    assert (url.target.repo, url.target.ref_kind, url.target.ref_number) == ("owner/repo", "issue", 12)
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "#12abc",
+        "Issue #12abc を実装して",
+        "abc#12",
+        "xIssue#12",
+        "xPR#34 をレビューして",
+        "Issue #12_x を実装して",
+        "`Issue #12を実装して`",
+        "```\nIssue #12を実装して\n```",
+        "> Issue #12を実装して",
+    ],
+)
+def test_given_adjacent_alnum_or_unchanged_semantics_when_classified_then_boundaries_kept(prompt):
+    # ASCII word characters after the digits / before the prefix, and code / quote
+    # text, are still not references.
+    result = classifier.classify(prompt, current_repo=REPO)
+    assert result.kind == classifier.KIND_NONE, prompt
+    assert result.target is None, prompt
+    assert _projection(prompt) == {"active_rebind_primary_eligible": False}, prompt
+    # Genuinely separate primaries stay AMBIGUOUS exactly like the spaced form.
+    for adjacent, spaced in (
+        ("Issue #12とIssue #34を対象にレビューして", "Issue #12 と Issue #34 を対象にレビューして"),
+        ("#12を、#34を実装して", "#12 を、#34 を実装して"),
+    ):
+        assert classifier.classify(adjacent, current_repo=REPO).kind == classifier.KIND_AMBIGUOUS, adjacent
+        assert classifier.classify(spaced, current_repo=REPO).kind == classifier.KIND_AMBIGUOUS, spaced
+        assert not _eligible(adjacent), adjacent
+
+
+@pytest.mark.parametrize(
+    ("prompt", "ref_kind"),
+    [
+        ("Issue#12", "issue"),
+        ("PR#34", "pr"),
+        ("イシュー#12", "issue"),
+        ("プルリク#34", "pr"),
+        ("プルリクエスト#34", "pr"),
+        ("pull request#34", "pr"),
+        ("Issue#12を対象にレビューして", "issue"),
+        ("PR#34をレビューして", "pr"),
+    ],
+)
+def test_given_closed_prefix_without_space_before_hash_when_classified_then_recognized(prompt, ref_kind):
+    # Closed-prefix policy (OWNER approved): only issue / pr / pull request and the
+    # Japanese counterparts may touch the `#`; the prefix is not glued to a word.
+    result = classifier.classify(prompt, current_repo=REPO)
+    assert result.kind == classifier.KIND_INFERRED, prompt
+    assert result.target.ref_kind == ref_kind, prompt
+    assert result.target.repo == REPO
+    assert result.target.ref_number in (12, 34)
+    assert result.target.explicit_repo is False
+    assert _projection(prompt)["active_rebind_ref_form"] == "prefixed", prompt
+    # `needs_current_repo_resolution` uses the same recognition (REPO is substituted by the caller).
+    assert classifier.needs_current_repo_resolution(prompt), prompt
+    # Words outside the closed set are not prefixes.
+    for outside in ("bug#12", "ticket#12", "Issues#12", "xIssue#12", "abc#12", "my_pr#34"):
+        assert classifier.classify(outside, current_repo=REPO).kind == classifier.KIND_NONE, outside
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "参考: #10、#11を実装して",
+        "参考: #10, #11を実装して",
+        "参考: #10、#11 を実装して",
+        "参考: #10、Issue #11 を実装して",
+        "関連資料: #10、#11",
+    ],
+)
+def test_given_marker_followed_by_reference_list_when_classified_then_reference_only_not_eligible(prompt):
+    result = classifier.classify(prompt, current_repo=REPO)
+    # Every reference is recognized (a NONE result that merely misses #11 would not pass) ...
+    assert result.kind == classifier.KIND_REFERENCE_ONLY, prompt
+    assert sorted(t.ref_number for t in result.targets) == [10, 11], prompt
+    # ... and none of them is an ACTIVE rebind primary.
+    assert _projection(prompt) == {"active_rebind_primary_eligible": False}, prompt
+
+
+@pytest.mark.parametrize(
+    ("prompt", "primary"),
+    [
+        ("Issue #2827を対象にレビューして、関連資料: #2826、#2829", 2827),
+        ("Issue #2827 を対象にレビューして、関連資料: #2826、#2829", 2827),
+        ("Issue #12を対象にレビューして、関連資料: #10、#11", 12),
+    ],
+)
+def test_given_primary_then_marker_reference_list_when_classified_then_primary_kept(prompt, primary):
+    result = classifier.classify(prompt, current_repo=REPO)
+    assert result.kind == classifier.KIND_INFERRED, prompt
+    assert (result.target.repo, result.target.ref_kind, result.target.ref_number) == (REPO, "issue", primary)
+    assert result.targets == (result.target,), prompt
+    projection = _projection(prompt)
+    assert projection["active_rebind_primary_eligible"] is True, prompt
+    assert projection["active_rebind_target_repo"] == REPO
+    assert projection["active_rebind_target_ref_kind"] == "issue"
+    assert projection["active_rebind_target_ref_number"] == primary
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "参考: #10、#11。Issue #12を実装して",
+        "参考: #10、#11\nIssue #12を実装して",
+        "参考: #10、#11. Issue #12を実装して",
+        "参考: #10、#11？Issue #12を実装して",
+        # A segment whose first token is not a reference ends the list.
+        "参考: #10、それとは別に Issue #12を実装して",
+    ],
+)
+def test_given_marker_list_then_sentence_boundary_when_classified_then_next_primary_kept(prompt):
+    result = classifier.classify(prompt, current_repo=REPO)
+    assert result.kind == classifier.KIND_INFERRED, prompt
+    assert result.target.ref_number == 12, prompt
+    assert result.targets == (result.target,), prompt
+    projection = _projection(prompt)
+    assert projection["active_rebind_primary_eligible"] is True, prompt
+    assert projection["active_rebind_target_ref_number"] == 12
+    # The marker list references (#10 / #11) never become the primary.
+    assert all(t.ref_number not in (10, 11) for t in result.targets), prompt
+
+
+def test_given_pre_fix_behavior_restored_when_classified_then_regression_cases_fail(monkeypatch):
+    """Negative control (AC7): restoring the pre-fix module-level regexes / helper
+    makes representative AC1 / AC4 / AC5 cases fail. No production switch exists;
+    the pre-fix behavior is injected by monkeypatching the module attributes."""
+
+    def satisfies_ac1() -> bool:
+        return _shape("Issue #12を対象にレビューして") == _shape("Issue #12 を対象にレビューして") and (
+            classifier.classify("#12を実装して", current_repo=REPO).kind == classifier.KIND_INFERRED
+        )
+
+    def satisfies_ac4() -> bool:
+        result = classifier.classify("参考: #10、#11を実装して", current_repo=REPO)
+        return (
+            result.kind == classifier.KIND_REFERENCE_ONLY
+            and sorted(t.ref_number for t in result.targets) == [10, 11]
+            and not _eligible("参考: #10、#11を実装して")
+        )
+
+    def satisfies_ac4_spaced() -> bool:
+        # Boundary already fine in the spaced form: only the marker list rule matters here.
+        return not _eligible("参考: #10、#11 を実装して")
+
+    def satisfies_ac5() -> bool:
+        result = classifier.classify("Issue #2827を対象にレビューして、関連資料: #2826、#2829", current_repo=REPO)
+        return result.kind == classifier.KIND_INFERRED and result.target.ref_number == 2827
+
+    def satisfies_ac5_spaced() -> bool:
+        result = classifier.classify("Issue #2827 を対象にレビューして、関連資料: #2826、#2829", current_repo=REPO)
+        return result.kind == classifier.KIND_INFERRED and result.target.ref_number == 2827
+
+    def satisfies_ac3() -> bool:
+        return classifier.classify("Issue#12", current_repo=REPO).kind == classifier.KIND_INFERRED
+
+    checks = {
+        "ac1": satisfies_ac1,
+        "ac3": satisfies_ac3,
+        "ac4": satisfies_ac4,
+        "ac4_spaced": satisfies_ac4_spaced,
+        "ac5": satisfies_ac5,
+        "ac5_spaced": satisfies_ac5_spaced,
+    }
+    # Post-fix: every representative case holds.
+    assert {name: check() for name, check in checks.items()} == dict.fromkeys(checks, True)
+
+    # Pre-fix number boundary (Unicode `\b`), no `Issue#12` adjacency recognition.
+    monkeypatch.setattr(classifier, "_OWNER_REPO_HASH_RE", re.compile(r"\b([\w.-]+/[\w.-]+)#(\d+)\b"))
+    monkeypatch.setattr(classifier, "_BARE_HASH_RE", re.compile(r"(?<![\w/])#(\d+)\b"))
+    monkeypatch.setattr(classifier, "_ADJACENT_PREFIX_HASH_RE", re.compile(r"(?!x)x"))
+    # Pre-fix marker binding: only the marker's own `、` / `,` segment is demoted.
+    post_fix_primary_occurrences = classifier._primary_occurrences
+
+    def pre_fix_primary_occurrences(authority_text, occurrences):
+        marker_segments = []
+        for clause in classifier._clause_spans(authority_text):
+            if not any(m in authority_text[clause[0] : clause[1]] for m in classifier._JA_REFERENCE_ONLY_MARKERS):
+                continue
+            for segment in classifier._marker_segment_spans(authority_text, clause):
+                if any(m in authority_text[segment[0] : segment[1]] for m in classifier._JA_REFERENCE_ONLY_MARKERS):
+                    marker_segments.append(segment)
+        if not marker_segments:
+            return list(occurrences)
+        return [o for o in occurrences if not any(s <= o.start < e for s, e in marker_segments)]
+
+    monkeypatch.setattr(classifier, "_primary_occurrences", pre_fix_primary_occurrences)
+    assert classifier._primary_occurrences is not post_fix_primary_occurrences
+
+    # Each representative case fails once the pre-fix behavior is restored.
+    assert {name: check() for name, check in checks.items()} == dict.fromkeys(checks, False)
