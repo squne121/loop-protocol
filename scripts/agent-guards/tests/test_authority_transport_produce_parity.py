@@ -58,14 +58,18 @@ def _command(root: Path, fixture: str, sha: str, *, repo: str = REPO, extra: tup
 # fail the test.
 # The second entry is the exact root-owned readiness artifact observed while
 # #2842's AC6 ran concurrently with the #2854 review; it is NOT a wildcard.
-# The fixed AC7 runtime-verification log pattern is a third independently
-# observed root-owned pipeline artifact; no general artifacts/** exemption.
+# The fixed AC7 runtime-verification log and the issue-comment publisher's
+# exact marker path (for other real Issues, not this 90-million test sentinel)
+# are independently observed root-owned writes. No general artifacts/**
+# exemption is introduced.
 _FOREIGN_SCRATCH_FAILURE = re.compile(
     rf"SKILL_RUNTIME_FAIL: reason_code=unauthorized_write_path target_issue={ISSUE} "
     r"unauthorized write path=(tmp/root_review_pipeline_[a-z0-9_]{1,32}/"
     r"root_review_pipeline_body_[a-z0-9_]{1,32}\.md|"
     r"tmp/r2854/readiness2\.json|"
     r"artifacts/runtime-verification-AC7-native-live-handoff-\d{8}T\d{6}Z\.log|"
+    r"artifacts/[1-9]\d{0,6}/issue-metadata/issue_comment\.publish/"
+    r"issue_comment_publish\.marker\.json|"
     r"\.skill-runtime-git-hooks-[a-z0-9_]{1,32}) "
     r"recovery=do_not_write_outside_allowed_root"
 )
@@ -132,6 +136,8 @@ def test_given_no_linked_issue_worktree_when_real_producer_executes_then_local_m
     ".claude/artifacts/issue-refinement-loop/other-issue/file.json",
     "artifacts/runtime-verification-AC7-native-live-handoff-unknown.log",
     "artifacts/other-runtime-verification-20261001T131825Z.log",
+    "artifacts/2850/issue-metadata/issue_comment.publish/other-marker.json",
+    "artifacts/2850/issue-metadata/other-publisher/issue_comment_publish.marker.json",
 ])
 def test_genuine_unauthorized_write_is_not_retried(monkeypatch, tmp_path, path):
     failure = subprocess.CompletedProcess(
@@ -175,6 +181,7 @@ def test_known_foreign_scratch_collision_requires_second_successful_invocation(m
     "tmp/root_review_pipeline_abcdefgh/root_review_pipeline_body_abcdefgh.md",
     "tmp/r2854/readiness2.json",
     "artifacts/runtime-verification-AC7-native-live-handoff-20261001T131825Z.log",
+    "artifacts/2850/issue-metadata/issue_comment.publish/issue_comment_publish.marker.json",
 ])
 def test_foreign_scratch_collision_requires_real_success_not_failed_retry(
     monkeypatch, tmp_path, foreign_path
