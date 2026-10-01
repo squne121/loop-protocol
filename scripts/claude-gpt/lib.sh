@@ -672,6 +672,25 @@ CLAUDE_GPT_AUTO_MODE_ENVIRONMENT_NARROW_LABEL="claude-gpt launcher narrow enviro
 
 CLAUDE_GPT_AUTO_MODE_ALLOW_NARROW_LABEL="claude-gpt launcher narrow allow（second-gate 判断補助。authority ではない）: ${CLAUDE_GPT_TRUSTED_REPO} に repository 固定した native GitHub client（\`gh\` 相当）による Issue の read/create/edit/comment/close と、同一 repository の PR の read/create/edit/comment/review、および同一 repository への non-force task-branch push（force push・branch/tag/release 削除・repository settings/IAM/secret 変更は含まない）。これら通常操作の correctness は mutation 前後の authoritative live readback で確認する。加えて controlled canonical Issue-edit transaction は \`uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file <repo-relative-safe-operand>\` の正確な token/argv identity に限定し、shell operator、追加引数、absolute/unsafe operand、generic uv/Python/raw gh は含まない（この token/argv 制限は本 controlled canonical Issue-edit transaction にのみ適用する transaction-local restriction であり、前段で許可した repository-scoped native GitHub client（\`gh\` 相当）による通常操作を一律に禁止するものではない）。repository-owned canonical codebase-investigator -> gemini-cli-headless-delegation -> provider=agy の read-only isolated delegation（direct arbitrary agy 起動・provider!=agy・canonical builder/wrapper bypass・AGY からの GitHub mutation は対象外。github_research route は既存の read-only broker が credential を専有する）。push/ref/merge の authority は repository permissions・GitHub Rulesets/branch protection・required CI が持ち、Issue/PR object mutation の authority は GitHub API authorization（repository permissions）と mutation 前後の authoritative live readback が持つ。この allow rule はいずれの authority でもない second-gate 判断補助に過ぎない。"
 
+# --- Issue #2843: canonical workflow delegation context（追加的な説明）-------------
+#
+# 上記 ENVIRONMENT/ALLOW narrow label は一切変更せず、その後ろに独立した entry として
+# 追加する（既存 label は autoMode.environment/allow の index 1 のまま。新 entry は
+# index 2）。これは classifier が読む自然言語の判断材料であり、決定論的 authorization
+# ではない（permissions.allow / hook / settings / permission mode は増やさない）。
+# 対象は「ユーザーが current issue-refinement-loop / impl-review-loop の自律実行を
+# 明示した session」の canonical SubAgent delegation に限る。
+#   - #2223 / #2658 / PR #2666 の Owner Decision（repository-scoped native GitHub
+#     操作の許可、raw gh / git push を遮断する新規 enforcing hook を追加しない）は
+#     狭めない。wrapper 必須条件は actor・mode・operation 単位でのみ記述する。
+#   - #2839（independent `claude -p` runtime VC への operator approval context）、
+#     #2456 / #2471（secret-free diagnostic false-positive）、raw CI rerun
+#     （`gh run rerun`。Interfere With Workloads）はそれぞれ別 ownership であり、
+#     この context に吸収しない。
+CLAUDE_GPT_AUTO_MODE_ENVIRONMENT_DELEGATION_LABEL="claude-gpt launcher canonical workflow delegation context（second-gate 判断補助。authority ではない）: ユーザーが current issue-refinement-loop または impl-review-loop の自律実行を明示した interactive session では、その loop の documented terminal boundary（ユーザーが指定した停止点。例: merge 判断直前）までの完走がユーザー自身の依頼に含まれる。対象は ${CLAUDE_GPT_TRUSTED_REPO} の current task / current linked Issue・PR / current repo に限る。親 Agent がユーザーの依頼文脈（依頼文や同 session の指定）で示された current linked Issue・PR と canonical Skill/Agent contract に基づいて組み立てた SubAgent 呼び出しは、ユーザー依頼の実行であり、transcript の中にしか現れない別の依頼として扱わない。ユーザーの依頼文脈に無い PR・Issue・repository が対象の場合はこの限りではない。この文脈は上記 narrow environment の記述を狭めない追加説明である。"
+
+CLAUDE_GPT_AUTO_MODE_ALLOW_DELEGATION_LABEL="claude-gpt launcher canonical workflow delegation allow（second-gate 判断補助。authority ではない）: ユーザーが明示的に起動した current issue-refinement-loop / impl-review-loop を完了するために current Skill/Agent contract が定める canonical SubAgent（issue-editor / implementation-worker / test-runner / pr-reviewer）への routine delegation（例: implementation-worker への update_pr_body_hygiene mode の IMPLEMENTATION_WORKER_REQUEST_V2 委譲）は、追加の個別承認を必要とする別の依頼として扱わない。loop の documented terminal boundary までを対象とし、mutation は current task / current linked Issue・PR / current repo に限る。親 Agent がユーザーの依頼文脈で示された current linked PR・Issue の番号・mode・body file などを引き継いで組み立てた IMPLEMENTATION_WORKER_REQUEST_V2 は、transcript の中にしか現れない別の依頼ではなくユーザー依頼の実行である。この文脈は前段の allow で許可した repository-scoped native GitHub client（\`gh\` 相当）による通常操作の許可を狭めず、controlled Issue-edit transaction の exact argv 制限が transaction-local restriction である旨も変更せず、各 Agent の役割や read-only 制約も変えない。wrapper 必須条件は current Agent/Skill contract がその条件を明示している actor・mode・operation（例: implementation-worker の update_pr_body_hygiene mode は .claude/skills/open-pr/scripts/update_pr.py 経由）にだけ適用し、全 session 共通の raw gh 禁止ではない。実 merge / auto-merge・force push・default branch direct push・remote ref deletion・secret や credential の read-egress・repository settings/IAM の変更・stale や current-head evidence の偽造（実行していない結果を current-head の成功証拠として作ること）はこの文脈に含まれない。ユーザーが指定した停止点・禁止事項は常に優先する。"
+
 # hard_deny への追加分（P0-2, PR #2214 OWNER adversarial review 反映）。$defaults の
 # hard_deny を置換・削除せず、default branch push・force push・remote ref
 # deletion を明示的に追加する。以下の hard_deny は classifier に対する追加
@@ -784,11 +803,15 @@ claude_gpt_build_model_incompatibility_json() {
 claude_gpt_auto_mode_json_fragment() {
   env_label_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_ENVIRONMENT_NARROW_LABEL")
   allow_label_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_ALLOW_NARROW_LABEL")
+  env_delegation_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_ENVIRONMENT_DELEGATION_LABEL")
+  allow_delegation_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_ALLOW_DELEGATION_LABEL")
   hard_deny_default_branch_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_DEFAULT_BRANCH_PUSH_LABEL")
   hard_deny_force_push_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_FORCE_PUSH_LABEL")
   hard_deny_ref_deletion_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_REF_DELETION_LABEL")
-  printf '"autoMode": {"environment": ["$defaults", %s], "allow": ["$defaults", %s], "hard_deny": ["$defaults", %s, %s, %s]}' \
-    "$env_label_json" "$allow_label_json" \
+  # Issue #2843: 既存 narrow label（index 1）は変更せず、canonical workflow delegation
+  # context を index 2 に追加的に置く（classifyAllShell は引き続き省略する）。
+  printf '"autoMode": {"environment": ["$defaults", %s, %s], "allow": ["$defaults", %s, %s], "hard_deny": ["$defaults", %s, %s, %s]}' \
+    "$env_label_json" "$env_delegation_json" "$allow_label_json" "$allow_delegation_json" \
     "$hard_deny_default_branch_json" "$hard_deny_force_push_json" "$hard_deny_ref_deletion_json"
 }
 
