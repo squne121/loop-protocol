@@ -475,7 +475,26 @@ hook_boundaries_manifest_v1:
       current Task/Activity/Binding を一切変更せず、target ref の claim も silent rebind も
       行わず、EventJournal への必須記録（`status="pass"` の non-blocking observation。
       hard-block state を示す `status="block"` ではない）と stderr 上の advisory 診断のみで
-      扱う（AC1/AC2）。
+      扱う（AC1/AC2）。ただし下記 Issue #2827 の auto-rebind 適格条件を満たす ordinary
+      user prompt だけは、この advisory の代わりに既存 atomic binder で対象 Task へ rebind する。
+
+      Issue #2827（ordinary user prompt による ACTIVE Task auto-rebind）: normal ACTIVE Task
+      切替は、operator が `/task` を先に入力することを必須としない。`UserPromptSubmit`
+      adapter は `input_provenance`（`user_prompt_observed` | `internal_or_unknown` の 2 値、
+      fail-closed）を生成して core へ渡す。`hook_event_name == "UserPromptSubmit"`・非空
+      `prompt_id`・文字列 `prompt`・既知 internal envelope marker（初期値 `<task-notification>`）
+      で始まらない、を全て満たす場合のみ `user_prompt_observed` とし、`prompt_id` 単独や
+      transcript 末尾は根拠にしない（physical-human 認証ではなく operator_asserted 相当）。
+      `internal_or_unknown` の場合は UNBOUND autobind / 0-ref provisional absorb / terminal
+      rebind / ACTIVE different-primary rebind の 4 入口すべてで Task identity を変更せず、
+      Claude の通常処理は継続する（mutation なし・確認 dialog なし・`/task` 強制なし）。
+      ACTIVE different-primary の auto-rebind は、ACTIVE 専用 projection
+      （`active_rebind_primary_eligible` 等）が ordinary prompt の primary 閉集合を満たし、
+      target Task が別 Binding の open managed ExecutionRun を持たない場合に限る。
+      `/task <target>` は削除せず、低頻度の explicit forced override（escape hatch）として残る。
+      内部完了通知・曖昧な入力・未 claim PR では Task は自動では切り替わらず、advisory が
+      「強制するには `/task <target>`（escape hatch）」と案内するのみで、hot path に GitHub
+      lookup・LLM classifier・新 daemon は追加しない。
 
       `/task <target>` の state-changing authority はこのイベントから完全に撤去された
       （AC6）。raw prompt 文字列の `/task` special-case 判定（`classifier._SLASH_TASK_RE`）
@@ -924,7 +943,7 @@ Stop / StopFailure / SubagentStop / PostToolUse で実際に動作する `sessio
 | `session_manifest_coordinator.sh`（StopFailure） | telemetry | 継続 |
 | `session_manifest_coordinator.sh`（SubagentStop） | telemetry | 継続 |
 | `session_manifest_debounce.mjs` | telemetry | 継続 |
-| `hook_entry.py`（SessionStart/UserPromptSubmit/CwdChanged/SubagentStart/SessionEnd/Stop/StopFailure/SubagentStop、および PostToolUse matcher: Agent） | telemetry | 継続（`main()` はこれらの event で非ゼロを返す分岐を持たない。Issue #2625: UserPromptSubmit の different-primary-target mismatch は advisory のみで、prompt submission は停止しない） |
+| `hook_entry.py`（SessionStart/UserPromptSubmit/CwdChanged/SubagentStart/SessionEnd/Stop/StopFailure/SubagentStop、および PostToolUse matcher: Agent） | telemetry | 継続（`main()` はこれらの event で非ゼロを返す分岐を持たない。Issue #2625: UserPromptSubmit の different-primary-target mismatch は advisory のみで、prompt submission は停止しない。Issue #2827: ordinary user prompt の primary target は `/task` なしで自動 rebind され、`/task` は explicit override / escape hatch） |
 | `hook_entry.py`（UserPromptExpansion, matcher: task） | blocker（`command_name == "task"` の target validation / persistence failure、および adapter 自身の transport failure / invalid envelope のみ。`command_name != "task"` は常に exit 0） | **`/task` command 自体を停止**（他 Skill/command の expansion は一切妨げない。Issue #2625: `/task` の state-changing authority は UserPromptSubmit の raw 文字列 special-case からこのイベントへ移った） |
 
 ### local_main_branch_guard の gh CLI コマンド 5 分類（#1124）

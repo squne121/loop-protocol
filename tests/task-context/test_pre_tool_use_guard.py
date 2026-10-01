@@ -60,6 +60,7 @@ def _bind_session_to_task(conn, *, herdr_tab_id: str, claude_session_id: str, re
         {
             "herdr_tab_id": herdr_tab_id,
             "claude_session_id": claude_session_id,
+            "input_provenance": "user_prompt_observed",
             "classification_kind": "EXPLICIT",
             "target_repo": repo,
             "target_ref_kind": "issue",
@@ -95,6 +96,7 @@ def test_given_send_message_to_same_task_peer_when_pre_tool_use_then_pass_no_dec
         {
             "herdr_tab_id": "tab-2",
             "claude_session_id": "s2",
+            "input_provenance": "user_prompt_observed",
             "classification_kind": "EXPLICIT",
             "target_repo": "owner/repo",
             "target_ref_kind": "issue",
@@ -143,6 +145,7 @@ def test_given_notify_when_idle_same_task_when_pre_tool_use_then_pass(conn):
         {
             "herdr_tab_id": "tab-2",
             "claude_session_id": "s2",
+            "input_provenance": "user_prompt_observed",
             "classification_kind": "EXPLICIT",
             "target_repo": "owner/repo",
             "target_ref_kind": "issue",
@@ -231,6 +234,7 @@ def test_given_send_message_to_registry_name_same_task_when_pre_tool_use_then_pa
         {
             "herdr_tab_id": "tab-2",
             "claude_session_id": "sess-uuid-peer-alpha",
+            "input_provenance": "user_prompt_observed",
             "classification_kind": "EXPLICIT",
             "target_repo": "owner/repo",
             "target_ref_kind": "issue",
@@ -332,6 +336,7 @@ def test_given_notify_when_idle_registry_name_same_task_when_pre_tool_use_then_p
         {
             "herdr_tab_id": "tab-2",
             "claude_session_id": "sess-uuid-peer-gamma",
+            "input_provenance": "user_prompt_observed",
             "classification_kind": "EXPLICIT",
             "target_repo": "owner/repo",
             "target_ref_kind": "issue",
@@ -386,6 +391,7 @@ def test_given_herdr_content_read_same_task_when_pre_tool_use_then_pass(conn):
         {
             "herdr_tab_id": "tab-2",
             "claude_session_id": "s2",
+            "input_provenance": "user_prompt_observed",
             "classification_kind": "EXPLICIT",
             "target_repo": "owner/repo",
             "target_ref_kind": "issue",

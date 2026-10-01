@@ -35,6 +35,7 @@ def test_given_ordinary_hook_issue_start_when_refinement_and_pr_workflow_run_the
         {
             "herdr_tab_id": "tab-1",
             "claude_session_id": "ordinary-session",
+            "input_provenance": "user_prompt_observed",
             "classification_kind": "EXPLICIT",
             "target_repo": REPO,
             "target_ref_kind": "issue",
@@ -94,6 +95,7 @@ def test_given_cleanup_started_when_different_issue_prompt_arrives_then_current_
         {
             "herdr_tab_id": "tab-1",
             "claude_session_id": "session-1",
+            "input_provenance": "user_prompt_observed",
             "classification_kind": "EXPLICIT",
             "target_repo": REPO,
             "target_ref_kind": "issue",
@@ -123,6 +125,7 @@ def test_given_accepted_merge_before_cleanup_begin_when_fresh_binding_resumes_th
         {
             "herdr_tab_id": "tab-2",
             "claude_session_id": "session-2",
+            "input_provenance": "user_prompt_observed",
             "classification_kind": "EXPLICIT",
             "target_repo": REPO,
             "target_ref_kind": "issue",
