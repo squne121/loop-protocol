@@ -67,8 +67,30 @@ _GITHUB_URL_RE = re.compile(
     r"https?://github\.com/([\w.-]+/[\w.-]+)/(issues|pull)/(\d+)",
     re.IGNORECASE,
 )
-_OWNER_REPO_HASH_RE = re.compile(r"\b([\w.-]+/[\w.-]+)#(\d+)\b")
-_BARE_HASH_RE = re.compile(r"(?<![\w/])#(\d+)\b")
+# Issue #2850: the number boundary is ASCII based. A reference number is the
+# run of digits after ``#`` that is NOT directly followed by an ASCII word
+# character (``[A-Za-z0-9_]``). Python's ``\b`` / ``\w`` are Unicode aware, so
+# the old trailing ``\b`` rejected ``#12を実装して`` (a CJK character is ``\w``)
+# while ``#12abc`` must stay rejected. A CJK character, a particle or
+# punctuation after the digits therefore keeps the reference recognised, and the
+# same boundary is shared by every ``#N`` regex below (and by
+# ``needs_current_repo_resolution``). The digit semantics (``\d``, including
+# full-width digits) are intentionally unchanged, so the trailing lookahead also
+# rejects a following Unicode digit (``[\d...]``): otherwise ``#１２abc`` would
+# backtrack to ``#１`` and succeed on a truncated number.
+_OWNER_REPO_HASH_RE = re.compile(r"\b([\w.-]+/[\w.-]+)#(\d+)(?![\dA-Za-z_])")
+_BARE_HASH_RE = re.compile(r"(?<![A-Za-z0-9_/])#(\d+)(?![\dA-Za-z_])")
+# Issue #2850 closed-prefix adjacency (OWNER-approved policy): ``Issue#12`` /
+# ``PR#34`` (no space between the prefix word and ``#``) is accepted as a
+# reference ONLY when the prefix word itself is one of the closed English
+# prefixes (issue / pr / pull request) and is not glued to a preceding ASCII
+# word character or ``/`` (``xIssue#12`` and any ``abc#12`` are NOT references).
+# The Japanese counterparts (``イシュー#12`` / ``プルリク#34``) already pass the
+# ASCII ``_BARE_HASH_RE`` lookbehind and are classified by the prefix regexes
+# below.
+_ADJACENT_PREFIX_HASH_RE = re.compile(
+    r"(?<![A-Za-z0-9_/])((?ai:issue|pr|pull request))#(\d+)(?![\dA-Za-z_])"
+)
 # Issue #2827: the closed set of reference "prefix" words that may precede a
 # bare ``#N`` (English is case-insensitive): Issue / PR / pull request /
 # イシュー / プルリク / プルリクエスト. Longer Japanese forms are listed first.
@@ -131,6 +153,10 @@ def _target_key(target: Target) -> tuple[str | None, str, int]:
     return (target.repo, target.ref_kind, target.ref_number)
 
 
+def _inside_any_span(position: int, spans: list[tuple[int, int]]) -> bool:
+    return any(start <= position < end for start, end in spans)
+
+
 def _find_occurrences(authority_text: str, current_repo: str | None) -> list[_Occurrence]:
     occurrences: list[_Occurrence] = []
 
@@ -160,6 +186,16 @@ def _find_occurrences(authority_text: str, current_repo: str | None) -> list[_Oc
         form = REF_FORM_PREFIXED if (is_pr or _ISSUE_PREFIX_RE.search(prefix)) else REF_FORM_BARE
         target = Target(repo=current_repo, ref_kind=ref_kind, ref_number=number, explicit_repo=False)
         occurrences.append(_Occurrence(target, match.start(), match.end(), form))
+
+    owner_repo_spans = [m.span() for m in _OWNER_REPO_HASH_RE.finditer(authority_text)]
+    for match in _ADJACENT_PREFIX_HASH_RE.finditer(authority_text):
+        # A prefix word inside an already recognised ``owner/repo#N`` span
+        # (``owner/my-issue#12``) is part of the repo name, not a second ref.
+        if _inside_any_span(match.start(), owner_repo_spans):
+            continue
+        ref_kind = "issue" if match.group(1).lower() == "issue" else "pr"
+        target = Target(repo=current_repo, ref_kind=ref_kind, ref_number=int(match.group(2)), explicit_repo=False)
+        occurrences.append(_Occurrence(target, match.start(), match.end(), REF_FORM_PREFIXED))
 
     return occurrences
 
@@ -222,19 +258,65 @@ def _marker_segment_spans(text: str, clause: tuple[int, int]) -> list[tuple[int,
     return spans
 
 
+# Issue #2850 marker-bound reference list (bounded rule). A Japanese
+# reference-only marker also binds the reference LIST that directly follows it:
+#   * an element is a marker-local segment (split at `、` / ASCII `,`) whose first
+#     non-space token is a reference (bare ``#N`` / prefixed ``Issue #N`` /
+#     ``owner/repo#N`` / full URL); the particle / verb phrase after the
+#     reference (``を実装して`` ...) belongs to the same element;
+#   * the list starts at the marker's own segment and continues segment by
+#     segment, and ends at the first segment whose first token is NOT a reference,
+#     or at the clause end (the generic ``_clause_spans``: `。` `．` `？` `！`
+#     `?` `!`, newline, `.` + whitespace/end). A reference after that end is not
+#     part of the list (``参考: #10、#11。Issue #12を実装して`` keeps #12 primary);
+#   * references before the marker (a different clause or an earlier segment that
+#     does not contain the marker) are never demoted.
+# Boundary choice: the list is bounded by the existing clause delimiters plus the
+# "first token is a reference" test instead of widening ``_CLAUSE_DELIMITERS``
+# (which would change ACTIVE target-phrase pairing and creation/reply
+# exclusion). Consequence of the literal rule: every reference-led segment right
+# after a marker segment is a list element, so
+# ``関連資料: #2826、Issue #2827 を対象にレビューして`` demotes #2827 too.
+_REFERENCE_LEAD_PREFIX_RE = re.compile(r"(?:issue|pr|pull request|イシュー|プルリクエスト|プルリク)\s*", re.IGNORECASE)
+
+
+def _segment_starts_with_reference(text: str, segment: tuple[int, int], occurrences: list[_Occurrence]) -> bool:
+    start, end = segment
+    position = start
+    while position < end and text[position].isspace():
+        position += 1
+    if position >= end:
+        return False
+    for occurrence in occurrences:
+        if not position <= occurrence.start < end:
+            continue
+        head = text[position : occurrence.start]
+        if head == "" or _REFERENCE_LEAD_PREFIX_RE.fullmatch(head):
+            return True
+    return False
+
+
 def _primary_occurrences(authority_text: str, occurrences: list[_Occurrence]) -> list[_Occurrence]:
     """Drop the occurrences demoted by a Japanese reference-only marker: a
-    reference is demoted only when it shares a marker-local segment (its clause
-    split at `、` / `,`) with ``参考`` or ``関連資料``. References in other
-    segments or clauses stay primary candidates."""
+    reference is demoted when it shares a marker-local segment (its clause split
+    at `、` / `,`) with ``参考`` or ``関連資料``, or when it is an element of the
+    reference list that directly follows that segment (Issue #2850, see the
+    comment above). References before the marker and after the list end stay
+    primary candidates."""
     spans = _clause_spans(authority_text)
     marker_segments: list[tuple[int, int]] = []
     for clause in spans:
         if not any(marker in authority_text[clause[0] : clause[1]] for marker in _JA_REFERENCE_ONLY_MARKERS):
             continue
+        in_list = False
         for segment in _marker_segment_spans(authority_text, clause):
             if any(marker in authority_text[segment[0] : segment[1]] for marker in _JA_REFERENCE_ONLY_MARKERS):
                 marker_segments.append(segment)
+                in_list = True
+            elif in_list and _segment_starts_with_reference(authority_text, segment, occurrences):
+                marker_segments.append(segment)
+            else:
+                in_list = False
     if not marker_segments:
         return list(occurrences)
     return [o for o in occurrences if not any(start <= o.start < end for start, end in marker_segments)]
@@ -443,7 +525,12 @@ def needs_current_repo_resolution(prompt: str) -> bool:
         if start > 0 and authority_text[start - 1] == "/":
             continue
         return True
-    return False
+    # Issue #2850: ``Issue#12`` / ``PR#34`` also resolve against ``current_repo``.
+    owner_repo_spans = [m.span() for m in _OWNER_REPO_HASH_RE.finditer(authority_text)]
+    return any(
+        not _inside_any_span(match.start(), owner_repo_spans)
+        for match in _ADJACENT_PREFIX_HASH_RE.finditer(authority_text)
+    )
 
 
 def raw_target_needs_current_repo_resolution(raw_target: str) -> bool:
