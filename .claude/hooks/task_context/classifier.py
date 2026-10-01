@@ -75,9 +75,11 @@ _GITHUB_URL_RE = re.compile(
 # punctuation after the digits therefore keeps the reference recognised, and the
 # same boundary is shared by every ``#N`` regex below (and by
 # ``needs_current_repo_resolution``). The digit semantics (``\d``, including
-# full-width digits) are intentionally unchanged.
-_OWNER_REPO_HASH_RE = re.compile(r"\b([\w.-]+/[\w.-]+)#(\d+)(?![A-Za-z0-9_])")
-_BARE_HASH_RE = re.compile(r"(?<![A-Za-z0-9_/])#(\d+)(?![A-Za-z0-9_])")
+# full-width digits) are intentionally unchanged, so the trailing lookahead also
+# rejects a following Unicode digit (``[\d...]``): otherwise ``#１２abc`` would
+# backtrack to ``#１`` and succeed on a truncated number.
+_OWNER_REPO_HASH_RE = re.compile(r"\b([\w.-]+/[\w.-]+)#(\d+)(?![\dA-Za-z_])")
+_BARE_HASH_RE = re.compile(r"(?<![A-Za-z0-9_/])#(\d+)(?![\dA-Za-z_])")
 # Issue #2850 closed-prefix adjacency (OWNER-approved policy): ``Issue#12`` /
 # ``PR#34`` (no space between the prefix word and ``#``) is accepted as a
 # reference ONLY when the prefix word itself is one of the closed English
@@ -87,7 +89,7 @@ _BARE_HASH_RE = re.compile(r"(?<![A-Za-z0-9_/])#(\d+)(?![A-Za-z0-9_])")
 # ASCII ``_BARE_HASH_RE`` lookbehind and are classified by the prefix regexes
 # below.
 _ADJACENT_PREFIX_HASH_RE = re.compile(
-    r"(?<![A-Za-z0-9_/])(issue|pr|pull request)#(\d+)(?![A-Za-z0-9_])", re.IGNORECASE
+    r"(?<![A-Za-z0-9_/])((?ai:issue|pr|pull request))#(\d+)(?![\dA-Za-z_])"
 )
 # Issue #2827: the closed set of reference "prefix" words that may precede a
 # bare ``#N`` (English is case-insensitive): Issue / PR / pull request /
@@ -151,6 +153,10 @@ def _target_key(target: Target) -> tuple[str | None, str, int]:
     return (target.repo, target.ref_kind, target.ref_number)
 
 
+def _inside_any_span(position: int, spans: list[tuple[int, int]]) -> bool:
+    return any(start <= position < end for start, end in spans)
+
+
 def _find_occurrences(authority_text: str, current_repo: str | None) -> list[_Occurrence]:
     occurrences: list[_Occurrence] = []
 
@@ -181,7 +187,12 @@ def _find_occurrences(authority_text: str, current_repo: str | None) -> list[_Oc
         target = Target(repo=current_repo, ref_kind=ref_kind, ref_number=number, explicit_repo=False)
         occurrences.append(_Occurrence(target, match.start(), match.end(), form))
 
+    owner_repo_spans = [m.span() for m in _OWNER_REPO_HASH_RE.finditer(authority_text)]
     for match in _ADJACENT_PREFIX_HASH_RE.finditer(authority_text):
+        # A prefix word inside an already recognised ``owner/repo#N`` span
+        # (``owner/my-issue#12``) is part of the repo name, not a second ref.
+        if _inside_any_span(match.start(), owner_repo_spans):
+            continue
         ref_kind = "issue" if match.group(1).lower() == "issue" else "pr"
         target = Target(repo=current_repo, ref_kind=ref_kind, ref_number=int(match.group(2)), explicit_repo=False)
         occurrences.append(_Occurrence(target, match.start(), match.end(), REF_FORM_PREFIXED))
@@ -515,7 +526,11 @@ def needs_current_repo_resolution(prompt: str) -> bool:
             continue
         return True
     # Issue #2850: ``Issue#12`` / ``PR#34`` also resolve against ``current_repo``.
-    return _ADJACENT_PREFIX_HASH_RE.search(authority_text) is not None
+    owner_repo_spans = [m.span() for m in _OWNER_REPO_HASH_RE.finditer(authority_text)]
+    return any(
+        not _inside_any_span(match.start(), owner_repo_spans)
+        for match in _ADJACENT_PREFIX_HASH_RE.finditer(authority_text)
+    )
 
 
 def raw_target_needs_current_repo_resolution(raw_target: str) -> bool:

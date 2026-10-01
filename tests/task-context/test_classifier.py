@@ -489,6 +489,49 @@ def test_given_closed_prefix_without_space_before_hash_when_classified_then_reco
 
 
 @pytest.mark.parametrize(
+    ("prompt", "repo", "ref_number"),
+    [
+        ("owner/repo#12", "owner/repo", 12),
+        ("owner/my-issue#12", "owner/my-issue", 12),
+        ("owner/my-pr#34", "owner/my-pr", 34),
+        ("owner/fix.issue#12", "owner/fix.issue", 12),
+        ("PR owner/my-pr#34 をレビューして", "owner/my-pr", 34),
+    ],
+)
+def test_given_prefix_word_inside_owner_repo_ref_when_classified_then_single_explicit_reference(
+    prompt, repo, ref_number
+):
+    # A prefix word inside an already recognised `owner/repo#N` span is part of the
+    # repo name, not a second current-repo reference (no AMBIGUOUS / no resolution).
+    result = classifier.classify(prompt, current_repo=REPO)
+    assert result.kind == classifier.KIND_EXPLICIT, prompt
+    assert [(t.repo, t.ref_number) for t in result.targets] == [(repo, ref_number)], prompt
+    assert _eligible(prompt), prompt
+    assert not classifier.needs_current_repo_resolution(prompt), prompt
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "Issue #１２abc を実装して",
+        "Issue #12３abc を実装して",
+        "#１２abc",
+        "owner/repo#１２abc",
+        "Issue#１２abc",
+        "İssue#12 を実装して",
+        "ıssue#12 を実装して",
+    ],
+)
+def test_given_unicode_digit_suffix_or_non_ascii_prefix_when_classified_then_not_a_reference(prompt):
+    # The trailing boundary must not backtrack into a Unicode digit run (`#１２abc`
+    # -> `#１`), and the English prefix words are ASCII-only (no `İssue` -> PR).
+    result = classifier.classify(prompt, current_repo=REPO)
+    assert result.kind == classifier.KIND_NONE, prompt
+    assert result.targets == (), prompt
+    assert not classifier.needs_current_repo_resolution(prompt), prompt
+
+
+@pytest.mark.parametrize(
     "prompt",
     [
         "参考: #10、#11を実装して",
