@@ -965,6 +965,44 @@ def test_hermetic_fake_gh_answers_worker_read_only_queries_for_the_fixture_only(
     assert not any("body_sha256" in r for r in records)
 
 
+def test_hermetic_fake_gh_answers_read_only_pr_status_and_keeps_other_argv_fail_closed(tmp_path):
+    """GIVEN canary 所有の fake gh
+    WHEN worker が wrapper 後の read-only 読み戻しとして `gh pr status` を実行する
+    THEN trusted repo (または --repo 省略) に限り fixture PR と整合する応答を返す。
+         foreign repo・未知 flag・重複 flag は従来どおり fail-closed (exit 97)
+    """
+    log_path = tmp_path / "calls.jsonl"
+    shim = tmp_path / "gh"
+    shim.write_text(canary._fake_gh_source(log_path), encoding="utf-8")
+    shim.chmod(0o755)
+    pr = str(canary.CANONICAL_WORKFLOW_FIXTURE_PR_NUMBER)
+    repo = canary.TRUSTED_REPO
+
+    def run(*argv):
+        return subprocess.run([str(shim), *argv], capture_output=True, text=True, timeout=20, check=False)
+
+    text = run("pr", "status", "--repo", repo)
+    assert text.returncode == 0 and f"#{pr}" in text.stdout
+    assert run("pr", "status").returncode == 0  # --repo 省略は cwd の trusted origin
+    as_json = json.loads(run("pr", "status", "--repo", repo, "--json", "number,state").stdout)
+    assert as_json["createdBy"] == [{"number": int(pr), "state": "OPEN"}]
+    assert as_json["needsReview"] == []
+    for argv in (
+        ("pr", "status", "--repo", "other/repo"),
+        ("pr", "status", "--repo", repo, "--body-file", "x"),
+        ("pr", "status", "--repo", repo, "--web"),
+        ("pr", "status", "--repo", repo, "--repo", repo),
+        ("pr", "status", pr),
+        ("pr", "status", "--repo"),
+        ("pr", "edit", "123", "--repo", repo, "--body-file", "x"),
+    ):
+        assert run(*argv).returncode == canary.FAKE_GH_UNDEFINED_ARGV_EXIT, argv
+    records = canary._read_fake_gh_records(log_path)
+    assert [r["handled"] for r in records[:3]] == [True] * 3
+    assert all(r["handled"] is False for r in records[3:])
+    assert not any("body_sha256" in r for r in records)
+
+
 def _stream_with_denials(*, child_command: str, denial_text: str, denied: bool = True) -> str:
     """親 Agent は拒否されず、子 Bash 1 件だけが denial (hook block / classifier) となる合成 stream。"""
     events: list[dict] = [

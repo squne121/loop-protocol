@@ -1157,6 +1157,36 @@ elif argv[:2] == ["pr", "checks"] and len(argv) > 2 and argv[2] == FIXTURE_PR an
     # fixture PR は check を持たない。--json 指定時は空配列、それ以外は空出力。
     answer("[]" if option("--json") else "")
 elif (
+    argv[:2] == ["pr", "status"]
+    and repo_ok()
+    and all(
+        arg in ("--repo", "--json") if index % 2 == 0 else not arg.startswith("-")
+        for index, arg in enumerate(argv[2:])
+    )
+    and len(argv[2:]) % 2 == 0
+    and len(set(argv[2::2])) == len(argv[2::2])
+):
+    # `gh pr status` の read-only 読み戻し。受け付ける flag は --repo / --json (値付き) だけ。
+    # fixture PR だけを「自分が作成した PR」として返し、他の PR は存在しない。
+    pr_fields = {{
+        "number": int(FIXTURE_PR),
+        "state": "OPEN",
+        "title": "canary fixture",
+        "url": "https://github.com/" + ALLOWED_REPO + "/pull/" + FIXTURE_PR,
+        "isDraft": True,
+        "headRefName": "canary-fixture",
+        "baseRefName": "main",
+        "mergeable": "MERGEABLE",
+    }}
+    fields = option("--json")
+    if fields:
+        pr_json = {{name: pr_fields.get(name) for name in fields.split(",")}}
+        answer(json.dumps({{"currentBranch": None, "createdBy": [pr_json], "needsReview": []}}))
+    answer(
+        "Relevant pull requests in " + ALLOWED_REPO + "\\n\\nCreated by you\\n  #" + FIXTURE_PR
+        + " canary fixture [canary-fixture]\\n\\nRequesting a code review from you\\n  You have no pull requests to review\\n"
+    )
+elif (
     argv[:1] == ["api"]
     and len(argv) >= 2
     and all(arg in ("api", "--paginate") or not arg.startswith("-") for arg in argv)
