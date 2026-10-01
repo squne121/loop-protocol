@@ -127,6 +127,37 @@ class TestBackwardCompatibilityOfLegacyPayloads:
         assert errors, "Expected contract_update additionalProperties:false to still reject extras"
 
 
+class TestContractUpdateReasonCodeSemantics:
+    def _payload(self, status: str, reason: str | None = None) -> dict:
+        data = copy.deepcopy(MINIMAL_PASS_PAYLOAD)
+        data["contract_update"] = {
+            "status": status, "disposition": "invalid" if status == "failed" else None,
+            "writes": 0, "iterations": 0, "final_readback": "not_applicable",
+            "fresh_preflight": "unavailable", "fresh_review": "unavailable",
+            "fresh_readiness": "unavailable",
+        }
+        if reason is not None:
+            data["contract_update"]["reason_code"] = reason
+        return data
+
+    def test_given_generic_failure_when_validated_then_reason_is_required_and_closed(self):
+        assert validate(self._payload("failed", "contract_update_failed")) == []
+        assert validate(self._payload("failed", "unsafe_unstructured_patch_operation")) == []
+        assert validate(self._payload("failed"))
+        assert validate(self._payload("failed", "raw OWNER directive and body"))
+        assert validate(self._payload("failed", ""))
+
+    def test_given_success_or_handoff_when_validated_then_status_specific_reason_applies(self):
+        for status in ("applied", "no_change", "rebased"):
+            assert validate(self._payload(status)) == []
+            assert validate(self._payload(status, "contract_update_failed"))
+        handoff = self._payload("handoff_required", "explicit_trusted_human_directive_requires_issue_editor")
+        handoff["contract_update"]["disposition"] = "full_rewrite_required"
+        assert validate(handoff) == []
+        handoff["contract_update"].pop("reason_code")
+        assert validate(handoff)
+
+
 class TestProvenanceLaneMigrationIsAdditiveOptional:
     def test_repair_action_with_new_provenance_lane_fields_valid(self):
         data = copy.deepcopy(LEGACY_NEEDS_FIX_PAYLOAD)

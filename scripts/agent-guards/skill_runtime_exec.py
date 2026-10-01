@@ -34,6 +34,7 @@ from skill_runtime_command_policy import (
     REGISTRY_REL,
     SKILL_RUNTIME_EXEC_REL,
     TRUSTED_REPO_SLUG,
+    authority_transport_produce_rejection_reason,
     ExactSkillRuntimeCommand,
     _is_safe_issue_artifact_path,
     command_allows_root_no_worktree,
@@ -41,7 +42,6 @@ from skill_runtime_command_policy import (
     is_exact_skill_runtime_anchor_executor_command,
     is_exact_skill_runtime_anchor_fixture_executor_command,
     is_exact_skill_runtime_authority_transport_consume_executor_command,
-    is_exact_skill_runtime_authority_transport_produce_executor_command,
     is_exact_skill_runtime_contract_update_anchor_executor_command,
     is_exact_skill_runtime_decide_authority_executor_command,
     is_exact_skill_runtime_decide_executor_command,
@@ -2551,6 +2551,26 @@ def main(argv: list[str] | None = None) -> int:
             print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
             return 2
 
+    # The producer has one fixed outer argv shape. Check raw tokens BEFORE
+    # argparse can normalize duplicates or echo a user-controlled argument
+    # into stderr. Keep the other command classes' parsers unchanged.
+    if "authority_transport.produce" in raw_argv or "--command-id=authority_transport.produce" in raw_argv:
+        producer_flags = (
+            "--command-id", "--issue-number", "--repo", "--invocation-id",
+            "--git-head-sha", "--evidence-fixture-path",
+        )
+        if (
+            len(raw_argv) != 12
+            or any(raw_argv[2 * i] != flag for i, flag in enumerate(producer_flags))
+            or not raw_argv[3].isdigit()
+            or int(raw_argv[3]) <= 0
+        ):
+            print("skill_runtime_exec: authority_transport.produce: invalid_argv", file=sys.stderr)
+            return 2
+        if raw_argv[5] != TRUSTED_REPO_SLUG:
+            print("skill_runtime_exec: authority_transport.produce: repo_mismatch", file=sys.stderr)
+            return 2
+
     args = parser.parse_args(raw_argv)
 
     project_root = resolve_project_root()
@@ -3037,10 +3057,11 @@ def main(argv: list[str] | None = None) -> int:
                 args.evidence_fixture_path,
             ]
         )
-        if not is_exact_skill_runtime_authority_transport_produce_executor_command(
-            command_text, project_root, project_root
-        ):
-            print("skill_runtime_exec: exact command class rejected", file=sys.stderr)
+        produce_rejection = authority_transport_produce_rejection_reason(
+            command_text, os.getcwd(), project_root
+        )
+        if produce_rejection is not None:
+            print(f"skill_runtime_exec: authority_transport.produce: {produce_rejection}", file=sys.stderr)
             return 2
     elif is_consume_command:
         if (

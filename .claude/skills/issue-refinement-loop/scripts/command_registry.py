@@ -601,6 +601,9 @@ REGISTRY: dict[str, dict[str, Any]] = {
     # command_id) uses, instead of the narrower authority-transport-specific
     # literal that was never cross-validated against policy.py before this
     # Issue's AC10 wiring made `validate_registry_entry()` actually check it).
+    # Local-only producer on canonical main root/default branch. Linked
+    # Issue worktrees are optional: policy's root-no-worktree invariant must
+    # match these exact fields (no worktree bootstrap for artifact production).
     "authority_transport.produce": {
         "id": "authority_transport.produce",
         "argv": [

@@ -683,6 +683,75 @@ _NON_QUOTED_GROUP = (
 )
 
 
+_URL_START_RE = re.compile(r"(?<![\w/])(?:https?://|www\.)", re.IGNORECASE)
+_LINK_OPEN_RE = re.compile(r"\]\(\s*")
+_REFERENCE_DESTINATION_RE = re.compile(r"(?m)^[ \t]{0,3}\[[^\]\n]+\]:[ \t]*")
+_ANGLE_PATH_DESTINATION_RE = re.compile(r"<(?:(?:\.claude|docs|src|scripts|tests|\.github)/)[^>\n]+>")
+
+
+def _without_link_destinations(text: str) -> str:
+    """Mask source spans, not candidate substrings, before matching paths.
+
+    A URL's `/docs/...` is a valid-looking suffix even though the *whole*
+    URL is not a repository path. Keep the original character coordinates and
+    surrounding prose so adjacent real literals remain independently visible.
+    This is a bounded destination pre-pass, not a Markdown document parser.
+    """
+    spans: list[tuple[int, int]] = []
+    for match in _LINK_OPEN_RE.finditer(text):
+        start = match.end()
+        if start < len(text) and text[start] == "<":
+            end = text.find(">", start + 1)
+            if end != -1 and "\n" not in text[start:end]:
+                spans.append((start, end + 1))
+            continue
+        depth = 0
+        end = start
+        while end < len(text) and text[end] not in "\n\r":
+            ch = text[end]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+            end += 1
+        if end < len(text) and text[end] == ")":
+            spans.append((start, end))
+    for match in _REFERENCE_DESTINATION_RE.finditer(text):
+        start = match.end()
+        if start < len(text) and text[start] == "<":
+            end = text.find(">", start + 1)
+            if end != -1 and "\n" not in text[start:end]:
+                spans.append((start, end + 1))
+        else:
+            end = start
+            while end < len(text) and not text[end].isspace():
+                end += 1
+            spans.append((start, end))
+    spans.extend(match.span() for match in _ANGLE_PATH_DESTINATION_RE.finditer(text))
+    for match in _URL_START_RE.finditer(text):
+        # Explicit backtick-quoted URLs are unsafe literal *candidates*, not
+        # link destinations. Preserve the pre-existing mixed-literal veto.
+        if text[:match.start()].count("`") % 2:
+            continue
+        end = match.end()
+        depth = 0
+        while end < len(text) and not text[end].isspace() and text[end] not in "<>`":
+            if text[end] == "(":
+                depth += 1
+            elif text[end] == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+            end += 1
+        spans.append((match.start(), end))
+    chars = list(text)
+    for start, end in spans:
+        chars[start:end] = " " * (end - start)
+    return "".join(chars)
+
+
 def _extract_path_literals_from_text(text: str) -> list[str]:
     """Extract only safe repository-relative Allowed Paths literals.
 
@@ -694,7 +763,7 @@ def _extract_path_literals_from_text(text: str) -> list[str]:
     if _allowed_paths_expansion_is_negated(text):
         return []
     path_literals: list[str] = []
-    for match in PATH_TOKEN_RE.finditer(text or ""):
+    for match in PATH_TOKEN_RE.finditer(_without_link_destinations(text or "")):
         candidate = match.group("path") or match.group("bare") or ""
         normalized = _normalize_exact_repository_path_literal(candidate)
         if normalized is None:
@@ -1402,6 +1471,30 @@ _MARKER_TO_CONTRACT_SECTION = {
 }
 
 
+def is_safe_contract_patch_append(operation: dict) -> bool:
+    """Only structured, section-specific append text may reach a transaction.
+
+    This does not change scope-reframe/editor eligibility or synthesize
+    investigation-derived operations. It rejects an already-built unsafe
+    plan as well as preventing the producer from emitting one.
+    """
+    if not isinstance(operation, dict) or operation.get("op", operation.get("kind")) != "append":
+        return False
+    section, text = operation.get("section"), operation.get("text")
+    if not isinstance(text, str) or not text.strip() or "\n" in text:
+        return False
+    if section == "Allowed Paths":
+        match = re.fullmatch(r"- `([^`]+)`", text)
+        return bool(match and _normalize_exact_repository_path_literal(match.group(1)) == match.group(1))
+    if section == "Acceptance Criteria":
+        return bool(re.fullmatch(r"-\s+(?:\[[ xX]\]\s*)?AC[0-9]+\s*:.+", text, re.IGNORECASE))
+    if section == "Stop Conditions":
+        return bool(re.fullmatch(r"-\s+\S.+", text))
+    if section == "Verification Commands":
+        return bool(re.fullmatch(r"(?:-\s+|\$\s+)\S.+", text))
+    return False
+
+
 def derive_contract_patch_operations(evidence_list: list) -> list:
     """Derive section-bound operations from normalized directives.
 
@@ -1416,8 +1509,10 @@ def derive_contract_patch_operations(evidence_list: list) -> list:
         directives = evidence.get("extracted_directives") or []
         if not markers:
             continue
-        texts = directives or [f"Reflect reviewer directive ({markers[0]})"]
-        for text in texts:
+        # An unlabelled explanation is not a section-bound operation. A
+        # comment-level marker elsewhere in the OWNER text must not turn
+        # every unrelated bullet into a raw Acceptance Criteria append.
+        for text in directives:
             lowered = text.lower()
             if "allowed path" in lowered:
                 marker = "allowed paths"
@@ -1427,13 +1522,15 @@ def derive_contract_patch_operations(evidence_list: list) -> list:
                 marker = "stop condition"
             elif "precondition" in lowered or "前提条件" in text:
                 marker = "precondition"
-            elif "ac" in lowered or "acceptance criteria" in lowered:
+            elif re.match(r"(?:-\s*)?(?:\[[ xX]\]\s*)?AC[0-9]+\s*:", text, re.IGNORECASE):
                 marker = "revised acceptance criteria"
+            elif markers and set(markers) <= {"revised ac", "revised acceptance criteria"}:
+                # Both spellings describe the same explicit section; preserve
+                # that legacy single-section directive without enabling the
+                # freeform multi-section fallback.
+                marker = "revised ac" if "revised ac" in markers else "revised acceptance criteria"
             else:
-                marker = next(
-                    (candidate for candidate in markers if candidate in _MARKER_TO_CONTRACT_SECTION),
-                    "revised acceptance criteria",
-                )
+                continue
             if marker == "allowed paths":
                 # Never append untrusted prose to the authorization-bearing
                 # Allowed Paths section.  A mixed or malformed directive
@@ -1450,15 +1547,20 @@ def derive_contract_patch_operations(evidence_list: list) -> list:
                         }
                     )
                 continue
-            operations.append(
-                {
-                    "section": _MARKER_TO_CONTRACT_SECTION[marker],
-                    "op": "append",
-                    "text": text,
-                    "rationale": f"Directive extracted from trusted review comment ({marker})",
-                    "source_evidence_index": index,
-                }
-            )
+            normalized_text = text
+            if not text.startswith("- ") and re.match(
+                r"(?:\[[ xX]\]\s*)?AC[0-9]+\s*:", text, re.IGNORECASE
+            ):
+                normalized_text = f"- {text}"
+            operation = {
+                "section": _MARKER_TO_CONTRACT_SECTION[marker],
+                "op": "append",
+                "text": normalized_text,
+                "rationale": f"Directive extracted from trusted review comment ({marker})",
+                "source_evidence_index": index,
+            }
+            if is_safe_contract_patch_append(operation):
+                operations.append(operation)
     return operations
 
 

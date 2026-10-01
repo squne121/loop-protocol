@@ -1369,10 +1369,13 @@ def test_issue2715_origin_comment_reproduction_stays_fail_closed_at_expands_allo
 
     assert result["next_action"] != "issue_editor_required"
     assert result["next_action"] == "human_judgment_required"
-    assert "PLANNER_FAIL_CLOSED" in result["blockers"]
+    assert "CONTRACT_UPDATE_FAILED" in result["blockers"]
+    assert "PLANNER_FAIL_CLOSED" not in result["blockers"]
+    assert result["planner_fail_closed"] is False
+    assert result["planner_fail_closed_reason_codes"] == []
     assert result["contract_update"]["status"] == "failed"
     assert result["contract_update"]["writes"] == 0
-    assert result["contract_update"].get("reason_code") is None
+    assert result["contract_update"]["reason_code"] == "contract_patch_plan_missing"
     assert calls["apply_transaction"] == 0
     # The boundary check short-circuits before the #2620 route's own fresh,
     # TOCTOU-safe fetch_current() readback is ever reached.
@@ -1478,7 +1481,7 @@ def test_missing_planner_plan_ineligible_input_remains_fail_closed_production_re
     (`scope_signal_delta.classify_scope_delta_authority()`) was reached at
     all for this ineligibility cause, and (2) when reached, the exact
     `route.reason_code` it independently resolved -- distinguishing the
-    shared `PLANNER_FAIL_CLOSED` marker's DIFFERENT underlying causes
+    shared `CONTRACT_UPDATE_FAILED` marker's DIFFERENT underlying causes
     (wrong lane / untrusted author / ambiguous directive / never reached at
     all for a binding-mismatched structured payload) instead of treating
     them as one interchangeable outcome.
@@ -1500,7 +1503,11 @@ def test_missing_planner_plan_ineligible_input_remains_fail_closed_production_re
     assert result["contract_update"]["status"] == "failed"
     assert result["contract_update"]["disposition"] not in {"proven_no_change", "no_change"}
     assert calls["apply_transaction"] == 0
-    assert "PLANNER_FAIL_CLOSED" in result["blockers"]
+    assert "CONTRACT_UPDATE_FAILED" in result["blockers"]
+    assert "PLANNER_FAIL_CLOSED" not in result["blockers"]
+    assert result["planner_fail_closed"] is False
+    assert result["planner_fail_closed_reason_codes"] == []
+    assert result["contract_update"]["reason_code"] == "contract_patch_plan_missing"
 
     if expect_classifier_reached:
         assert len(classify_calls) == 1
