@@ -1415,19 +1415,65 @@ def _find_live_claim_tx(
     return _row_to_dict(row)
 
 
+def _resolve_or_create_task_with_created_tx(
+    conn: sqlite3.Connection, repo: str, ref_kind: str, ref_number: int
+) -> tuple[str, bool]:
+    """Transaction-internal resolve-or-create that also reports whether this
+    call created the Task (Issue #2827: only a Task created in the SAME
+    transaction gets the ``refine`` initial Activity of an ordinary ACTIVE
+    auto-rebind). Safe against the concurrent "both create, one loses the
+    claim" orphan because the enclosing ``BEGIN IMMEDIATE`` already holds the
+    write lock when the live-claim read below runs."""
+    live = _find_live_claim_tx(conn, repo, ref_kind, ref_number)
+    if live is not None:
+        return live["task_id"], False
+    task_id = _create_task_tx(conn, f"{repo}#{ref_number}")
+    _claim_task_ref_tx(conn, task_id, repo, ref_kind, ref_number)
+    return task_id, True
+
+
 def _resolve_or_create_task_for_target_tx(
     conn: sqlite3.Connection, repo: str, ref_kind: str, ref_number: int
 ) -> str:
-    """Transaction-internal resolve-or-create. Safe against the concurrent
-    "both create, one loses the claim" orphan because the enclosing
-    ``BEGIN IMMEDIATE`` already holds the write lock when the live-claim read
-    below runs."""
-    live = _find_live_claim_tx(conn, repo, ref_kind, ref_number)
-    if live is not None:
-        return live["task_id"]
-    task_id = _create_task_tx(conn, f"{repo}#{ref_number}")
-    _claim_task_ref_tx(conn, task_id, repo, ref_kind, ref_number)
-    return task_id
+    """Transaction-internal resolve-or-create (task id only)."""
+    return _resolve_or_create_task_with_created_tx(conn, repo, ref_kind, ref_number)[0]
+
+
+def _other_binding_open_managed_runs_tx(
+    conn: sqlite3.Connection, task_id: str, binding_id: str
+) -> list[dict[str, Any]]:
+    """Transaction-internal lookup of OPEN managed ExecutionRuns
+    (``run_kind`` in ``MANAGED_RUN_KINDS``) that belong to ``task_id`` but NOT
+    to ``binding_id`` (Issue #2827: another live managed session already
+    holds this Task). A managed run with a NULL ``binding_id`` cannot be
+    attributed to the caller either, so it is treated as held (fail toward
+    no-mutation). Same predicate as ``find_open_execution_runs`` (run per
+    managed ``run_kind``) but evaluated on the write connection so it sits in
+    the binder's own ``BEGIN IMMEDIATE`` transaction."""
+    kinds = sorted(MANAGED_RUN_KINDS)
+    placeholders = ",".join("?" for _ in kinds)
+    rows = conn.execute(
+        "SELECT id, binding_id, run_kind FROM execution_runs "
+        f"WHERE task_id = ? AND ended_at IS NULL AND run_kind IN ({placeholders}) "
+        "AND binding_id IS NOT ? ORDER BY started_at DESC",
+        (task_id, *kinds, binding_id),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _current_task_id_for_binding_tx(conn: sqlite3.Connection, binding_id: str) -> str | None:
+    """Transaction-internal counterpart of
+    ``get_current_task_activity_for_binding`` returning only the Task id of
+    the binding's open managed run (the pre-rebind Task identity)."""
+    kinds = sorted(MANAGED_RUN_KINDS)
+    placeholders = ",".join("?" for _ in kinds)
+    row = conn.execute(
+        "SELECT task_id FROM execution_runs "
+        f"WHERE binding_id = ? AND ended_at IS NULL AND run_kind IN ({placeholders}) "
+        "ORDER BY started_at DESC LIMIT 1",
+        (binding_id, *kinds),
+    ).fetchone()
+    return row["task_id"] if row is not None else None
 
 
 def _ensure_active_activity_tx(conn: sqlite3.Connection, task_id: str, kind: str) -> str:
@@ -1557,6 +1603,7 @@ def _finish_binding_mutation_tx(
     execution_run_id: str | None,
     event_type: str,
     reason_code: str,
+    extra_event_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     run_id = _attach_or_start_binding_run_tx(conn, binding_id, task_id, activity_id, execution_run_id)
     _append_event_tx(
@@ -1566,7 +1613,7 @@ def _finish_binding_mutation_tx(
         activity_id=activity_id,
         binding_id=binding_id,
         execution_run_id=run_id,
-        metadata={"reason_code": reason_code, "status": "pass"},
+        metadata={"reason_code": reason_code, "status": "pass", **(extra_event_metadata or {})},
     )
     projection_key, projection_revision = _bump_projection_tx(conn, binding_id)
     return {
@@ -1589,17 +1636,59 @@ def bind_target_to_binding(
     reason_code: str,
     event_type: str = "hook:UserPromptSubmit",
     activity_kind: str = "native_operator",
+    activity_kind_for_new_task: str | None = None,
+    refuse_when_other_binding_holds_task: bool = False,
+    record_identity_transition: bool = False,
 ) -> dict[str, Any]:
     """Atomically point ``binding_id`` at the Task that owns
     ``(repo, ref_kind, ref_number)`` -- creating the Task and claiming the
     ref if nobody owns it yet -- ensure it has an ACTIVE Activity, attach the
     binding's ExecutionRun, append the lifecycle event, and bump the
     projection outbox. Used for autobind, terminal-activity advance/rebind
-    and explicit ``/task <github-ref>`` rebind."""
+    and explicit ``/task <github-ref>`` rebind.
+
+    Issue #2827: three additive opt-in arguments used ONLY by the ordinary
+    ACTIVE ``A -> prompt B`` auto-rebind (every other caller leaves them at
+    their defaults and behaves exactly as before):
+
+    - ``activity_kind_for_new_task``: when set, a Task created by THIS
+      transaction starts with this Activity kind (``refine``). An existing
+      Task keeps the normal selector (an ACTIVE Activity is preserved; with no
+      ACTIVE one the ``activity_kind`` default applies, so an existing Task is
+      never restarted as ``refine`` just for the rebind).
+    - ``refuse_when_other_binding_holds_task``: evaluated inside this same
+      ``BEGIN IMMEDIATE``; if a DIFFERENT Binding has an open managed
+      ExecutionRun on the resolved Task, nothing is written and
+      ``{"blocked_by_other_live_binding": True, ...}`` is returned. Because
+      the check and the run attach share one write transaction, two Bindings
+      racing for the same Task cannot both succeed.
+    - ``record_identity_transition``: adds bounded pre/post Task identity
+      (``source_task_id`` / ``destination_task_id`` plus the target ref) to the
+      lifecycle event's metadata in the same transaction. No raw prompt."""
     with db.write_transaction(conn):
-        task_id = _resolve_or_create_task_for_target_tx(conn, repo, ref_kind, ref_number)
-        activity_id = _select_activity_for_binding_tx(conn, task_id, activity_kind)
-        return _finish_binding_mutation_tx(
+        task_id, created = _resolve_or_create_task_with_created_tx(conn, repo, ref_kind, ref_number)
+        if refuse_when_other_binding_holds_task and not created:
+            holders = _other_binding_open_managed_runs_tx(conn, task_id, binding_id)
+            if holders:
+                return {
+                    "blocked_by_other_live_binding": True,
+                    "task_id": task_id,
+                    "blocking_binding_ids": sorted({h["binding_id"] for h in holders if h["binding_id"]}),
+                }
+        source_task_id = _current_task_id_for_binding_tx(conn, binding_id) if record_identity_transition else None
+        kind = activity_kind_for_new_task if (created and activity_kind_for_new_task) else activity_kind
+        activity_id = _select_activity_for_binding_tx(conn, task_id, kind)
+        extra_metadata = None
+        if record_identity_transition:
+            extra_metadata = {
+                "source_task_id": source_task_id,
+                "destination_task_id": task_id,
+                "repo": repo,
+                "ref_kind": ref_kind,
+                "ref_number": ref_number,
+                "operation": "active_prompt_rebind",
+            }
+        result = _finish_binding_mutation_tx(
             conn,
             binding_id=binding_id,
             task_id=task_id,
@@ -1607,7 +1696,12 @@ def bind_target_to_binding(
             execution_run_id=execution_run_id,
             event_type=event_type,
             reason_code=reason_code,
+            extra_event_metadata=extra_metadata,
         )
+        if record_identity_transition:
+            result["task_created"] = created
+            result["source_task_id"] = source_task_id
+        return result
 
 
 def bind_ad_hoc_task_to_binding(
