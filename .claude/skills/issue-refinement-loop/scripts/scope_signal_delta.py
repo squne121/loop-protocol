@@ -1538,22 +1538,6 @@ def _structured_comment_items(body: str) -> list[tuple[str | None, str, str]]:
     return items
 
 
-def _single_revised_ac_bullet(anchor_body: str | None, text: str) -> bool:
-    """Preserve the pre-existing one-bullet Revised AC directive (including CF_HTML)."""
-    if not anchor_body:
-        return False
-    canonical = _canonicalize_cf_html_envelope(anchor_body)
-    if canonical is None:
-        return False
-    match = re.fullmatch(
-        r"\s*##\s+Revised (?:Acceptance Criteria|AC)[ \t]*\n"
-        r"(?:[ \t]*\n)*[ \t]*-\s+([^\r\n]+)[ \t]*",
-        canonical,
-        re.IGNORECASE,
-    )
-    return bool(match and match.group(1).strip() == text)
-
-
 def is_safe_contract_patch_append(operation: dict, *, anchor_body: str | None = None) -> bool:
     """Validate a bounded section-bound append independent of producer claims."""
     if not isinstance(operation, dict) or operation.get("op", operation.get("kind")) != "append":
@@ -1571,10 +1555,14 @@ def is_safe_contract_patch_append(operation: dict, *, anchor_body: str | None = 
         match = re.fullmatch(r"- `([^`\n]+)`", text)
         return bool(match and _normalize_exact_repository_path_literal(match.group(1)) == match.group(1))
     if section == "Acceptance Criteria":
-        return bool(_AC_LINE_RE.fullmatch(lines[0]) or (
-            len(lines) == 1 and _single_revised_ac_bullet(anchor_body, text)
-        ))
+        # Neither a Revised AC heading nor evidence provenance substitutes for
+        # an AC number: never append an unnumbered, unbulleted prose line.
+        return bool(_AC_LINE_RE.fullmatch(lines[0]))
     if section == "Stop Conditions":
+        # An inline request marker does not turn its raw-prose payload into a
+        # section-bound Stop Condition merely by prefixing the whole request.
+        if _STOP_DIRECTIVE_RE.fullmatch(text.removeprefix("- ").strip()):
+            return False
         # A traversal/absolute/backslash literal is never silently copied as
         # a legitimate directive even when other structured operations exist.
         if any(_is_unsafe_path_literal(token) for token in re.findall(r"`([^`]+)`", text)):
@@ -1669,17 +1657,7 @@ def derive_contract_patch_operations(evidence_list: list, *, source_body: str | 
                 "rationale": f"Directive extracted from trusted review comment ({marker})",
                 "source_evidence_index": index,
             }
-            # #2333 legacy one-bullet Revised AC without an AC number is safe
-            # only when the *entire* canonical comment is that one heading and
-            # bullet. For the old evidence-only API, require real evidence
-            # provenance; the consumer checks the freshly supplied anchor body.
-            legacy_single = (
-                source_body is None and section == "Acceptance Criteria"
-                and not text.startswith("-") and len(records) == 1
-                and set(markers) <= {"revised ac", "revised acceptance criteria"}
-                and evidence.get("schema_version") == "SCOPE_DELTA_AUTHORITY_EVIDENCE_V1"
-            )
-            if not legacy_single and not is_safe_contract_patch_append(operation, anchor_body=source_body):
+            if not is_safe_contract_patch_append(operation, anchor_body=source_body):
                 return []
             operations.append(operation)
     return operations

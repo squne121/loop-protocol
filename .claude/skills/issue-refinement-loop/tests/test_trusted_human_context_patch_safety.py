@@ -56,6 +56,41 @@ def test_given_only_revised_ac_marker_when_raw_prose_is_extracted_then_no_append
     )
 
 
+def test_given_revised_ac_heading_and_one_unnumbered_bullet_then_no_raw_append():
+    comment = "## Revised Acceptance Criteria\n\n- Add retry handling to the sync worker.\n"
+    evidence = preflight._build_scope_delta_authority_evidence(
+        comment_payload={"id": 5891092074, "author_association": "OWNER",
+                         "user": {"login": "squne121", "type": "User"}},
+        comment_body=comment, repo=REPO, issue_number=ISSUE, anchor_url=URL,
+        captured_at="2026-09-29T00:00:00Z", human_context_comment_urls=[URL],
+    )
+    assert derive_contract_patch_operations([evidence]) == []
+    assert derive_contract_patch_operations([evidence], source_body=comment) == []
+    state, calls = {"body": BODY}, []
+    raw = [{"section": "Acceptance Criteria", "op": "append",
+            "text": "Add retry handling to the sync worker.", "source_evidence_index": 0}]
+    result = _consumer(raw, state, calls, anchor_body=comment)
+    assert (result["status"], result["failure"], result["writes"]) == (
+        "blocked", "unsafe_unstructured_patch_operation", 0)
+    assert state["body"] == BODY and calls == []
+
+
+def test_given_inline_stop_marker_with_prose_then_no_synthesized_bullet_or_write():
+    comment = "- Stop Condition を追加してください: dedicated worktree 外への書き込みを禁止する。"
+    evidence = {"directive_markers": ["stop condition"],
+                "extracted_directives": extract_directive_items(comment)}
+    assert derive_contract_patch_operations([evidence], source_body=comment) == []
+    assert derive_contract_patch_operations([evidence]) == []
+    state, calls = {"body": BODY + "\n## Stop Conditions\n\n- existing\n"}, []
+    original = state["body"]
+    raw = [{"section": "Stop Conditions", "op": "append",
+            "text": "- Stop Condition を追加してください: dedicated worktree 外への書き込みを禁止する。"}]
+    result = _consumer(raw, state, calls, anchor_body=comment)
+    assert (result["status"], result["failure"], result["writes"]) == (
+        "blocked", "unsafe_unstructured_patch_operation", 0)
+    assert state["body"] == original and calls == []
+
+
 def test_given_checkbox_ac_mentions_stop_conditions_when_derived_then_ac_operations_survive():
     # Issue #1270's OWNER evidence is evidence-only: a numbered Revised AC
     # mentions stop conditions in its content but is not a Stop directive.

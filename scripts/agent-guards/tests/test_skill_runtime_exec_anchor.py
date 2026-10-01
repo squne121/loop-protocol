@@ -1590,21 +1590,15 @@ def test_mutation_gate_transport_triple_reaches_real_subprocess_and_heavy_mutati
 
 
 # ---------------------------------------------------------------------------
-# Issue #2678 AC5: a trusted, operator-selected human-context directive that
-# only names an "expand Allowed Paths as needed" phrase in prose (no exact
-# backtick literal -- the SAME `expands_allowed_paths`-boundary shape #2086's
-# read-only `preflight.run.with_human_context` lane already clears via
-# `investigation_derived_path_literals`) ALSO reaches a real, applied GitHub
-# mutation through the mutation-phase `contract_update.run.with_human_context`
-# -- with the transport artifact placed ONLY in the PRIMARY checkout (never
-# copied into the dedicated worktree `execution_root`), reusing the SAME
-# `_install_real_contract_update_fixture()` / dedicated-worktree harness
-# `test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff`
-# above already establishes.
+# Issue #2678 AC5: a trusted operator-selected human-context directive can
+# reach the dedicated-worktree consumer with transport stored ONLY in the
+# primary checkout. Issue #2842 AC1: if its Stop marker has only raw prose,
+# that reachability must result in a bounded no-write handoff rather than an
+# invented Stop Conditions bullet and false-success mutation.
 # ---------------------------------------------------------------------------
 
 
-def test_contract_update_phase_with_primary_only_transport_reaches_dedicated_worktree_consumer_and_applies(
+def test_contract_update_phase_with_primary_only_transport_reaches_dedicated_worktree_consumer_and_hands_off(
     tmp_path: Path, monkeypatch
 ) -> None:
     repo = _make_repo(tmp_path)
@@ -1644,18 +1638,10 @@ def test_contract_update_phase_with_primary_only_transport_reaches_dedicated_wor
     # this AC verifies).
     pre_body = base64.b64decode(immutable["expected_post_body_base64"]).decode("utf-8")
     anchor_url = "https://github.com/squne121/loop-protocol/issues/1498#issuecomment-1"
-    # #2086 AC3/AC4 shape: a vague "expand Allowed Paths as needed" directive
-    # (no exact backtick literal -- triggers `expands_allowed_paths` and
-    # fails closed to `human_escalation` WITHOUT investigation evidence,
-    # exactly like the read-only lane's own regression coverage in
-    # `test_operator_selected_scope_reframe.py` /
-    # `test_preflight_run_with_anchor.py::test_finding1_*`), COMBINED with a
-    # second bullet naming a known `_DIRECTIVE_SECTION_MARKERS` heading
-    # ("Stop Condition") so `derive_contract_patch_operations()` produces a
-    # non-empty, safely-appendable operation independent of the investigation
-    # literals themselves (AC5(b): non-empty patch operations, semantically
-    # the SAME shape the read-only lane would derive from this identical
-    # anchor body).
+    # The vague Allowed Paths request plus an unstructured inline Stop marker
+    # must not be transformed into a section-bound append. A real transport
+    # manifest still reaches the dedicated consumer, but cannot authorize a
+    # raw-prose write by itself.
     directive_text = "Stop Condition を追加してください: dedicated worktree 外への書き込みを禁止する。"
     anchor_body = "\n".join(
         [
@@ -1750,47 +1736,39 @@ def test_contract_update_phase_with_primary_only_transport_reaches_dedicated_wor
 
     result_payload = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
     contract_update = result_payload["contract_update"]
-    # AC5(c): applied, exactly one write.
-    assert contract_update["status"] == "applied", contract_update
-    assert contract_update["disposition"] == "patch"
-    assert contract_update["writes"] == 1
-    assert contract_update["final_readback"] == "verified"
-    # AC5(e): the post-update gate is not skipped/short-circuited.
-    assert contract_update["fresh_preflight"] == "pass"
-    assert contract_update["fresh_review"] == "approve"
-    assert contract_update["fresh_readiness"] == "go"
+    # The primary-only manifest is consumed through the real dedicated
+    # worktree subprocess, but the unstructured Stop directive cannot become
+    # an automatic patch. The existing #2620/#2785 handoff route is retained.
+    assert contract_update == {
+        "status": "handoff_required",
+        "disposition": "full_rewrite_required",
+        "writes": 0,
+        "iterations": 0,
+        "final_readback": "not_applicable",
+        "fresh_preflight": "unavailable",
+        "fresh_review": "unavailable",
+        "fresh_readiness": "unavailable",
+        "reason_code": "explicit_trusted_human_directive_requires_issue_editor",
+    }
+    assert result_payload["next_action"] == "issue_editor_required"
+    assert result_payload["planner_fail_closed"] is False
+    assert result_payload["planner_fail_closed_reason_codes"] == []
 
-    # AC5(d): the fake GitHub readback body reflects the expected update --
-    # the operation the vague-Allowed-Paths + Stop-Condition anchor body
-    # derives (non-empty, AC5(b)), applied under "## Stop Conditions".
-    updated_body = json.loads((artifact_dir / "fake_remote_issue.json").read_text())["body"]
-    assert directive_text in updated_body
-    stop_conditions_idx = updated_body.find("## Stop Conditions")
-    directive_idx = updated_body.find(directive_text)
-    required_skills_idx = updated_body.find("## Required Skills")
-    assert stop_conditions_idx != -1 and required_skills_idx != -1
-    assert stop_conditions_idx < directive_idx < required_skills_idx
-
-    # AC5(c): the fake `gh` boundary received exactly one PATCH (update)
-    # request.
-    operations = [
-        json.loads(line)
-        for line in (artifact_dir / "fake_gh_operations.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
-    assert operations.count("issue_content_patch") == 1
+    # No mutation was attempted, and the remote body is exactly unchanged.
+    assert json.loads((artifact_dir / "fake_remote_issue.json").read_text())["body"] == pre_body
+    operations_file = artifact_dir / "fake_gh_operations.jsonl"
+    assert not operations_file.exists() or "issue_content_patch" not in operations_file.read_text()
+    assert not (artifact_dir / "fake_gh_patch_attempts.jsonl").exists()
 
     # AC5(a): the transport artifact is STILL absent from the dedicated
     # worktree after the real dispatch -- the primary-root propagation (AC2)
     # is what let the child find it, never a copy step.
     assert not (execution_root / transport_rel_path).exists()
 
-    # PR #2623 regression: a directive with a KNOWN section marker but that
-    # does NOT expand Allowed Paths (no investigation evidence needed) still
-    # reaches `issue_editor_required` unaffected when its own operations[]
-    # resolve empty -- unaffected by this test's own scenario (non-regression
-    # sanity: run without a transport path at all reaches the pre-#2678
-    # `expands_allowed_paths` -> `human_escalation` fail-closed route on the
-    # SAME anchor body, never a mutation).
+    # Without the primary-only transport, this same vague Allowed Paths
+    # request takes the earlier human-escalation route. Its remote body must
+    # also stay unchanged; the difference in route confirms the transport
+    # really reached the dedicated consumer in the first dispatch.
     (artifact_dir / "fake_remote_issue.json").write_text(
         json.dumps(
             {
