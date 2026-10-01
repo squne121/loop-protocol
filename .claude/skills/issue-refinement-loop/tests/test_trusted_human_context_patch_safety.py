@@ -56,6 +56,30 @@ def test_given_only_revised_ac_marker_when_raw_prose_is_extracted_then_no_append
     )
 
 
+def test_given_checkbox_ac_mentions_stop_conditions_when_derived_then_ac_operations_survive():
+    # Issue #1270's OWNER evidence is evidence-only: a numbered Revised AC
+    # mentions stop conditions in its content but is not a Stop directive.
+    evidence = {"directive_markers": ["revised ac", "revised acceptance criteria", "stop condition", "前提条件"],
+                "extracted_directives": [
+                    "[ ] AC0: runtime order、eligible profiles、stop conditions が定義されている。",
+                    "[ ] AC1: failure classes の対応表が追加されている。",
+                ]}
+    operations = derive_contract_patch_operations([evidence])
+    assert [(op["section"], op["text"]) for op in operations] == [
+        ("Acceptance Criteria", "- [ ] AC0: runtime order、eligible profiles、stop conditions が定義されている。"),
+        ("Acceptance Criteria", "- [ ] AC1: failure classes の対応表が追加されている。"),
+    ]
+
+
+def test_given_checkbox_ac_and_unsafe_path_when_derived_then_no_partial_plan():
+    evidence = {"directive_markers": ["revised ac", "allowed paths"],
+                "extracted_directives": [
+                    "[ ] AC0: safe numbered acceptance criterion",
+                    "Allowed Paths を追加してください: `../../escape.py`",
+                ]}
+    assert derive_contract_patch_operations([evidence]) == []
+
+
 def test_given_sectioned_owner_comment_when_extracted_then_stop_vc_ac_and_paths_are_preserved():
     comment = """## Revised Acceptance Criteria
 - [ ] AC19: verify one outcome

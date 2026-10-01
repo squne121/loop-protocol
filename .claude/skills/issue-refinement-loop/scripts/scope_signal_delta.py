@@ -1613,14 +1613,20 @@ def derive_contract_patch_operations(evidence_list: list, *, source_body: str | 
                 return []
             text = item.strip()
             lowered = text.lower()
-            inline_sections = [
-                name for name, matches in (
-                    ("Allowed Paths", "allowed path" in lowered),
-                    ("Verification Commands", "verification command" in lowered),
-                    ("Stop Conditions", "stop condition" in lowered),
-                    ("Acceptance Criteria", bool(re.match(r"(?:-\s*)?(?:\[[ xX]\]\s*)?AC[0-9]+\s*:", text, re.I))),
-                ) if matches
-            ]
+            # A numbered AC is already section-bound. Its content can mention
+            # "stop conditions" (as in the real #1270 OWNER fixture) without
+            # requesting an append to Stop Conditions. Keep the mixed-plan
+            # veto for separate, malformed directives later in the records.
+            if _AC_LINE_RE.fullmatch(f"- {text}"):
+                inline_sections = ["Acceptance Criteria"]
+            else:
+                inline_sections = [
+                    name for name, matches in (
+                        ("Allowed Paths", "allowed path" in lowered),
+                        ("Verification Commands", "verification command" in lowered),
+                        ("Stop Conditions", "stop condition" in lowered),
+                    ) if matches
+                ]
             if len(inline_sections) > 1 and (explicit_section is None or explicit_section not in inline_sections):
                 return []  # A mixed, ambiguous section request is not a partial plan.
             section = explicit_section or (inline_sections[0] if len(inline_sections) == 1 else None)
