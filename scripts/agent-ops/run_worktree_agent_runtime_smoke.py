@@ -807,6 +807,12 @@ _HOOK_IF_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:@%+,=
 _HOOK_IF_BARE_WORD_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.+-]*")
 _HOOK_IF_SHELL_CONTROL_CHARS = frozenset("&|;<>()`$\\\n\r{}")
 _HOOK_IF_QUOTE_CHARS = frozenset("'\"")
+# Bash words are separated only by space / tab (newline separates commands).
+# Any other Unicode / control whitespace (NBSP, \r, \x0b, \x0c, \x1c-\x1f,
+# U+2028, ...) is part of a Bash word, so a command containing one cannot be
+# tokenised the way Python's bare ``str.split()`` would; it is ``unknown``.
+_HOOK_IF_BASH_SEPARATORS = " \t\n"
+_HOOK_IF_SPLIT_RE = re.compile(r"[ \t\n]+")
 # Words that run / modify / introduce another command: a command starting
 # with one of these is never provably "just this word" (``timeout 5 herdr
 # x`` fires a ``herdr *`` rule through the wrapped command), so it is
@@ -834,8 +840,10 @@ def _evaluate_hook_if_condition(if_value: object, tool_name: object, command: ob
         return _HOOK_IF_UNKNOWN
     if not isinstance(command, str) or not command.strip():
         return _HOOK_IF_UNKNOWN
+    if any(ch.isspace() and ch not in _HOOK_IF_BASH_SEPARATORS for ch in command):
+        return _HOOK_IF_UNKNOWN
     word = rule.group(1)
-    tokens = command.split()
+    tokens = [tok for tok in _HOOK_IF_SPLIT_RE.split(command) if tok]
     index = 0
     while index < len(tokens) and _HOOK_IF_ASSIGNMENT_RE.fullmatch(tokens[index]):
         index += 1

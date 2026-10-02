@@ -4094,3 +4094,77 @@ def test_hook_chain_if_unknown_window_is_unverified(tmp_path: Path) -> None:
             aggregate = module.evaluate_hook_chain_evidence(stdout, str(worktree), [], [])
             assert _HC_IF_SENTINEL not in json.dumps(aggregate), command
             assert _HC_IF_SENTINEL not in repr(aggregate)
+
+
+# Issue #2865 PR #2867 fix_delta: Bash words are separated only by space/tab
+# (newline separates commands). Python-only whitespace (NBSP, CR, VT, FF,
+# FS/GS/RS/US, U+2028, ...) is part of a Bash word, so such commands must be
+# ``unknown`` (never ``match`` through ``str.split()``).
+_HC_IF_SPECIAL_WS = {
+    "nbsp": " ",
+    "cr": "\r",
+    "vt": "\x0b",
+    "ff": "\x0c",
+    "fs": "\x1c",
+    "gs": "\x1d",
+    "rs": "\x1e",
+    "us": "\x1f",
+    "nel": "\x85",
+    "ls": " ",
+    "ideographic": "　",
+}
+
+
+def _hc_if_special_ws_commands() -> list[tuple[str, str]]:
+    commands: list[tuple[str, str]] = []
+    for name, ws in _HC_IF_SPECIAL_WS.items():
+        commands.append((f"{name}-joined", f"herdr{ws}list"))
+        commands.append((f"{name}-trailing", f"herdr{ws} --version"))
+        commands.append((f"{name}-leading", f"{ws}herdr list"))
+        commands.append((f"{name}-nonmatch-shape", f"echo{ws}smoke"))
+        commands.append((f"{name}-sentinel", f"echo {_HC_IF_SENTINEL}{ws}x"))
+    return commands
+
+
+def test_hook_if_special_whitespace_command_is_unknown_unit() -> None:
+    module = _load_module()
+    evaluate = module._evaluate_hook_if_condition
+    rule = "Bash(herdr *)"
+    for label, command in _hc_if_special_ws_commands():
+        assert evaluate(rule, "Bash", command) == "unknown", (label, repr(command))
+
+    # Supported separators keep their pre-existing semantics.
+    assert evaluate(rule, "Bash", "herdr list") == "match"
+    assert evaluate(rule, "Bash", "herdr\tlist") == "match"
+    assert evaluate(rule, "Bash", "  herdr   list  ") == "match"
+    assert evaluate(rule, "Bash", "herdr") == "match"
+    assert evaluate(rule, "Bash", "X=1 herdr x") == "match"
+    assert evaluate(rule, "Bash", "herdr list && echo ok") == "match"
+    assert evaluate(rule, "Bash", "echo smoke") == "nonmatch"
+    assert evaluate(rule, "Bash", "echo\tsmoke") == "nonmatch"
+    assert evaluate(rule, "Bash", "git status") == "nonmatch"
+    assert evaluate(rule, "Bash", "") == "unknown"
+    assert evaluate(rule, "Bash", "   ") == "unknown"
+
+
+def test_hook_if_special_whitespace_window_is_unverified_and_leak_free(tmp_path: Path) -> None:
+    module = _load_module()
+    worktree = _hc_if_worktree(tmp_path / "main", _hc_settings_with_if_hook())
+
+    for label, command in _hc_if_special_ws_commands():
+        for siblings in (4, 5):
+            stdout = _hc_if_stdout([
+                {"id": "tu-pos", "command": command, "siblings": siblings},
+                {"id": "tu-deny", "command": _HC_IF_DENY_COMMAND, "siblings": 4, "denied": True},
+            ])
+            result = module.evaluate_all_matching_hooks_observed(stdout, str(worktree))
+            window = result["windows"][0]
+            assert window["status"] == "unverified", (label, siblings, window)
+            assert window["reason"] == "if_condition_unverifiable", (label, siblings, window)
+            assert window["expected_count"] is None, (label, siblings, window)
+            assert result["status"] == "unverified", (label, siblings, result)
+            assert result["passed"] is False
+
+            aggregate = module.evaluate_hook_chain_evidence(stdout, str(worktree), [], [])
+            assert _HC_IF_SENTINEL not in json.dumps(aggregate), (label, siblings)
+            assert _HC_IF_SENTINEL not in repr(aggregate), (label, siblings)
