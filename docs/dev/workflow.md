@@ -417,10 +417,12 @@ Issue #2241 / PR #2247 の実装範囲では、以下は意図的に「未解決
   `_fetch_issue()` / `_fetch_issue_comments()` に配線済みだった。Issue #2257 では、`_fetch_single_comment()` だけが
   isolated-profile 分岐を持たず無条件で `gh api` を呼んでいたこと（split-brain transport、Issue #2197 のアンカーコメント
   5315264311 誤 missing 判定の直接原因）を修正し、さらに OWNER レビュー（PR #2260）指摘を受けて以下を実装した:
-  - `run_preflight()` が invocation ごとに単一の read-authority transport（isolated 時は
-    `_CredentiallessPreflightTransport`、通常時は `_GhCliPreflightTransport`）を一度だけ `_select_read_transport()` で
-    選択し、`_fetch_issue()` / `_fetch_issue_comments()` / `_fetch_single_comment()` / `_validate_anchor_comment_url()` /
-    `_validate_anchor_comments_batch()` へ明示的に引き渡す構造に変更した。initial anchor comment は、live mode で
+  - `run_preflight()` が invocation ごとに単一の read-authority transport を一度だけ `_select_read_transport()` で
+    選択し、`_fetch_single_comment()` / `_validate_anchor_comment_url()` /
+    `_validate_anchor_comments_batch()` へ明示的に引き渡す構造に変更した（`_fetch_issue()` /
+    `_fetch_issue_comments()` は `transport=None` 既定で同じ constant selector から同一 instance を解決する。
+    なお Issue #2872 以降、選択される transport は isolated / 通常を問わず native `gh`（`_GhCliPreflightTransport`）
+    であり、下記の isolated 時 credentialless 選択は #2299 contract で置き換えられた）。initial anchor comment は、live mode で
     `run_preflight()` が既に取得済みの `comments`（complete paginated traversal の結果）から解決され、以前のように
     毎回 single-comment GET を再実行することはない（single-comment GET は、その traversal 結果に anchor が含まれない
     場合の fresh-readback フォールバック、および trusted-anchor contract update の TOCTOU 検証でのみ使われる）。
@@ -436,11 +438,24 @@ Issue #2241 / PR #2247 の実装範囲では、以下は意図的に「未解決
     environment_failure 生成箇所（transport 読み取り失敗・fixture load 失敗・artifact 書き込み失敗・planner 内部
     エラー）にこの projection を実装した。
 
-  isolated Claude-GPT session からの `preflight.run.with_human_context` 相当 command は、Issue/comments 一覧/単一
-  anchor comment のいずれも credentialless transport のみで解決し、`gh` へフォールバックしない。transport failure
-  （認証依存/rate limit(primary/secondary区別)/403 forbidden/5xx/DNS/接続/timeout/不正 JSON・エンコーディング/
-  pagination 不完全）は `semantic_missing` と区別された `environment_failure` として報告され、実在する anchor
-  comment を missing と誤分類しない。
+  **#2299 contract への更新（Issue #2872）**: Claude-GPT launcher は #2299 以降、GitHub auth のみを child へ
+  native 同等に共有する（isolation 前の `GH_CONFIG_DIR` を固定して export し、`GH_TOKEN` / `GITHUB_TOKEN` /
+  `GH_HOST` / `GH_REPO` も scrub しない。host HOME 全体・SSH agent・GPG 等は引き続き isolate）。このため
+  `HOME` が OS account home と異なること（isolated HOME）は「GitHub auth 不在」の根拠にならず、
+  `_select_read_transport()` は HOME・`GH_TOKEN`・`hosts.yml`・`GH_CONFIG_DIR`・`gh auth status` を一切参照せず、
+  常に native `gh`（認証解決は `gh` 自身が env token / 保存済み設定 / keyring から行う）を返す constant selector
+  である。isolated Claude-GPT session からの `preflight.run.with_human_context` 相当 command は、Issue/comments 一覧/
+  単一 anchor comment のいずれも同一の native `gh` で読み、取得途中に認証エラー・rate limit・接続失敗を理由として
+  anonymous credentialless transport へ切り替えない（Issue #2257 の split-brain を再導入しない）。
+  `skill_runtime_exec.py::_sanitize_env()` は production preflight の `preflight.run.with_anchor` /
+  `preflight.run.with_human_context` / `preflight.run.with_agent_report` の child にも、親に設定されている
+  `GH_CONFIG_DIR` を渡す（未設定・空の場合は値を作らず、設定内容も読まない。`preflight.run.fixture.*` は対象外）。
+  真正な authless の isolated 環境では `gh` が認証要求（exit 4）を返し、`environment_failure` /
+  `gh_auth_required` として構造化報告される。いずれの場合も transport failure（認証依存/rate limit/403 forbidden/
+  5xx/DNS/接続/timeout/不正 JSON・エンコーディング/pagination 不完全）は `semantic_missing` と区別された
+  `environment_failure` として報告され、実在する anchor comment を missing と誤分類しない。
+  `github_credentialless_read.py` の GET-only transport 本体は引き続き 60 req/hour の anonymous budget を前提とする
+  contract として維持され、production preflight の read path では選択されない。
 
   **未解決事項（Issue #2257 スコープ内の残課題、PR #2260 OWNER レビュー時点）**:
   - `scripts/agent-guards/tests/test_isolated_anchor_single_authority.py` /
