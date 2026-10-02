@@ -617,6 +617,7 @@ export CLAUDE_GPT_SPARK_PROMPT_RETIREMENT_HOOK
 SPARK_PROMPT_RETIREMENT_HOOK_GROUP='{"hooks": [{"type": "command", "command": "python3 \"$CLAUDE_GPT_SPARK_PROMPT_RETIREMENT_HOOK\""}]}'
 UPS_HOOK_GROUPS="${SPARK_PROMPT_RETIREMENT_HOOK_GROUP}"
 PTU_HOOK_GROUPS=""
+POSTTOOLUSE_HOOK_GROUPS=""
 PERMISSION_REQUEST_HOOK_GROUPS='{"matcher": "Bash", "hooks": [{"type": "command", "command": "python3 \"$ISSUE_EDITOR_PERMISSION_REQUEST_HOOK\""}]}'
 SAS_HOOK_GROUPS=""
 SAP_HOOK_GROUPS=""
@@ -852,6 +853,23 @@ HOOK_SINK_WRITER_EOF
     \"CLAUDE_GPT_LATITUDE_PACKAGE_SPEC\": \"${CLAUDE_GPT_LATITUDE_PACKAGE_SPEC}\"${LATITUDE_PROJECT_ENV_FRAGMENT}
   }"
   export CLAUDE_GPT_HOOK_SINK_NONCE CLAUDE_GPT_HOOK_SINK_PATH CLAUDE_GPT_HOOK_SINK_WRITER
+elif [ "${CLAUDE_GPT_RUNTIME_SMOKE_HOOKS:-}" = "subagent-name-resume" ]; then
+  # --- Issue #2840: THIRD launcher-owned fixed value, for the opt-in named
+  #     SubAgent spawn -> complete -> name resume -> complete runtime-smoke
+  #     scenario (`run_worktree_agent_runtime_smoke.py --named-subagent-resume`).
+  #     It registers ONLY the generic observation hook set that the runner's own
+  #     scenario overlay also carries (SubagentStart / SubagentStop /
+  #     PostToolUse matcher Agent / PreToolUse matcher SendMessage), each a
+  #     bare `cat` that echoes the hook's own stdin payload onto the stream.
+  #     It carries no Task Context verdict and no authorization semantics.
+  #     No caller-supplied string is ever interpolated into a hook command;
+  #     this does not touch CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS and does not accept
+  #     an arbitrary caller --settings/hook command. ---
+  NAME_RESUME_CAT_GROUP='{"hooks": [{"type": "command", "command": "cat"}]}'
+  SAS_HOOK_GROUPS="${NAME_RESUME_CAT_GROUP}"
+  SAP_HOOK_GROUPS="${NAME_RESUME_CAT_GROUP}"
+  PTU_HOOK_GROUPS='{"matcher": "SendMessage", "hooks": [{"type": "command", "command": "cat"}]}'
+  POSTTOOLUSE_HOOK_GROUPS='{"matcher": "Agent", "hooks": [{"type": "command", "command": "cat"}]}'
 fi
 
 # Issue #2426 AC1: "Stop" is now unconditionally present (STOP_HOOK_GROUPS
@@ -868,6 +886,12 @@ HOOKS_JSON_FRAGMENT=',
     "Stop": ['"${STOP_HOOK_GROUPS}"']'"$(
   if [ -n "$STOPFAILURE_HOOK_GROUPS" ]; then
     printf ',\n    "StopFailure": [%s]' "$STOPFAILURE_HOOK_GROUPS"
+  fi
+  # Issue #2840: PostToolUse is registered ONLY by the fixed
+  # `subagent-name-resume` value (POSTTOOLUSE_HOOK_GROUPS stays empty for every
+  # other value, so their settings output stays byte-identical).
+  if [ -n "$POSTTOOLUSE_HOOK_GROUPS" ]; then
+    printf ',\n    "PostToolUse": [%s]' "$POSTTOOLUSE_HOOK_GROUPS"
   fi
 )"'
   }'
@@ -894,6 +918,15 @@ case "${CLAUDE_GPT_RUNTIME_SMOKE_HOOKS:-}" in
   subagent-start-stop|hook-sink-multi-turn)
     PEER_POLICY_DENY_SUFFIX=',
       "SendMessage",
+      "ListAgents"'
+    PEER_POLICY_SETTINGS_FRAGMENT=',
+  "crossSessionInbound": "refuse"'
+    ;;
+  subagent-name-resume)
+    # Issue #2840: the named SubAgent resume scenario needs `SendMessage`, so
+    # ONLY its blanket deny is dropped. `ListAgents` stays denied and
+    # `crossSessionInbound: refuse` stays in force.
+    PEER_POLICY_DENY_SUFFIX=',
       "ListAgents"'
     PEER_POLICY_SETTINGS_FRAGMENT=',
   "crossSessionInbound": "refuse"'
