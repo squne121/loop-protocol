@@ -221,6 +221,64 @@ def test_given_allowed_paths_heading_with_exact_path_when_derived_then_section_i
         ("Allowed Paths", "- `scripts/agent-guards/skill_runtime_exec.py`")]
 
 
+def test_given_allowed_paths_h2_with_conflicting_bullet_label_when_classified_and_consumed_then_no_write():
+    for conflicting_bullet in (
+        "- Stop Condition: verify `src/b.ts` before editing.",
+        "1. Verification Command: check `src/b.ts` before editing.",
+        "- In Scope: verify `src/b.ts` before editing.",
+    ):
+        comment = "## Allowed Paths\n- Allowed Paths: `src/a.ts`\n" + conflicting_bullet + "\n"
+        evidence = preflight._build_scope_delta_authority_evidence(
+            comment_payload={"id": 5891092074, "author_association": "OWNER",
+                             "user": {"login": "squne121", "type": "User"}},
+            comment_body=comment, repo=REPO, issue_number=ISSUE, anchor_url=URL,
+            captured_at="2026-09-29T00:00:00Z", human_context_comment_urls=[URL],
+        )
+        authority = classify_scope_delta_authority(
+            [evidence], source_body=comment, target_issue_number=ISSUE,
+            base_issue_body_sha256="a" * 64, expected_repo=REPO,
+        )
+        operations = authority["contract_patch_plan"]["operations"]
+        assert operations == []  # Never accept src/a.ts as a partial safe plan.
+        # Empty-plan editor eligibility for other labels belongs to #2785;
+        # the Stop Condition case must fail closed, and every stale partial
+        # Allowed Paths plan must be rejected before any consumer write.
+        plans = ([operations] if conflicting_bullet.startswith("- Stop Condition:") else [])
+        plans.extend([{"section": "Allowed Paths", "op": "append", "text": f"- `{path}`"}]
+                     for path in ("src/a.ts", "src/b.ts"))
+        for plan in plans:
+            state, calls = {"body": BODY + "\n## Stop Conditions\n\n- existing\n"}, []
+            original = state["body"]
+            result = _consumer(plan, state, calls, anchor_body=comment,
+                               known_context={"scope_delta_authority_evidence": [evidence],
+                                              "human_context_comment_urls": [URL]})
+            assert (result["status"], result.get("failure"), result["writes"]) == (
+                "blocked", "unsafe_unstructured_patch_operation", 0), (conflicting_bullet, plan, result)
+            assert state["body"] == original and calls == []
+
+
+def test_given_only_valid_allowed_paths_h2_when_classified_and_consumed_then_path_written():
+    comment = "## Allowed Paths\n- Allowed Paths: `src/a.ts`\n"
+    evidence = preflight._build_scope_delta_authority_evidence(
+        comment_payload={"id": 5891092074, "author_association": "OWNER",
+                         "user": {"login": "squne121", "type": "User"}},
+        comment_body=comment, repo=REPO, issue_number=ISSUE, anchor_url=URL,
+        captured_at="2026-09-29T00:00:00Z", human_context_comment_urls=[URL],
+    )
+    authority = classify_scope_delta_authority(
+        [evidence], source_body=comment, target_issue_number=ISSUE,
+        base_issue_body_sha256="a" * 64, expected_repo=REPO,
+    )
+    operations = authority["contract_patch_plan"]["operations"]
+    assert [(op["section"], op["text"]) for op in operations] == [("Allowed Paths", "- `src/a.ts`")]
+    state, calls = {"body": BODY}, []
+    result = _consumer(operations, state, calls, anchor_body=comment,
+                       known_context={"scope_delta_authority_evidence": [evidence],
+                                      "human_context_comment_urls": [URL]})
+    assert (result["status"], result["writes"], calls) == ("applied", 1, ["write"])
+    assert "- `src/a.ts`" in extract_sections(state["body"])["Allowed Paths"]
+
+
 def test_given_mixed_inline_sections_with_unsafe_item_when_derived_then_whole_plan_rejected():
     comment = ("## Revised Acceptance Criteria\n"
                "- AC19: safe\n"

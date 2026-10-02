@@ -1503,6 +1503,10 @@ _VC_BACKTICK_DIRECTIVE_RE = re.compile(
     re.IGNORECASE,
 )
 _INLINE_SECTION_LABEL_RE = re.compile(r"(?:Stop Conditions?|Verification Commands?)\s*:", re.IGNORECASE)
+_CONFLICTING_PATH_BULLET_LABEL_RE = re.compile(
+    r"^(?:Stop Conditions?|Verification Commands?|Acceptance Criteria|Revised AC|In Scope|Out of Scope)\s*[:：]",
+    re.IGNORECASE,
+)
 # Indentation is not section authority: a nested directive under a numbered AC
 # must not be laundered into its continuation text by a pre-existing plan.
 _CROSS_SECTION_CONTINUATION_RE = re.compile(
@@ -1646,6 +1650,14 @@ def derive_contract_patch_operations(evidence_list: list, *, source_body: str | 
                         ("Stop Conditions", "stop condition" in lowered),
                     ) if matches
                 ]
+            # An Allowed Paths heading cannot turn a differently labelled
+            # bullet (or a mixed per-bullet request) into path authority. Reject
+            # the whole plan, including any earlier valid paths, before emitting.
+            if explicit_section == "Allowed Paths" and (
+                any(name != "Allowed Paths" for name in inline_sections)
+                or _CONFLICTING_PATH_BULLET_LABEL_RE.match(text)
+            ):
+                return []
             if len(inline_sections) > 1 and (explicit_section is None or explicit_section not in inline_sections):
                 return []  # A mixed, ambiguous section request is not a partial plan.
             # An H2 Stop/VC context cannot authorize a path expansion just
