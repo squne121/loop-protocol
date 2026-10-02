@@ -1148,8 +1148,30 @@ class _CountingStr(str):
 
 class _CountingSpans(list):
     """``list`` whose element accesses (iteration + indexing) are counted.
-    This seam counts the same thing for a linear search and for a ``bisect``
-    based lookup that is built on the spans."""
+    This seam observes the spans *themselves*: reading them to build the end
+    positions and any cache-miss / fallback reads. It does NOT observe the
+    search over the derived end-position list (the production code copies the
+    ends into a fresh plain list); that search is counted by
+    ``_CountingEnds`` through the ``_clause_index_from_ends`` seam."""
+
+    counters: dict[str, int]
+
+    def __iter__(self):
+        for item in list.__iter__(self):
+            self.counters["lookup_work"] += 1
+            yield item
+
+    def __getitem__(self, key):
+        self.counters["lookup_work"] += 1
+        return list.__getitem__(self, key)
+
+
+class _CountingEnds(list):
+    """``list`` of clause end positions whose element accesses are counted into
+    ``lookup_work``. CPython's ``bisect_right`` reads through ``__getitem__`` on
+    a list subclass (O(log C) reads per lookup) and a linear scan reads through
+    ``__iter__`` (O(C) reads per lookup), so replacing only the helper with a
+    linear scan is visible as super-linear growth of ``lookup_work``."""
 
     counters: dict[str, int]
 
@@ -1194,12 +1216,19 @@ def _measure_projection_work(monkeypatch, prompt: str) -> dict[str, int]:
     }
     _CountingStr.counters = counters
     _CountingSpans.counters = counters
+    _CountingEnds.counters = counters
+    real_index_from_ends = classifier._clause_index_from_ends
 
     def counting_strip(text):
         return _CountingStr(real_strip(text))
 
     def counting_spans(text):
         return _CountingSpans(real_spans(text))
+
+    def counting_index_from_ends(clause_ends, position):
+        # Run the ORIGINAL helper over a counting list so the real search work
+        # (bisect or any replacement) is observed.
+        return real_index_from_ends(_CountingEnds(clause_ends), position)
 
     def counting_target(clause):
         counters["target_calls"] += 1
@@ -1216,6 +1245,7 @@ def _measure_projection_work(monkeypatch, prompt: str) -> dict[str, int]:
         patch.setattr(classifier, "_find_occurrences", lambda *_a, **_k: occurrences)
         patch.setattr(classifier, "_primary_occurrences", lambda *_a, **_k: primary_all)
         patch.setattr(classifier, "_clause_spans", counting_spans)
+        patch.setattr(classifier, "_clause_index_from_ends", counting_index_from_ends)
         patch.setattr(classifier, "_clause_has_target_phrase", counting_target)
         patch.setattr(classifier, "_clause_has_creation_or_reply_phrase", counting_creation)
         measured = classifier.active_rebind_projection(prompt, classification, current_repo=_PERF_REPO)
