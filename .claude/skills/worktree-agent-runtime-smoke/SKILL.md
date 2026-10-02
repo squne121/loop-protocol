@@ -206,7 +206,9 @@ AC3/AC4 の充足は、ローカル live 実行が出力したこの JSON の `v
 `backend_model_emission` / `hook_lifecycle` / `unclassified` のいずれかに分類する。`unclassified` は
 失敗であり、PASS にならない。`proxy_translation` は、実際の error event（`result` の API error や
 stderr の translation error 文字列）に結び付く場合だけ選ぶ。proxy の製品名や launcher の正常な起動行
-（`launcher=... proxy=<version>`）は根拠にしない。根拠がなければ `hook_lifecycle` または
+（`launcher=... proxy=<version>`）は根拠にしない。API error も 400 / 422 や `invalid_request_error`、
+tool schema 系の文字列だけが変換障害の根拠で、401（認証）・429（rate limit）・529（過負荷）・その他 5xx は
+根拠にしない。根拠がなければ `hook_lifecycle` または
 `unclassified` に留める。
 
 ### evidence の再利用規則（freshness、AC8）

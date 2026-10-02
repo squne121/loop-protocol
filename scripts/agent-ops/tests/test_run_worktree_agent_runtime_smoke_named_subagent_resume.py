@@ -1293,6 +1293,74 @@ def test_normal_proxy_startup_line_does_not_turn_hook_failure_into_proxy_transla
     assert _evidence(no_resume_hooks, adapter="claude-gpt", stderr=startup)["failure_layer"] == "hook_lifecycle"
 
 
+def _hook_failure_stream() -> Stream:
+    stream = Stream()
+    stream.agent_call("toolu_agent_1", NAME).start("agent-A").child_text(FIRST).stop("agent-A")
+    stream.post_agent("toolu_agent_1", NAME, "agent-A", handback=FIRST)
+    stream.send_call("toolu_send_1", NAME).pretool_send(NAME)
+    stream.send_result("toolu_send_1", resumed="agent-A", pin_name=NAME)
+    return stream
+
+
+@pytest.mark.parametrize("status", [401, 429, 529, 500, 503])
+def test_generic_api_error_status_is_not_attributed_to_proxy_translation_on_stderr(status):
+    stream = _hook_failure_stream()
+    stderr = f"API Error: {status} upstream said no\n"
+    chain, layer = _classify(stream, adapter="claude-gpt", stderr=stderr)
+    assert chain["chain_break"] == "resume_subagent_start_missing"
+    # no translation evidence: the layer stays with the hook failure, never the proxy
+    assert layer == "hook_lifecycle", (status, layer)
+
+
+@pytest.mark.parametrize("status", [401, 429, 529, 500, 503])
+def test_generic_api_error_status_is_not_attributed_to_proxy_translation_in_result_event(status):
+    stream = _hook_failure_stream()
+    stream.result(is_error=True, result=f"API Error: {status} upstream said no", api_error_status=status)
+    chain, layer = _classify(stream, adapter="claude-gpt")
+    assert chain["chain_break"] == "resume_subagent_start_missing"
+    assert layer == "hook_lifecycle", (status, layer)
+    # a result event whose text alone says so (no api_error_status field) is not translation either
+    text_only = _hook_failure_stream()
+    text_only.result(is_error=True, result=f"API Error: {status} upstream said no")
+    assert _classify(text_only, adapter="claude-gpt")[1] == "hook_lifecycle"
+
+
+def test_generic_api_error_without_hook_failure_is_never_proxy_translation():
+    # started session, no chain-break reason mapped to another layer: never a proxy blame
+    stream = Stream()
+    stream.agent_call("toolu_agent_1", NAME).post_agent("toolu_agent_1", NAME, "agent-A")
+    stream.start("agent-A").child_text(FIRST).stop("agent-A")
+    for status in (401, 429, 529):
+        layer = _classify(stream, adapter="claude-gpt", stderr=f"API Error: {status} nope\n")[1]
+        assert layer != "proxy_translation", (status, layer)
+        assert layer in set(MODULE.NAMED_RESUME_FAILURE_LAYERS)
+
+
+@pytest.mark.parametrize("text", [
+    "API Error: 400 bad request",
+    "API Error: 422 unprocessable",
+    "API Error: 400 invalid_request_error",
+    "invalid_request_error: messages.1.content",
+    "tool input schema rejected",
+    "strict mode not supported for function",
+])
+def test_translation_error_evidence_is_still_attributed_to_proxy_translation(text):
+    stderr_stream = _hook_failure_stream()
+    assert _classify(stderr_stream, adapter="claude-gpt", stderr=text + "\n")[1] == "proxy_translation", text
+    result_stream = _hook_failure_stream()
+    result_stream.result(is_error=True, result=text)
+    assert _classify(result_stream, adapter="claude-gpt")[1] == "proxy_translation", text
+    # the native adapter is never blamed on the proxy
+    assert _classify(_hook_failure_stream(), adapter="native", stderr=text + "\n")[1] != "proxy_translation"
+
+
+@pytest.mark.parametrize("status", [400, 422])
+def test_result_event_api_error_status_400_422_is_proxy_translation(status):
+    stream = _hook_failure_stream()
+    stream.result(is_error=True, result="request rejected", api_error_status=status)
+    assert _classify(stream, adapter="claude-gpt")[1] == "proxy_translation"
+
+
 # F5: run-level verdict is finalised once from the final exit code --------------------------
 
 

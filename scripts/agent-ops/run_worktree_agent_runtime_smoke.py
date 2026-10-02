@@ -6932,12 +6932,15 @@ _NAMED_RESUME_CLIENT_SCHEMA_ERROR_RE = re.compile(
     r"Invalid input|schema validation|unknown (?:parameter|field)",
     re.IGNORECASE,
 )
-# Proxy translation evidence: only strings that describe an actual error.  The bare
-# product name (``claude-code-proxy``) is deliberately NOT a pattern: it appears in the
-# launcher's normal ``launcher=... proxy=<version>`` startup line, and a normal log line
-# must never change which layer a failure is attributed to.
+# Proxy translation evidence: only strings that describe an actual translation fault
+# (a malformed-request rejection: ``API Error: 400`` / ``422``, ``invalid_request_error``,
+# a tool-schema / strict tool|function message).  A generic ``API Error: 4xx/5xx`` (401
+# auth, 429 rate limit, 529 overload, 5xx upstream) is NOT evidence and is never matched
+# here.  The bare product name (``claude-code-proxy``) is deliberately NOT a pattern: it
+# appears in the launcher's normal ``launcher=... proxy=<version>`` startup line, and a
+# normal log line must never change which layer a failure is attributed to.
 _NAMED_RESUME_PROXY_ERROR_RE = re.compile(
-    r"invalid_request_error|API Error: *(?:4\d\d|5\d\d)|"
+    r"invalid_request_error|API Error: *(?:400|422)\b|"
     r"tool[^\n]{0,40}schema|strict[^\n]{0,40}(?:tool|function)",
     re.IGNORECASE,
 )
