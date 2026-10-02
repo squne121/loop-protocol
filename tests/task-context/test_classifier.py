@@ -1439,16 +1439,20 @@ def test_given_spans_when_clause_index_from_ends_then_same_as_linear_clause_inde
 # Issue #2875: `_find_occurrences()` の `_OWNER_REPO_HASH_RE` ループ内の
 # prefix 前段処理（match ごとの先頭からの prefix 切り出しと分割）から二乗経路を除去する。
 #
-# 計数 test は #2877 の `_measure_projection_work` と同型の seam で、owner/repo ループの
-# 本体が実行されている間だけ authority_text に対する全 copy（slice 長）と全走査（find /
-# split / count 等が走査した文字数、`_PR_PREFIX_RE` の search 範囲長）を数える。
+# 計数 test は #2877 の `_measure_projection_work` と同型の seam で、`_OWNER_REPO_HASH_RE`
+# proxy の match を消費している間だけ、決定論的な作業量モデルとして 2 つの値を数える。
+#   - `copy_chars`: authority_text への slice 要求が返した結果文字数。実メモリコピー量の
+#     計測ではない（`split()` / `partition()` が生成する substring の文字数は加算しない）。
+#   - `lookup_work`: find / index / split / count 等が走査した文字数の見積りと
+#     `_PR_PREFIX_RE` の search 範囲長。
 # 呼び出し回数だけを合否指標にしない。実時間の閾値は使わない。
 #
 # Scope note: 計数対象は owner/repo ループ内の prefix 前段処理のみ。
 # `_OWNER_REPO_HASH_RE.finditer` 自体の走査（match 0 件の `"a." * n` で二乗になる経路）は
 # #2881 の所有で、ここでは計数にも合否にも含めない。したがって本 test の PASS は
 # scanner 全体 / `classify()` / hook 全体の非二乗性を示さない。
-# 観測できない経路: 新規 compiled regex、`+` / join など plain str を返す演算。
+# 観測できない経路: 新規 compiled regex、`+` / join など plain str を返す演算、
+# `split()` / `partition()` が生成する substring の実コピー。
 # 未対応の str メソッド / regex メソッドがループ内で呼ばれた場合は
 # `unobserved_calls` に計上され、各 test が 0 であることを assert する
 # （観測できない経路を黙って見逃さない）。残る穴は mutant 感度 test で補う。
@@ -1463,7 +1467,11 @@ _OWNER_REPO_STR_PUBLIC_METHODS = frozenset(name for name in dir(str) if not name
 
 
 def _owner_repo_str_class(counters, state):
-    """Return a ``str`` subclass counting copies / scans while ``state['on']``."""
+    """Return a ``str`` subclass counting a deterministic work model while ``state['on']``.
+
+    ``copy_chars`` is the summed result length of slice requests only; it is not the total
+    memory copied (``split()`` / ``partition()`` substrings are not added to it). ``lookup_work``
+    is an estimate of the characters scanned by the observed methods."""
 
     class _OwnerRepoCountingStr(str):
         def _range(self, start, end):
@@ -1560,7 +1568,9 @@ class _OwnerRepoCountingRegex:
 class _OwnerRepoFinditerProxy:
     """Stands in for ``_OWNER_REPO_HASH_RE``. The counting is enabled only while the
     consumer's loop body runs (between the yield and the next ``next()``), so the
-    ``finditer`` scan itself (#2881) is excluded."""
+    ``finditer`` scan itself (#2881) is excluded. Because this proxy replaces the module-level
+    ``_OWNER_REPO_HASH_RE``, every consumer of it is observed, not only the main owner/repo
+    loop: ``_path_token_spans()`` and the later ``owner_repo_spans`` construction as well."""
 
     def __init__(self, real, state):
         self._real, self._state = real, state
@@ -1585,7 +1595,9 @@ class _OwnerRepoFinditerProxy:
 
 def _measure_owner_repo_prefix_work(monkeypatch, prompt, find_occurrences=None) -> dict[str, int]:
     """Run ``find_occurrences`` (default: the production ``_find_occurrences``) once on
-    ``prompt`` with the owner/repo loop instrumented; return the work counters."""
+    ``prompt`` with the ``_OWNER_REPO_HASH_RE`` consumers instrumented; return the work counters.
+    ``loop_iterations`` counts matches yielded to all of those consumers (the main owner/repo
+    loop plus the auxiliary scans), so it alone does not prove the main loop ran n times."""
     counters = {"copy_chars": 0, "lookup_work": 0, "unobserved_calls": 0, "loop_iterations": 0}
     state = {"on": False}
     counting_str = _owner_repo_str_class(counters, state)
@@ -1711,8 +1723,10 @@ def test_given_scanner_work_counter_when_input_reaches_owner_repo_loop_then_coun
 ):
     for n in (_PERF_SMALL_N, _PERF_LARGE_N):
         measured = _measure_owner_repo_prefix_work(monkeypatch, build_prompt(n))
-        # 各 corpus が実際に owner/repo ループへ到達し、copy / lookup の key が非ゼロである。
-        # finditer is also consumed by the helper scans (not counted); the loop sees all n matches.
+        # 各 corpus が owner/repo の match を生成して consumer に到達し、copy / lookup の key が
+        # 非ゼロである。loop_iterations は補助走査（_path_token_spans / owner_repo_spans）の
+        # yield も含むため、主ループの n 回実行の証明ではない。主ループへの到達は非ゼロの
+        # copy_chars / lookup_work と mutant 感度 test が裏付ける。
         assert measured["loop_iterations"] >= n, measured
         assert measured["copy_chars"] > 0, measured
         assert measured["lookup_work"] > 0, measured
