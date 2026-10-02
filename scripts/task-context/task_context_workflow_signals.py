@@ -13,6 +13,7 @@ import sqlite3
 from typing import Any
 
 import task_context_db as db
+import task_context_errors as errors
 import task_context_service as service
 
 _SIGNAL_SOURCES = {
@@ -821,6 +822,288 @@ def begin_cleanup_lifecycle(
         )
         service._bump_projection_tx(conn, origin["binding_id"])
         return _outcome("selected", "CLEANUP_STARTED", task_id=task_id, activity_id=activity_id)
+
+
+# ---------------------------------------------------------------------------
+# Retroactive implementation-claim recovery (Issue #2817)
+#
+# An explicit, repository-local recovery operation for a merged PR whose
+# Issue/PR claims were never recorded (or were recorded only on one side).
+# It is NOT a public workflow signal: it adds no ``signal_kind``, no wire
+# field and no table. It reuses the existing ownership rules of
+# ``_validate_implementation_claims_tx`` and records exactly one
+# ``recovery:implementation_claims`` event (never ``workflow:``-prefixed, so
+# no existing workflow helper reads it) inside ONE ``BEGIN IMMEDIATE``
+# transaction. No external I/O happens inside that transaction.
+# ---------------------------------------------------------------------------
+
+RECOVERY_EVENT_TYPE = "recovery:implementation_claims"
+RECOVERY_OPERATION = "retroactive_claim_recovery"
+RECOVERY_SOURCE = "post-merge-cleanup"
+RECOVERY_METADATA_KEYS = (
+    "operation",
+    "source",
+    "source_schema_version",
+    "repo",
+    "issue_number",
+    "pr_number",
+    "merge_commit_oid",
+    "task_id",
+    "execution_run_id",
+    "activity_id",
+    "prior_activity_id",
+    "prior_activity_kind",
+    "claims_attached",
+    "activity_action",
+)
+
+ACTIVITY_ACTIVE_KINDS = ("none", "implementation", "refine", "native_operator", "cleanup", "other")
+ACTIVITY_IMPL_LATEST_STATUSES = ("none", "ACTIVE", "terminal")
+_TRANSITIONABLE_ACTIVE_KINDS = ("refine", "native_operator")
+_NOT_RECOVERABLE_ACTIVE_KINDS = ("cleanup", "other")
+
+
+def recovery_dedupe_key(repo: str, pr_number: int, merge_commit_oid: str) -> str:
+    return f"task-context-v1:retroactive_claim_recovery:{repo}:{pr_number}:{merge_commit_oid}"
+
+
+def decide_activity_action(active_kind: str, impl_latest_status: str, merge_accepted: bool) -> dict[str, Any]:
+    """Pure implementation-Activity decision for the recovery operation.
+
+    ``active_kind`` is the kind of the Task's single ACTIVE Activity
+    (``none`` when there is none); ``impl_latest_status`` is ``ACTIVE`` when
+    any ACTIVE implementation row exists (the same fact as
+    ``active_kind == "implementation"``, because ``ux_activities_active_per_task``
+    allows at most one ACTIVE row per Task), otherwise ``terminal`` when the
+    Task has implementation history and ``none`` when it has none.
+
+    Returns ``{"action": "reuse" | "start" | "transition"}`` for a write
+    decision, or ``{"action": "noop" | "reject", "disposition", "reason_code"}``
+    (no write). A combination that the database cannot represent (it is
+    prevented by ``ux_activities_active_per_task``) is reported as
+    ``conflict / ACTIVITY_STATE_INCONSISTENT`` and is never guessed at.
+    """
+    if active_kind not in ACTIVITY_ACTIVE_KINDS or impl_latest_status not in ACTIVITY_IMPL_LATEST_STATUSES:
+        return _inconsistent_activity()
+    # "an ACTIVE implementation row exists" and "the ACTIVE kind is
+    # implementation" are one fact; any disagreement is not DB-constructible.
+    if (active_kind == "implementation") != (impl_latest_status == "ACTIVE"):
+        return _inconsistent_activity()
+    if active_kind == "implementation":
+        return {"action": "reuse"}
+    if impl_latest_status == "terminal":
+        if merge_accepted:
+            return {"action": "noop", **_outcome("duplicate_noop", "MERGE_FACT_ALREADY_ACCEPTED")}
+        return {"action": "reject", **_outcome("conflict", "IMPLEMENTATION_ACTIVITY_TERMINAL")}
+    if active_kind == "none":
+        return {"action": "start"}
+    if active_kind in _TRANSITIONABLE_ACTIVE_KINDS:
+        return {"action": "transition"}
+    return {"action": "reject", **_outcome("conflict", "ACTIVITY_KIND_NOT_RECOVERABLE")}
+
+
+def _inconsistent_activity() -> dict[str, Any]:
+    return {"action": "reject", **_outcome("conflict", "ACTIVITY_STATE_INCONSISTENT")}
+
+
+def _recovery_rejection(task_id: str, outcome: dict[str, Any]) -> dict[str, Any]:
+    """Every post-origin non-applied outcome states plainly that nothing was
+    written."""
+    return {**outcome, "task_id": task_id, "activity_action": "none", "claims_attached": "none"}
+
+
+def _recovery_claim_matrix_tx(
+    conn: sqlite3.Connection, task_id: str, evidence: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Claim ownership matrix (judged strictly in order 1 -> 2 -> 3; released
+    claims are never owners). Returns a rejection outcome, or ``None`` when
+    every claim is "absent" or owned by ``task_id`` (matrix row 4)."""
+    repo, issue, pr = evidence["repo"], evidence["issue_number"], evidence["pr_number"]
+    issue_claim, pr_claim = _claim_for_tx(conn, repo, "issue", issue), _claim_for_tx(conn, repo, "pr", pr)
+    if (issue_claim and issue_claim["task_id"] != task_id) or (pr_claim and pr_claim["task_id"] != task_id):
+        diagnostics: dict[str, Any] = {}
+        if issue_claim:
+            diagnostics["issue_claim_owner_task_id"] = issue_claim["task_id"]
+        if pr_claim:
+            diagnostics["pr_claim_owner_task_id"] = pr_claim["task_id"]
+        return _outcome("conflict", "FACT_TASK_IDENTITY_CONFLICT", **diagnostics)
+    other_issue = conn.execute(
+        "SELECT ref_number FROM task_ref_claims WHERE task_id = ? AND ref_kind = 'issue' AND released_at IS NULL "
+        "AND (repo != ? OR ref_number != ?) LIMIT 1",
+        (task_id, repo, issue),
+    ).fetchone()
+    if other_issue:
+        return _outcome("conflict", "FACT_TASK_IDENTITY_CONFLICT", origin_other_issue_number=other_issue["ref_number"])
+    other_pr = conn.execute(
+        "SELECT ref_number FROM task_ref_claims WHERE task_id = ? AND repo = ? AND ref_kind = 'pr' "
+        "AND ref_number != ? AND released_at IS NULL LIMIT 1",
+        (task_id, repo, pr),
+    ).fetchone()
+    if other_pr:
+        return _outcome("conflict", "OUT_OF_ORDER_SIGNAL", origin_other_pr_number=other_pr["ref_number"])
+    return None
+
+
+def _task_activity_state_tx(conn: sqlite3.Connection, task_id: str) -> tuple[str, str, dict[str, Any] | None]:
+    """Return ``(active_kind, impl_latest_status, active_row)`` for a Task."""
+    row = conn.execute("SELECT * FROM activities WHERE task_id = ? AND status = 'ACTIVE'", (task_id,)).fetchone()
+    active = dict(row) if row else None
+    if active is None:
+        active_kind = "none"
+    elif active["kind"] in ACTIVITY_ACTIVE_KINDS and active["kind"] != "none":
+        active_kind = active["kind"]
+    else:
+        active_kind = "other"
+    if active_kind == "implementation":
+        impl_latest_status = "ACTIVE"
+    else:
+        latest = _activity_for_tx(conn, task_id, "implementation")
+        impl_latest_status = "none" if latest is None else "terminal"
+    return active_kind, impl_latest_status, active
+
+
+def recover_implementation_claims(
+    conn: sqlite3.Connection,
+    *,
+    origin_session_id: str | None,
+    evidence: dict[str, Any],
+    explicit_recovery: bool,
+) -> dict[str, Any]:
+    """Atomically attach the missing implementation claims (and, when needed,
+    an implementation Activity) of the origin Task for an already merged PR.
+
+    ``evidence`` carries exactly ``repo`` / ``issue_number`` / ``pr_number`` /
+    ``merge_commit_oid`` already proven against a fresh merged snapshot by the
+    caller (this function performs no GitHub I/O and no Task guessing: the only
+    Task it can touch is the one the live managed origin session resolves to).
+
+    Evaluation order, all before any write: arguments -> origin -> claim
+    ownership matrix -> recovery dedupe -> Activity decision -> writes.
+    """
+    if not explicit_recovery:
+        return _outcome("rejected_evidence", "EXPLICIT_RECOVERY_REQUIRED")
+    if not isinstance(evidence, dict) or set(evidence) != {"repo", "issue_number", "pr_number", "merge_commit_oid"}:
+        return _outcome("rejected_evidence", "INVALID_EVIDENCE_FIELDS")
+    oid = evidence["merge_commit_oid"]
+    if not isinstance(oid, str) or not _HEX40.fullmatch(oid):
+        return _outcome("rejected_evidence", "MERGE_IDENTITY_MISMATCH")
+    _, rejected = _validate_evidence("pr_merged_observed", evidence)
+    if rejected:
+        return rejected
+    repo, issue, pr = evidence["repo"], evidence["issue_number"], evidence["pr_number"]
+    key = recovery_dedupe_key(repo, pr, oid)
+    merge_key = dedupe_key_for(
+        {"signal_kind": "pr_merged_observed", "source": RECOVERY_SOURCE, "evidence": evidence}
+    )
+    try:
+        with db.write_transaction(conn):
+            origin, origin_failure = _resolve_origin_tx(conn, origin_session_id)
+            if origin_failure:
+                # Frozen public wire; the specific cause is `diagnose-origin`.
+                return _unbound_outcome()
+            assert origin is not None
+            task_id = origin["task_id"]
+            claim_rejection = _recovery_claim_matrix_tx(conn, task_id, evidence)
+            if claim_rejection:
+                return _recovery_rejection(task_id, claim_rejection)
+            existing = _accepted_event_tx(conn, key)
+            if existing is not None:
+                if existing["task_id"] == task_id:
+                    return _recovery_rejection(task_id, _outcome("duplicate_noop", "SAME_TASK_SAME_FACT"))
+                # Additive diagnostic (Issue #2817 PR #2873 review P2): name the
+                # Task that already owns the recovery dedupe key. The row is
+                # already loaded, so no extra DB lookup is made.
+                return _recovery_rejection(
+                    task_id,
+                    _outcome("conflict", "FACT_TASK_IDENTITY_CONFLICT", conflicting_task_id=existing["task_id"]),
+                )
+            accepted_merge = _accepted_event_tx(conn, merge_key)
+            if accepted_merge is not None and accepted_merge["task_id"] != task_id:
+                # The merge fact is already owned by a different Task; this
+                # origin must not acquire claims for it. The owner Task id is an
+                # additive diagnostic from the already-loaded row.
+                return _recovery_rejection(
+                    task_id,
+                    _outcome(
+                        "conflict",
+                        "FACT_TASK_IDENTITY_CONFLICT",
+                        conflicting_task_id=accepted_merge["task_id"],
+                    ),
+                )
+            active_kind, impl_latest_status, active = _task_activity_state_tx(conn, task_id)
+            decision = decide_activity_action(
+                active_kind, impl_latest_status, accepted_merge is not None and accepted_merge["task_id"] == task_id
+            )
+            if decision["action"] in ("noop", "reject"):
+                return _recovery_rejection(
+                    task_id, _outcome(decision["disposition"], decision["reason_code"])
+                )
+            attached: list[str] = []
+            if _claim_for_tx(conn, repo, "issue", issue) is None:
+                _claim_tx(conn, task_id, repo, "issue", issue)
+                attached.append("issue")
+            if _claim_for_tx(conn, repo, "pr", pr) is None:
+                _claim_tx(conn, task_id, repo, "pr", pr)
+                attached.append("pr")
+            claims_attached = ",".join(attached) if attached else "none"
+            prior_activity_id = prior_activity_kind = None
+            if decision["action"] == "reuse":
+                assert active is not None
+                implementation_activity_id = active["id"]
+                activity_action = "reused"
+            else:
+                if decision["action"] == "transition":
+                    assert active is not None
+                    prior_activity_id, prior_activity_kind = active["id"], active["kind"]
+                implementation_activity_id = service._transition_activity_tx(conn, task_id, "implementation")
+                service._attach_execution_run_tx(
+                    conn,
+                    origin["execution_run_id"],
+                    task_id=task_id,
+                    activity_id=implementation_activity_id,
+                    binding_id=origin["binding_id"],
+                )
+                activity_action = "started" if decision["action"] == "start" else "transitioned"
+            metadata = {
+                "operation": RECOVERY_OPERATION,
+                "source": RECOVERY_SOURCE,
+                "source_schema_version": "v1",
+                "repo": repo,
+                "issue_number": issue,
+                "pr_number": pr,
+                "merge_commit_oid": oid,
+                "task_id": task_id,
+                "execution_run_id": origin["execution_run_id"],
+                "activity_id": implementation_activity_id,
+                "prior_activity_id": prior_activity_id,
+                "prior_activity_kind": prior_activity_kind,
+                "claims_attached": claims_attached,
+                "activity_action": activity_action,
+            }
+            assert tuple(metadata) == RECOVERY_METADATA_KEYS
+            service._append_event_tx(
+                conn,
+                event_type=RECOVERY_EVENT_TYPE,
+                task_id=task_id,
+                activity_id=implementation_activity_id,
+                binding_id=origin["binding_id"],
+                execution_run_id=origin["execution_run_id"],
+                metadata=metadata,
+                dedupe_key=key,
+            )
+            service._bump_projection_tx(conn, origin["binding_id"])
+            return _outcome(
+                "applied",
+                "RECOVERED",
+                task_id=task_id,
+                activity_action=activity_action,
+                claims_attached=claims_attached,
+            )
+    except (sqlite3.IntegrityError, errors.ConflictError):
+        # ``db.write_transaction`` already rolled back. The dedupe/claim unique
+        # indexes are the physical race backstop: a lost race is the same
+        # reject as the pre-write dedupe judgment, never an applied result.
+        return _outcome("conflict", "FACT_TASK_IDENTITY_CONFLICT")
 
 
 def cleanup_pending_for_task(conn: sqlite3.Connection, task_id: str) -> bool:
