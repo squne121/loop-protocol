@@ -95,6 +95,137 @@ namespace は変更しない。
   reason code は `herdr_isolated_session_unavailable`。通常 lane は snapshot を試行せず、
   opt-in preservation observation の unavailable 結果だけを fail-closed で扱う。
 
+## Named SubAgent resume scenario（名前指定で SubAgent を resume する検証手順、Issue #2840）
+
+opt-in の `--named-subagent-resume` は、通常の named SubAgent を `Agent(name=N)` で spawn し、
+初回 completion の後に `SendMessage(to=N)` で同じ agent ID のまま resume し、resume 後の
+completion を親が回収するまでを、structured lane（`-p`）で駆動・観測する scenario である。
+上の「Invocation-local Claude peer policy」は既定 smoke の policy であり、flag が無い既定 smoke の
+policy と出力は変更しない（byte-identical）。
+
+### 固定 fixture（公開用の固定試験入力と互換性説明）
+
+- `.claude/skills/worktree-agent-runtime-smoke/fixtures/named-subagent-resume.prompt.md` —
+  固定の公開試験 prompt。`--prompt-file` に渡す。
+- `.claude/skills/worktree-agent-runtime-smoke/fixtures/named-subagent-resume.compat.md` —
+  互換性説明。CLI 自身の `--append-system-prompt-file` で **この scenario の invocation にだけ**
+  渡す。恒久的な system-prompt 注入ではなく、launcher にも常設しない。補足なしで backend model が
+  自発的に name を付けることは合格条件にしない（互換性説明の有無による結果は観測として記録する）。
+
+### scenario で変わる policy（これだけ）
+
+- harness 由来の blanket `SendMessage` deny だけを外す。`ListAgents` deny、
+  `crossSessionInbound: refuse`、Task Context hook、通常の permission 判定（bypass 系は使わない）、
+  isolation は維持する。
+- name 指定 resume は子 SubAgent の persisted transcript を読み直すため、この scenario だけは
+  `--no-session-persistence` を付けない（付けると `SendMessage` が transcript 不在で失敗する。
+  live で確認済み）。
+- 観測用 hook は generic な 4 種のみ（`SubagentStart` / `SubagentStop` / `PostToolUse` の
+  matcher `Agent` / `PreToolUse` の matcher `SendMessage`）。runner は hook 名・決定種別・
+  name と agent ID の対応だけを記録し、Task Context の semantic verdict は持たない。
+- Claude-GPT adapter は caller `--settings` を受け取らず、launcher 固定値
+  `CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-name-resume` を使う（`SendMessage` deny だけを外し、
+  `ListAgents` deny と `crossSessionInbound: refuse` を維持する。既存の固定値
+  `subagent-start-stop` / `hook-sink-multi-turn` の出力は変更しない）。
+
+### 直接実行する手順
+
+`--claude-adapter claude-gpt` で `--claude-bin` を省略すると、runner は検証対象 checkout
+（`--worktree`）の `scripts/claude-gpt/launch.sh` を絶対 path に解決して使う。`--output-dir` は
+未存在の path を指定する。`--named-resume-evidence-json` の親 directory（例: `artifacts/`）は
+事前に作成しておく。
+
+```bash
+WORKTREE="$(pwd)"   # linked worktree。root checkout は拒否される
+FIXTURES=".claude/skills/worktree-agent-runtime-smoke/fixtures"
+HEAD8="$(git rev-parse --short=8 HEAD)"
+mkdir -p artifacts
+for ADAPTER in native claude-gpt; do
+  uv run --locked python3 scripts/agent-ops/run_worktree_agent_runtime_smoke.py \
+    --runtime claude --mode structured --claude-adapter "$ADAPTER" \
+    --worktree "$WORKTREE" \
+    --prompt-file "$WORKTREE/$FIXTURES/named-subagent-resume.prompt.md" \
+    --append-system-prompt-file "$WORKTREE/$FIXTURES/named-subagent-resume.compat.md" \
+    --named-subagent-resume \
+    --named-resume-evidence-json "artifacts/runtime-verification-2840-$ADAPTER-$HEAD8.json" \
+    --output-dir "$(mktemp -u)" --timeout-seconds 540
+  echo "adapter=$ADAPTER exit=$?"
+done
+```
+
+pytest ラッパ経由の入口は次のとおり（CI では skip され、その skip は PASS ではない）。
+
+```bash
+uv run --locked pytest scripts/agent-ops/tests/test_run_worktree_agent_runtime_smoke_named_subagent_resume.py::test_live_native_named_subagent_resume
+uv run --locked pytest scripts/agent-ops/tests/test_run_worktree_agent_runtime_smoke_named_subagent_resume.py::test_live_claude_gpt_named_subagent_resume
+```
+
+exit code は `0`=因果鎖が全て成立（verdict=pass）／`1`=失敗／`77`=SKIP（runtime・auth・launcher・proxy
+が使えない、または causal evidence が観測不能。PASS には昇格しない。ラッパは `pytest.exit(returncode=77)`
+で伝播する）。fixture・static schema・別 backend・agent ID lane への fallback による成功は FAIL として
+扱い、Native の成功を Claude-GPT の成功の代替にしない。
+
+### 証跡 JSON の形式（`--named-resume-evidence-json`、公開して安全な内容のみ）
+
+`NAMED_SUBAGENT_RESUME_EVIDENCE_V1` は id・hash・version・真偽値・event 件数だけを持つ。
+raw prompt、raw message、transcript、credential、HOME 絶対 path は保存しない。主な項目は
+tested HEAD、Claude Code version、adapter、launcher path と sha256、proxy path と version、
+model route、Agent name、agent ID、caller session identity、Agent Teams の effective state、
+起動した agent の種別（hook event と team signal から決める。panel 表示や name だけでは決めない）、
+初回 completion、resume 後も同一 agent ID であること、因果鎖 9 段、`PreToolUse:SendMessage` hook の
+決定種別（false ASK の有無）、fixture と互換性説明の content sha256、`verdict`、`failure_layer`。
+AC3/AC4 の充足は、ローカル live 実行が出力したこの JSON の `verdict=pass` かつ
+`tested_head` が現在の HEAD と一致することだけで判定する。
+
+因果鎖は次の 9 段である: name 付き `Agent` の実呼び出し／`PostToolUse:Agent` で name と agent ID の対応を
+同じ caller session が記録／初回 completion／`SendMessage(to=N)` の発行／受理／同じ agent ID の resume／
+新しい `Agent` 呼び出しが無いこと／resume 後の completion／親が resume 後の結果を回収。別 session にしかない
+同名、同 session 内の name collision、未記録 name、`agent_type` だけの一致は addressable name として
+扱わず、一意解決もしない。
+
+失敗時は `failure_layer` を `client_schema` / `launcher_config` / `proxy_translation` /
+`backend_model_emission` / `hook_lifecycle` / `unclassified` のいずれかに分類する。`unclassified` は
+失敗であり、PASS にならない。
+
+### evidence の再利用規則（freshness、AC8）
+
+evidence の再利用可否は prose ではなく `evaluate_evidence_freshness(recorded, current)`
+（`run_worktree_agent_runtime_smoke.py`）の recorded と current の比較で決める。result-affecting path の
+閉じた allowlist は、`scripts/claude-gpt/`（Claude-GPT canary のみ再取得）と、
+`scripts/agent-ops/run_worktree_agent_runtime_smoke.py`・
+`.claude/skills/worktree-agent-runtime-smoke/fixtures/`・`.claude/settings.json`・
+`.claude/hooks/task_context/`・`scripts/task-context/`（両 adapter の canary を再取得）である。
+tested HEAD から final HEAD までの `git diff --name-only`（`compute_changed_paths()`）がこの allowlist と
+交わらず、記録された Claude Code version・proxy version・model route・launcher hash・fixture と互換性説明の
+sha256 が現在値と一致する場合に限り、旧 evidence を再利用できる。allowlist 外の無関係な commit だけを
+live canary の再実行理由にしない。古い evidence を final state の evidence と偽装しない。
+
+### Task Context の判定を呼び出す手順
+
+この runner は Task Context の semantic verdict を持たない。Task Context 固有の判定（`PreToolUse`
+`SendMessage` が false ASK を返さないこと等）は、既存の
+`scripts/task-context/task_context_runtime_smoke_verifier.py::orchestrate_runtime_smoke()` が所有する
+（本 scenario はその verifier を変更しない）。同 entrypoint の `runner_argv_extra` に scenario flag を渡して
+呼び出す。
+
+```python
+orchestrate_runtime_smoke(
+    canonical_conn,
+    worktree=worktree,
+    base_dir=base_dir,
+    prompt_file=f"{worktree}/.claude/skills/worktree-agent-runtime-smoke/fixtures/named-subagent-resume.prompt.md",
+    output_dir=output_dir,
+    canonical_task_id=task_id,
+    canonical_activity_id=activity_id,
+    runner_argv_extra=[
+        "--named-subagent-resume",
+        "--append-system-prompt-file",
+        f"{worktree}/.claude/skills/worktree-agent-runtime-smoke/fixtures/named-subagent-resume.compat.md",
+        "--named-resume-evidence-json", named_resume_evidence_path,
+    ],
+)
+```
+
 ## Lane 選択
 
 ### capability 判定の方針(help への非掲載は capability 不足を意味しない)
@@ -617,7 +748,7 @@ evidence は、対象変更を commit した HEAD に対してのみ成立する
   その session だけを stop／delete し、両 command の成功と launcher process termination を
   確認できない場合は exit 1 とする（`--keep-pane` 相当の opt-out は存在しない）
 - SIGINT／SIGTERM を含む全ての終了経路で isolated session cleanup を実行する
-- 新しい schema、digest、receipt、publisher、state store、semantic verdict classifier を追加しない（Issue #2046 で `main_agent_identity` / `agent_definition` / `skill_evidence` / `mutation_boundary` / `settings_provenance` の 5 フィールドが Issue 契約に基づき追加済み — この制約は Issue 契約に基づかない追加の schema/digest/receipt 拡張を禁じるものであり、既存の Issue 契約で明示的に要求された追加を遡って禁止するものではない）
+- 新しい schema、digest、receipt、publisher、state store、semantic verdict classifier を追加しない（Issue #2046 で `main_agent_identity` / `agent_definition` / `skill_evidence` / `mutation_boundary` / `settings_provenance` の 5 フィールドが Issue 契約に基づき追加済み — この制約は Issue 契約に基づかない追加の schema/digest/receipt 拡張を禁じるものであり、既存の Issue 契約で明示的に要求された追加を遡って禁止するものではない。Issue #2840 の `--named-subagent-resume` scenario 専用の public-safe evidence JSON も、同 Issue 契約（AC2〜AC4・AC8・AC9）が明示的に要求した追加であり、scenario flag が無い既定 smoke の出力には現れない）
 
 ## Reference Map（参照資料の一覧）
 
