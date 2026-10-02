@@ -1,6 +1,25 @@
 """Issue #2257 review fix_delta (iteration 1): real-subprocess coverage for
 the production anchor-comment resolution path.
 
+Issue #2872 update (read first): since the #2299 launcher contract shares
+GitHub auth with the isolated child natively, production preflight reads use
+native `gh` for every profile (an isolated HOME no longer selects the
+anonymous credentialless transport). The pre-#2299 "empty GH_CONFIG_DIR +
+credentialless is the only path" fixtures below therefore exercise the
+credentialless GET-only transport through an EXPLICIT `transport=` argument
+only (opt-in `github_live`); the isolated-session read-path contract itself
+is pinned by `test_run_refinement_preflight_credentialless_transport.py`
+(selector / call-path tests) and the live AC9 runtime test. The former live
+`skill_runtime_exec.py` command-graph test asserted "zero `gh` invocations
+with an empty GH_CONFIG_DIR", which encodes the superseded premise and had
+also drifted from `_install_real_contract_update_fixture()`'s signature. It is
+NOT deleted: its regression coverage (the REAL `skill_runtime_exec.py ->
+command_registry.py -> run_refinement_preflight.py` command graph resolves the
+anchor comment through ONE read authority) is preserved by the repaired,
+hermetic `test_isolated_with_human_context_command_graph_resolves_anchor_via_
+single_native_gh_authority` below (fake `gh` at the GitHub boundary, no
+network), which complements (does not duplicate) the live AC9 runtime test.
+
 `test_run_refinement_preflight_credentialless_transport.py::
 test_ac5_exact_incident_replay_anchor_comment_5315264311_resolves_live`
 already exercises `run_refinement_preflight._fetch_single_comment()`
@@ -89,6 +108,7 @@ marker.
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import os
@@ -211,7 +231,10 @@ module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 
-data, err = module._fetch_single_comment("{repo}", {comment_id})
+# Issue #2872: the credentialless GET-only transport is no longer selected by
+# any profile; it is exercised here through an explicit `transport=` argument.
+transport = module._CredentiallessPreflightTransport()
+data, err = module._fetch_single_comment("{repo}", {comment_id}, transport=transport)
 print(json.dumps({{"data": data, "err": err}}))
 """
 
@@ -230,20 +253,23 @@ def _install_gh_marker_executable(tmp_path: Path, env: dict[str, str]) -> Path:
 
 
 @pytest.mark.github_live
-def test_isolated_anchor_comment_resolves_via_single_credentialless_authority(tmp_path: Path) -> None:
-    """GIVEN a genuine `uv run python3` child subprocess of the REAL
+def test_explicit_credentialless_transport_resolves_anchor_across_subprocess_boundary(tmp_path: Path) -> None:
+    """Pre-#2299 contract replay (Issue #2872: explicit credentialless
+    transport, `github_live` opt-in, never a default/required gate).
+
+    GIVEN a genuine `uv run python3` child subprocess of the REAL
     `run_refinement_preflight.py` production script (never a copy, never a
     stub), launched with a fresh isolated `HOME`, an empty `GH_CONFIG_DIR`,
     `GH_TOKEN`/`GITHUB_TOKEN` unset, and a fail-on-use `gh` marker
     executable at the front of `PATH`
     WHEN that subprocess resolves Issue #2197's real anchor comment
-    5315264311 with NO transport mocking (a real, unauthenticated GitHub
-    REST call made from an actual child process, not an in-process call)
+    5315264311 through an explicitly passed credentialless transport with NO
+    transport mocking (a real, unauthenticated GitHub REST call made from an
+    actual child process, not an in-process call)
     THEN the comment resolves successfully via the credentialless
     transport and the `gh` marker executable is never invoked -- proving
-    the single-authority credentialless transport holds across a genuine
-    process boundary (Issue #2257 AC5/AC6, PR review fix_delta iteration
-    1)."""
+    the GET-only transport contract holds across a genuine process boundary
+    (Issue #2257 AC5/AC6, PR review fix_delta iteration 1)."""
     driver_path = tmp_path / "driver.py"
     driver_path.write_text(
         _DRIVER_SCRIPT.format(preflight_script=str(_PREFLIGHT_SCRIPT), repo=REPO, comment_id=ANCHOR_COMMENT_ID),
@@ -368,11 +394,13 @@ def test_production_command_registry_wires_anchor_command_to_run_refinement_pref
 
 
 # ---------------------------------------------------------------------------
-# PR #2260 review fix_delta (iteration 2): real `skill_runtime_exec.py
-# --command-id preflight.run.with_human_context` subprocess launch, resolving
-# the AC5/AC6 real anchor comment via live network from OUTSIDE any mocked
-# transport, with an independent (never child-self-reported) `gh`
-# invocation-count assertion.
+# PR #2260 review fix_delta (iteration 2) coverage, repaired for Issue #2872:
+# real `skill_runtime_exec.py --command-id preflight.run.with_human_context`
+# subprocess command graph. The pre-#2299 live variant (empty GH_CONFIG_DIR,
+# "gh invoked zero times", real anonymous REST) is superseded by the #2299
+# contract; this hermetic variant keeps the same failure-class coverage with
+# an independent (outside-the-child) invocation record at the fake-`gh`
+# boundary and no network.
 # ---------------------------------------------------------------------------
 
 _SKILL_RUNTIME_EXEC_ANCHOR_FIXTURES_MODULE = (
@@ -382,14 +410,12 @@ _SKILL_RUNTIME_EXEC_ANCHOR_FIXTURES_MODULE = (
 
 def _load_skill_runtime_exec_anchor_fixtures():
     """Import `test_skill_runtime_exec_anchor.py`'s disposable-repo fixture
-    helpers (`_make_repo()` / `_install_real_contract_update_fixture()`)
-    under a private module name, rather than re-deriving the disposable git
-    repo / real `uv sync --locked` bootstrap / `sitecustomize.py`
-    subprocess-instrumentation pattern that module already establishes and
-    exercises for the real `skill_runtime_exec.py` subprocess chain (Issue
-    #1498, PR #2260 review fix_delta iteration 2 blocker 2)."""
+    helpers under a private module name (never re-deriving the disposable git
+    repo / real `uv sync --locked` bootstrap / `sitecustomize.py` fake-`gh`
+    boundary that module already establishes for the real
+    `skill_runtime_exec.py` subprocess chain)."""
     spec = importlib.util.spec_from_file_location(
-        "test_skill_runtime_exec_anchor_fixtures_for_2257_live_command_graph",
+        "test_skill_runtime_exec_anchor_fixtures_for_2257_command_graph",
         str(_SKILL_RUNTIME_EXEC_ANCHOR_FIXTURES_MODULE),
     )
     module = importlib.util.module_from_spec(spec)
@@ -398,140 +424,114 @@ def _load_skill_runtime_exec_anchor_fixtures():
     return module
 
 
-@pytest.mark.github_live
-def test_ac5_ac6_skill_runtime_exec_with_human_context_live_subprocess_resolves_anchor_via_credentialless_authority(
-    tmp_path: Path,
+def test_isolated_with_human_context_command_graph_resolves_anchor_via_single_native_gh_authority(
+    tmp_path: Path, monkeypatch
 ) -> None:
     """GIVEN the REAL `skill_runtime_exec.py --command-id
     preflight.run.with_human_context` production command graph (privileged
     executor -> `command_registry.py` -> `run_refinement_preflight.py`),
     launched as a genuine `uv run python3` subprocess against a disposable
-    fixture repository (`_install_real_contract_update_fixture()`, reused
-    unmodified from `test_skill_runtime_exec_anchor.py`) with a fresh
-    isolated `HOME`, an empty `GH_CONFIG_DIR`, and `GH_TOKEN`/`GITHUB_TOKEN`
-    unset
-    WHEN that subprocess graph resolves Issue #2197's real anchor comment
-    5315264311 with NO transport mocking (a real, unauthenticated GitHub
-    REST call reached only through `github_credentialless_read.py`)
-    THEN the command graph resolves the anchor comment successfully and the
-    `gh` CLI is invoked zero times anywhere in the real subprocess chain --
-    verified independently, from outside the child process, via a
-    `sitecustomize.py` `subprocess.run`/`subprocess.Popen` interception hook
-    that survives `skill_runtime_exec.py`'s own `PATH`-allowlist rebuild
-    (Issue #2257 AC5/AC6, PR #2260 review fix_delta iteration 2, blockers
-    1 and 2)."""
+    fixture repository, with a fresh isolated `HOME` and a test-owned
+    config-only `GH_CONFIG_DIR` (token env unset -- the stored `gh auth
+    login` shape the #2299 launcher shares natively)
+    WHEN that graph resolves the anchor comment
+    THEN (Issue #2872 AC1/AC2/AC3) the Issue, comments and anchor comment are
+    ALL read through the native `gh` boundary with the carried
+    `GH_CONFIG_DIR` (verified independently, outside the child, from the fake
+    `gh` boundary's own invocation record), the anchor resolves, and the
+    credentialless transport is never the read authority (no
+    `credentialless_transport` SOURCE / `rate_limited` environment failure)."""
     fixtures = _load_skill_runtime_exec_anchor_fixtures()
     repo = fixtures._make_repo(tmp_path)
-    fixtures._install_real_contract_update_fixture(repo)
-    # `_install_real_contract_update_fixture()` only materializes
-    # `skill_runtime_exec.py` / `skill_runtime_command_policy.py` from
-    # `scripts/agent-guards/` (its own tests never exercise the isolated
-    # Claude-GPT profile). `run_refinement_preflight.py`'s isolated-profile
-    # branch additionally needs the REAL, unmodified
-    # `github_credentialless_read.py` at the exact same repo-relative path
-    # (`_AGENT_GUARDS_SCRIPTS_DIR = parents[4] / "scripts" / "agent-guards"`)
-    # so the credentialless transport is genuinely reachable rather than
-    # falling through its best-effort `ImportError` fallback.
-    (repo / "scripts" / "agent-guards" / "github_credentialless_read.py").write_text(
-        (REPO_ROOT / "scripts" / "agent-guards" / "github_credentialless_read.py").read_text(encoding="utf-8"),
-        encoding="utf-8",
-    )
+    trusted_gh_bin = tmp_path / "trusted-gh-bin"
+    control_plane_remote_url = fixtures._install_real_contract_update_fixture(repo, trusted_gh_bin)
+    execution_root = fixtures._materialize_dedicated_worktree(repo, control_plane_remote_url, monkeypatch)
+    artifact_dir = execution_root / ".claude" / "artifacts" / "issue-refinement-loop" / "1498"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
 
     isolated_home = tmp_path / "isolated-home-command-graph"
     isolated_home.mkdir()
-    empty_gh_config_dir = tmp_path / "empty-gh-config-dir-command-graph"
-    empty_gh_config_dir.mkdir()
+    gh_config_dir = tmp_path / "stored-gh-config-dir-command-graph"
+    gh_config_dir.mkdir()
+    env = {
+        "HOME": str(isolated_home),
+        "GH_CONFIG_DIR": str(gh_config_dir),
+        "SKILL_RUNTIME_TEST_EXPECTED_GH_CONFIG_DIR": str(gh_config_dir),
+        "GH_TOKEN": "",
+        "GITHUB_TOKEN": "",
+        "GH_ENTERPRISE_TOKEN": "",
+        "GITHUB_ENTERPRISE_TOKEN": "",
+    }
 
-    env = {**os.environ, "CLAUDE_PROJECT_DIR": str(repo)}
-    env["HOME"] = str(isolated_home)
-    env["GH_CONFIG_DIR"] = str(empty_gh_config_dir)
-    env.pop("GH_TOKEN", None)
-    env.pop("GITHUB_TOKEN", None)
+    immutable = json.loads(
+        (
+            REPO_ROOT
+            / ".claude/skills/issue-refinement-loop/tests/fixtures/issue_1835_trusted_anchor_iteration_zero.json"
+        ).read_text(encoding="utf-8")
+    )
+    pre_body = base64.b64decode(immutable["expected_post_body_base64"]).decode("utf-8")
+    anchor_url = "https://github.com/squne121/loop-protocol/issues/1498#issuecomment-1"
+    anchor = {
+        "id": 1,
+        "body": "## Revised AC\n- AC2: trusted fixture directive\n",
+        "html_url": anchor_url,
+        "url": "https://api.github.com/repos/squne121/loop-protocol/issues/comments/1",
+        "issue_url": "https://api.github.com/repos/squne121/loop-protocol/issues/1498",
+        "author_association": "OWNER",
+        "user": {"login": "owner", "type": "User"},
+        "created_at": "2026-08-01T00:00:00Z",
+        "updated_at": "2026-08-01T00:00:00Z",
+    }
+    (artifact_dir / "fake_remote_issue.json").write_text(
+        json.dumps(
+            {
+                "number": 1498,
+                "title": "fixture",
+                "body": pre_body,
+                "labels": [],
+                "url": "x",
+                "updatedAt": "2026-08-01T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (artifact_dir / "fake_anchor.json").write_text(json.dumps(anchor), encoding="utf-8")
 
-    anchor_url = f"https://github.com/{REPO}/issues/{ISSUE_NUMBER}#issuecomment-{ANCHOR_COMMENT_ID}"
-    result = subprocess.run(
-        [
-            "uv",
-            "run",
-            "python3",
-            "scripts/agent-guards/skill_runtime_exec.py",
-            "--command-id",
-            "preflight.run.with_human_context",
-            "--issue-number",
-            str(ISSUE_NUMBER),
-            "--repo",
-            REPO,
-            "--anchor-comment-url",
-            anchor_url,
-        ],
-        cwd=str(repo),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=180,
+    result = fixtures._run_executor(
+        repo,
+        command_id="preflight.run.with_human_context",
+        anchor_comment_url=anchor_url,
+        use_fixture_runtime=True,
+        extra_env=env,
     )
 
-    # The fixture's `sitecustomize.py` (installed by
-    # `_install_real_contract_update_fixture()`) logs EVERY `subprocess.run`
-    # call whose argv[0] resolves to `gh`, regardless of which issue number
-    # the call was for, to this fixed path -- this is an independent,
-    # outside-the-child-process invocation counter that cannot be spoofed by
-    # anything the child process itself prints to stdout/stderr.
-    gh_calls_file = repo / ".claude" / "artifacts" / "issue-refinement-loop" / "1498" / "fake_gh_calls.jsonl"
-    assert not gh_calls_file.exists(), (
-        "AC6 unmet: the gh CLI was invoked by the real skill_runtime_exec.py -> "
-        "command_registry.py -> run_refinement_preflight.py production subprocess "
-        f"graph while resolving the isolated-profile anchor comment: "
-        f"{gh_calls_file.read_text(encoding='utf-8') if gh_calls_file.exists() else ''}. "
+    # Independent, outside-the-child invocation record: the fixture's trusted
+    # `gh` executable exits non-zero (66) unless the carried GH_CONFIG_DIR
+    # matches, and appends one operation label + config-path identity per
+    # successful call to these files.
+    operations_file = artifact_dir / "fake_gh_operations.jsonl"
+    config_states_file = artifact_dir / "fake_gh_config_states.jsonl"
+    assert operations_file.is_file(), (
+        "native gh was never invoked by the production command graph: "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
+    operations = [json.loads(line) for line in operations_file.read_text(encoding="utf-8").splitlines()]
+    config_states = [json.loads(line) for line in config_states_file.read_text(encoding="utf-8").splitlines()]
+    assert config_states == ["expected_path"] * len(operations), (config_states, operations)
+    # Issue + comments (the anchor resolves out of the same comments read) all
+    # went through the one native authority; the read-only lane never mutates.
+    assert "issue_view" in operations and "issue_comments_read" in operations, operations
+    assert set(operations) <= {"issue_view", "issue_comments_read", "issue_comment_read"}, operations
 
-    stdout = result.stdout
-    assert "BLOCKER_ANCHOR_COMMENT_NOT_FOUND" not in stdout, (
-        f"AC5 unmet: real anchor comment {ANCHOR_COMMENT_ID} was misclassified as "
-        f"missing across the real production subprocess graph. "
-        f"stdout={stdout!r} stderr={result.stderr!r}"
-    )
-    assert "ANCHOR_NOT_IN_ISSUE" not in stdout, (
-        f"AC5 unmet: real anchor comment {ANCHOR_COMMENT_ID} was misclassified as "
-        f"not belonging to Issue #{ISSUE_NUMBER} across the real production "
-        f"subprocess graph. stdout={stdout!r} stderr={result.stderr!r}"
-    )
-
-    # Issue #2317: replaced the prior broad substring OR-chain (which also
-    # matched stderr and could false-green a genuine `GH_API_FAILURE`
-    # blocker) with the structured, stdout-only, closed-set `REASON_CODE:`
-    # predicate defined above (AC3/AC4/AC5/AC6/AC7).
-    if result.returncode == 3 and _stdout_indicates_transient_environment_failure(stdout):
-        pytest.skip(
-            f"transient environment failure reason_code in this environment: "
-            f"stdout={stdout!r} stderr={result.stderr!r}"
-        )
-    assert "authentication" not in stdout and "gh_exit_4" not in stdout, (
-        f"AC5/AC6 unmet: exact incident replay reproduced the Issue #2197 "
-        f"auth-dependency misclassification across the real production "
-        f"subprocess graph. stdout={stdout!r} stderr={result.stderr!r}"
-    )
-
-    raw_snapshot_path = (
-        repo / ".claude" / "artifacts" / "issue-refinement-loop" / str(ISSUE_NUMBER) / "raw_issue_snapshot.json"
-    )
-    assert raw_snapshot_path.is_file(), (
-        f"AC5 unmet: no raw_issue_snapshot.json artifact was produced by the real "
-        f"production subprocess graph (early-failure path never reached anchor "
-        f"resolution). stdout={stdout!r} stderr={result.stderr!r}"
-    )
-    raw_snapshot = json.loads(raw_snapshot_path.read_text(encoding="utf-8"))
-    anchor_comment_state = raw_snapshot.get("anchor_comment")
-    assert anchor_comment_state is not None, (
-        f"AC5 unmet: raw_issue_snapshot.json has no anchor_comment entry -- the "
-        f"real anchor comment {ANCHOR_COMMENT_ID} did not resolve through the "
-        f"real production subprocess graph. raw_snapshot={raw_snapshot!r}"
-    )
-    assert str(ANCHOR_COMMENT_ID) in str(anchor_comment_state.get("url", "")), (
-        f"AC5 unmet: resolved anchor_comment does not reference comment "
-        f"{ANCHOR_COMMENT_ID}: {anchor_comment_state!r}"
-    )
+    # The anchor resolved through that single native authority.
+    raw_snapshot = json.loads((artifact_dir / "raw_issue_snapshot.json").read_text(encoding="utf-8"))
+    anchor_state = raw_snapshot.get("anchor_comment")
+    assert anchor_state is not None, raw_snapshot
+    assert "issuecomment-1" in str(anchor_state.get("url", "")), anchor_state
+    combined = f"{result.stdout}\n{result.stderr}"
+    assert "credentialless_transport" not in combined, combined
+    assert "BLOCKER_ANCHOR_COMMENT_NOT_FOUND" not in combined, combined
+    assert "ANCHOR_NOT_IN_ISSUE" not in combined, combined
 
 
 # ---------------------------------------------------------------------------

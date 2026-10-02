@@ -2,11 +2,17 @@
 """Credentialless public GitHub REST read for Claude-GPT isolated sessions
 (Issue #2241, hardened per PR #2247 human review).
 
-This module exists so an isolated Claude-GPT session -- which intentionally
-never receives the host's `GH_TOKEN` / `GITHUB_TOKEN` / `GH_CONFIG_DIR`
-(Issue #2232 comment 5316900237 root cause) -- can still read a *public*
-GitHub Issue (and its comments) in this repository without any
-authentication. It is deliberately narrow:
+This module was introduced for a Claude-GPT launcher that did not forward
+GitHub auth into the isolated child (Issue #2232 comment 5316900237 root
+cause), so the child could still read a *public* GitHub Issue (and its
+comments) in this repository without any authentication.
+
+Issue #2872 note: since the #2299 launcher contract the isolated child shares
+GitHub auth natively, and `run_refinement_preflight.py`'s production read path
+uses native `gh` for every profile -- an isolated HOME no longer selects this
+transport. It remains a deliberately narrow GET-only primitive that a caller
+must opt into explicitly (and whose anonymous 60 req/hour budget is accepted
+only for such explicit use):
 
   - GET only. There is no function anywhere in this module that constructs
     a request with any HTTP method other than GET. This is a hard,
@@ -34,12 +40,10 @@ broker, not this module.
 
 PR #2247 review P1-1 note: this module provides the credentialless
 transport primitives (`read_public_issue`, `list_issue_comments`,
-`CredentiallessGitHubReadTransport`). Wiring `run_refinement_preflight.py`'s
-`_fetch_issue()` / `_fetch_issue_comments()` to select this transport under
-an isolated-session profile requires editing
-`.claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py`,
-which is outside this Issue's Allowed Paths -- see the PR body "Not
-controlled" section and the accompanying human-review reply comment.
+`CredentiallessGitHubReadTransport`). `run_refinement_preflight.py` wraps them
+as `_CredentiallessPreflightTransport`, which a caller passes explicitly via
+`transport=`; it is no longer chosen implicitly by an isolated-session profile
+(Issue #2872).
 """
 
 from __future__ import annotations
@@ -389,9 +393,10 @@ def read_single_comment(comment_id: int, repo: str = TRUSTED_REPO_SLUG) -> dict:
     This is the credentialless counterpart to `_fetch_single_comment`'s
     previously-unconditional `gh api repos/{repo}/issues/comments/{id}`
     call in `run_refinement_preflight.py` (Issue #2257 root cause: that
-    call had no isolated-profile branch, so an isolated Claude-GPT session
-    -- which never has a working `gh` credential -- always failed there,
-    even for a genuinely-existing anchor comment).
+    call had no isolated-profile branch, so under the pre-#2299 launcher an
+    isolated Claude-GPT session -- which then had no working `gh`
+    credential -- always failed there, even for a genuinely-existing anchor
+    comment).
 
     Raises `CrossRepositoryReadRejected` if `repo` is not
     `TRUSTED_REPO_SLUG`, `InvalidCommentIdRejected` if `comment_id` is not
