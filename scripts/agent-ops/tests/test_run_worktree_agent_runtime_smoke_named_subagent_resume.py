@@ -30,6 +30,7 @@ import os
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -481,7 +482,7 @@ def _run_live_wrapper(adapter: str, *, runner_argv: list[str] | None = None, out
         runner_argv = [
             sys.executable, str(SCRIPT), "--runtime", "claude", "--mode", "structured",
             "--worktree", str(REPO_ROOT), "--prompt-file", str(PROMPT_FIXTURE),
-            "--output-dir", str(out_root / f"out-{adapter}"),
+            "--output-dir", str(Path(tempfile.mkdtemp(prefix=f"named-resume-{adapter}-")) / "out"),
             "--named-subagent-resume", "--append-system-prompt-file", str(COMPAT_FIXTURE),
             "--named-resume-evidence-json", str(evidence_path),
             "--claude-adapter", adapter, "--timeout-seconds", "540",
