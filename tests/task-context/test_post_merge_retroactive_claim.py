@@ -1450,6 +1450,20 @@ def test_skill_contract_runtime_prompt_fixture_is_read_only_and_asks_for_one_exp
     assert "post-merge-cleanup-worker` の起動は一切行いません" in fixture
 
 
+def test_skill_contract_runtime_prompt_fixture_requires_foreground_synchronous_explore_launch():
+    fixture = _runtime_prompt_fixture()
+    step2 = fixture[fixture.index("## 手順 2") : fixture.index("### Explore への依頼")]
+    # the single Explore must be launched synchronously so its final message is recoverable
+    assert "foreground（同期）で起動" in step2
+    assert "`run_in_background` は指定せず" in step2
+    assert "バックグラウンドや非同期のタスクとして起動してはいけません" in step2
+    assert "結果が返ってくるまで待ち" in step2
+    assert "最終回答が返ってきた後にだけ" in step2
+    # the foreground instruction must not be satisfiable by an async launch phrasing
+    assert "run_in_background: true" not in fixture
+    assert "run_in_background=true" not in fixture
+
+
 def test_skill_contract_runtime_prompt_fixture_requires_markers_in_the_child_output_in_order():
     fixture = _runtime_prompt_fixture()
     request = _explore_request_section(fixture)

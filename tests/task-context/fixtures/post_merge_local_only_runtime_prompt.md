@@ -8,7 +8,11 @@ Read ツールで `.claude/skills/post-merge-cleanup/SKILL.md` を読んでく�
 
 ## 手順 2: 読み取り専用の SubAgent を 1 件だけ起動
 
-Agent ツールで `Explore` の SubAgent をちょうど 1 件だけ起動してください。ほかの SubAgent（特に `post-merge-cleanup-worker`）は起動しません。`Explore` には、次の「Explore への依頼」の節の本文を、そのまま依頼文として渡してください（ファイル編集もコマンド実行も依頼しません）。この依頼文には期待する経路の答えを一切含めません。経路は `Explore` 自身が SKILL 本文だけから導きます。
+Agent ツールで `Explore` の SubAgent をちょうど 1 件だけ起動してください。ほかの SubAgent（特に `post-merge-cleanup-worker`）は起動しません。`Explore` には、次の「Explore への依頼」の節の本文を、そのまま依頼文として渡してください（ファイル編集もコマンド実行も依頼しません）。
+
+`Explore` は必ず foreground（同期）で起動してください。Agent ツールの `run_in_background` は指定せず、バックグラウンドや非同期のタスクとして起動してはいけません。`Explore` の結果が返ってくるまで待ち、結果を受け取る前に次の手順へ進んではいけません。手順 3 で引用する 3 行は、`Explore` の最終回答が返ってきた後にだけ、その最終回答の末尾 3 行をそのまま使います。
+
+この依頼文には期待する経路の答えを一切含めません。経路は `Explore` 自身が SKILL 本文だけから導きます。
 
 ### Explore への依頼
 
