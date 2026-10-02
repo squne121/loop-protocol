@@ -941,6 +941,14 @@ ALLOWED_EVENT_METADATA_KEYS = frozenset(
         "source_task_id",
         "destination_task_id",
         "decision",
+        # Retroactive implementation-claim recovery journal (Issue #2817).
+        # Only these four keys are new; the other ten keys of that recovery
+        # journal record are already allowlisted above. Values remain small
+        # closed scalars.
+        "prior_activity_id",
+        "prior_activity_kind",
+        "claims_attached",
+        "activity_action",
     }
 )
 _MAX_EVENT_METADATA_STRING_LEN = 200

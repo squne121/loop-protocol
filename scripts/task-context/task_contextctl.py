@@ -9,6 +9,7 @@ typed API/CLI operations within this directory):
     task-contextctl hook <event>
     task-contextctl signal apply
     task-contextctl signal diagnose-origin  # Issue #2790 AC3/AC7: read-only
+    task-contextctl signal recover          # Issue #2817: explicit retroactive claim recovery
     task-contextctl query current           # payload: {task_id} or {session_id}
     task-contextctl projection flush
     task-contextctl projection ack
@@ -247,6 +248,27 @@ def _dispatch(operation: str, payload: dict) -> dict:
             )
             return envelope.build_ok_result(result)
 
+        if operation == "signal_recover":
+            # Issue #2817: explicit retroactive claim recovery. The only
+            # caller is the post-merge-cleanup adapter's `--phase recover`,
+            # which has already proven the evidence against a fresh merged
+            # snapshot. The origin comes from the invoking session
+            # environment exactly like `signal apply`; the payload can never
+            # select a Task, Activity, Binding or session.
+            required = ("repo", "issue_number", "pr_number", "merge_commit_oid", "explicit_recovery")
+            if any(key not in payload for key in required) or set(payload) - set(required):
+                raise errors.ValidationError(
+                    "signal recover requires exactly repo, issue_number, pr_number, merge_commit_oid, "
+                    "explicit_recovery"
+                )
+            result = workflow_signals.recover_implementation_claims(
+                conn,
+                origin_session_id=os.environ.get("CLAUDE_CODE_SESSION_ID"),
+                evidence={key: payload[key] for key in required if key != "explicit_recovery"},
+                explicit_recovery=payload["explicit_recovery"] is True,
+            )
+            return envelope.build_ok_result(result)
+
         if operation == "cleanup_begin":
             required = ("repo", "issue_number", "pr_number", "merge_identity")
             if any(key not in payload for key in required):
@@ -326,6 +348,7 @@ def main(argv: list[str] | None = None) -> int:
     signal_sub = signal_p.add_subparsers(dest="signal_command", required=True)
     signal_sub.add_parser("apply")
     signal_sub.add_parser("diagnose-origin")
+    signal_sub.add_parser("recover")
 
     cleanup_p = sub.add_parser("cleanup")
     cleanup_sub = cleanup_p.add_subparsers(dest="cleanup_command", required=True)
@@ -357,6 +380,8 @@ def main(argv: list[str] | None = None) -> int:
         operation = "signal_apply"
     elif args.command == "signal" and args.signal_command == "diagnose-origin":
         operation = "signal_diagnose_origin"
+    elif args.command == "signal" and args.signal_command == "recover":
+        operation = "signal_recover"
     elif args.command == "cleanup" and args.cleanup_command == "begin":
         operation = "cleanup_begin"
     elif args.command == "query" and args.query_command == "current":
