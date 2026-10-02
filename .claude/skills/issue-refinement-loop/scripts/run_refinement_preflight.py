@@ -202,15 +202,18 @@ _IMPL_MAIN_DRIFT_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "impl-revie
 if str(_IMPL_MAIN_DRIFT_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_IMPL_MAIN_DRIFT_SCRIPTS_DIR))
 
-# Issue #2241 AC8 / PR #2247 review P1-1: an isolated Claude-GPT session
-# never receives the host's GH_TOKEN/GITHUB_TOKEN/GH_CONFIG_DIR (Issue #2232
-# comment 5316900237 root cause), so `gh issue view`/`gh api` cannot succeed
-# there. `github_credentialless_read.py` (scripts/agent-guards/) provides an
-# unauthenticated REST transport for that profile; imported best-effort so a
-# harness that only provisions this skill's own scripts/ directory keeps its
-# pre-existing behavior (falls through to the `gh` CLI path, which is the
-# only path in that case anyway since `_is_isolated_claude_gpt_profile()`
-# gates the credentialless branch, not this import).
+# Issue #2241 AC8 / PR #2247 review P1-1 introduced
+# `github_credentialless_read.py` (scripts/agent-guards/), an unauthenticated
+# GET-only REST transport, for a Claude-GPT launcher that did not forward any
+# GitHub auth. Issue #2299 (PR #2303) changed that launcher contract: the
+# isolated child now shares GitHub auth (an ambient `GH_CONFIG_DIR` pinned
+# before isolation plus any `GH_TOKEN`/`GITHUB_TOKEN`/`GH_HOST`/`GH_REPO`)
+# natively, so an isolated `HOME` is NOT evidence that GitHub auth is absent.
+# Issue #2872: the production read path therefore always uses native `gh`
+# (see `_select_read_transport()`); this module is still imported best-effort
+# because the credentialless transport classes/exception taxonomy remain the
+# GET-only contract surface (and are exercised directly by its own tests),
+# but `_is_isolated_claude_gpt_profile()` no longer selects it.
 _AGENT_GUARDS_SCRIPTS_DIR = Path(__file__).resolve().parents[4] / "scripts" / "agent-guards"
 if str(_AGENT_GUARDS_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_AGENT_GUARDS_SCRIPTS_DIR))
@@ -3827,22 +3830,22 @@ def _run_gh(argv: list[str], timeout: int = GH_API_TIMEOUT) -> tuple[dict | list
 
 
 def _is_isolated_claude_gpt_profile() -> bool:
-    """Detect a Claude-GPT isolated session (Issue #2241 AC8).
+    """Detect a Claude-GPT isolated HOME (Issue #2241 AC8).
 
-    `scripts/claude-gpt/launch.sh` deliberately overrides `HOME` (and
-    `GH_CONFIG_DIR`/`XDG_CONFIG_HOME`/`XDG_CACHE_HOME`) to a fresh, empty
-    sandbox directory before spawning the isolated Claude child process --
-    it never forwards the host's real `GH_TOKEN`/`GITHUB_TOKEN`/
-    `GH_CONFIG_DIR` into that child (Issue #2232 comment 5316900237 root
-    cause), so `gh` has no credential to authenticate with there.
+    `scripts/claude-gpt/launch.sh` overrides `HOME` (and
+    `XDG_CONFIG_HOME`/`XDG_CACHE_HOME`) to a fresh sandbox directory before
+    spawning the isolated Claude child process. Since Issue #2299 it ALSO
+    shares GitHub auth with that child natively (a `GH_CONFIG_DIR` fixed
+    before isolation; `GH_TOKEN`/`GITHUB_TOKEN`/`GH_HOST`/`GH_REPO` are not
+    scrubbed), so this signal says ONLY "HOME is an isolated sandbox". It
+    is NOT a proxy for "GitHub auth is absent" and MUST NOT be used to
+    select the read transport (Issue #2872): transport selection is
+    independent of HOME isolation and of GitHub auth availability.
 
-    This reuses the exact divergence Issue #2241 AC1 already established as
-    the deterministic isolated-session signal for
-    `skill_runtime_exec.py::_os_account_home()`'s trust-root fix: the real
-    OS account home (resolved via the passwd database, never via `HOME`)
-    differs from the current `HOME` env var only inside that launcher's
-    sandbox -- never in a normal human/dev/CI shell, where `HOME` is left
-    at its OS-assigned value and therefore equals `pwd.getpwuid(...).pw_dir`.
+    The real OS account home (resolved via the passwd database, never via
+    `HOME`) differs from the current `HOME` env var only inside that
+    launcher's sandbox -- never in a normal human/dev/CI shell. Retained as
+    an independent axis for focused tests and diagnostics.
     """
     current_home = os.environ.get("HOME")
     if not current_home:
@@ -3858,19 +3861,20 @@ def _is_isolated_claude_gpt_profile() -> bool:
 # Issue #2257 P0-1: single read-authority transport adapters.
 #
 # `run_preflight()` selects exactly ONE of these once per invocation (via
-# `_select_read_transport()`) and threads it explicitly through every call
-# site on the Issue/comments/anchor-comment read path -- `_fetch_issue`,
-# `_fetch_issue_comments`, `_fetch_single_comment`, `_validate_anchor_comment_url`,
-# and `_validate_anchor_comments_batch` all accept a `transport` parameter
-# instead of independently re-evaluating `_is_isolated_claude_gpt_profile()`
-# and re-instantiating a transport per call (the split-brain pattern that
-# caused Issue #2197's anchor comment 5315264311 misclassification: every
-# call site that skips this parameter is, by construction, re-selecting
-# authority). The `transport=None` default on each fetch function exists
-# ONLY for backward compatibility with pre-existing unit tests that exercise
-# a single fetch function in isolation; `run_preflight()` itself never
-# relies on that default -- it always passes an explicitly-selected
-# `transport`.
+# `_select_read_transport()`) and threads it explicitly through every anchor
+# comment call site on the read path -- `_fetch_single_comment`,
+# `_validate_anchor_comment_url`, and `_validate_anchor_comments_batch` all
+# accept a `transport` parameter. `_fetch_issue`/`_fetch_issue_comments` also
+# accept it, but several pre-existing tests outside this module patch them
+# with fixed-arity doubles, so `run_preflight()` leaves them on the
+# `transport=None` default (and so do the repair-apply/trusted-anchor
+# `_fetch_*` call sites). That is still single-authority because
+# `_select_read_transport()` is a pure constant: it never consults HOME,
+# GitHub auth, rate-limit state or a prior failure, so every resolution --
+# explicit or via the `None` default -- yields the SAME native-`gh` transport
+# instance for the whole process (Issue #2872; the split-brain pattern that
+# caused Issue #2197's anchor comment 5315264311 misclassification cannot
+# recur without a state-dependent selector). Never add one.
 # ---------------------------------------------------------------------------
 
 
@@ -3998,58 +4002,53 @@ class _GhCliPreflightTransport:
 
 
 def _reset_read_transport_cache() -> None:
-    """No-op retained for call-site compatibility (Issue #2257 P0-1 does NOT
-    use process-global transport memoization: `_is_isolated_claude_gpt_profile()`
-    is a pure function of `HOME`/passwd for the lifetime of any single
-    process, and several existing unit tests directly monkeypatch/mutate
-    `HOME` and expect an IMMEDIATE, freshly-recomputed transport selection on
-    the very next call -- a global memoization cache would make those tests
-    observe a stale decision from an earlier, unrelated call in the same
-    pytest process. `run_preflight()` still calls this once at the top of
-    its live-mode branch to document the single-authority-selection-point
-    invariant even though there is no cache state to actually clear)."""
+    """No-op retained for call-site compatibility. Since Issue #2872 the
+    selector is a pure constant (`_select_read_transport()` never depends on
+    HOME, GitHub auth or any prior read outcome), so there is no selection
+    state to cache or clear. `run_preflight()` still calls this once at the
+    top of its live-mode branch to document the single-authority selection
+    point."""
     return None
 
 
-def _select_read_transport() -> "_CredentiallessPreflightTransport | _GhCliPreflightTransport | None":
-    """Select the read-authority transport for the current profile (Issue
-    #2257 P0-1): `_CredentiallessPreflightTransport` in the isolated
-    Claude-GPT profile, `_GhCliPreflightTransport` otherwise. `run_preflight()`
-    calls this exactly once per invocation and threads the SAME returned
-    instance explicitly through every anchor-comment read on the critical
-    path (`_fetch_single_comment`, `_validate_anchor_comment_url`,
-    `_validate_anchor_comments_batch`) -- no call site on that path
-    re-selects independently. `_fetch_issue`/`_fetch_issue_comments` also
-    call this function (when not given an explicit `transport`) rather than
-    inlining their own isolated-profile branch as they did pre-#2257; since
-    `_is_isolated_claude_gpt_profile()` is deterministic for the lifetime of
-    a process, every such call resolves to the SAME transport CLASS (never a
-    divergent authority mid-invocation) even though, for backward
-    compatibility with pre-existing unit tests that monkeypatch those two
-    functions with a fixed 2-positional-argument signature, no shared
-    instance identity is threaded into them. Returns `None` only when the
-    isolated profile is active but `github_credentialless_read` failed to
-    import (a real environment failure, surfaced by the caller as
-    `BLOCKER_CREDENTIALLESS_TRANSPORT_UNAVAILABLE`)."""
-    if _is_isolated_claude_gpt_profile():
-        if _credentialless_read is None:
-            return None
-        return _CredentiallessPreflightTransport()
-    return _GhCliPreflightTransport()
+# Issue #2872: a single process-wide instance. `_GhCliPreflightTransport` is
+# stateless (every method shells out to `gh` afresh), so sharing one instance
+# makes "the same transport for every read in one invocation" an identity
+# property rather than a convention.
+_NATIVE_GH_READ_TRANSPORT = _GhCliPreflightTransport()
+
+
+def _select_read_transport() -> "_GhCliPreflightTransport":
+    """Return the read-authority transport for every production read
+    (Issue #2872): native `gh`, always.
+
+    Authentication (env token, stored `GH_CONFIG_DIR` config, keyring) is
+    resolved by `gh` itself. This selector deliberately does NOT inspect
+    `HOME`, `GH_TOKEN`, `hosts.yml`, `GH_CONFIG_DIR` or `gh auth status`,
+    and never falls back to the anonymous credentialless transport: an
+    isolated HOME is not evidence that GitHub auth is absent since the
+    #2299 launcher contract shares GitHub auth natively, and switching to an
+    anonymous 60 req/hour budget (Issue #2845) or mid-invocation authority
+    splitting (Issue #2257) is the failure mode this fixes. A genuinely
+    authless environment surfaces as a structured `environment_failure`
+    (`gh_auth_required`) from the `gh` read itself, not a secret probe.
+
+    `run_preflight()` calls this once per invocation; every other caller
+    that resolves it (the `transport=None` defaults of `_fetch_*`) gets the
+    exact same instance (`_NATIVE_GH_READ_TRANSPORT`), so no read can land
+    on a different authority."""
+    return _NATIVE_GH_READ_TRANSPORT
 
 
 def _fetch_issue(
     repo: str, issue_number: int, transport: "object | None" = None
 ) -> tuple[dict | None, str]:
     """Fetch issue data via `transport` (Issue #2257 P0-1: `transport` is
-    the single read authority selected once by `_select_read_transport()`
-    and threaded down from `run_preflight()` -- this function itself never
-    re-evaluates `_is_isolated_claude_gpt_profile()`).
+    the single read authority selected once by `_select_read_transport()`).
 
-    `transport=None` (only reached by call sites that do not pass one
-    explicitly -- pre-existing unit tests exercising this function in
-    isolation) preserves the pre-#2257 behavior of resolving a transport
-    internally via `_is_isolated_claude_gpt_profile()`.
+    `transport=None` (call sites that do not pass one explicitly) resolves
+    `_select_read_transport()`, which is a constant (Issue #2872), so it is
+    the same native-`gh` instance an explicit caller would have passed.
     """
     if transport is None:
         transport = _select_read_transport()
@@ -4150,6 +4149,36 @@ def _classify_final_environment_failure(blockers: list[str], planner_exit_code: 
     return "planner_internal_error"
 
 
+# Issue #2872 (PR #2876 review P2): confirmable EXTERNAL GitHub outage /
+# connectivity evidence in `gh`'s own stderr snippet. Closed, bounded
+# patterns only -- everything else (including every unrecognised exit 1) stays
+# an unclassified `gh_exit_error`, so an implementation/propagation defect is
+# never relabelled as an external outage. `gh` exits 1 for HTTP errors and
+# connection failures alike, so the exit code alone cannot tell them apart.
+_GH_OUTAGE_STDERR_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("rate_limited", re.compile(r"api rate limit exceeded|secondary rate limit|http 429", re.IGNORECASE)),
+    ("upstream_environment_failure", re.compile(r"http 5\d\d\b", re.IGNORECASE)),
+    (
+        "transport_connectivity_failure",
+        re.compile(
+            r"error connecting to|dial tcp|no such host|connection refused|connection reset"
+            r"|i/o timeout|tls handshake timeout|network is unreachable|temporary failure in name resolution",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def _classify_gh_outage_from_stderr(detail: str) -> Optional[str]:
+    """Return the closed external-outage reason code evidenced by a `gh`
+    stderr snippet, or None when the snippet does not confirm one (Issue
+    #2872). Pure; never echoes any part of `detail`."""
+    for reason_code, pattern in _GH_OUTAGE_STDERR_PATTERNS:
+        if pattern.search(detail or ""):
+            return reason_code
+    return None
+
+
 def _project_environment_failure_reason(err: str) -> str:
     """Map a raw `(data, err)` failure string from any fetch function in
     this module onto the closed `_ENVIRONMENT_FAILURE_REASON_CODES` enum
@@ -4164,8 +4193,15 @@ def _project_environment_failure_reason(err: str) -> str:
         reason = reason[len(_TRANSPORT_FAILURE_PREFIX):]
     elif reason.startswith(_SEMANTIC_MISSING_PREFIX):
         reason = reason[len(_SEMANTIC_MISSING_PREFIX):]
+    elif reason.startswith("gh_exit_4:"):
+        # gh CLI's documented "authentication required" exit code: a
+        # genuinely authless environment surfaces here as a structured
+        # environment_failure (Issue #2872), never as a secret probe.
+        reason = "gh_auth_required"
     elif reason.startswith("gh_exit_"):
-        reason = "gh_exit_error"
+        # Only a stderr-confirmed external outage is projected onto the
+        # outage reason codes; every other exit stays `gh_exit_error`.
+        reason = _classify_gh_outage_from_stderr(reason.partition(":")[2]) or "gh_exit_error"
     elif reason.startswith("gh_not_found"):
         reason = "gh_not_found"
     elif reason.startswith("gh_timeout"):
@@ -4202,6 +4238,9 @@ def _classify_gh_single_comment_error(err: str) -> str:
             # this is exactly the isolated-profile failure mode Issue
             # #2197 misclassified as ANCHOR_COMMENT_NOT_FOUND.
             return f"{_TRANSPORT_FAILURE_PREFIX}gh_auth_required"
+        outage = _classify_gh_outage_from_stderr(detail)
+        if outage is not None:
+            return f"{_TRANSPORT_FAILURE_PREFIX}{outage}"
         return f"{_TRANSPORT_FAILURE_PREFIX}gh_exit_{code_str}"
     if err.startswith("gh_not_found"):
         return f"{_TRANSPORT_FAILURE_PREFIX}gh_not_found"
@@ -4220,14 +4259,12 @@ def _fetch_single_comment(
     """Fetch a single issue comment (Issue #2257 AC1/AC2/AC3/P0-1) via
     `transport` -- the single read authority selected once by
     `_select_read_transport()` and threaded down from `run_preflight()`.
-    This function itself never re-evaluates `_is_isolated_claude_gpt_profile()`
-    or re-instantiates a transport when `transport` is given explicitly.
+    This function never re-evaluates HOME or any GitHub auth state to pick a
+    transport (Issue #2872).
 
-    `transport=None` (only reached by call sites that do not pass one
-    explicitly -- pre-existing unit tests exercising this function in
-    isolation, e.g. `test_trusted_anchor_iteration_zero.py`'s
-    `mock.patch.object` of this whole function) preserves the pre-#2257
-    behavior of resolving a transport internally.
+    `transport=None` (call sites that do not pass one explicitly) resolves
+    `_select_read_transport()`, a constant native-`gh` selector (Issue
+    #2872), so it is the same instance an explicit caller would pass.
 
     On failure, `err` is prefixed with either `_SEMANTIC_MISSING_PREFIX`
     (the comment genuinely does not exist at the canonical URL -- a true
@@ -8283,8 +8320,9 @@ def run_preflight(
         # ONCE here and threaded through every subsequent read on this
         # invocation's critical path -- `_fetch_issue`, `_fetch_issue_comments`,
         # and (only for the fresh-readback/TOCTOU fallback below)
-        # `_fetch_single_comment` all receive this SAME instance; none of
-        # them re-evaluate `_is_isolated_claude_gpt_profile()` independently.
+        # `_fetch_single_comment` all resolve this SAME instance (Issue
+        # #2872: native `gh` always; no HOME/auth/failure-dependent
+        # re-selection, so no read can switch to an anonymous authority).
         _reset_read_transport_cache()
         transport = _select_read_transport()
         transport_source = getattr(transport, "SOURCE_LABEL", "internal")
@@ -8315,9 +8353,8 @@ def run_preflight(
         # (`test_main_drift_evidence_epoch.py`, outside this Issue's Allowed
         # Paths) keep working. Single-authority is still guaranteed: both
         # functions resolve their transport via `_select_read_transport()`,
-        # which is memoized (see `_read_transport_cache`) and therefore
-        # returns the EXACT SAME `transport` instance already selected on
-        # the line above.
+        # which is a constant (Issue #2872) and therefore returns the EXACT
+        # SAME `transport` instance already selected on the line above.
         if evidence_index is not None:
             _issue_outcome = evidence_index.get_or_fetch(
                 repository=repo,
