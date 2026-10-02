@@ -26,6 +26,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -267,121 +268,253 @@ def test_sleep_and_mark_completion():
 
 
 # Issue #2207 OWNER P1-2 item 5 (PR #2221 REQUEST_CHANGES): repeat count.
-# Each repeat launches a REAL `uv run --locked pytest` subprocess tree
-# (interpreter + pytest collection + a grandchild process) and waits out an
-# outer deadline + bounded reap -- unlike the in-process race tests
-# elsewhere in this repo, this cannot be sped up to microseconds. ~50
+# Each repeat launches a REAL `python3 -m pytest` subprocess tree
+# (interpreter + pytest collection + a grandchild process) and reaps it via
+# the production outer-timeout handling path -- unlike the in-process race
+# tests elsewhere in this repo, this cannot be sped up to microseconds. ~50
 # same-shape repeats of a full production subprocess spawn would take
-# several minutes and make this suite impractical to run routinely; 10
-# repeats already exercises the SIGTERM-delivery -> handler-raises ->
+# minutes and make this suite impractical to run routinely; 10 repeats
+# already exercises the SIGTERM-delivery -> handler-raises ->
 # top-level-catch -> register/unregister -> reap -> confirm-absence
 # sequence enough times to catch the register/unregister ordering races
 # this item targets (a single run cannot distinguish "always correct" from
-# "correct by luck once"), while keeping wall-clock time bounded to roughly
-# a repeat_count * (deadline + reap grace) upper bound.
+# "correct by luck once").
 _OUTER_DEADLINE_REPEAT_COUNT = 10
 
-# Issue #2207 OWNER P1-2 item 5: the literal 50-200ms range specified for
-# the injected deadline assumes negligible child-process startup. Measured
-# in THIS repo, `.venv/bin/python3 -m pytest --version` alone (interpreter
-# boot + pytest import, before any collection) already costs ~200ms (see
-# also the documented `uv run --locked pytest` startup-jitter finding in
-# `test_scaled_fault_injection_inner_timeout_precedes_outer_deadline` above
-# in this same file) -- a 50-200ms deadline would fire before the fixture's
-# grandchild is even spawned, making it impossible to prove grandchild
-# reaping (as opposed to "nothing had started yet"). 600ms is the smallest
-# value that reliably let the fixture reach "grandchild spawned and alive"
-# before the outer deadline fires in local measurement, while still being
-# a small fraction (well under 1%) of the real per-VC-command production
-# cap (150s). The venv interpreter (`sys.executable`, NOT `uv run
-# --locked`) is used as the VC command's interpreter to avoid uv's own
-# per-invocation dependency-resolution overhead stacking on top.
-_OUTER_DEADLINE_SECONDS = 0.6
+# Issue #2883: the outer-timeout integration test no longer depends on a
+# fixed wall-clock deadline (formerly `_OUTER_DEADLINE_SECONDS = 0.6`, which
+# made the fixture's readiness -- interpreter boot + pytest import + a
+# grandchild spawn -- race a 600ms timer and flake under CPU load, see
+# PR #2876 CI run 37068873394). Instead, the production supervisor's
+# `Popen.communicate(timeout=...)` arm point for the `baseline_vc_preflight.py`
+# child is fault-injected: the injected `TimeoutExpired` is raised ONLY
+# after the test has synchronously observed the real VC leader and the real
+# SIGTERM-ignoring grandchild readiness markers. Everything downstream of
+# `TimeoutExpired` (SIGTERM to the process group, grace wait, SIGKILL
+# escalation, reap, typed timeout result) is the unmodified production code.
+#
+# The REAL `communicate(timeout=...)` value handed to the supervisor is
+# deliberately enormous: it must never elapse on its own, so any outcome
+# that depends on real elapsed time (rather than the injected fault) fails
+# loudly instead of flaking.
+_OUTER_TIMEOUT_NEVER_ELAPSES_SECONDS = 600.0
 _REAP_GRACE_SECONDS = 0.2
 
+# The retired fixed outer deadline. Kept ONLY as the lower bound for the
+# deterministic delayed-readiness regression: the fixture's readiness is
+# held back (by a test-controlled release file) past this duration, a
+# condition under which the retired fixed-deadline design necessarily fired
+# before readiness and broke.
+_RETIRED_FIXED_OUTER_DEADLINE_SECONDS = 0.6
+_DELAYED_READINESS_MARGIN_SECONDS = 0.6
 
-def test_outer_deadline_via_run_baseline_vc_preflight_reaps_full_process_tree(tmp_path):
-    """Issue #2207 OWNER P1-2 item 5 (PR #2221 REQUEST_CHANGES): a
-    production-shaped integration test that goes through
-    `contract_readiness_check.run_baseline_vc_preflight()` -- the REAL
-    production entry point `run_root_review_pipeline.py`'s
-    `_cmd_produce()` uses -- not a hand-rolled harness that calls
-    `baseline_vc_preflight.py` internals directly. It actually triggers an
-    outer (aggregate wrapper) deadline via `override_timeout_seconds`
-    (Issue #2207 OWNER P1-2 item 7's DI hook), spawns both a direct child
-    (the VC leader, a `pytest` worker process) and a SIGTERM-ignoring
-    grandchild, confirms the `baseline_vc_preflight.py` SIGTERM handler
-    actually ran (via a test-only marker file it writes on handler entry),
-    confirms FULL absence of the wrapper (`baseline_vc_preflight.py`
-    itself), the VC leader, and the grandchild afterward, confirms the
-    outer result is the typed `runtime_error` / `baseline_vc_preflight_aggregate`
-    timeout-phase payload (never a plain `errors: [...]` blocked payload),
-    and repeats this `_OUTER_DEADLINE_REPEAT_COUNT` times (see rationale
-    above) to catch register/unregister ordering races."""
-    # `sys.executable` itself may report basename "python" (e.g. a venv's
-    # primary entry point) rather than "python3", but the VC preflight
-    # allowlist requires the literal basename "python3" (Issue #2207 OWNER
-    # P1-2 item 5). venvs created by `uv`/`python -m venv` conventionally
-    # also install a "python3" sibling binary alongside "python" in the
-    # same bin directory (pointing at the same interpreter) -- use that
-    # sibling so the spawned process still has pytest installed.
-    interpreter = str(Path(sys.executable).parent / "python3")
-    assert Path(interpreter).exists(), (
-        f"expected a 'python3' sibling binary next to sys.executable ({sys.executable!r}) "
-        f"for the VC preflight allowlist to accept it, but {interpreter!r} does not exist"
+# Upper bound used ONLY to turn a hung fixture into a clear failure instead
+# of an indefinite hang. It is not a readiness deadline the design relies
+# on: readiness is awaited synchronously and no success path depends on it
+# being short.
+_READINESS_FAILURE_BOUND_SECONDS = 120.0
+
+
+class _OuterTimeoutFaultInjection:
+    """Test-local fault injection for the production supervisor's outer
+    timeout arm point (Issue #2883).
+
+    Injects ONLY the point at which `Popen.communicate(timeout=...)` raises
+    `subprocess.TimeoutExpired` for the `baseline_vc_preflight.py` child,
+    and only after the fixture's readiness markers are observed. It does
+    not stub, re-implement, or bypass the supervisor's SIGTERM, grace wait,
+    SIGKILL escalation, reap, or typed timeout result construction.
+    """
+
+    def __init__(
+        self,
+        *,
+        readiness_paths,
+        release_path,
+        hold_release_for_seconds=None,
+        expected_timeout_seconds,
+    ):
+        self.readiness_paths = list(readiness_paths)
+        self.release_path = release_path
+        self.hold_release_for_seconds = hold_release_for_seconds
+        self.expected_timeout_seconds = expected_timeout_seconds
+        self.fired = False
+        self.readiness_absent_while_held = None
+        self.readiness_observed_before_fire = False
+
+    def matches(self, popen, timeout) -> bool:
+        argv = popen.args
+        return (
+            not self.fired
+            and timeout is not None
+            and isinstance(argv, (list, tuple))
+            and str(_BASELINE_VC_PREFLIGHT_PY) in [str(a) for a in argv]
+        )
+
+    def fire(self, popen, timeout):
+        self.fired = True
+        assert timeout == self.expected_timeout_seconds, (
+            "fault injection must intercept the supervisor's own outer "
+            f"communicate(timeout=...) arm point; got timeout={timeout!r}"
+        )
+        armed_at = time.monotonic()
+
+        if self.hold_release_for_seconds is not None:
+            # Deterministic delayed-readiness: the fixture is blocked on the
+            # release file, so readiness CANNOT exist yet. Hold past the
+            # retired fixed deadline (lower bound only; no upper bound is
+            # asserted, so CPU load cannot break this) to prove the injected
+            # timeout waits for readiness rather than for elapsed time.
+            remaining = self.hold_release_for_seconds - (time.monotonic() - armed_at)
+            if remaining > 0:
+                threading.Event().wait(remaining)
+            self.readiness_absent_while_held = not any(p.exists() for p in self.readiness_paths)
+            self.release_path.write_text("release", encoding="utf-8")
+
+        for path in self.readiness_paths:
+            _wait_for_file(path, timeout=_READINESS_FAILURE_BOUND_SECONDS)
+        self.readiness_observed_before_fire = True
+        raise subprocess.TimeoutExpired(cmd=popen.args, timeout=timeout)
+
+
+@pytest.fixture
+def outer_timeout_fault_injection(monkeypatch):
+    """Install an `_OuterTimeoutFaultInjection` into `baseline_vc_preflight`'s
+    own `subprocess` namespace only (not the global `subprocess` module).
+    Returns an installer taking the injection to arm."""
+
+    real_popen = subprocess.Popen
+    state = {}
+
+    class _FaultInjectingPopen(real_popen):
+        def communicate(self, input=None, timeout=None):
+            injection = state.get("injection")
+            if injection is not None and injection.matches(self, timeout):
+                injection.fire(self, timeout)
+            return super().communicate(input=input, timeout=timeout)
+
+    class _SubprocessNamespace:
+        Popen = _FaultInjectingPopen
+
+        def __getattr__(self, name):
+            return getattr(subprocess, name)
+
+    monkeypatch.setattr(vcp, "subprocess", _SubprocessNamespace())
+
+    def _install(injection):
+        state["injection"] = injection
+        return injection
+
+    return _install
+
+
+def _build_immortal_grandchild_fixture_source(
+    *, self_pid_path, grandchild_pid_path, release_path
+) -> str:
+    return (
+        "import os\n"
+        "import signal\n"
+        "import subprocess\n"
+        "import sys\n"
+        "import time\n"
+        "\n"
+        "\n"
+        "def _ignore_sigterm(signum, frame):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "def test_spawn_sigterm_ignoring_grandchild_and_sleep():\n"
+        "    signal.signal(signal.SIGTERM, _ignore_sigterm)\n"
+        "    # Test-controlled readiness gate (Issue #2883): block until the\n"
+        "    # test releases this fixture. The bound only converts a lost\n"
+        "    # release into a clear failure.\n"
+        f"    release_path = {str(release_path)!r}\n"
+        f"    gate_deadline = time.monotonic() + {_READINESS_FAILURE_BOUND_SECONDS!r}\n"
+        "    while not os.path.exists(release_path):\n"
+        "        assert time.monotonic() < gate_deadline, 'release gate never opened'\n"
+        "        time.sleep(0.01)\n"
+        "    grandchild = subprocess.Popen(\n"
+        "        [sys.executable, \"-c\",\n"
+        "         \"import signal, time\\n\"\n"
+        "         \"signal.signal(signal.SIGTERM, lambda *a: None)\\n\"\n"
+        "         \"time.sleep(30.0)\"]\n"
+        "    )\n"
+        f"    with open({str(self_pid_path)!r}, \"w\") as f:\n"
+        "        f.write(str(os.getpid()))\n"
+        f"    with open({str(grandchild_pid_path)!r}, \"w\") as f:\n"
+        "        f.write(str(grandchild.pid))\n"
+        "    grandchild.wait()\n"
     )
 
-    for iteration in range(_OUTER_DEADLINE_REPEAT_COUNT):
-        marker_dir = tmp_path / f"iter_{iteration}"
-        marker_dir.mkdir()
 
-        sigterm_marker_path = marker_dir / "sigterm_handler.marker"
-        self_pid_path = marker_dir / "self.pid"
-        grandchild_pid_path = marker_dir / "grandchild.pid"
+def _run_outer_timeout_fault_injection_iteration(
+    tmp_path, *, iteration, interpreter, install_fault_injection, delay_readiness
+):
+    """One fault-injection integration invocation (Issue #2883): ready real
+    process tree -> production outer-timeout handling branch -> SIGTERM
+    handler marker -> wrapper / VC leader / grandchild full reap -> typed
+    timeout result, all inside ONE `run_baseline_vc_preflight()` call."""
+    marker_dir = tmp_path / f"iter_{iteration}"
+    marker_dir.mkdir()
 
-        fixture_source = (
-            "import os\n"
-            "import signal\n"
-            "import subprocess\n"
-            "import sys\n"
-            "\n"
-            "\n"
-            "def _ignore_sigterm(signum, frame):\n"
-            "    pass\n"
-            "\n"
-            "\n"
-            "def test_spawn_sigterm_ignoring_grandchild_and_sleep():\n"
-            "    signal.signal(signal.SIGTERM, _ignore_sigterm)\n"
-            "    grandchild = subprocess.Popen(\n"
-            "        [sys.executable, \"-c\",\n"
-            "         \"import signal, time\\n\"\n"
-            "         \"signal.signal(signal.SIGTERM, lambda *a: None)\\n\"\n"
-            "         \"time.sleep(30.0)\"]\n"
-            "    )\n"
-            f"    with open({str(self_pid_path)!r}, \"w\") as f:\n"
-            "        f.write(str(os.getpid()))\n"
-            f"    with open({str(grandchild_pid_path)!r}, \"w\") as f:\n"
-            "        f.write(str(grandchild.pid))\n"
-            "    grandchild.wait()\n"
+    sigterm_marker_path = marker_dir / "sigterm_handler.marker"
+    self_pid_path = marker_dir / "self.pid"
+    grandchild_pid_path = marker_dir / "grandchild.pid"
+    release_path = marker_dir / "fixture_release.marker"
+    if not delay_readiness:
+        release_path.write_text("release", encoding="utf-8")
+
+    fixture_path = marker_dir / "test_immortal_grandchild_fixture.py"
+    fixture_path.write_text(
+        _build_immortal_grandchild_fixture_source(
+            self_pid_path=self_pid_path,
+            grandchild_pid_path=grandchild_pid_path,
+            release_path=release_path,
+        ),
+        encoding="utf-8",
+    )
+
+    body = (
+        "## Verification Commands\n\n"
+        "```bash\n"
+        f"$ {interpreter} -m pytest {fixture_path} -q -s\n"
+        "```\n"
+    )
+
+    injection = install_fault_injection(
+        _OuterTimeoutFaultInjection(
+            readiness_paths=[self_pid_path, grandchild_pid_path],
+            release_path=release_path,
+            hold_release_for_seconds=(
+                _RETIRED_FIXED_OUTER_DEADLINE_SECONDS + _DELAYED_READINESS_MARGIN_SECONDS
+                if delay_readiness
+                else None
+            ),
+            expected_timeout_seconds=_OUTER_TIMEOUT_NEVER_ELAPSES_SECONDS,
         )
-        fixture_path = marker_dir / "test_immortal_grandchild_fixture.py"
-        fixture_path.write_text(fixture_source, encoding="utf-8")
+    )
 
-        body = (
-            "## Verification Commands\n\n"
-            "```bash\n"
-            f"$ {interpreter} -m pytest {fixture_path} -q -s\n"
-            "```\n"
-        )
-
+    try:
         result, exit_code = crc.run_baseline_vc_preflight(
             body,
-            override_timeout_seconds=_OUTER_DEADLINE_SECONDS,
+            override_timeout_seconds=_OUTER_TIMEOUT_NEVER_ELAPSES_SECONDS,
             override_grace_seconds=_REAP_GRACE_SECONDS,
             _test_extra_env={
                 "BASELINE_VC_PREFLIGHT_TEST_SIGTERM_MARKER_PATH": str(sigterm_marker_path),
             },
         )
+
+        # The injected timeout must have fired through the supervisor's own
+        # outer arm point, and only after readiness was observed.
+        assert injection.fired, "fault injection never intercepted the supervisor's outer timeout"
+        assert injection.readiness_observed_before_fire, (
+            f"outer timeout fired before readiness was observed (iteration {iteration})"
+        )
+        if delay_readiness:
+            assert injection.readiness_absent_while_held is True, (
+                "readiness markers existed before the fixture was released; the "
+                "delayed-readiness condition was not actually established"
+            )
 
         # Typed runtime_error payload (Issue #2165 P0-1 / Issue #2207 OWNER
         # P0-1): never a plain `errors: ["timeout"]` blocked payload.
@@ -399,12 +532,10 @@ def test_outer_deadline_via_run_baseline_vc_preflight_reaps_full_process_tree(tm
         assert marker_content.startswith("sigterm_handler_entered pid="), marker_content
         wrapper_pid = int(marker_content.strip().split("pid=", 1)[1])
 
-        # The VC leader and grandchild pid files are only written once the
-        # fixture actually started running, so their presence here proves
-        # the process tree was genuinely alive before the outer deadline
-        # reaped it (not "never started").
-        _wait_for_file(self_pid_path, timeout=5.0)
-        _wait_for_file(grandchild_pid_path, timeout=5.0)
+        # Readiness was already observed synchronously by the injection
+        # BEFORE the timeout branch ran, so these files exist: the process
+        # tree was genuinely alive when the production path reaped it.
+        assert self_pid_path.exists() and grandchild_pid_path.exists()
         vc_leader_pid = int(self_pid_path.read_text().strip())
         grandchild_pid = int(grandchild_pid_path.read_text().strip())
 
@@ -414,17 +545,98 @@ def test_outer_deadline_via_run_baseline_vc_preflight_reaps_full_process_tree(tm
         # supervisor's own poll window elapsed right at the edge).
         assert _wait_until_dead(wrapper_pid, timeout=5.0), (
             f"wrapper (baseline_vc_preflight.py, pid={wrapper_pid}) was not reaped "
-            f"after the outer deadline (iteration {iteration})"
+            f"after the outer timeout (iteration {iteration})"
         )
         assert _wait_until_dead(vc_leader_pid, timeout=5.0), (
             f"VC leader (pid={vc_leader_pid}) was not reaped after the outer "
-            f"deadline (iteration {iteration})"
+            f"timeout (iteration {iteration})"
         )
         assert _wait_until_dead(grandchild_pid, timeout=5.0), (
             f"SIGTERM-ignoring grandchild (pid={grandchild_pid}) was not reaped "
-            f"after the outer deadline (iteration {iteration}) -- process group leak"
+            f"after the outer timeout (iteration {iteration}) -- process group leak"
+        )
+    finally:
+        # Never leak a fixture tree on a failing iteration.
+        for p in (self_pid_path, grandchild_pid_path):
+            if p.exists():
+                try:
+                    pid = int(p.read_text().strip())
+                    if _pid_alive(pid):
+                        os.kill(pid, signal.SIGKILL)
+                except (ValueError, OSError):
+                    pass
+
+
+def _venv_python3_interpreter() -> str:
+    # `sys.executable` itself may report basename "python" (e.g. a venv's
+    # primary entry point) rather than "python3", but the VC preflight
+    # allowlist requires the literal basename "python3" (Issue #2207 OWNER
+    # P1-2 item 5). venvs created by `uv`/`python -m venv` conventionally
+    # also install a "python3" sibling binary alongside "python" in the
+    # same bin directory (pointing at the same interpreter) -- use that
+    # sibling so the spawned process still has pytest installed.
+    interpreter = str(Path(sys.executable).parent / "python3")
+    assert Path(interpreter).exists(), (
+        f"expected a 'python3' sibling binary next to sys.executable ({sys.executable!r}) "
+        f"for the VC preflight allowlist to accept it, but {interpreter!r} does not exist"
+    )
+    return interpreter
+
+
+def test_outer_timeout_fault_injection_reaps_full_process_tree(
+    tmp_path, outer_timeout_fault_injection
+):
+    """Issue #2883 (supersedes the fixed-0.6s-deadline design of Issue #2207
+    OWNER P1-2 item 5 / PR #2221): a production-shaped FAULT-INJECTION
+    integration test. It is NOT a test of an elapsed 0.6s deadline.
+
+    It goes through `contract_readiness_check.run_baseline_vc_preflight()`
+    -- the REAL production entry point `run_root_review_pipeline.py`'s
+    `_cmd_produce()` uses -- with a real `baseline_vc_preflight.py`, a real
+    VC leader (a `pytest` worker process) and a real SIGTERM-ignoring
+    grandchild. After the test has synchronously observed the readiness
+    markers (`self.pid` / `grandchild.pid`), a test-local injection raises
+    `TimeoutExpired` at the supervisor's own outer `communicate(timeout=...)`
+    arm point so the UNMODIFIED production outer-timeout handling branch
+    runs: SIGTERM to the group -> grace -> SIGKILL escalation -> reap ->
+    typed timeout result. It then confirms the `baseline_vc_preflight.py`
+    SIGTERM handler ran (test-only marker), FULL absence of wrapper / VC
+    leader / grandchild, and the typed `runtime_error` /
+    `baseline_vc_preflight_aggregate` payload (never a plain `errors: [...]`
+    blocked payload) within ONE invocation, repeated
+    `_OUTER_DEADLINE_REPEAT_COUNT` times to catch register/unregister
+    ordering races. Real elapsed-timeout coverage lives in
+    `test_scaled_fault_injection_inner_timeout_precedes_outer_deadline`."""
+    interpreter = _venv_python3_interpreter()
+    for iteration in range(_OUTER_DEADLINE_REPEAT_COUNT):
+        _run_outer_timeout_fault_injection_iteration(
+            tmp_path,
+            iteration=iteration,
+            interpreter=interpreter,
+            install_fault_injection=outer_timeout_fault_injection,
+            delay_readiness=False,
         )
 
+
+def test_outer_timeout_fault_injection_waits_for_ready_process_tree(
+    tmp_path, outer_timeout_fault_injection
+):
+    """Issue #2883 deterministic delayed-readiness regression: the fixture's
+    readiness (`self.pid` / `grandchild.pid`) is gated on a release file the
+    test controls, and is held back past the retired fixed 0.6s outer
+    deadline. The retired design (fire the deadline at a fixed elapsed
+    0.6s) necessarily fired before readiness here and broke; the injected
+    timeout instead fires only AFTER the process tree is ready, so the
+    full chain (typed timeout result, SIGTERM handler marker, wrapper / VC
+    leader / grandchild reap) passes regardless of CPU load. No CPU
+    saturation is involved, and only a lower bound on the delay is used."""
+    _run_outer_timeout_fault_injection_iteration(
+        tmp_path,
+        iteration=0,
+        interpreter=_venv_python3_interpreter(),
+        install_fault_injection=outer_timeout_fault_injection,
+        delay_readiness=True,
+    )
 
 
 def test_kill_process_group_reaps_sigterm_ignoring_grandchild(tmp_path):
