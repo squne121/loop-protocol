@@ -4,6 +4,18 @@
 The caller supplies a fresh, already-fetched GraphQL merged-PR snapshot.  This
 adapter performs no GitHub I/O, so snapshot acquisition remains outside the
 Task Context SQLite transaction.
+
+Issue #2817 adds two additive, explicit phases next to ``merged`` / ``completed``
+(whose output is frozen and unchanged):
+
+* ``--phase recover``: explicit retroactive claim recovery. It re-validates a
+  fresh snapshot and the merge identity, then asks ``task_contextctl.py signal
+  recover`` to attach the missing Issue/PR claims in one transaction.
+* ``--phase local-only``: a Task-Context-free permit for the local cleanup of a
+  merged PR that Task Context cannot record. It never calls ``task_contextctl``
+  and writes nothing; the caller-declared ``--task-context-outcome`` is checked
+  against a closed enum, which is a fail-closed local guardrail, not a security
+  boundary.
 """
 
 from __future__ import annotations
@@ -11,8 +23,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[4]
@@ -20,6 +34,36 @@ sys.path.insert(0, str(_ROOT / "scripts"))
 from check_post_merge_cleanup_boundary import validate_report_v1  # noqa: E402
 
 _CTL = _ROOT / "scripts" / "task-context" / "task_contextctl.py"
+
+_HEX40 = re.compile(r"^[0-9a-f]{40}$")
+
+# Issue #2817: a snapshot is "fresh" for `--phase recover` / `--phase local-only`
+# only when its file mtime is within this many seconds of adapter start. The
+# adapter performs no GitHub I/O, so this is the verifiable definition of
+# "fetched immediately before this invocation".
+SNAPSHOT_MAX_AGE_SECONDS = 300
+
+# Issue #2817: the single source of the local-only permitted outcomes -- every
+# case where Task Context cannot record the lifecycle. `<reason>` of
+# `unbound/<reason>` is one of the six diagnose-origin causes that remain
+# recordable-by-neither; `unbound/origin_ambiguous` and `unbound/resolved` are
+# deliberately excluded. This is a caller-declared, fail-closed local
+# guardrail, NOT a security boundary: the adapter cannot verify the outcome.
+LOCAL_ONLY_UNBOUND_REASONS = (
+    "origin_session_missing",
+    "origin_run_not_found",
+    "origin_run_ended",
+    "origin_run_kind_mismatch",
+    "origin_task_unattached",
+    "origin_binding_session_mismatch",
+)
+LOCAL_ONLY_PERMITTED_OUTCOMES = (
+    "deferred/IMPLEMENTATION_NOT_READY",
+    "conflict/FACT_TASK_IDENTITY_CONFLICT",
+    "conflict/OUT_OF_ORDER_SIGNAL",
+    "recovery_rejected",
+    *(f"unbound/{reason}" for reason in LOCAL_ONLY_UNBOUND_REASONS),
+)
 
 
 def _final_success_receipt_reason(receipt_file: Path | None) -> str | None:
@@ -196,12 +240,127 @@ def diagnose_origin(origin_session_id: str | None) -> dict:
     return {"resolved": False, "reason_code": str(envelope.get("code", "ADAPTER_UNAVAILABLE"))}
 
 
+def _print(payload: dict) -> int:
+    print(json.dumps(payload))
+    return 0
+
+
+def _missing_argument() -> int:
+    return _print({"disposition": "rejected_evidence", "reason_code": "MISSING_REQUIRED_ARGUMENT"})
+
+
+def _fresh_merged_evidence(args: argparse.Namespace) -> tuple[dict | None, dict | None]:
+    """Shared snapshot/identity gate of `--phase recover` and `--phase local-only`.
+
+    Returns ``(evidence, None)`` or ``(None, <typed rejection>)``. Order:
+    snapshot validity -> freshness (mtime) -> merge identity binding. Nothing
+    here touches Task Context.
+    """
+    try:
+        snapshot = json.loads(args.snapshot_file.read_text(encoding="utf-8"))
+        snapshot_mtime = args.snapshot_file.stat().st_mtime
+    except (OSError, json.JSONDecodeError):
+        return None, {"disposition": "deferred", "reason_code": "RELATION_UNAVAILABLE"}
+    evidence, reason = _merged_evidence(snapshot, args.issue_number, args.pr_number)
+    if evidence is None:
+        return None, {"disposition": "deferred", "reason_code": reason}
+    if time.time() - snapshot_mtime > SNAPSHOT_MAX_AGE_SECONDS:
+        return None, {"disposition": "deferred", "reason_code": "SNAPSHOT_STALE"}
+    oid = evidence["merge_commit_oid"]
+    if (
+        not _HEX40.fullmatch(oid)
+        or not _HEX40.fullmatch(args.merge_identity)
+        or oid != args.merge_identity
+    ):
+        return None, {"disposition": "rejected_evidence", "reason_code": "MERGE_IDENTITY_MISMATCH"}
+    return evidence, None
+
+
+def _phase_recover(args: argparse.Namespace) -> int:
+    """`--phase recover`: explicit retroactive claim recovery (Issue #2817)."""
+    if not args.explicit_recovery:
+        return _print({"disposition": "rejected_evidence", "reason_code": "EXPLICIT_RECOVERY_REQUIRED"})
+    # The origin must be named explicitly; recovery never falls back to the
+    # ambient CLAUDE_CODE_SESSION_ID of this process.
+    if not args.merge_identity or not args.origin_session_id:
+        return _missing_argument()
+    evidence, rejection = _fresh_merged_evidence(args)
+    if rejection is not None:
+        return _print(rejection)
+    assert evidence is not None
+    result = _run(
+        ["signal", "recover"],
+        {
+            "schema_version": "task-context-request/v1",
+            "operation": "signal_recover",
+            "request_id": "post-merge-cleanup-recover",
+            "payload": {**evidence, "explicit_recovery": True},
+        },
+        origin_session_id=args.origin_session_id,
+    )
+    return _print(result)
+
+
+def _phase_local_only(args: argparse.Namespace) -> int:
+    """`--phase local-only`: caller-declared, Task-Context-free cleanup permit.
+
+    Writes nothing to Task Context, never starts or completes a lifecycle and
+    emits no `cleanup_exec` argv (the worker runs its own executor procedure).
+    """
+    if not (
+        args.merge_identity
+        and args.task_context_outcome
+        and args.worktree_path
+        and args.worktree_path.strip()
+        and args.branch_name
+        and args.branch_name.strip()
+    ):
+        return _missing_argument()
+    evidence, rejection = _fresh_merged_evidence(args)
+    if rejection is not None:
+        return _print(rejection)
+    assert evidence is not None
+    if args.task_context_outcome not in LOCAL_ONLY_PERMITTED_OUTCOMES:
+        return _print({"disposition": "refused", "reason_code": "LOCAL_ONLY_NOT_PERMITTED"})
+    return _print(
+        {
+            "disposition": "local_only",
+            "reason_code": "LOCAL_ONLY_PERMITTED",
+            "task_context": "unrecorded",
+            "authority": {"cleanup_completed": False, "parent_issue_close": False, "superseded_pr_close": False},
+            "repo": evidence["repo"],
+            "issue_number": evidence["issue_number"],
+            "pr_number": evidence["pr_number"],
+            "merge_commit_oid": evidence["merge_commit_oid"],
+            "worktree_path": args.worktree_path,
+            "branch_name": args.branch_name,
+        }
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--snapshot-file", type=Path, required=True)
     parser.add_argument("--issue-number", type=int, required=True)
     parser.add_argument("--pr-number", type=int, required=True)
-    parser.add_argument("--phase", choices=("merged", "completed"), required=True)
+    parser.add_argument("--phase", choices=("merged", "completed", "recover", "local-only"), required=True)
+    parser.add_argument(
+        "--merge-identity",
+        default=None,
+        help="40-hex merge commit OID the caller expects (required for --phase recover / local-only)",
+    )
+    parser.add_argument(
+        "--explicit-recovery",
+        action="store_true",
+        help="explicit recovery request (required for --phase recover)",
+    )
+    parser.add_argument(
+        "--task-context-outcome",
+        default=None,
+        help="caller-declared outcome that justifies local-only (required for --phase local-only; closed enum)",
+    )
+    parser.add_argument("--worktree-path", default=None, help="cleanup target worktree (--phase local-only)")
+    parser.add_argument("--branch-name", default=None, help="cleanup target branch (--phase local-only)")
     parser.add_argument(
         "--cleanup-receipt-file",
         type=Path,
@@ -218,6 +377,10 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+    if args.phase == "recover":
+        return _phase_recover(args)
+    if args.phase == "local-only":
+        return _phase_local_only(args)
     origin_session_id = args.origin_session_id or os.environ.get("CLAUDE_CODE_SESSION_ID")
     try:
         snapshot = json.loads(args.snapshot_file.read_text(encoding="utf-8"))
