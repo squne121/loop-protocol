@@ -4149,6 +4149,36 @@ def _classify_final_environment_failure(blockers: list[str], planner_exit_code: 
     return "planner_internal_error"
 
 
+# Issue #2872 (PR #2876 review P2): confirmable EXTERNAL GitHub outage /
+# connectivity evidence in `gh`'s own stderr snippet. Closed, bounded
+# patterns only -- everything else (including every unrecognised exit 1) stays
+# an unclassified `gh_exit_error`, so an implementation/propagation defect is
+# never relabelled as an external outage. `gh` exits 1 for HTTP errors and
+# connection failures alike, so the exit code alone cannot tell them apart.
+_GH_OUTAGE_STDERR_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("rate_limited", re.compile(r"api rate limit exceeded|secondary rate limit|http 429", re.IGNORECASE)),
+    ("upstream_environment_failure", re.compile(r"http 5\d\d\b", re.IGNORECASE)),
+    (
+        "transport_connectivity_failure",
+        re.compile(
+            r"error connecting to|dial tcp|no such host|connection refused|connection reset"
+            r"|i/o timeout|tls handshake timeout|network is unreachable|temporary failure in name resolution",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def _classify_gh_outage_from_stderr(detail: str) -> Optional[str]:
+    """Return the closed external-outage reason code evidenced by a `gh`
+    stderr snippet, or None when the snippet does not confirm one (Issue
+    #2872). Pure; never echoes any part of `detail`."""
+    for reason_code, pattern in _GH_OUTAGE_STDERR_PATTERNS:
+        if pattern.search(detail or ""):
+            return reason_code
+    return None
+
+
 def _project_environment_failure_reason(err: str) -> str:
     """Map a raw `(data, err)` failure string from any fetch function in
     this module onto the closed `_ENVIRONMENT_FAILURE_REASON_CODES` enum
@@ -4169,7 +4199,9 @@ def _project_environment_failure_reason(err: str) -> str:
         # environment_failure (Issue #2872), never as a secret probe.
         reason = "gh_auth_required"
     elif reason.startswith("gh_exit_"):
-        reason = "gh_exit_error"
+        # Only a stderr-confirmed external outage is projected onto the
+        # outage reason codes; every other exit stays `gh_exit_error`.
+        reason = _classify_gh_outage_from_stderr(reason.partition(":")[2]) or "gh_exit_error"
     elif reason.startswith("gh_not_found"):
         reason = "gh_not_found"
     elif reason.startswith("gh_timeout"):
@@ -4206,6 +4238,9 @@ def _classify_gh_single_comment_error(err: str) -> str:
             # this is exactly the isolated-profile failure mode Issue
             # #2197 misclassified as ANCHOR_COMMENT_NOT_FOUND.
             return f"{_TRANSPORT_FAILURE_PREFIX}gh_auth_required"
+        outage = _classify_gh_outage_from_stderr(detail)
+        if outage is not None:
+            return f"{_TRANSPORT_FAILURE_PREFIX}{outage}"
         return f"{_TRANSPORT_FAILURE_PREFIX}gh_exit_{code_str}"
     if err.startswith("gh_not_found"):
         return f"{_TRANSPORT_FAILURE_PREFIX}gh_not_found"
