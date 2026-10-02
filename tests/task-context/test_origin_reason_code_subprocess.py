@@ -309,3 +309,136 @@ def test_given_existing_db_when_diagnose_origin_cli_runs_then_schema_and_data_ar
     after_mtime = db_file.stat().st_mtime_ns
     assert after_bytes == before_bytes, "diagnose-origin must never mutate the existing DB file's bytes"
     assert after_mtime == before_mtime, "diagnose-origin must never even touch/rewrite the existing DB file"
+
+
+# ---------------------------------------------------------------------------
+# Issue #2817 PR #2873 review fix_delta A (P1): the post-merge-cleanup SKILL's
+# canonical explicit-origin diagnose-origin invocation must really diagnose
+# the explicit origin S (not the ambient parent env R), and the old
+# `--origin-session-id` form on diagnose-origin must stay a parser error.
+# ---------------------------------------------------------------------------
+
+_SKILL_PATH = _REPO_ROOT / ".claude" / "skills" / "post-merge-cleanup" / "SKILL.md"
+_CANONICAL_PREFIX = "uv run --locked python3 "
+
+
+def _skill_canonical_diagnose_command() -> str:
+    import re
+
+    text = _SKILL_PATH.read_text(encoding="utf-8")
+    commands = [
+        line.strip()
+        for block in re.findall(r"```bash\n(.*?)```", text, flags=re.S)
+        for line in block.splitlines()
+        if "signal diagnose-origin" in line
+    ]
+    assert len(commands) == 1, commands
+    return commands[0]
+
+
+def _run_skill_canonical_command(*, state_root, origin: str, ambient: str) -> dict:
+    """Run the exact command string the SKILL documents through a real shell.
+
+    Only the `uv run --locked python3 ` launcher is swapped for the current
+    interpreter (so the test does not depend on uv resolving offline); the
+    env-prefix, script path, subcommand and `</dev/null` are the SKILL's own."""
+    import shlex
+
+    command = _skill_canonical_diagnose_command()
+    assert command.startswith('CLAUDE_CODE_SESSION_ID="$ORIGIN_SESSION_ID" ' + _CANONICAL_PREFIX), command
+    runnable = command.replace(_CANONICAL_PREFIX, shlex.quote(sys.executable) + " ", 1)
+    child_env = dict(os.environ)
+    child_env["LOOP_TASK_CONTEXT_STATE_ROOT"] = str(state_root)
+    child_env["CLAUDE_CODE_SESSION_ID"] = ambient  # the parent process env (R)
+    child_env["ORIGIN_SESSION_ID"] = origin  # the explicit target origin (S)
+    proc = subprocess.run(
+        ["bash", "-c", runnable], cwd=_REPO_ROOT, capture_output=True, text=True, env=child_env, timeout=30
+    )
+    assert proc.returncode == 0, proc.stderr
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+    return json.loads(lines[-1])
+
+
+def test_given_explicit_origin_differs_from_ambient_when_skill_canonical_diagnose_runs_then_origin_is_diagnosed(
+    state_root, conn
+):
+    # S: explicit target origin whose run has ended -> origin_run_ended.
+    ended = _bind_ended_origin(conn, session_id="explicit-origin-s")
+    # R: ambient parent session, live and fully bound -> resolved.
+    live_task = service.create_task(conn, title="ambient-r-live")
+    live_activity = service.transition_activity(conn, live_task["id"], "implementation")
+    live_binding = service.create_binding(conn)
+    live_run = service.start_execution_run(
+        conn,
+        run_kind="native_operator",
+        task_id=live_task["id"],
+        activity_id=live_activity["id"],
+        binding_id=live_binding["id"],
+        claude_session_id="ambient-parent-r",
+    )
+    service.set_binding_session(conn, live_binding["id"], "ambient-parent-r", execution_run_id=live_run["id"])
+    conn.close()
+
+    diagnosed = _run_skill_canonical_command(
+        state_root=state_root, origin="explicit-origin-s", ambient="ambient-parent-r"
+    )
+    assert diagnosed["data"]["resolved"] is False
+    assert diagnosed["data"]["reason_code"] == "origin_run_ended"  # S was diagnosed, not R
+
+    # Control: swapping the roles diagnoses the other session, so the result
+    # above is not an accident of the fixture.
+    swapped = _run_skill_canonical_command(
+        state_root=state_root, origin="ambient-parent-r", ambient="explicit-origin-s"
+    )
+    assert swapped["data"]["resolved"] is True
+    assert swapped["data"]["execution_run_id"] == live_run["id"]
+    assert ended["run"]["id"] != live_run["id"]
+
+    # Control: omitting the explicit setting (what the old SKILL text amounted
+    # to) diagnoses the ambient R, the wrong session for an S-origin apply.
+    ambient_only = _run_ctl(
+        ["signal", "diagnose-origin"], {}, state_root=state_root, claude_session_id="ambient-parent-r"
+    )
+    assert ambient_only["data"]["resolved"] is True
+
+
+def test_given_origin_session_id_option_when_diagnose_origin_cli_runs_then_it_is_a_parser_error(state_root, conn):
+    """The pre-fix SKILL told callers to pass `--origin-session-id` to
+    diagnose-origin; the parser has no such option, so that form is broken."""
+    conn.close()
+    child_env = dict(os.environ)
+    child_env["LOOP_TASK_CONTEXT_STATE_ROOT"] = str(state_root)
+    proc = subprocess.run(
+        [sys.executable, str(_CTL), "signal", "diagnose-origin", "--origin-session-id", "explicit-origin-s"],
+        capture_output=True,
+        text=True,
+        env=child_env,
+        stdin=subprocess.DEVNULL,
+        timeout=15,
+    )
+    assert proc.returncode == 2
+    assert "unrecognized arguments: --origin-session-id" in proc.stderr
+    assert proc.stdout.strip() == ""
+
+
+def test_given_no_db_when_skill_canonical_diagnose_runs_then_nothing_is_created(tmp_path):
+    fresh_root = tmp_path / "never-materialized-state-root"
+    diagnosed = _run_skill_canonical_command(state_root=fresh_root, origin="explicit-origin-s", ambient="parent-r")
+    assert diagnosed["data"] == {"resolved": False, "reason_code": "origin_run_not_found"}
+    assert not fresh_root.exists()
+
+
+def test_given_existing_db_when_skill_canonical_diagnose_runs_then_every_row_is_unchanged(state_root, conn):
+    from retroactive_claim_support import dump_db
+
+    _bind_ended_origin(conn, session_id="explicit-origin-s")
+    before = dump_db(conn)
+    conn.close()
+    db_file = config.db_path()
+    before_bytes = db_file.read_bytes()
+
+    diagnosed = _run_skill_canonical_command(state_root=state_root, origin="explicit-origin-s", ambient="parent-r")
+
+    assert diagnosed["data"]["reason_code"] == "origin_run_ended"
+    assert db_file.read_bytes() == before_bytes
+    assert dump_db() == before

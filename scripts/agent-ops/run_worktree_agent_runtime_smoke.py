@@ -126,6 +126,11 @@ _PUBLIC_EVIDENCE_SHA_LENGTHS = {
     ("approval_carrier", "repo_head"): 40,
     ("approval_carrier", "overlay_sha256"): 64,
     ("approval_carrier", "fixture_git_blob_hash"): 40,
+    # Issue #2840: ``--named-subagent-resume`` evidence (public-safe ids/hashes only).
+    ("named_subagent_resume", "tested_head"): 40,
+    ("named_subagent_resume", "launcher", "sha256"): 64,
+    ("named_subagent_resume", "fixtures", "prompt_sha256"): 64,
+    ("named_subagent_resume", "fixtures", "compat_note_sha256"): 64,
 }
 
 # Issue #2421: ``resolved_executable`` must never persist a raw absolute
@@ -653,6 +658,48 @@ _CLAUDE_SPAWN_HOOK_OBSERVABILITY_WITH_USER_PROMPT_EXPANSION_SETTINGS_JSON = json
     },
 })
 
+# Issue #2840: opt-in ``--named-subagent-resume`` scenario overlay.  A SEPARATE
+# constant (never a mutation of the two constants above), so every default
+# smoke keeps observing byte-identical ``--settings`` JSON.  Compared with the
+# default overlay this scenario drops ONLY the harness's blanket ``SendMessage``
+# deny (a name-addressed resume needs ``SendMessage``).  ``ListAgents`` deny,
+# ``crossSessionInbound: refuse`` and the normal permission decision flow are
+# kept; no permission mode is set here (never a bypass mode).  The hook set is
+# GENERIC observation only (``cat`` echoes the hook's own stdin payload so the
+# stream-json channel carries it): it never carries a Task Context verdict.
+# ``NAMED_SUBAGENT_RESUME_OBSERVATION_HOOKS`` is the single definition shared by
+# this overlay and the launcher-owned fixed value
+# (``CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-name-resume``); the AC1 tests assert
+# both sides carry exactly this set.
+NAMED_SUBAGENT_RESUME_OBSERVATION_HOOKS = (
+    ("SubagentStart", None),
+    ("SubagentStop", None),
+    ("PostToolUse", "Agent"),
+    ("PreToolUse", "SendMessage"),
+)
+
+
+def _named_subagent_resume_hooks_payload() -> dict:
+    hooks: dict = {}
+    for event, matcher in NAMED_SUBAGENT_RESUME_OBSERVATION_HOOKS:
+        group: dict = {"hooks": [{"type": "command", "command": "cat"}]}
+        if matcher is not None:
+            group = {"matcher": matcher, **group}
+        hooks[event] = [group]
+    return hooks
+
+
+_NAMED_SUBAGENT_RESUME_SETTINGS_JSON = json.dumps({
+    "crossSessionInbound": "refuse",
+    "permissions": {"deny": ["ListAgents"]},
+    "hooks": _named_subagent_resume_hooks_payload(),
+})
+
+# Launcher-owned fixed ``CLAUDE_GPT_RUNTIME_SMOKE_HOOKS`` value for this scenario
+# (``scripts/claude-gpt/launch.sh``).  The runner only ever sets this one fixed
+# string; no caller-supplied JSON / ``--settings`` crosses the launcher boundary.
+NAMED_SUBAGENT_RESUME_LAUNCHER_SMOKE_HOOKS = "subagent-name-resume"
+
 
 # ---------------------------------------------------------------------------
 # Issue #2663: generic hook-chain evidence capability -- bounded, CLOSED
@@ -735,14 +782,17 @@ def _read_project_settings(worktree: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _load_command_hooks_for_event(
+def _load_command_hook_records_for_event(
     settings: dict, event: str, tool_name: str | None
-) -> list[str]:
-    """The ``command`` template string of every ``type: "command"`` hook
-    registered under ``hooks[event]`` in a parsed ``.claude/settings.json``
-    object, restricted to groups whose ``matcher`` token-set covers
-    ``tool_name`` (or every group, when ``tool_name`` is ``None`` -- used
-    for matcher-less events like ``Stop``).
+) -> list[dict]:
+    """Detailed form of ``_load_command_hooks_for_event`` (Issue #2865): one
+    ``{"command": str, "has_if": bool, "if": <raw value or None>}`` record
+    per ``type: "command"`` hook registered under ``hooks[event]``,
+    restricted to groups whose ``matcher`` token-set covers ``tool_name``
+    (or every group, when ``tool_name`` is ``None`` -- used for matcher-less
+    events like ``Stop``). ``has_if`` is ``True`` whenever the hook object
+    carries an ``if`` key at all (regardless of its value type), so a
+    malformed ``if`` is never silently read as "no condition".
 
     Issue #2663 Out of Scope: this deliberately mirrors (but does not
     subprocess-execute, and is not imported from)
@@ -753,9 +803,9 @@ def _load_command_hooks_for_event(
     reuses that harness's SEQUENTIAL SUBPROCESS EXECUTION technique as a
     runtime evidence producer (Out of Scope)."""
     groups = (settings.get("hooks") or {}).get(event) or []
-    commands: list[str] = []
+    records: list[dict] = []
     if not isinstance(groups, list):
-        return commands
+        return records
     for group in groups:
         if not isinstance(group, dict):
             continue
@@ -769,8 +819,115 @@ def _load_command_hooks_for_event(
                 continue
             command = hook.get("command")
             if isinstance(command, str):
-                commands.append(command)
-    return commands
+                records.append({
+                    "command": command,
+                    "has_if": "if" in hook,
+                    "if": hook.get("if"),
+                })
+    return records
+
+
+def _load_command_hooks_for_event(
+    settings: dict, event: str, tool_name: str | None
+) -> list[str]:
+    """The ``command`` template string of every ``type: "command"`` hook
+    registered under ``hooks[event]`` (see
+    ``_load_command_hook_records_for_event`` for the matcher semantics).
+    Kept as a ``list[str]`` wrapper for consumers that only need the command
+    text (e.g. the Stop-event target-handler configured check)."""
+    return [
+        record["command"]
+        for record in _load_command_hook_records_for_event(settings, event, tool_name)
+    ]
+
+
+# Issue #2865: handler-level ``if`` evaluation for the hook-chain evidence
+# expected count. Deliberately NOT a Bash parser / permission-rule
+# interpreter: only the exact current-settings form ``Bash(<word> *)`` and a
+# conservative "provably a single plain command" check are decided; anything
+# else is ``unknown`` and never counted towards a pass.
+_HOOK_IF_MATCH = "match"
+_HOOK_IF_NONMATCH = "nonmatch"
+_HOOK_IF_UNKNOWN = "unknown"
+_HOOK_IF_BASH_RULE_RE = re.compile(r"Bash\(([A-Za-z0-9_][A-Za-z0-9_.+-]*) \*\)")
+_HOOK_IF_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:@%+,=-]*")
+_HOOK_IF_BARE_WORD_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.+-]*")
+_HOOK_IF_SHELL_CONTROL_CHARS = frozenset("&|;<>()`$\\\n\r{}")
+_HOOK_IF_QUOTE_CHARS = frozenset("'\"")
+# Bash words are separated only by space / tab (newline separates commands).
+# Any other Unicode / control whitespace (NBSP, \r, \x0b, \x0c, \x1c-\x1f,
+# U+2028, ...) is part of a Bash word, so a command containing one cannot be
+# tokenised the way Python's bare ``str.split()`` would; it is ``unknown``.
+_HOOK_IF_BASH_SEPARATORS = " \t\n"
+_HOOK_IF_SPLIT_RE = re.compile(r"[ \t\n]+")
+# Words that run / modify / introduce another command: a command starting
+# with one of these is never provably "just this word" (``timeout 5 herdr
+# x`` fires a ``herdr *`` rule through the wrapped command), so it is
+# ``unknown`` rather than ``nonmatch``.
+_HOOK_IF_WRAPPER_WORDS = frozenset({
+    "timeout", "time", "nice", "nohup", "stdbuf", "xargs", "env", "command",
+    "exec", "sudo", "sh", "bash", "zsh", "eval",
+    "doas", "su", "setsid", "ionice", "chrt", "taskset", "flock", "watch",
+    "strace", "ltrace", "unbuffer", "parallel", "busybox", "builtin", "source",
+    "if", "then", "else", "elif", "fi", "while", "until", "for", "do", "done",
+    "case", "esac", "select", "function", "coproc",
+})
+
+
+def _evaluate_hook_if_condition(if_value: object, tool_name: object, command: object) -> str:
+    """3-valued evaluation of one hook's handler-level ``if`` condition for
+    one ``Bash`` tool call (Issue #2865): ``"match"`` (the hook fires),
+    ``"nonmatch"`` (provably does not fire) or ``"unknown"`` (cannot be
+    decided here). Pure function of its inputs; the command text is only
+    inspected in memory and never returned or logged."""
+    if tool_name != "Bash" or not isinstance(if_value, str):
+        return _HOOK_IF_UNKNOWN
+    rule = _HOOK_IF_BASH_RULE_RE.fullmatch(if_value)
+    if rule is None:
+        return _HOOK_IF_UNKNOWN
+    if not isinstance(command, str) or not command.strip():
+        return _HOOK_IF_UNKNOWN
+    if any(ch.isspace() and ch not in _HOOK_IF_BASH_SEPARATORS for ch in command):
+        return _HOOK_IF_UNKNOWN
+    word = rule.group(1)
+    tokens = [tok for tok in _HOOK_IF_SPLIT_RE.split(command) if tok]
+    index = 0
+    while index < len(tokens) and _HOOK_IF_ASSIGNMENT_RE.fullmatch(tokens[index]):
+        index += 1
+    if index >= len(tokens):
+        return _HOOK_IF_UNKNOWN
+    first = tokens[index]
+    if first == word:
+        # ``Bash(<word> *)`` also matches the bare word (no arguments); a
+        # compound command whose first subcommand is the word fires too.
+        return _HOOK_IF_MATCH
+    if (
+        any(ch in _HOOK_IF_SHELL_CONTROL_CHARS or ch in _HOOK_IF_QUOTE_CHARS for ch in command)
+        or _HOOK_IF_BARE_WORD_RE.fullmatch(first) is None
+        or first in _HOOK_IF_WRAPPER_WORDS
+    ):
+        return _HOOK_IF_UNKNOWN
+    return _HOOK_IF_NONMATCH
+
+
+def _expected_hook_count_for_command(
+    hook_records: list[dict], tool_name: str, command: object
+) -> int | None:
+    """The number of non-observer hooks expected to fire for one tool call,
+    or ``None`` when any conditional hook's ``if`` is ``unknown`` (the
+    expected count is then NOT a confirmed value; an undecidable hook is
+    never added to the count). Hooks without an ``if`` always count."""
+    expected = 0
+    for record in hook_records:
+        if not record["has_if"]:
+            expected += 1
+            continue
+        verdict = _evaluate_hook_if_condition(record["if"], tool_name, command)
+        if verdict == _HOOK_IF_MATCH:
+            expected += 1
+        elif verdict == _HOOK_IF_UNKNOWN:
+            return None
+    return expected
 
 
 def _task_context_env_pairs(
@@ -840,6 +997,7 @@ def _load_approval_contract():
 def select_native_observation_settings_json(
     *, include_user_prompt_expansion_hook: bool = False,
     include_hook_chain_evidence_hooks: bool = False,
+    named_subagent_resume: bool = False,
 ) -> str:
     """Issue #2839 (PR #2844 OWNER fix_delta): native adapter が子 ``claude -p`` へ渡す固定
     observation overlay (``--settings`` の JSON) を選択して返す唯一の関数。
@@ -847,7 +1005,17 @@ def select_native_observation_settings_json(
     ``run_structured_claude()`` と、approval carrier の overlay を組み立てる ``main()`` の
     両方がこの関数を使うため、carrier は runner が実際に選択した overlay (hook-chain 用の
     PreToolUse / Stop を含む) の同じ内容へ ``autoMode`` を足す形で合成される。
-    caller 由来の JSON / 文字列は受け取らない。"""
+    caller 由来の JSON / 文字列は受け取らない。
+
+    Issue #2840: ``named_subagent_resume=True`` は固定 scenario overlay
+    (``_NAMED_SUBAGENT_RESUME_SETTINGS_JSON``。blanket ``SendMessage`` deny だけを外す) を
+    返す。他の opt-in 観測 overlay とは併用しない単独 scenario である。"""
+    if named_subagent_resume:
+        if include_user_prompt_expansion_hook or include_hook_chain_evidence_hooks:
+            raise ValueError(
+                "named_subagent_resume overlay cannot be combined with other observation overlays"
+            )
+        return _NAMED_SUBAGENT_RESUME_SETTINGS_JSON
     # Issue #2498 AC4: purely additive -- the extended settings JSON
     # (adding a "UserPromptExpansion" hook registration) is used ONLY
     # when the caller opted into ``--expect-skill-command``. Every
@@ -909,6 +1077,8 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
                            task_context_state_root: str | None = None,
                            approval_settings_json: str | None = None,
                            approval_child_env: dict[str, str] | None = None,
+                           named_subagent_resume: bool = False,
+                           append_system_prompt_file: str | None = None,
                            ) -> tuple[int | None, str, str, bool]:
     """Issue #2839: ``approval_settings_json`` / ``approval_child_env`` は
     ``--approval-profile`` 使用時にだけ main() が渡す、registry 由来の固定 overlay と、
@@ -940,14 +1110,25 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
         # unparsed. The 'native' adapter never receives this separator, so
         # its argv shape is unchanged.
         argv.append("--")
+    # Issue #2840: a name-addressed ``SendMessage`` resume re-reads the child's
+    # persisted transcript, so the opt-in named SubAgent resume scenario (and
+    # ONLY that scenario) must not pass ``--no-session-persistence``
+    # (confirmed live: with it, ``SendMessage`` fails with "No transcript found
+    # for agent ID").  Every other caller keeps the exact default argv.
     argv += [
         "-p",
         "--output-format", "stream-json",
         "--include-hook-events",
-        "--no-session-persistence",
+        *([] if named_subagent_resume else ["--no-session-persistence"]),
         "--max-turns", str(max_turns),
         "--verbose",
     ]
+    if append_system_prompt_file and not named_subagent_resume:
+        raise ValueError("append_system_prompt_file is only supported by the named SubAgent resume scenario")
+    # Issue #2840: invocation-local compatibility note.  Passed through the CLI's
+    # own per-invocation capability (never a permanent system-prompt injection).
+    if append_system_prompt_file:
+        argv += ["--append-system-prompt-file", append_system_prompt_file]
     # Issue #2176: a launcher wrapper pinned via ``--claude-bin`` (e.g.
     # ``scripts/claude-gpt/launch.sh``) rejects any ``--settings`` CLI flag
     # outright as a policy-weakening extra flag
@@ -972,11 +1153,16 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
             # ため、carrier は native adapter 専用である (呼び出し側の precondition の二重防御)。
             raise ValueError("approval carrier requires the native adapter")
         launch_env = os.environ.copy()
-        launch_env["CLAUDE_GPT_RUNTIME_SMOKE_HOOKS"] = "subagent-start-stop"
+        launch_env["CLAUDE_GPT_RUNTIME_SMOKE_HOOKS"] = (
+            NAMED_SUBAGENT_RESUME_LAUNCHER_SMOKE_HOOKS
+            if named_subagent_resume
+            else "subagent-start-stop"
+        )
     else:
         settings_json = select_native_observation_settings_json(
             include_user_prompt_expansion_hook=include_user_prompt_expansion_hook,
             include_hook_chain_evidence_hooks=include_hook_chain_evidence_hooks,
+            named_subagent_resume=named_subagent_resume,
         )
         if approval_settings_json is not None:
             # Issue #2839: carrier の overlay は、上で選択した観測 overlay と同じ内容に
@@ -2839,9 +3025,14 @@ def extract_claude_hook_event_records(
 
 
 def _claude_bash_tool_use_events(stdout: str) -> list[dict]:
-    """Every ``Bash`` ``tool_use`` block's ``{"stream_index", "tool_use_id"}``
-    (Issue #2663 AC5 positive/deny scenario windowing) -- never the
-    command text itself, which is never read or persisted here."""
+    """Every ``Bash`` ``tool_use`` block's ``{"stream_index", "tool_use_id",
+    "command"}`` (Issue #2663 AC5 positive/deny scenario windowing).
+
+    Issue #2865: ``command`` is ``input.command`` bound to its own
+    ``tool_use_id`` (``None`` when absent or not a string) and exists only
+    in memory so handler-level ``if`` conditions can be evaluated per
+    window -- it is never copied into any summary / evidence / error
+    text."""
     results: list[dict] = []
     for stream_index, payload in enumerate(_iter_claude_stream_events(stdout)):
         if payload.get("type") != "assistant":
@@ -2856,7 +3047,13 @@ def _claude_bash_tool_use_events(stdout: str) -> list[dict]:
                 and block.get("type") == "tool_use"
                 and block.get("name") == "Bash"
             ):
-                results.append({"stream_index": stream_index, "tool_use_id": block.get("id")})
+                tool_input = block.get("input")
+                command = tool_input.get("command") if isinstance(tool_input, dict) else None
+                results.append({
+                    "stream_index": stream_index,
+                    "tool_use_id": block.get("id"),
+                    "command": command if isinstance(command, str) else None,
+                })
     return results
 
 
@@ -2911,7 +3108,9 @@ def _pair_pretool_hook_records_globally(records: list[dict]) -> dict:
     return {"paired": paired, "orphan_responses": orphan_responses}
 
 
-def _evaluate_hook_chain_window(paired: list[dict], unmatched_response_count: int, expected_count: int) -> dict:
+def _evaluate_hook_chain_window(
+    paired: list[dict], unmatched_response_count: int, expected_count: int | None
+) -> dict:
     """Evaluate one PreToolUse/Bash scenario window (Issue #2663 AC2/AC6).
 
     ``paired`` is every GLOBALLY hook_id-matched ``{"started", "response"}``
@@ -2931,7 +3130,14 @@ def _evaluate_hook_chain_window(paired: list[dict], unmatched_response_count: in
     none orphaned/missing/unattributable-extra" -- never "the specific N
     handlers named in settings.json, individually, each ran" (no channel
     exists to prove the latter; see the "Confirmed runtime-capability
-    boundary" comment above ``_hook_chain_self_echo_fields``)."""
+    boundary" comment above ``_hook_chain_self_echo_fields``).
+
+    Issue #2865: ``expected_count`` is this window's OWN expected count
+    (handler-level ``if`` conditions already resolved for this window's
+    Bash command), or ``None`` when some conditional hook's ``if`` could
+    not be decided -- such a window is ``unverified`` (reason
+    ``if_condition_unverifiable``) and never ``pass``, regardless of the
+    observed count."""
     self_echo = [p for p in paired if p["response"]["is_self_echo"]]
     non_observer = [p for p in paired if not p["response"]["is_self_echo"]]
 
@@ -2956,6 +3162,15 @@ def _evaluate_hook_chain_window(paired: list[dict], unmatched_response_count: in
             "observed_count": observed_count,
             "expected_count": expected_count,
             "unmatched_response_count": unmatched_response_count,
+            "denied": denied,
+        }
+    if expected_count is None:
+        return {
+            "status": "unverified",
+            "reason": "if_condition_unverifiable",
+            "observed_count": observed_count,
+            "expected_count": None,
+            "unmatched_response_count": 0,
             "denied": denied,
         }
     if observed_count < expected_count:
@@ -3084,19 +3299,27 @@ def evaluate_all_matching_hooks_observed(stdout: str, worktree: str) -> dict:
             "deny_window_count": 0,
             "windows": [],
         }
-    expected_commands = _load_command_hooks_for_event(
+    expected_hook_records = _load_command_hook_records_for_event(
         settings, _HOOK_CHAIN_EVIDENCE_EVENT, _HOOK_CHAIN_EVIDENCE_TOOL
     )
-    expected_count = len(expected_commands)
 
     bash_tool_uses = _claude_bash_tool_use_events(stdout)
+    # Issue #2865: expected count is per Bash tool_use (handler-level ``if``
+    # conditions are evaluated against THAT call's own command); ``None``
+    # means "not decidable" and is never turned into a number.
+    per_tool_use_expected: list[int | None] = [
+        _expected_hook_count_for_command(
+            expected_hook_records, _HOOK_CHAIN_EVIDENCE_TOOL, tool_use["command"]
+        )
+        for tool_use in bash_tool_uses
+    ]
 
     if not bash_tool_uses:
         return {
             "status": "fail",
             "passed": False,
             "reason": "no_bash_tool_use_observed",
-            "expected_count": expected_count,
+            "expected_count": None,
             "positive_window_count": 0,
             "deny_window_count": 0,
             "windows": [],
@@ -3171,7 +3394,7 @@ def evaluate_all_matching_hooks_observed(stdout: str, worktree: str) -> dict:
                     "status": "unverified",
                     "reason": "self_echo_tool_use_id_ambiguous",
                     "observed_count": 0,
-                    "expected_count": expected_count,
+                    "expected_count": per_tool_use_expected[len(window_bounds) - 1],
                     "unmatched_response_count": 0,
                     "denied": False,
                 })
@@ -3206,7 +3429,8 @@ def evaluate_all_matching_hooks_observed(stdout: str, worktree: str) -> dict:
             window_results.append(window_forced[i])
         else:
             window_results.append(_evaluate_hook_chain_window(
-                per_window_paired[i], per_window_unmatched_response_count[i], expected_count
+                per_window_paired[i], per_window_unmatched_response_count[i],
+                per_tool_use_expected[i],
             ))
 
     if any(w["status"] == "fail" for w in window_results):
@@ -3222,11 +3446,17 @@ def evaluate_all_matching_hooks_observed(stdout: str, worktree: str) -> dict:
 
     positive_window_count = sum(1 for w in window_results if not w["denied"])
     deny_window_count = sum(1 for w in window_results if w["denied"])
+    # Issue #2865: ``windows[i].expected_count`` is canonical; the top-level
+    # value is the common value only when every window agrees, else ``None``.
+    window_expected_values = {w["expected_count"] for w in window_results}
+    top_level_expected_count = (
+        next(iter(window_expected_values)) if len(window_expected_values) == 1 else None
+    )
     return {
         "status": overall_status,
         "passed": overall_status == "pass",
         "reason": None if overall_status == "pass" else "see windows[]",
-        "expected_count": expected_count,
+        "expected_count": top_level_expected_count,
         "positive_window_count": positive_window_count,
         "deny_window_count": deny_window_count,
         "windows": window_results,
@@ -6658,6 +6888,1173 @@ def count_session_log_metadata(raw_lines: list[str]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Issue #2840: opt-in named SubAgent spawn -> complete -> name resume -> complete
+# scenario (``--named-subagent-resume``).
+#
+# Ownership boundary: everything below is GENERIC observation and correlation of
+# the already-captured native stream-json channel (hook name, decision kind,
+# name <-> agent ID correspondence, lifecycle ordering).  This runner never
+# emits a Task Context semantic verdict -- that stays owned by
+# ``scripts/task-context/task_context_runtime_smoke_verifier.py::
+# orchestrate_runtime_smoke()`` (the SKILL documents how to call it).
+# ---------------------------------------------------------------------------
+
+NAMED_SUBAGENT_RESUME_EVIDENCE_SCHEMA = "NAMED_SUBAGENT_RESUME_EVIDENCE_V1"
+NAMED_SUBAGENT_RESUME_FIXTURE_DIR_RELPATH = ".claude/skills/worktree-agent-runtime-smoke/fixtures"
+NAMED_SUBAGENT_RESUME_PROMPT_FIXTURE_RELPATH = (
+    NAMED_SUBAGENT_RESUME_FIXTURE_DIR_RELPATH + "/named-subagent-resume.prompt.md"
+)
+NAMED_SUBAGENT_RESUME_COMPAT_FIXTURE_RELPATH = (
+    NAMED_SUBAGENT_RESUME_FIXTURE_DIR_RELPATH + "/named-subagent-resume.compat.md"
+)
+NAMED_SUBAGENT_RESUME_LAUNCHER_RELPATH = "scripts/claude-gpt/launch.sh"
+NAMED_SUBAGENT_RESUME_AGENT_NAME = "named-resume-worker"
+NAMED_SUBAGENT_RESUME_FIRST_MARKER = "NAMED_RESUME_FIRST_DONE"
+NAMED_SUBAGENT_RESUME_SECOND_MARKER = "NAMED_RESUME_SECOND_DONE"
+
+NAMED_RESUME_VERDICT_PASS = "pass"
+NAMED_RESUME_VERDICT_FAIL = "fail"
+NAMED_RESUME_VERDICT_SKIP = "skip"
+
+NAMED_RESUME_FAILURE_LAYERS = (
+    "client_schema",
+    "launcher_config",
+    "proxy_translation",
+    "backend_model_emission",
+    "hook_lifecycle",
+    "unclassified",
+)
+
+_NAMED_RESUME_SPAWN_TOOL_NAMES = frozenset({"Agent", "Task"})
+_NAMED_RESUME_NON_ALLOW_DECISIONS = frozenset({"ask", "deny", "block", "defer"})
+_NAMED_RESUME_CLIENT_SCHEMA_ERROR_RE = re.compile(
+    r"InputValidationError|unexpected parameter|is not a valid parameter|"
+    r"Invalid input|schema validation|unknown (?:parameter|field)",
+    re.IGNORECASE,
+)
+# Proxy translation evidence: only strings that describe an actual translation fault
+# (a malformed-request rejection: ``API Error: 400`` / ``422``, ``invalid_request_error``,
+# a tool-schema / strict tool|function message).  A generic ``API Error: 4xx/5xx`` (401
+# auth, 429 rate limit, 529 overload, 5xx upstream) is NOT evidence and is never matched
+# here.  The bare product name (``claude-code-proxy``) is deliberately NOT a pattern: it
+# appears in the launcher's normal ``launcher=... proxy=<version>`` startup line, and a
+# normal log line must never change which layer a failure is attributed to.
+_NAMED_RESUME_PROXY_ERROR_RE = re.compile(
+    r"invalid_request_error|API Error: *(?:400|422)\b|"
+    r"tool[^\n]{0,40}schema|strict[^\n]{0,40}(?:tool|function)",
+    re.IGNORECASE,
+)
+# A ``result`` error event carrying one of these API statuses is a request the upstream
+# rejected as malformed (the shape of a translation fault).  Other statuses (auth, rate
+# limit, overload) say nothing about translation.
+_NAMED_RESUME_TRANSLATION_API_STATUSES = frozenset({400, 422})
+_NAMED_RESUME_LAUNCHER_STARTUP_LINE_PREFIX = "launcher="
+# Hook execution outcomes that are a normal run of the hook.
+_NAMED_RESUME_HOOK_OK_OUTCOMES = frozenset({None, "success"})
+_HOME_PATH_RE = re.compile(r"/(?:home|root|Users)/[^\s\"']+")
+
+
+def _nr_public_text(value: str) -> str:
+    """Strip HOME-style absolute paths from a string that may reach public evidence."""
+    return _HOME_PATH_RE.sub("<redacted-path>", value)
+
+
+def _nr_public_path(path: str | None, *, repo_root: str | None = None) -> str | None:
+    """Public-safe rendering of a filesystem path: repo-relative when inside the
+    checkout, ``~/...`` when under HOME, otherwise the path unchanged unless it
+    still looks like a HOME path (then only the basename is kept)."""
+    if not path:
+        return None
+    candidate = os.path.abspath(path)
+    if repo_root:
+        root = os.path.abspath(repo_root)
+        if candidate == root or candidate.startswith(root + os.sep):
+            return os.path.relpath(candidate, root)
+    home = os.path.expanduser("~")
+    if home and home != "~" and (candidate == home or candidate.startswith(home + os.sep)):
+        return "~" + candidate[len(home):]
+    return os.path.basename(candidate) if _HOME_PATH_RE.search(candidate) else candidate
+
+
+def _nr_file_sha256(path: str | None) -> str | None:
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _nr_text_blocks(message: object) -> list[str]:
+    """Plain text a (child) assistant message *reports*: ``text`` blocks and the
+    ``message`` of a ``SubagentHandback`` tool_use (the handback form).  The input
+    strings of any other ``tool_use`` (e.g. ``Grep(pattern=<marker>)``) are what the
+    model asked a tool to do, never a result, and are not returned."""
+    texts: list[str] = []
+    if not isinstance(message, dict):
+        return texts
+    content = message.get("content")
+    if isinstance(content, str):
+        texts.append(content)
+        return texts
+    if not isinstance(content, list):
+        return texts
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text" and isinstance(block.get("text"), str):
+            texts.append(block["text"])
+        elif (
+            block.get("type") == "tool_use" and block.get("name") == "SubagentHandback"
+            and isinstance(block.get("input"), dict) and isinstance(block["input"].get("message"), str)
+        ):
+            texts.append(block["input"]["message"])
+    return texts
+
+
+def _nr_hook_payload(event: dict) -> dict | None:
+    """Embedded hook stdin payload from a ``hook_response`` stream event (``cat``
+    echoes it on ``stdout``/``output``).  Only an exact object parse is accepted."""
+    for key in ("stdout", "output"):
+        raw = event.get(key)
+        if isinstance(raw, str) and raw.strip():
+            parsed = _parse_embedded_json_object(raw)
+            if parsed is not None and "hook_event_name" in parsed:
+                return parsed
+    return None
+
+
+def _nr_hook_decision(event: dict) -> str:
+    """Generic decision kind of a ``PreToolUse`` hook response: the value of
+    ``hookSpecificOutput.permissionDecision`` (or a legacy top-level ``decision``)
+    when the hook stdout carries a decision object, ``"none"`` otherwise.  A hook
+    that exits non-zero without a decision is reported as ``"error"``."""
+    for key in ("stdout", "output"):
+        raw = event.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        parsed = _parse_embedded_json_object(raw)
+        if parsed is None:
+            continue
+        specific = parsed.get("hookSpecificOutput")
+        if isinstance(specific, dict):
+            decision = specific.get("permissionDecision")
+            if isinstance(decision, str) and decision:
+                return decision
+        decision = parsed.get("decision")
+        if isinstance(decision, str) and decision:
+            return decision
+    exit_code = event.get("exit_code")
+    if isinstance(exit_code, int) and exit_code != 0:
+        return "error"
+    return "none"
+
+
+def extract_named_subagent_resume_observations(stdout: str) -> dict:
+    """Generic, ordered observations from a captured stream-json stdout.
+
+    Every list entry carries ``index`` (0-based ordinal among ALL parsed stream
+    events) so the chain evaluator can require real ordering.  Raw prompt /
+    message text is returned only as transient strings for marker matching and is
+    never persisted by the evidence builder."""
+    obs: dict = {
+        "init": {
+            "session_id": None, "model": None, "claude_code_version": None,
+            "permission_mode": None, "tool_names": None,
+        },
+        "agent_calls": [],
+        "name_records": [],
+        "agent_starts": [],
+        "agent_stops": [],
+        "sendmessage_calls": [],
+        "sendmessage_pretool": [],
+        "sendmessage_decisions": [],
+        "sendmessage_results": [],
+        "task_started": [],
+        "task_notifications": [],
+        "child_texts": [],
+        "parent_texts": [],
+        "tool_errors": [],
+        "result_events": [],
+        "hook_event_counts": {},
+        "team_signals": {
+            "team_tool_use_events": 0, "team_name_in_agent_input": False,
+            "teammate_task_types": [], "teammate_hook_events": 0,
+        },
+    }
+    tool_use_names: dict[str, str] = {}
+    for index, event in enumerate(_iter_claude_stream_events(stdout)):
+        etype = event.get("type")
+        subtype = event.get("subtype")
+        if etype == "system" and subtype == "init":
+            if obs["init"]["session_id"] is None:
+                session_value = event.get("session_id")
+                obs["init"]["session_id"] = session_value if isinstance(session_value, str) else None
+                obs["init"]["model"] = event.get("model") if isinstance(event.get("model"), str) else None
+                version = event.get("claude_code_version")
+                obs["init"]["claude_code_version"] = version if isinstance(version, str) else None
+                mode = event.get("permissionMode")
+                obs["init"]["permission_mode"] = mode if isinstance(mode, str) else None
+                tools = event.get("tools")
+                if isinstance(tools, list):
+                    obs["init"]["tool_names"] = [t for t in tools if isinstance(t, str)]
+            continue
+        if etype == "system" and subtype == "task_started":
+            task_type = event.get("task_type")
+            obs["task_started"].append({
+                "index": index,
+                "task_id": event.get("task_id"),
+                "tool_use_id": event.get("tool_use_id"),
+                "task_type": task_type,
+            })
+            if isinstance(task_type, str) and "teammate" in task_type.lower():
+                obs["team_signals"]["teammate_task_types"].append(task_type)
+            continue
+        if etype == "system" and subtype == "task_notification":
+            obs["task_notifications"].append({
+                "index": index,
+                "task_id": event.get("task_id"),
+                "tool_use_id": event.get("tool_use_id"),
+                "status": event.get("status"),
+            })
+            continue
+        if etype == "system" and subtype == "hook_response":
+            hook_event = event.get("hook_event")
+            hook_name = event.get("hook_name") if isinstance(event.get("hook_name"), str) else ""
+            if isinstance(hook_event, str):
+                obs["hook_event_counts"][hook_event] = obs["hook_event_counts"].get(hook_event, 0) + 1
+            if isinstance(hook_event, str) and hook_event.startswith("Teammate"):
+                obs["team_signals"]["teammate_hook_events"] += 1
+            payload = _nr_hook_payload(event)
+            if hook_event in _CLAUDE_HOOK_LIFECYCLE_EVENTS and payload is not None:
+                record = {
+                    "index": index,
+                    "agent_id": payload.get("agent_id") if isinstance(payload.get("agent_id"), str) else None,
+                    "session_id": payload.get("session_id") if isinstance(payload.get("session_id"), str) else None,
+                    "agent_type": payload.get("agent_type") if isinstance(payload.get("agent_type"), str) else None,
+                }
+                key = "agent_starts" if hook_event == "SubagentStart" else "agent_stops"
+                obs[key].append(record)
+            elif (
+                hook_event == "PostToolUse" and payload is not None
+                and payload.get("tool_name") in _NAMED_RESUME_SPAWN_TOOL_NAMES
+            ):
+                tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+                tool_response = payload.get("tool_response") if isinstance(payload.get("tool_response"), dict) else {}
+                name = tool_input.get("name")
+                agent_id = tool_response.get("agentId")
+                obs["name_records"].append({
+                    "index": index,
+                    "session_id": payload.get("session_id") if isinstance(payload.get("session_id"), str) else None,
+                    "name": name if isinstance(name, str) and name else None,
+                    "agent_id": agent_id if isinstance(agent_id, str) and agent_id else None,
+                    "tool_use_id": payload.get("tool_use_id"),
+                    "status": tool_response.get("status"),
+                    "response_texts": _nr_response_texts(tool_response),
+                })
+            elif hook_event == "PreToolUse" and hook_name.endswith(":SendMessage"):
+                obs["sendmessage_decisions"].append({
+                    "index": index,
+                    "hook_name": hook_name,
+                    "exit_code": event.get("exit_code") if isinstance(event.get("exit_code"), int) else None,
+                    "outcome": event.get("outcome") if isinstance(event.get("outcome"), str) else None,
+                    "decision": _nr_hook_decision(event),
+                    "payload_tool_use_id": (
+                        payload.get("tool_use_id") if payload is not None
+                        and isinstance(payload.get("tool_use_id"), str) else None
+                    ),
+                })
+                if payload is not None and payload.get("tool_name") == "SendMessage":
+                    tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+                    to = tool_input.get("to")
+                    obs["sendmessage_pretool"].append({
+                        "index": index,
+                        "session_id": payload.get("session_id") if isinstance(payload.get("session_id"), str) else None,
+                        "tool_use_id": payload.get("tool_use_id"),
+                        "to": to if isinstance(to, str) else None,
+                    })
+            continue
+        if etype == "result":
+            obs["result_events"].append({
+                "index": index,
+                "is_error": bool(event.get("is_error")),
+                "api_error_status": event.get("api_error_status"),
+                "text": event.get("result") if isinstance(event.get("result"), str) else "",
+            })
+            continue
+        if etype == "assistant":
+            message = event.get("message")
+            parent_tool_use_id = event.get("parent_tool_use_id")
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list):
+                for block in content:
+                    if not (isinstance(block, dict) and block.get("type") == "tool_use"):
+                        continue
+                    name = block.get("name")
+                    tool_use_id = block.get("id")
+                    if isinstance(tool_use_id, str) and isinstance(name, str):
+                        tool_use_names[tool_use_id] = name
+                    tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+                    if name in ("TeamCreate", "TeamDelete"):
+                        obs["team_signals"]["team_tool_use_events"] += 1
+                    if parent_tool_use_id is not None:
+                        continue
+                    if name in _NAMED_RESUME_SPAWN_TOOL_NAMES:
+                        agent_name = tool_input.get("name")
+                        if "team_name" in tool_input:
+                            obs["team_signals"]["team_name_in_agent_input"] = True
+                        obs["agent_calls"].append({
+                            "index": index,
+                            "tool_use_id": tool_use_id,
+                            "name": agent_name if isinstance(agent_name, str) and agent_name else None,
+                            "subagent_type": tool_input.get("subagent_type")
+                            if isinstance(tool_input.get("subagent_type"), str) else None,
+                        })
+                    elif name == "SendMessage":
+                        to = tool_input.get("to")
+                        obs["sendmessage_calls"].append({
+                            "index": index,
+                            "tool_use_id": tool_use_id,
+                            "to": to if isinstance(to, str) else None,
+                        })
+            texts = _nr_text_blocks(message)
+            bucket = "parent_texts" if parent_tool_use_id is None else "child_texts"
+            for text in texts:
+                record = {"index": index, "text": text}
+                if parent_tool_use_id is not None:
+                    # provenance: which Agent/Task call's child produced this text
+                    record["parent_tool_use_id"] = parent_tool_use_id if isinstance(parent_tool_use_id, str) else None
+                obs[bucket].append(record)
+            continue
+        if etype == "user":
+            message = event.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            tool_use_result = event.get("tool_use_result")
+            for block in content:
+                if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+                    continue
+                tool_use_id = block.get("tool_use_id")
+                tool_name = tool_use_names.get(tool_use_id) if isinstance(tool_use_id, str) else None
+                if block.get("is_error") and tool_name in (_NAMED_RESUME_SPAWN_TOOL_NAMES | {"SendMessage"}):
+                    obs["tool_errors"].append({
+                        "index": index, "tool_name": tool_name,
+                        "text": _nr_tool_result_text(block),
+                    })
+                if tool_name == "SendMessage":
+                    result_obj = tool_use_result if isinstance(tool_use_result, dict) else _nr_parse_json_text(
+                        _nr_tool_result_text(block)
+                    )
+                    result_obj = result_obj if isinstance(result_obj, dict) else {}
+                    pin = result_obj.get("pin") if isinstance(result_obj.get("pin"), dict) else {}
+                    resumed = result_obj.get("resumedAgentId")
+                    pin_name = pin.get("name")
+                    obs["sendmessage_results"].append({
+                        "index": index,
+                        "tool_use_id": tool_use_id,
+                        "success": result_obj.get("success") is True,
+                        "resumed_agent_id": resumed if isinstance(resumed, str) and resumed else None,
+                        "pin_name": pin_name if isinstance(pin_name, str) and pin_name else None,
+                        "error_text": _nr_public_text(str(result_obj.get("message") or ""))[:200]
+                        if result_obj.get("success") is not True else None,
+                    })
+            continue
+    return obs
+
+
+def _nr_tool_result_text(block: dict) -> str:
+    content = block.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            item.get("text", "") for item in content if isinstance(item, dict) and isinstance(item.get("text"), str)
+        )
+    return ""
+
+
+def _nr_parse_json_text(text: str) -> object:
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _nr_response_texts(tool_response: dict) -> list[str]:
+    texts: list[str] = []
+    handback = tool_response.get("handbackReport")
+    if isinstance(handback, dict) and isinstance(handback.get("text"), str):
+        texts.append(handback["text"])
+    content = tool_response.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                texts.append(item["text"])
+    elif isinstance(content, str):
+        texts.append(content)
+    return texts
+
+
+def evaluate_named_subagent_resume_chain(
+    obs: dict, *, first_marker: str = NAMED_SUBAGENT_RESUME_FIRST_MARKER,
+    resume_marker: str = NAMED_SUBAGENT_RESUME_SECOND_MARKER,
+) -> dict:
+    """Generic causal-chain correlation (no Task Context verdict, no resolver).
+
+    A name is only addressable when the SAME caller session recorded a
+    ``PostToolUse:Agent`` ``tool_input.name`` <-> ``tool_response.agentId``
+    pair for it.  A name that only another session recorded, an unrecorded name,
+    an ``agent_type``-only match, or a same-session name collision is NEVER
+    resolved here: the chain breaks and the verdict is never ``pass``.
+
+    Returns ``{"verdict", "chain_break", "addressing", "agent_name", "agent_id",
+    "steps", ...}``; ``steps`` is the ordered boolean causal chain."""
+    steps = {
+        "agent_call_with_name": False,
+        "name_agent_id_recorded": False,
+        "first_completion": False,
+        "sendmessage_to_name_issued": False,
+        "sendmessage_accepted": False,
+        "same_agent_id_resumed": False,
+        "no_new_agent_invocation": False,
+        "resume_completion": False,
+        "parent_retrieved_resume_result": False,
+    }
+    result: dict = {
+        "verdict": NAMED_RESUME_VERDICT_FAIL,
+        "chain_break": None,
+        "addressing": None,
+        "agent_name": None,
+        "agent_id": None,
+        "agent_id_lane": {"agent_id": None, "accepted": False, "resumed_same_agent_id": False},
+        "first_completion_marker_from_child": False,
+        "resume_completion_marker_from_child": False,
+        "steps": steps,
+        "sendmessage_decisions": [],
+        "new_agent_ids_after_spawn": [],
+    }
+
+    def _break(reason: str) -> dict:
+        result["chain_break"] = reason
+        result["verdict"] = NAMED_RESUME_VERDICT_FAIL
+        return result
+
+    caller = obs["init"]["session_id"]
+    if not caller:
+        return _break("caller_session_unknown")
+
+    hook_signal_present = bool(obs["name_records"] or obs["agent_starts"] or obs["agent_stops"])
+    if obs["agent_calls"] and not hook_signal_present:
+        # The Agent tool was really called but the generic hook channel produced no
+        # SubagentStart/SubagentStop/PostToolUse:Agent record at all: the causal
+        # evidence is unobservable (e.g. #2846 ``no_evidence``).  That is a SKIP,
+        # never a PASS and never a guess.
+        result["verdict"] = NAMED_RESUME_VERDICT_SKIP
+        result["chain_break"] = "subagent_causal_observation_unavailable"
+        return result
+
+    if not obs["agent_calls"]:
+        return _break("no_agent_call")
+    steps["agent_call_with_name"] = any(call["name"] for call in obs["agent_calls"])
+
+    # Identity: a ``PostToolUse:Agent`` record only counts when it answers a REAL Agent
+    # invocation (same tool_use_id, same ``name``, issued earlier in the stream).  A
+    # record that answers no invocation, or answers one with another name, is never used.
+    calls_by_tuid = {call["tool_use_id"]: call for call in obs["agent_calls"] if call["tool_use_id"]}
+
+    def _linked_call(record: dict) -> dict | None:
+        call = calls_by_tuid.get(record["tool_use_id"]) if isinstance(record["tool_use_id"], str) else None
+        if call is None or call["index"] >= record["index"]:
+            return None
+        return call
+
+    # Caller-session records only: a record another session produced is never used.
+    own_records = [
+        record for record in obs["name_records"]
+        if record["session_id"] == caller and record["name"] and record["agent_id"]
+        and (call := _linked_call(record)) is not None and call["name"] == record["name"]
+    ]
+    own_agent_ids = {
+        record["agent_id"] for record in obs["name_records"]
+        if record["session_id"] == caller and record["agent_id"]
+    }
+    own_agent_ids |= {s["agent_id"] for s in obs["agent_starts"] if s["session_id"] == caller and s["agent_id"]}
+
+    send_calls = [call for call in obs["sendmessage_calls"] if call["to"]]
+    if not send_calls:
+        steps["name_agent_id_recorded"] = bool(own_records)
+        return _break("sendmessage_not_issued" if steps["agent_call_with_name"] else "agent_call_without_name")
+    send = send_calls[0]
+    target = send["to"]
+
+    # --- addressing: name (caller-session recorded) vs. agent ID vs. unrecorded ---
+    name_ids = {record["agent_id"] for record in own_records if record["name"] == target}
+    same_name_calls = [call for call in obs["agent_calls"] if call["name"] == target]
+    if len(name_ids) > 1 or len(same_name_calls) > 1:
+        # Same-session name collision: never silently resolved to one agent.
+        result["addressing"] = "name"
+        result["agent_name"] = target
+        return _break("name_collision_same_session")
+    if len(name_ids) == 1:
+        addressing = "name"
+        agent_id = next(iter(name_ids))
+        result["agent_name"] = target
+    elif target in own_agent_ids:
+        addressing = "agent_id"
+        agent_id = target
+        recorded_for_id = [r["name"] for r in own_records if r["agent_id"] == agent_id and r["name"]]
+        result["agent_name"] = recorded_for_id[0] if recorded_for_id else None
+    else:
+        agent_types = {call["subagent_type"] for call in obs["agent_calls"] if call["subagent_type"]}
+        agent_types |= {s["agent_type"] for s in obs["agent_starts"] if s["agent_type"]}
+        result["agent_name"] = target
+        if target in agent_types:
+            return _break("sendmessage_target_is_agent_type_only")
+        if not steps["agent_call_with_name"]:
+            return _break("agent_call_without_name")
+        if not same_name_calls:
+            # No Agent invocation actually carried this name.
+            return _break("sendmessage_target_not_recorded_name")
+        # The name was really passed to an Agent call but no PostToolUse:Agent record
+        # answers THAT invocation (tool_use_id / name): the name <-> agent ID pair is
+        # not established by the hook channel.
+        return _break("agent_call_post_tool_use_unlinked")
+    result["addressing"] = addressing
+    result["agent_id"] = agent_id
+    steps["agent_call_with_name"] = addressing == "name"
+    steps["name_agent_id_recorded"] = bool(own_records) and addressing == "name"
+    if addressing == "agent_id":
+        steps["name_agent_id_recorded"] = False
+        steps["agent_call_with_name"] = any(call["name"] for call in obs["agent_calls"])
+
+    # --- spawn identity of A: the Agent call whose PostToolUse:Agent returned agentId A ---
+    spawn_record = next(
+        (
+            r for r in obs["name_records"]
+            if r["session_id"] == caller and r["agent_id"] == agent_id and _linked_call(r) is not None
+            and (addressing != "name" or r["name"] == target)
+        ),
+        None,
+    )
+    spawn_call = _linked_call(spawn_record) if spawn_record else None
+    owner_tuids: set[str] = set()
+    if spawn_call is not None and isinstance(spawn_call["tool_use_id"], str):
+        owner_tuids.add(spawn_call["tool_use_id"])
+    if isinstance(send["tool_use_id"], str):
+        owner_tuids.add(send["tool_use_id"])
+    owner_tuids |= {
+        t["tool_use_id"] for t in obs["task_started"]
+        if t["task_id"] == agent_id and isinstance(t["tool_use_id"], str)
+    }
+    spawn_index = spawn_call["index"] if spawn_call is not None else None
+
+    # --- first completion of A: its own SubagentStart -> child result -> SubagentStop,
+    #     all after the Agent call that created A and before the SendMessage call ---
+    first_starts = [
+        s for s in obs["agent_starts"]
+        if s["agent_id"] == agent_id and spawn_index is not None and spawn_index < s["index"] < send["index"]
+    ]
+    first_stops = [
+        s for s in obs["agent_stops"]
+        if first_starts and s["agent_id"] == agent_id and first_starts[0]["index"] < s["index"] < send["index"]
+    ]
+    first_marker_from_child = bool(first_starts) and (
+        any(
+            first_marker in text["text"] for text in obs["child_texts"]
+            if text.get("parent_tool_use_id") in owner_tuids
+            and first_starts[0]["index"] < text["index"] < send["index"]
+        )
+        or bool(spawn_record and any(first_marker in text for text in spawn_record["response_texts"]))
+    )
+    result["first_completion_marker_from_child"] = first_marker_from_child
+    steps["first_completion"] = bool(first_starts) and bool(first_stops) and first_marker_from_child
+
+    # --- SendMessage issued / hook observation / accepted ---
+    steps["sendmessage_to_name_issued"] = addressing == "name"
+    send_results = [r for r in obs["sendmessage_results"] if r["tool_use_id"] == send["tool_use_id"]]
+    accepted_result = send_results[0] if send_results else None
+    # The PreToolUse hooks that ran for THIS SendMessage sit between the call and its result.
+    window_end = accepted_result["index"] if accepted_result is not None else float("inf")
+    window_decisions = [d for d in obs["sendmessage_decisions"] if send["index"] < d["index"] < window_end]
+    result["sendmessage_decisions"] = [
+        {"hook_name": d["hook_name"], "decision": d["decision"], "exit_code": d["exit_code"], "outcome": d["outcome"]}
+        for d in window_decisions[:8]
+    ]
+    # Observation of the hook itself, separate from whether the SendMessage went through:
+    # observed (a hook response echoing this tool_use_id, all responses ran normally),
+    # unobserved (no hook response for this call), failed (a response did not run normally).
+    correlated = [
+        p for p in obs["sendmessage_pretool"]
+        if p["tool_use_id"] == send["tool_use_id"] and send["index"] < p["index"] < window_end
+    ]
+    failed_hooks = [
+        d for d in window_decisions
+        if d["decision"] == "error"
+        or (d["exit_code"] is not None and d["exit_code"] != 0)
+        or d["outcome"] not in _NAMED_RESUME_HOOK_OK_OUTCOMES
+    ]
+    hook_status = "failed" if failed_hooks else ("observed" if correlated else "unobserved")
+    result["hook_observation"] = {
+        "status": hook_status, "response_count": len(window_decisions), "failed_count": len(failed_hooks),
+    }
+    steps["sendmessage_accepted"] = bool(
+        accepted_result and accepted_result["success"]
+        and not any(d["decision"] in _NAMED_RESUME_NON_ALLOW_DECISIONS for d in window_decisions)
+    )  # whether the call went through; whether this smoke may PASS on it is ``hook_status``
+    result["agent_id_lane"]["agent_id"] = agent_id if addressing == "agent_id" else None
+    if any(d["decision"] in _NAMED_RESUME_NON_ALLOW_DECISIONS for d in window_decisions):
+        return _break("pretooluse_sendmessage_non_allow_decision")
+    if not steps["first_completion"]:
+        return _break("first_completion_not_observed")
+    if hook_status == "failed":
+        return _break("pretooluse_sendmessage_hook_failed")
+    if hook_status == "unobserved":
+        return _break("pretooluse_sendmessage_hook_unobserved")
+    if accepted_result is None or not accepted_result["success"]:
+        return _break("sendmessage_not_accepted")
+    resumed_id = accepted_result["resumed_agent_id"]
+    if resumed_id != agent_id:
+        return _break("resumed_agent_id_mismatch")
+
+    # --- same agent ID resumed, no new Agent invocation ---
+    resume_starts = [s for s in obs["agent_starts"] if s["agent_id"] == agent_id and s["index"] > send["index"]]
+    all_start_ids = {s["agent_id"] for s in obs["agent_starts"] if s["agent_id"]}
+    new_ids = sorted(all_start_ids - {agent_id})
+    result["new_agent_ids_after_spawn"] = new_ids
+    new_agent_calls_after = [c for c in obs["agent_calls"] if c["index"] > send["index"]]
+    steps["same_agent_id_resumed"] = bool(resume_starts)
+    steps["no_new_agent_invocation"] = not new_ids and not new_agent_calls_after
+    if addressing == "agent_id":
+        result["agent_id_lane"]["accepted"] = True
+        result["agent_id_lane"]["resumed_same_agent_id"] = steps["same_agent_id_resumed"]
+    if not steps["no_new_agent_invocation"]:
+        return _break("new_agent_invocation_observed")
+    if not steps["same_agent_id_resumed"]:
+        return _break("resume_subagent_start_missing")
+
+    # --- resume completion (A's own resume lifecycle) and parent retrieval ---
+    resume_start_index = resume_starts[0]["index"]
+    resume_stops = [s for s in obs["agent_stops"] if s["agent_id"] == agent_id and s["index"] > resume_start_index]
+    resume_marker_indexes = [
+        text["index"] for text in obs["child_texts"]
+        if resume_marker in text["text"] and text.get("parent_tool_use_id") in owner_tuids
+        and text["index"] > resume_start_index
+    ]
+    resume_marker_from_child = bool(resume_marker_indexes)
+    result["resume_completion_marker_from_child"] = resume_marker_from_child
+    steps["resume_completion"] = bool(resume_stops) and resume_marker_from_child
+    if not resume_stops:
+        return _break("resume_subagent_stop_missing")
+    if not resume_marker_from_child:
+        return _break("resume_marker_not_from_child")
+
+    completion_index = max(resume_stops[0]["index"], min(resume_marker_indexes))
+    notifications = [
+        n for n in obs["task_notifications"]
+        if n["task_id"] == agent_id and n["status"] == "completed" and n["index"] > resume_start_index
+    ]
+    if notifications:
+        completion_index = max(completion_index, notifications[0]["index"])
+    steps["parent_retrieved_resume_result"] = any(
+        resume_marker in text["text"] for text in obs["parent_texts"] if text["index"] > completion_index
+    )
+    if not steps["parent_retrieved_resume_result"]:
+        return _break("parent_did_not_retrieve_resume_result")
+
+    if addressing != "name":
+        # Native success of the agent-ID lane alone is never a name-resume PASS.
+        return _break("agent_id_lane_only_not_name_resume")
+    if hook_status != "observed" or not all(steps.values()):
+        # Defence in depth only: every step above already broke the chain on its own
+        # evidence; this never turns a missing step into a pass.
+        return _break("causal_step_missing:" + ",".join(k for k, v in steps.items() if not v))
+    result["verdict"] = NAMED_RESUME_VERDICT_PASS
+    result["chain_break"] = None
+    return result
+
+
+def _nr_stderr_error_text(stderr_text: str) -> str:
+    """stderr minus the launcher's own startup diagnostic line (``launcher=... proxy=<version>``).
+
+    That line is a normal start-up record, not an error event, so it is never evidence
+    for a failure layer."""
+    return "\n".join(
+        line for line in (stderr_text or "").splitlines()
+        if not line.lstrip().startswith(_NAMED_RESUME_LAUNCHER_STARTUP_LINE_PREFIX)
+    )
+
+
+def classify_named_subagent_resume_failure_layer(
+    obs: dict, chain: dict, *, adapter: str,
+    launcher_receipt: dict | None = None,
+    process_exit_code: int | None = None,
+    stderr_text: str = "",
+) -> str | None:
+    """Failure-layer classification (AC7).  ``None`` for a PASS; otherwise one of
+    :data:`NAMED_RESUME_FAILURE_LAYERS`.  ``unclassified`` is the explicit
+    fallback and is never promotable to PASS."""
+    if chain.get("verdict") == NAMED_RESUME_VERDICT_PASS:
+        return None
+    reason = chain.get("chain_break")
+    receipt_status = (launcher_receipt or {}).get("status") if isinstance(launcher_receipt, dict) else None
+    started = obs["init"]["session_id"] is not None
+    if adapter == "claude-gpt" and receipt_status in ("blocked", "failed") and not started:
+        return "launcher_config"
+    if not started:
+        return "launcher_config" if adapter == "claude-gpt" and process_exit_code not in (None, 0) else "unclassified"
+    tool_names = obs["init"]["tool_names"]
+    if (
+        isinstance(tool_names, list) and tool_names and reason == "no_agent_call"
+        and not (_NAMED_RESUME_SPAWN_TOOL_NAMES & set(tool_names))
+    ):
+        return "client_schema"
+    if isinstance(tool_names, list) and tool_names and "SendMessage" not in tool_names and reason in (
+        "sendmessage_not_issued", "no_agent_call", "agent_call_without_name",
+    ):
+        # Tool list is known and does not expose SendMessage: client-side schema.
+        return "client_schema"
+    if any(_NAMED_RESUME_CLIENT_SCHEMA_ERROR_RE.search(err["text"] or "") for err in obs["tool_errors"]):
+        return "client_schema"
+    if adapter == "claude-gpt" and (
+        any(
+            r["is_error"] and (
+                r["api_error_status"] in _NAMED_RESUME_TRANSLATION_API_STATUSES
+                or _NAMED_RESUME_PROXY_ERROR_RE.search(r["text"] or "")
+            )
+            for r in obs["result_events"]
+        )
+        or _NAMED_RESUME_PROXY_ERROR_RE.search(_nr_stderr_error_text(stderr_text))
+    ):
+        return "proxy_translation"
+    if reason in (
+        "pretooluse_sendmessage_non_allow_decision",
+        "pretooluse_sendmessage_hook_failed",
+        "pretooluse_sendmessage_hook_unobserved",
+        "agent_call_post_tool_use_unlinked",
+        "resume_subagent_start_missing",
+        "resume_subagent_stop_missing",
+        "first_completion_not_observed",
+    ):
+        return "hook_lifecycle"
+    if reason in (
+        "no_agent_call",
+        "agent_call_without_name",
+        "sendmessage_not_issued",
+        "sendmessage_target_is_agent_type_only",
+        "resume_marker_not_from_child",
+    ):
+        return "backend_model_emission"
+    return "unclassified"
+
+
+def determine_named_resume_agent_kind(obs: dict, chain: dict) -> dict:
+    """Ordinary SubAgent vs. teammate, decided ONLY from hook events and team
+    signals in the stream -- never from a panel rendering or the name alone."""
+    signals = obs["team_signals"]
+    basis: list[str] = []
+    teammate = False
+    if signals["team_name_in_agent_input"]:
+        teammate = True
+        basis.append("agent_input_has_team_name")
+    if signals["team_tool_use_events"]:
+        teammate = True
+        basis.append("team_tool_use_observed")
+    if signals["teammate_task_types"]:
+        teammate = True
+        basis.append("teammate_task_type_observed")
+    if signals["teammate_hook_events"]:
+        teammate = True
+        basis.append("teammate_hook_event_observed")
+    agent_id = chain.get("agent_id")
+    lifecycle_ids = {s["agent_id"] for s in obs["agent_starts"] if s["agent_id"]} | {
+        s["agent_id"] for s in obs["agent_stops"] if s["agent_id"]
+    }
+    if teammate:
+        return {"kind": "teammate", "basis": basis}
+    if agent_id and agent_id in lifecycle_ids:
+        basis.append("subagent_start_stop_hook_events_observed")
+        basis.append("no_team_signal_observed")
+        return {"kind": "ordinary_subagent", "basis": basis}
+    return {"kind": "unknown", "basis": basis or ["no_subagent_lifecycle_for_agent"]}
+
+
+def determine_agent_teams_effective_state(obs: dict, env: dict | None = None) -> dict:
+    """Agent Teams effective state from independent signals: the runner's own
+    ``CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`` environment value (forwarded to the
+    child) and whether the child's tool list exposes the team tools."""
+    env = os.environ if env is None else env
+    raw = env.get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
+    env_enabled = isinstance(raw, str) and raw.strip().lower() in ("1", "true", "yes", "on")
+    tool_names = obs["init"]["tool_names"]
+    tools_known = isinstance(tool_names, list)
+    team_tools_exposed = tools_known and any(t in ("TeamCreate", "TeamDelete") for t in tool_names)
+    if env_enabled or team_tools_exposed:
+        state = "enabled"
+    elif tools_known:
+        state = "disabled"
+    else:
+        state = "unknown"
+    return {
+        "effective_state": state,
+        "env_flag_set": env_enabled,
+        "team_tools_exposed": team_tools_exposed if tools_known else None,
+        "structured_print_lane": True,
+    }
+
+
+# Closed allowlist of result-affecting paths (Issue #2840 AC8).  A directory
+# entry ends with ``/``; every other entry is an exact file path.
+NAMED_RESUME_FRESHNESS_BOTH_ADAPTER_PATHS = (
+    "scripts/agent-ops/run_worktree_agent_runtime_smoke.py",
+    ".claude/skills/worktree-agent-runtime-smoke/fixtures/",
+    ".claude/settings.json",
+    ".claude/hooks/task_context/",
+    "scripts/task-context/",
+)
+NAMED_RESUME_FRESHNESS_CLAUDE_GPT_ONLY_PATHS = ("scripts/claude-gpt/",)
+
+
+def evaluate_evidence_freshness(recorded: dict, current: dict) -> dict:
+    """Pure recorded-vs-current evidence reuse decision (Issue #2840 AC8).
+
+    ``recorded`` is the flat freshness record of ONE saved evidence file
+    (``freshness_record_from_evidence``); ``current`` carries the values observed
+    now.  Required ``current`` keys: ``head``, ``changed_paths`` (the
+    ``git diff --name-only <recorded.tested_head>..<current.head>`` list),
+    ``changed_paths_base`` (the base the diff was computed from; must equal
+    ``recorded.tested_head`` whenever the heads differ), ``claude_code_version``,
+    ``model_route``, ``fixture_sha256``, ``compat_note_sha256`` and, for a
+    ``claude-gpt`` record, ``proxy_version`` and ``launcher_sha256``.  A missing
+    key is fail-closed (not reusable); an unrelated path outside the closed
+    allowlist is never a recapture reason on its own."""
+    reasons: list[str] = []
+    adapter = recorded.get("adapter") if isinstance(recorded, dict) else None
+    if adapter not in ("native", "claude-gpt"):
+        return {
+            "reusable": False, "affected_adapters": [],
+            "reasons": ["recorded_adapter_invalid"], "result_affecting_changed_paths": [],
+        }
+    if not isinstance(current, dict):
+        current = {}
+    required_recorded = ["tested_head", "claude_code_version", "model_route", "fixture_sha256", "compat_note_sha256"]
+    required_current = [
+        "head", "changed_paths", "claude_code_version", "model_route", "fixture_sha256", "compat_note_sha256",
+    ]
+    if adapter == "claude-gpt":
+        required_recorded += ["proxy_version", "launcher_sha256"]
+        required_current += ["proxy_version", "launcher_sha256"]
+    for key in required_recorded:
+        if not recorded.get(key):
+            reasons.append(f"recorded_key_missing:{key}")
+    for key in required_current:
+        value = current.get(key)
+        if key == "changed_paths":
+            if not isinstance(value, list) or not all(isinstance(p, str) for p in value):
+                reasons.append("current_key_missing:changed_paths")
+        elif not value:
+            reasons.append(f"current_key_missing:{key}")
+    if recorded.get("verdict") != NAMED_RESUME_VERDICT_PASS:
+        reasons.append("recorded_verdict_not_pass")
+    # Producer/consumer contract: only the evidence of a run whose FINAL exit code was 0
+    # (``finalize_named_resume_evidence``) is a reusable success.  A missing exit code is
+    # a pre-finalization record and is never reusable.
+    exit_recorded = recorded.get("runner_exit_code")
+    if isinstance(exit_recorded, bool) or not isinstance(exit_recorded, int) or exit_recorded != EXIT_OK:
+        reasons.append("recorded_runner_exit_code_not_zero")
+    heads_differ = bool(recorded.get("tested_head")) and recorded.get("tested_head") != current.get("head")
+    if heads_differ and current.get("changed_paths_base") != recorded.get("tested_head"):
+        reasons.append("changed_paths_base_mismatch")
+
+    both_prefixes = NAMED_RESUME_FRESHNESS_BOTH_ADAPTER_PATHS
+    gpt_prefixes = NAMED_RESUME_FRESHNESS_CLAUDE_GPT_ONLY_PATHS
+
+    def _matches(path: str, entries: tuple[str, ...]) -> bool:
+        normalized = path[2:] if path.startswith("./") else path
+        return any(
+            normalized.startswith(entry) if entry.endswith("/") else normalized == entry
+            for entry in entries
+        )
+
+    changed = current.get("changed_paths") if isinstance(current.get("changed_paths"), list) else []
+    affecting: list[str] = []
+    affected_adapters: set[str] = set()
+    for path in changed:
+        if not isinstance(path, str):
+            continue
+        if _matches(path, both_prefixes):
+            affecting.append(path)
+            affected_adapters.update({"native", "claude-gpt"})
+            reasons.append(f"result_affecting_path_changed:{path}")
+        elif _matches(path, gpt_prefixes):
+            affecting.append(path)
+            affected_adapters.add("claude-gpt")
+            if adapter == "claude-gpt":
+                reasons.append(f"result_affecting_path_changed:{path}")
+    for key in ("claude_code_version", "model_route", "fixture_sha256", "compat_note_sha256"):
+        if recorded.get(key) and current.get(key) and recorded.get(key) != current.get(key):
+            reasons.append(f"{key}_changed")
+    if adapter == "claude-gpt":
+        for key in ("proxy_version", "launcher_sha256"):
+            if recorded.get(key) and current.get(key) and recorded.get(key) != current.get(key):
+                reasons.append(f"{key}_changed")
+    return {
+        "reusable": not reasons,
+        "affected_adapters": sorted(affected_adapters),
+        "reasons": reasons,
+        "result_affecting_changed_paths": affecting,
+    }
+
+
+
+
+def freshness_record_from_evidence(evidence: dict) -> dict:
+    """Flatten a saved named-resume evidence JSON into the ``recorded`` mapping
+    consumed by :func:`evaluate_evidence_freshness`."""
+    launcher = evidence.get("launcher") if isinstance(evidence.get("launcher"), dict) else {}
+    proxy = evidence.get("proxy") if isinstance(evidence.get("proxy"), dict) else {}
+    route = evidence.get("model_route") if isinstance(evidence.get("model_route"), dict) else {}
+    fixtures = evidence.get("fixtures") if isinstance(evidence.get("fixtures"), dict) else {}
+    return {
+        "adapter": evidence.get("adapter"),
+        "verdict": evidence.get("verdict"),
+        "runner_exit_code": evidence.get("runner_exit_code"),
+        "tested_head": evidence.get("tested_head"),
+        "claude_code_version": evidence.get("claude_code_version"),
+        "model_route": route.get("observed_main_model"),
+        "proxy_version": proxy.get("version"),
+        "launcher_sha256": launcher.get("sha256"),
+        "fixture_sha256": fixtures.get("prompt_sha256"),
+        "compat_note_sha256": fixtures.get("compat_note_sha256"),
+    }
+
+
+def compute_changed_paths(repo_dir: str, base: str, head: str) -> list[str] | None:
+    """``git diff --name-only <base>..<head>`` (``None`` when git fails)."""
+    git = shutil.which("git")
+    if git is None:
+        return None
+    rc, out, _err, timed_out = _run([git, "-C", repo_dir, "diff", "--name-only", f"{base}..{head}"], timeout=30.0)
+    if rc != 0 or timed_out:
+        return None
+    return [line for line in out.splitlines() if line.strip()]
+
+
+def _nr_launcher_receipt_public(receipt: dict | None) -> dict | None:
+    if not isinstance(receipt, dict):
+        return None
+    return {
+        key: (_nr_public_text(str(receipt[key])) if isinstance(receipt[key], str) else receipt[key])
+        for key in ("schema", "status", "reason", "flag")
+        if key in receipt
+    }
+
+
+def _nr_stderr_proxy_version(stderr_text: str) -> str | None:
+    """Proxy version string from the launcher's own startup diagnostic line
+    (``launcher=... proxy=<version line>``)."""
+    for line in (stderr_text or "").splitlines():
+        match = re.search(r"\bproxy=(.+)$", line.strip())
+        if line.strip().startswith("launcher=") and match:
+            return _nr_public_text(match.group(1).strip())[:200] or None
+    return None
+
+
+def _nr_launcher_model_policy_main(launcher_path: str | None) -> str | None:
+    if not launcher_path:
+        return None
+    lib = Path(launcher_path).resolve().parent / "lib.sh"
+    try:
+        text = lib.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = re.search(r'^CLAUDE_GPT_MODEL_MAIN="([^"\n]+)"', text, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def build_named_subagent_resume_evidence(
+    *, stdout: str, stderr: str, process_exit_code: int | None, timed_out: bool,
+    adapter: str, tested_head: str | None, runtime_version: str | None,
+    resolved_runtime_bin: str | None, worktree: str,
+    prompt_fixture_path: str | None, compat_fixture_path: str | None,
+    compat_note_applied: bool, invocation_flags: list[str],
+    launcher_receipt: dict | None = None, env: dict | None = None,
+    proxy_bin: str | None = None,
+) -> dict:
+    """Public-safe evidence for one named SubAgent resume run (AC2/AC3/AC4/AC8/AC9).
+
+    Contains ids, hashes, versions, booleans and event counts only: never a raw
+    prompt, message body, transcript, credential or HOME absolute path."""
+    obs = extract_named_subagent_resume_observations(stdout)
+    chain = evaluate_named_subagent_resume_chain(obs)
+    layer = classify_named_subagent_resume_failure_layer(
+        obs, chain, adapter=adapter, launcher_receipt=launcher_receipt,
+        process_exit_code=process_exit_code, stderr_text=stderr,
+    )
+    verdict = chain["verdict"]
+    if verdict == NAMED_RESUME_VERDICT_FAIL and layer is None:
+        layer = "unclassified"
+    if timed_out and verdict == NAMED_RESUME_VERDICT_PASS:
+        verdict, layer = NAMED_RESUME_VERDICT_FAIL, "unclassified"
+    is_gpt = adapter == "claude-gpt"
+    launcher_abs = resolved_runtime_bin if is_gpt else None
+    launcher_sha256 = _nr_file_sha256(launcher_abs) if is_gpt else None
+    proxy_path = proxy_bin
+    if is_gpt and proxy_path is None:
+        env_proxy = (env or os.environ).get("CLAUDE_GPT_PROXY_BIN")
+        proxy_path = env_proxy or shutil.which("claude-code-proxy")
+    proxy_version = None
+    if is_gpt:
+        proxy_version = _nr_stderr_proxy_version(stderr)
+        if proxy_version is None and proxy_path:
+            rc, out, err, _t = _run([proxy_path, "--version"], timeout=10.0, input_text="")
+            version_text = (out or err).strip()
+            if rc == 0 and version_text:
+                proxy_version = _nr_public_text(version_text.splitlines()[0])[:200]
+    agent_kind = determine_named_resume_agent_kind(obs, chain)
+    teams = determine_agent_teams_effective_state(obs, env)
+    claude_code_version = obs["init"]["claude_code_version"]
+    if not claude_code_version and runtime_version:
+        claude_code_version = _nr_public_text(runtime_version)
+    caller = obs["init"]["session_id"]
+    evidence: dict = {
+        "schema": NAMED_SUBAGENT_RESUME_EVIDENCE_SCHEMA,
+        # ``verdict`` / ``failure_layer`` are the RUN-level result.  Here they are provisional
+        # (stream-only); ``finalize_named_resume_evidence`` fixes them once from the final
+        # exit code, after every later assertion ran.  ``causal_chain_verdict`` is the
+        # causal chain's own result and stays separate from the run-level verdict.
+        "verdict": verdict,
+        "failure_layer": layer,
+        "causal_chain_verdict": chain["verdict"],
+        "chain_break": chain["chain_break"],
+        "tested_head": tested_head,
+        "claude_code_version": claude_code_version,
+        "adapter": adapter,
+        "runtime": "claude",
+        "mode": "structured",
+        "permission_mode_observed": obs["init"]["permission_mode"],
+        "launcher": {
+            "path": (
+                _nr_public_path(launcher_abs, repo_root=worktree) if is_gpt
+                else "native-claude-binary"
+            ),
+            "sha256": launcher_sha256,
+        },
+        "proxy": {
+            "path": _nr_public_path(proxy_path, repo_root=worktree) if is_gpt else None,
+            "version": proxy_version,
+        },
+        "model_route": {
+            "observed_main_model": obs["init"]["model"],
+            "launcher_policy_main_model": _nr_launcher_model_policy_main(launcher_abs) if is_gpt else None,
+        },
+        "agent_name": chain["agent_name"],
+        "agent_name_matches_fixture": chain["agent_name"] == NAMED_SUBAGENT_RESUME_AGENT_NAME,
+        "agent_id": chain["agent_id"],
+        "addressing": chain["addressing"],
+        "caller_session_id": caller,
+        "agent_teams": teams,
+        "agent_kind": agent_kind,
+        "first_completion": {
+            "observed": chain["steps"]["first_completion"],
+            "marker_from_child": chain["first_completion_marker_from_child"],
+        },
+        "same_agent_id_after_resume": bool(
+            chain["steps"]["same_agent_id_resumed"] and chain["steps"]["no_new_agent_invocation"]
+        ),
+        "causal_chain": dict(chain["steps"]),
+        "agent_id_lane": chain["agent_id_lane"],
+        "sendmessage_hook_decisions": chain["sendmessage_decisions"],
+        "sendmessage_hook_observation": chain.get("hook_observation"),
+        "false_ask_observed": any(
+            d["decision"] in _NAMED_RESUME_NON_ALLOW_DECISIONS for d in chain["sendmessage_decisions"]
+        ),
+        "hook_event_counts": {
+            key: obs["hook_event_counts"].get(key, 0)
+            for key in ("SubagentStart", "SubagentStop", "PostToolUse", "PreToolUse")
+        },
+        "new_agent_ids_after_spawn": chain["new_agent_ids_after_spawn"],
+        "process_exit_code": process_exit_code,
+        "timed_out": timed_out,
+        "invocation_flags_readback": invocation_flags,
+        "compat_note": {
+            "applied_via_append_system_prompt_file": compat_note_applied,
+            "fixture_path": NAMED_SUBAGENT_RESUME_COMPAT_FIXTURE_RELPATH if compat_note_applied else None,
+        },
+        "fixtures": {
+            "prompt_path": NAMED_SUBAGENT_RESUME_PROMPT_FIXTURE_RELPATH,
+            "prompt_sha256": _nr_file_sha256(prompt_fixture_path),
+            "compat_note_path": NAMED_SUBAGENT_RESUME_COMPAT_FIXTURE_RELPATH,
+            "compat_note_sha256": _nr_file_sha256(compat_fixture_path),
+        },
+        "launcher_receipt": _nr_launcher_receipt_public(launcher_receipt),
+    }
+    return _nr_assert_public_safe(evidence)
+
+
+def finalize_named_resume_evidence(evidence: dict, exit_code: int) -> dict:
+    """Fix the run-level ``verdict`` / ``failure_layer`` / ``runner_exit_code`` ONCE, from the
+    runner's FINAL exit code (after every assertion -- ``--expect-marker``, ordered markers,
+    output schema, required runtime observations -- has had its say).
+
+    ``causal_chain_verdict`` (the chain's own result) is kept untouched and separate.  The
+    exit code is authoritative: a run that exits non-zero is never ``pass`` and a run that
+    exits 0 is ``pass`` only when the stream-level verdict is ``pass``."""
+    final = dict(evidence)
+    provisional = final.get("verdict")
+    final["causal_chain_verdict"] = final.get("causal_chain_verdict", provisional)
+    final["runner_exit_code"] = exit_code
+    if exit_code == EXIT_OK:
+        if provisional != NAMED_RESUME_VERDICT_PASS:
+            final["verdict"] = NAMED_RESUME_VERDICT_FAIL
+            final["failure_layer"] = final.get("failure_layer") or "unclassified"
+            final["chain_break"] = final.get("chain_break") or "runner_exit_ok_without_chain_pass"
+        else:
+            final["failure_layer"] = None
+    elif exit_code == EXIT_SKIP:
+        final["verdict"] = NAMED_RESUME_VERDICT_SKIP
+        if provisional != NAMED_RESUME_VERDICT_SKIP:
+            final["failure_layer"] = None
+            final["chain_break"] = "runner_skipped_before_chain_evaluation"
+    else:
+        final["verdict"] = NAMED_RESUME_VERDICT_FAIL
+        if provisional == NAMED_RESUME_VERDICT_PASS:
+            final["failure_layer"] = "unclassified"
+            final["chain_break"] = "runner_outcome_not_ok_despite_chain"
+        elif not final.get("failure_layer"):
+            final["failure_layer"] = "unclassified"
+    return final
+
+
+def _nr_assert_public_safe(evidence: dict) -> dict:
+    """Last-line scrub: any string that still carries a HOME-style absolute path is
+    replaced.  (The evidence is built from ids/hashes/booleans, so this only guards
+    against an unexpected path leaking through a diagnostic field.)"""
+    def _scrub(value):
+        if isinstance(value, str):
+            return _nr_public_text(value)
+        if isinstance(value, list):
+            return [_scrub(item) for item in value]
+        if isinstance(value, dict):
+            return {key: _scrub(item) for key, item in value.items()}
+        return value
+    return _scrub(evidence)
+
+
+def named_resume_invocation_flag_readback(adapter: str, compat_note_applied: bool) -> list[str]:
+    """Flag-token readback of the fixed argv ``run_structured_claude`` builds for
+    the named SubAgent resume scenario (flag names only -- never a value/path).
+    A test pins this against the argv actually handed to the subprocess layer."""
+    flags = ["-p", "--output-format", "--include-hook-events", "--max-turns", "--verbose"]
+    if adapter == "native":
+        flags.append("--settings")
+    if compat_note_applied:
+        flags.append("--append-system-prompt-file")
+    return flags
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -6684,6 +8081,16 @@ def _absolute_path(value: str) -> str:
         raise argparse.ArgumentTypeError(
             f"--claude-bin must be an absolute path, got: {value!r}"
         )
+    return value
+
+
+def _absolute_existing_file(value: str) -> str:
+    """argparse ``type`` for ``--append-system-prompt-file`` (Issue #2840): an
+    absolute path to an existing regular file."""
+    if not os.path.isabs(value):
+        raise argparse.ArgumentTypeError(f"path must be absolute, got: {value!r}")
+    if not os.path.isfile(value):
+        raise argparse.ArgumentTypeError(f"path is not an existing file: {value!r}")
     return value
 
 
@@ -7062,6 +8469,45 @@ def build_parser() -> argparse.ArgumentParser:
             "unchanged."
         ),
     )
+    parser.add_argument(
+        "--named-subagent-resume",
+        action="store_true",
+        help=(
+            "Issue #2840: opt-in named SubAgent scenario (structured lane only). "
+            "Drives and observes ordinary named SubAgent spawn -> completion -> "
+            "SendMessage(to=<name>) resume -> completion -> parent retrieval. "
+            "Drops ONLY the harness's blanket SendMessage deny (ListAgents deny, "
+            "crossSessionInbound: refuse, the Task Context hook, the normal "
+            "permission decision flow and isolation are kept) and registers a "
+            "generic observation hook set (SubagentStart / SubagentStop / "
+            "PostToolUse:Agent / PreToolUse:SendMessage). No Task Context "
+            "semantic verdict is produced here. With --claude-adapter "
+            "claude-gpt and no --claude-bin, the checkout's own "
+            "scripts/claude-gpt/launch.sh is resolved as an absolute path. "
+            "Omitted by default, so the default smoke policy/output is unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--append-system-prompt-file",
+        type=_absolute_existing_file,
+        default=None,
+        help=(
+            "Issue #2840: absolute path to an invocation-local compatibility "
+            "note forwarded as the CLI's own --append-system-prompt-file "
+            "(requires --named-subagent-resume; never a permanent system-prompt "
+            "injection)."
+        ),
+    )
+    parser.add_argument(
+        "--named-resume-evidence-json",
+        default=None,
+        help=(
+            "Issue #2840: path of the public-safe named SubAgent resume evidence "
+            "JSON (requires --named-subagent-resume; the parent directory must "
+            "already exist). Unlike --evidence-json it carries only ids, hashes, "
+            "versions, booleans and event counts."
+        ),
+    )
     return parser
 
 
@@ -7070,8 +8516,27 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.claude_adapter == "claude-gpt" and not args.claude_bin:
+    if args.claude_adapter == "claude-gpt" and not args.claude_bin and not args.named_subagent_resume:
         parser.error("--claude-adapter claude-gpt requires --claude-bin")
+    # Issue #2840: scenario-only flags and their incompatible combinations.
+    if args.append_system_prompt_file and not args.named_subagent_resume:
+        parser.error("--append-system-prompt-file requires --named-subagent-resume")
+    if args.named_resume_evidence_json and not args.named_subagent_resume:
+        parser.error("--named-resume-evidence-json requires --named-subagent-resume")
+    if args.named_subagent_resume:
+        if args.runtime != "claude":
+            parser.error("--named-subagent-resume requires --runtime claude")
+        if args.mode != "structured":
+            parser.error("--named-subagent-resume requires --mode structured")
+        for flag_name, enabled in (
+            ("--approval-profile", bool(args.approval_profile)),
+            ("--expect-skill-command", bool(args.expect_skill_command)),
+            ("--require-hook-chain-evidence", bool(args.require_hook_chain_evidence)),
+            ("--hermetic-agent-definition", bool(args.hermetic_agent_definition)),
+            ("--claude-agent-name", bool(args.claude_agent_name)),
+        ):
+            if enabled:
+                parser.error(f"--named-subagent-resume cannot be combined with {flag_name}")
 
     # PR #2176 OWNER REQUEST_CHANGES Finding 6
     # (https://github.com/squne121/loop-protocol/pull/2176#issuecomment-5302819792):
@@ -7269,6 +8734,17 @@ def main(argv: list[str] | None = None) -> int:
     except IdentityError as exc:
         print(f"[FAIL] {exc.message}", file=sys.stderr)
         return EXIT_FAIL
+
+    if args.named_subagent_resume and args.claude_adapter == "claude-gpt" and not args.claude_bin:
+        # Issue #2840: the repository-owned launcher of the checkout under test
+        # (the tested HEAD's own scripts/claude-gpt/launch.sh), resolved as an
+        # absolute path so no VC depends on a machine-specific path or shell
+        # substitution. An explicit --claude-bin is never overridden.
+        launcher_candidate = os.path.join(worktree, NAMED_SUBAGENT_RESUME_LAUNCHER_RELPATH)
+        if not os.path.isfile(launcher_candidate):
+            print("[FAIL] repository-owned Claude-GPT launcher not found in the worktree", file=sys.stderr)
+            return EXIT_FAIL
+        args.claude_bin = launcher_candidate
 
     try:
         prompt = read_prompt(args.prompt_file)
@@ -7534,6 +9010,8 @@ def main(argv: list[str] | None = None) -> int:
                     task_context_state_root=args.task_context_state_root,
                     approval_settings_json=approval_overlay_json,
                     approval_child_env=approval_child_env,
+                    named_subagent_resume=bool(args.named_subagent_resume),
+                    append_system_prompt_file=args.append_system_prompt_file,
                 )
                 capability_decision, capability_reason = classify_claude_structured_outcome(
                     rc, out, err, timed_out
@@ -7821,6 +9299,45 @@ def main(argv: list[str] | None = None) -> int:
             elif terminal_event_observed is False:
                 errors.append("no terminal/result event observed in structured output")
                 exit_code = EXIT_FAIL
+
+            if args.named_subagent_resume:
+                # Issue #2840: generic causal-chain correlation + failure-layer
+                # classification over the already-captured stream.  PASS needs the
+                # whole chain; an unobservable chain is SKIP (77); everything else
+                # is FAIL.  ``unclassified`` is a FAIL layer, never a PASS.
+                named_resume_evidence = build_named_subagent_resume_evidence(
+                    stdout=out, stderr=err, process_exit_code=rc, timed_out=timed_out,
+                    adapter=args.claude_adapter, tested_head=tested_head,
+                    runtime_version=runtime_version, resolved_runtime_bin=resolved_runtime_bin,
+                    worktree=worktree, prompt_fixture_path=args.prompt_file,
+                    compat_fixture_path=(
+                        args.append_system_prompt_file
+                        or os.path.join(worktree, NAMED_SUBAGENT_RESUME_COMPAT_FIXTURE_RELPATH)
+                    ),
+                    compat_note_applied=bool(args.append_system_prompt_file),
+                    invocation_flags=named_resume_invocation_flag_readback(
+                        args.claude_adapter, bool(args.append_system_prompt_file)
+                    ),
+                    launcher_receipt=schema_summary.get("claude_gpt_launcher_receipt"),
+                )
+                # The evidence's run-level verdict is NOT adjusted here: later assertions
+                # may still change ``exit_code``.  It is finalised once, from the final
+                # exit code, where ``schema_summary["exit_code"]`` is set.
+                schema_summary["named_subagent_resume"] = named_resume_evidence
+                if exit_code == EXIT_OK:
+                    if named_resume_evidence["verdict"] == NAMED_RESUME_VERDICT_SKIP:
+                        errors.append(
+                            "named SubAgent resume causal evidence unobservable "
+                            f"({named_resume_evidence['chain_break']}); never promoted to PASS"
+                        )
+                        exit_code = EXIT_SKIP
+                    elif named_resume_evidence["verdict"] != NAMED_RESUME_VERDICT_PASS:
+                        errors.append(
+                            "named SubAgent resume chain not verified: "
+                            f"chain_break={named_resume_evidence['chain_break']!r} "
+                            f"failure_layer={named_resume_evidence['failure_layer']!r}"
+                        )
+                        exit_code = EXIT_FAIL
 
             # A marker is a success-only assertion.  If the bounded runtime
             # capability is unavailable (including timeout SKIP), no model
@@ -8391,6 +9908,12 @@ def main(argv: list[str] | None = None) -> int:
 
     schema_summary["errors"] = errors
     schema_summary["exit_code"] = exit_code
+    if isinstance(schema_summary.get("named_subagent_resume"), dict):
+        # Issue #2840 (PR #2879 review): run-level verdict / failure_layer / runner_exit_code
+        # are fixed once, here, from the final exit code.
+        schema_summary["named_subagent_resume"] = finalize_named_resume_evidence(
+            schema_summary["named_subagent_resume"], exit_code
+        )
 
     write_evidence(output_dir, schema_summary=schema_summary)
 
@@ -8415,6 +9938,25 @@ def main(argv: list[str] | None = None) -> int:
             )
         except OSError as exc:
             print(f"[WARN] could not write --evidence-json to {args.evidence_json}: {exc}", file=sys.stderr)
+
+    # Issue #2840: dedicated public-safe evidence (ids / hashes / versions /
+    # booleans only).  Already finalised from the final exit code above.
+    if args.named_resume_evidence_json:
+        named_resume_payload = schema_summary.get("named_subagent_resume")
+        if isinstance(named_resume_payload, dict):
+            try:
+                Path(args.named_resume_evidence_json).write_text(
+                    json.dumps(_nr_assert_public_safe(named_resume_payload), indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                print(f"[WARN] could not write --named-resume-evidence-json: {exc}", file=sys.stderr)
+        else:
+            print(
+                "[WARN] --named-resume-evidence-json given but no named SubAgent resume evidence "
+                "was produced (the runtime did not reach the structured run)",
+                file=sys.stderr,
+            )
 
     return exit_code
 
