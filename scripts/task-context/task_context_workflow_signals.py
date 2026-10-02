@@ -1010,12 +1010,26 @@ def recover_implementation_claims(
             if existing is not None:
                 if existing["task_id"] == task_id:
                     return _recovery_rejection(task_id, _outcome("duplicate_noop", "SAME_TASK_SAME_FACT"))
-                return _recovery_rejection(task_id, _outcome("conflict", "FACT_TASK_IDENTITY_CONFLICT"))
+                # Additive diagnostic (Issue #2817 PR #2873 review P2): name the
+                # Task that already owns the recovery dedupe key. The row is
+                # already loaded, so no extra DB lookup is made.
+                return _recovery_rejection(
+                    task_id,
+                    _outcome("conflict", "FACT_TASK_IDENTITY_CONFLICT", conflicting_task_id=existing["task_id"]),
+                )
             accepted_merge = _accepted_event_tx(conn, merge_key)
             if accepted_merge is not None and accepted_merge["task_id"] != task_id:
                 # The merge fact is already owned by a different Task; this
-                # origin must not acquire claims for it.
-                return _recovery_rejection(task_id, _outcome("conflict", "FACT_TASK_IDENTITY_CONFLICT"))
+                # origin must not acquire claims for it. The owner Task id is an
+                # additive diagnostic from the already-loaded row.
+                return _recovery_rejection(
+                    task_id,
+                    _outcome(
+                        "conflict",
+                        "FACT_TASK_IDENTITY_CONFLICT",
+                        conflicting_task_id=accepted_merge["task_id"],
+                    ),
+                )
             active_kind, impl_latest_status, active = _task_activity_state_tx(conn, task_id)
             decision = decide_activity_action(
                 active_kind, impl_latest_status, accepted_merge is not None and accepted_merge["task_id"] == task_id

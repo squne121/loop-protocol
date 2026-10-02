@@ -1809,7 +1809,9 @@ Task を推測して attach しない。`task-contextctl signal recover` も pay
 | claim 判定 1/2 | `conflict` / `FACT_TASK_IDENTITY_CONFLICT`（owner 診断 key を含む） |
 | claim 判定 3 | `conflict` / `OUT_OF_ORDER_SIGNAL` |
 | Activity reject | `conflict` / `IMPLEMENTATION_ACTIVITY_TERMINAL`・`ACTIVITY_KIND_NOT_RECOVERABLE`・`ACTIVITY_STATE_INCONSISTENT` |
-| recovery dedupe key が別 Task で accepted 済み（`ux_events_dedupe_key` の `IntegrityError` を含む） | `conflict` / `FACT_TASK_IDENTITY_CONFLICT` |
+| recovery dedupe key が別 Task で accepted 済み | `conflict` / `FACT_TASK_IDENTITY_CONFLICT`（所有 Task を additive な `conflicting_task_id` で返す） |
+| accepted 済みの merge fact が別 Task 所有 | `conflict` / `FACT_TASK_IDENTITY_CONFLICT`（所有 Task を additive な `conflicting_task_id` で返す） |
+| 競合 race による `ux_events_dedupe_key` の `IntegrityError` | `conflict` / `FACT_TASK_IDENTITY_CONFLICT`（所有 Task が不明なため `conflicting_task_id` は出さない） |
 | `--explicit-recovery` なし | `rejected_evidence` / `EXPLICIT_RECOVERY_REQUIRED` |
 | merge identity 不一致・HEX40 不正 | `rejected_evidence` / `MERGE_IDENTITY_MISMATCH` |
 | 必須引数の欠落 | `rejected_evidence` / `MISSING_REQUIRED_ARGUMENT` |
@@ -1836,6 +1838,8 @@ X = origin Task T 以外の Task。「T の別 claim」= T が保持する、対
 - 復旧は既存 signal の `IMPLEMENTATION_NOT_READY` を「安全に補える」という判定に使わず、存在する claim の所有 Task を先に確認する。
 - 実装上の追加ガード（契約本文には無い安全側の補足）: 同じ `(repo, pr_number, merge_commit_oid)` の `pr_merged_observed` が
   既に別 Task で accepted 済みの場合は、recovery dedupe の段階で `conflict` / `FACT_TASK_IDENTITY_CONFLICT` として拒否する。
+  この拒否と、accepted 済み merge fact が別 Task 所有の拒否では、既に読み込んだ行の所有 Task ID を追加の DB 参照なしに
+  additive な診断 key `conflicting_task_id` として返す（既存の `signal_kind`・closed key・disposition / reason_code は変更しない）。
 
 ### implementation Activity 状態表
 
@@ -1922,8 +1926,12 @@ print する（fields・authority を一切出さない、書き込み 0）。
 
 残余状態: 復旧が reject された場合の local-only 報告には reject 結果の owner Task id・保持 claim 番号を含める。local-only 後は
 Task / implementation Activity が ACTIVE のまま残る既知の残余状態であり、本経路はそれらを cleanup しない（人間が owner Task を解決する）。
-local-only の結果は「ローカル cleanup 成功 / Task Context 未記録」と区別して報告し、`cleanup_completed`、親 Issue close、
-別 PR close の根拠にしない。local-only 実行後に復旧が明示要求された場合は `--phase recover` を実行してよいが、同一 invocation で
+`LOCAL_ONLY_PERMITTED` は worker dispatch を許可する routing decision（実行許可）であり、cleanup 成功の根拠ではない。
+報告は worker が返す実行結果で決める: `status: ok` かつ `unresolved_cleanup_items` 空・`errors` 空・完了確認済みなら
+「ローカル cleanup 成功 / Task Context 未記録」、`status: partial`（または一部 unresolved）なら「ローカル cleanup 部分成功 /
+残件と理由 / Task Context 未記録」、`status: failed`・refused・完了未確認なら「ローカル cleanup 未完了 / 理由 /
+Task Context 未記録」。いずれも `cleanup_completed`、親 Issue close、別 PR close の根拠にしない。
+local-only 実行後に復旧が明示要求された場合は `--phase recover` を実行してよいが、同一 invocation で
 worker の再 dispatch や `--phase completed` は行わない。
 
 ### TOCTOU と both-missing の残余リスク

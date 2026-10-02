@@ -859,9 +859,38 @@ def test_atomic_idempotent_dedupe_key_accepted_by_another_task_rejects_after_the
         "task_id": second["task"]["id"],
         "activity_action": "none",
         "claims_attached": "none",
+        # additive diagnostic: the Task that already owns the recovery dedupe key
+        "conflicting_task_id": first["task"]["id"],
     }
     assert dump_db() == before  # zero writes: no claim for the second Task, no second event
     assert _live_claim_owner("issue", ISSUE) is None
+
+
+def test_atomic_idempotent_accepted_merge_fact_owned_by_another_task_names_that_owner(tmp_path, state_root, conn):
+    first = build_origin(conn, session="first-origin", title="first", active_kind="implementation")
+    second = build_origin(conn, session="second-origin", title="second", active_kind="refine")
+    first_id, second_id = first["task"]["id"], second["task"]["id"]
+    claim(conn, first_id, "issue", ISSUE)
+    claim(conn, first_id, "pr", PR)
+    applied = workflow_signals.apply_workflow_signal(conn, merged_payload(), origin_session_id="first-origin")
+    assert applied["disposition"] == "applied", applied
+    _release_all_live_claims(conn)  # claim matrix passes; only the accepted merge fact remains
+    conn.close()
+    assert not read_all("SELECT 1 FROM events WHERE event_type = 'recovery:implementation_claims'")
+    before = dump_db()
+
+    result = run_adapter(recover_args(write_snapshot(tmp_path), session="second-origin"), state_root=state_root)
+
+    assert result == {
+        "disposition": "conflict",
+        "reason_code": "FACT_TASK_IDENTITY_CONFLICT",
+        "task_id": second_id,
+        "activity_action": "none",
+        "claims_attached": "none",
+        "conflicting_task_id": first_id,
+    }
+    assert dump_db() == before  # owner diagnostic is read from the loaded row: zero writes
+    assert _live_claim_owner("issue", ISSUE) is None and _live_claim_owner("pr", PR) is None
 
 
 @pytest.mark.parametrize("injection", ["bypassed_precheck_real_unique_index", "raw_sqlite_integrity_error"])
@@ -1407,6 +1436,51 @@ def test_skill_contract_recover_path_is_explicit_and_never_recommends_the_double
             assert "案内しない" in line or "使わない" in line
 
 
+def test_skill_contract_explicit_origin_diagnose_uses_env_prefix_and_never_the_nonexistent_option():
+    """PR #2873 review fix_delta A. Wording guard only; the behavior is proven
+    by the real-CLI subprocess tests in test_origin_reason_code_subprocess.py."""
+    text = _skill()
+    canonical = (
+        'CLAUDE_CODE_SESSION_ID="$ORIGIN_SESSION_ID" uv run --locked python3 '
+        "scripts/task-context/task_contextctl.py signal diagnose-origin </dev/null"
+    )
+    assert canonical in text
+    assert "diagnose-origin --origin-session-id" not in text
+    for line in text.splitlines():  # no remaining line instructs passing the option to diagnose-origin
+        if "diagnose-origin" in line and "--origin-session-id" in line:
+            assert "存在せず" in line or "してはならない" in line, line
+    section = _section(text, "`unbound` の原因別フォールバック")
+    assert "ambient" in section and "別 session" in section
+
+
+def test_skill_contract_local_only_report_classes_follow_worker_result_not_the_permission():
+    """PR #2873 review fix_delta B: LOCAL_ONLY_PERMITTED is a routing decision;
+    the success/partial/incomplete report class is decided by the worker result."""
+    section = _section(_skill(), "local-only の報告区分")
+    prose = " ".join(line for line in section.splitlines() if not line.startswith("|"))
+    assert "`LOCAL_ONLY_PERMITTED`" in prose and "routing decision" in prose and "実行許可" in prose
+    assert "単独を成功の根拠にしてはならない" in prose
+    rows = _table(section)
+    by_class = {row[1]: row[0] for row in rows}
+    assert set(by_class) == {
+        "ローカル cleanup 成功 / Task Context 未記録",
+        "ローカル cleanup 部分成功 / 残件と理由 / Task Context 未記録",
+        "ローカル cleanup 未完了 / 理由 / Task Context 未記録",
+    }
+    success = by_class["ローカル cleanup 成功 / Task Context 未記録"]
+    partial = by_class["ローカル cleanup 部分成功 / 残件と理由 / Task Context 未記録"]
+    incomplete = by_class["ローカル cleanup 未完了 / 理由 / Task Context 未記録"]
+    assert "`status: ok`" in success and "`unresolved_cleanup_items` が空" in success and "`errors` が空" in success
+    assert "`status: partial`" in partial and "`status: failed`" not in partial and "`status: ok`" in partial
+    assert "`status: failed`" in incomplete and "refused" in incomplete and "完了を確認できない" in incomplete
+    for cls in by_class:  # every class keeps the "Task Context unrecorded" honesty marker
+        assert cls.endswith("Task Context 未記録")
+    # existing constraints are kept next to the mapping
+    local_only = _section(_skill(), "local-only 経路: `--phase local-only`")
+    assert "`--phase completed` を呼ばない" in local_only
+    assert "cleanup_completed" in local_only and "親 Issue close" in local_only
+
+
 def test_skill_contract_frozen_wire_is_distinguished_from_the_changed_orchestration_policy():
     text = _skill()
     paragraph = next(p for p in text.split("\n\n") if "凍結 wire と今回変更する orchestration policy の区別" in p)
@@ -1546,6 +1620,7 @@ def test_docs_contract_recovery_and_local_only_sections_are_documented():
             "pr_claim_owner_task_id",
             "origin_other_issue_number",
             "origin_other_pr_number",
+            "conflicting_task_id",
         ],
         "implementation Activity 状態表": [
             "MERGE_FACT_ALREADY_ACCEPTED",

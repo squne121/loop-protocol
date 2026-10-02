@@ -67,7 +67,13 @@ outcome は `cleanup_completed` を emit せず dispatch も再開しない。ad
 
 診断には `scripts/task-context/task_contextctl.py signal diagnose-origin`（`task_context_workflow_signals.diagnose_origin`、Issue #2790 AC3/AC7）を read-only に呼び出す。この診断呼び出しは `events` journal に何も書き込まず、DB/state-root を作成・migration もせず（`connect_readonly` 経由、PR #2795 review fix_delta P2-B）、`signal apply` 自身が返す公開 disposition/reason_code には一切影響しない。
 
-**同一 effective origin の一貫性（P2-A）**: 診断は、直前に失敗した `signal apply`/`cleanup begin` 呼び出しと **同じ effective origin session** を対象にする。`task_context_workflow_signal.py --origin-session-id` に明示 origin を渡していた場合、直後の診断呼び出しにも `--origin-session-id` として同じ値を渡す（診断が自身の ambient `CLAUDE_CODE_SESSION_ID` だけを読み、直前の apply とは無関係な session を診断してしまう不整合を避ける）。ambient 環境変数だけを頼りに診断すると、直前の apply が使った origin と食い違う場合がある。
+**同一 effective origin の一貫性（P2-A）**: 診断は、直前に失敗した `signal apply`/`cleanup begin` 呼び出しと **同じ effective origin session** を対象にする。`signal diagnose-origin` は option を一切持たず、診断対象はそのプロセスの環境変数 `CLAUDE_CODE_SESSION_ID` だけで決まる（`--origin-session-id` は diagnose-origin の parser に存在せず、渡すと `unrecognized arguments` の parser error になる。diagnose-origin に `--origin-session-id` を渡す記述・呼び出しをしてはならない）。`task_context_workflow_signal.py --origin-session-id` に明示 origin を渡していた場合は、診断コマンドの環境変数にだけ同じ値を明示設定する次の canonical invocation を使う（`$ORIGIN_SESSION_ID` は直前の apply に渡した値と同一とする）:
+
+```bash
+CLAUDE_CODE_SESSION_ID="$ORIGIN_SESSION_ID" uv run --locked python3 scripts/task-context/task_contextctl.py signal diagnose-origin </dev/null
+```
+
+この環境変数の明示設定を省くと、親プロセス（親 shell / Agent）の ambient `CLAUDE_CODE_SESSION_ID` が診断対象になり、直前の apply とは無関係な別 session の原因を報告してしまう危険がある。直前の apply が明示 origin を使わず ambient session を使っていた場合に限り、環境変数の明示設定なしで呼んでよい。新しい option・wrapper・API は追加しない。
 
 canonical flow（概念的な順序。`/task` はユーザーの直接入力 `UserPromptExpansion` を使う設計であり、Claude が単に Skill tool を呼ぶ経路とは異なるため、orchestrator が worker/Skill 呼び出しだけで同じ bootstrap が発火すると仮定しない）:
 
@@ -121,7 +127,7 @@ uv run --locked python3 .claude/skills/post-merge-cleanup/scripts/task_context_w
 ```
 
 - `--explicit-recovery` が無ければ `rejected_evidence` / `EXPLICIT_RECOVERY_REQUIRED`、必須引数（`--merge-identity` / `--origin-session-id`）の欠落は `rejected_evidence` / `MISSING_REQUIRED_ARGUMENT`（いずれも書き込み 0）。`--origin-session-id` は必須で、ambient env へ fallback しない。
-- 結果は `applied` / `RECOVERED`、同一 Task の再実行 `duplicate_noop` / `SAME_TASK_SAME_FACT`、claim 分裂などの `conflict`（owner Task id と保持 claim 番号を含む）、`deferred`、`rejected_evidence` のいずれかになる。`conflict` で reject された場合は何も変更されない。
+- 結果は `applied` / `RECOVERED`、同一 Task の再実行 `duplicate_noop` / `SAME_TASK_SAME_FACT`、claim 分裂などの `conflict`（owner Task id と保持 claim 番号を含む。recovery dedupe key または merge fact が別 Task 所有の場合は、その所有 Task を `conflicting_task_id` で返す）、`deferred`、`rejected_evidence` のいずれかになる。`conflict` で reject された場合は何も変更されない。
 - 復旧は存在する claim の所有 Task を先に確認する。既存の `IMPLEMENTATION_NOT_READY` を「不足 claim を安全に追加できる」という判定に使わない。
 - **Issue と PR の両方で `/task` を実行することを回避策として案内しない**。`/task <issue>` と `/task pr <N>` の二重実行は claim 分裂を起こすため、復旧手順として使わない。
 - 復旧後は同じ effective origin で `--phase merged` を **1 回だけ**再実行して決定表へ戻る。復旧記録（`recovery:implementation_claims`）は `cleanup_completed` ではなく、親 Issue close や PR close の根拠にもならない。
@@ -162,10 +168,20 @@ uv run --locked python3 .claude/skills/post-merge-cleanup/scripts/task_context_w
 - worker の Delegation message には、この結果の fields（`repo` / `issue_number` / `pr_number` / `merge_commit_oid` / `worktree_path` / `branch_name`）を**そのまま（verbatim）**埋め込む（Materialization rule と同じ）。
 - local-only 経路では dispatch 後に **`--phase completed` を呼ばない**。Task Context の cleanup lifecycle を開始・完了したことにしない。
 - local-only 経路では step 3 のうち、`parent_issue_status` による `gh issue close`、`superseded_prs` による `gh pr close` / `gh pr comment` を**実行せず、候補として報告するだけ**にする。follow-up 起票は Task Context と無関係な dedupe_key 起票なので従来どおり実行してよい。
-- 結果は「ローカル cleanup 成功 / Task Context 未記録」と明記して報告する。`cleanup_completed`、親 Issue close、別 PR close の根拠にはならない。
+- 報告は下の「報告区分」表に従い、worker が返した実行結果で決める。`LOCAL_ONLY_PERMITTED` は dispatch を許可する routing decision（実行許可）であり、cleanup が成功した根拠ではない。いずれの区分でも `cleanup_completed`、親 Issue close、別 PR close の根拠にはならない。
 - 削除は `scripts/agent-ops/cleanup_exec.py` の既存認可境界（merge 状態、exact な worktree / branch、未コミット変更）だけを通る。dirty worktree・対象不明・merge 状態を確認できない場合は削除しない。bare な Git 削除や `rm -rf`、別の cleanup 機構は使わない。
 - 復旧が reject された場合の local-only 報告には、reject 結果の owner Task id・保持 claim 番号を含める。local-only 後は Task / implementation Activity が ACTIVE のまま残る既知の残余状態であり、この経路はそれらを cleanup しない（人間が owner Task を解決する）。
 - local-only 実行後に復旧が明示要求された場合は `--phase recover` を実行してよいが、同一 invocation で worker の再 dispatch や `--phase completed` は行わない。以後の通常経路での cleanup は別 invocation の明示呼び出しで行う。
+
+### local-only の報告区分（実行許可と実行結果の分離）
+
+`LOCAL_ONLY_PERMITTED` は「Task Context に記録できない状況でも worker の dispatch を許可する」という実行許可（routing decision）だけを表す。cleanup が実際に完了したかどうかは、worker が返す `POST_MERGE_CLEANUP_REPORT_V1` の実行結果だけで決める。`LOCAL_ONLY_PERMITTED` 単独を成功の根拠にしてはならない。どの区分でも末尾に `Task Context 未記録` を付け、Task Context lifecycle の完了を偽装しない。
+
+| worker の実行結果 | 報告区分 |
+|---|---|
+| `status: ok`、かつ `unresolved_cleanup_items` が空・`errors` が空・cleanup 完了を確認できた | ローカル cleanup 成功 / Task Context 未記録 |
+| `status: partial`、または `status: ok` でも `unresolved_cleanup_items` に残件がある | ローカル cleanup 部分成功 / 残件と理由 / Task Context 未記録 |
+| `status: failed`、worker が refused（拒否）、report 欠落・不正、または `errors` 非空などで完了を確認できない | ローカル cleanup 未完了 / 理由 / Task Context 未記録 |
 
 ## Delegation / 委譲
 
@@ -306,6 +322,7 @@ worker / SubAgent が独自に `git worktree remove --force` や `git branch -D`
 - follow-up 起票は main thread（本 orchestrator）でのみ実行する。worker / executor 側は候補列挙のみで `gh issue create` を直接呼び出さない
 - parent issue close / superseded PR close の実行は main thread（本 orchestrator）でのみ行う
 - local-only 経路では `--phase completed` を呼ばず、`gh issue close` / `gh pr close` / `gh pr comment` を実行しない（候補報告のみ）
+- local-only 経路では `LOCAL_ONLY_PERMITTED` を cleanup 成功の根拠にせず、worker の実行結果（`status` / `unresolved_cleanup_items` / `errors`）で報告区分を決める
 - worker（`post-merge-cleanup-worker`）を再起動する指示、または nested delegation（`Agent` tool 経由・Bash 経由の外部 agent CLI 起動）を worker に要求しない
 
 ## Related / 関連
