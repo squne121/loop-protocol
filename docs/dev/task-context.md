@@ -1789,6 +1789,11 @@ Task を推測して attach しない。`task-contextctl signal recover` も pay
   `rejected_evidence` / `MERGE_IDENTITY_MISMATCH`。
 - **snapshot の安全条件**: 既存 `_merged_evidence` の検証（`closingIssuesReferences(first: 2)`、repository identity、
   merge OID）を再利用する。PR 本文の `Closes #N` 文字列は authority にしない。新しい証明書・署名・長寿命 token は追加しない。
+- **repository identity の束縛範囲**: AC1 が検証する repository identity は、snapshot 自身の `repository.nameWithOwner` と
+  `closingIssuesReferences` の node の `repository.nameWithOwner` が（大文字小文字を除き）一致すること、すなわち
+  snapshot identity と closing relation との束縛だけである。adapter は GitHub I/O を行わず、ローカル checkout の
+  remote や caller の cwd の repository を独立には検証しない。snapshot 自体を取得した repository の正しさは
+  fresh snapshot を取得する orchestrator の責務であり、adapter が保証する範囲には含まれない。
 - **評価順（全て書き込み前）**: 引数 → snapshot / merge identity → origin 解決 → claim ownership matrix → recovery dedupe →
   Activity 判定 → 書き込み。書き込み（claim 付与、Activity start / transition、origin run の付け替え、復旧記録 append、
   projection bump）は既存の `db.write_transaction`（`BEGIN IMMEDIATE`）1 つにまとめ、外側から BEGIN で包まない。
@@ -1855,6 +1860,11 @@ X = origin Task T 以外の Task。「T の別 claim」= T が保持する、対
   ACTIVE な implementation 行が存在すれば `ACTIVE`（`active == implementation` と同じ事実）として導出するため、
   `active == implementation` の行は履歴によらず優先順 1 の reuse になり、`(implementation, none)` と
   `(implementation, terminal)` の 2 セルは入力としては矛盾（構成不能）として扱う。
+  明示すると、`active == implementation` かつ `impl_latest_status == ACTIVE` の組は `merge_accepted` が `true` でも
+  `false` でも常に reuse（書き込みなし）であり、`duplicate_noop` や `IMPLEMENTATION_ACTIVITY_TERMINAL` にはならない。
+  一方 `(implementation, none)` と `(implementation, terminal)` は「ACTIVE な implementation 行が存在するのに履歴が無い /
+  terminal のみ」という自己矛盾であり、契約の「DB で構成できないセルは `ACTIVITY_STATE_INCONSISTENT`」に従って
+  `conflict` / `ACTIVITY_STATE_INCONSISTENT` を返す（推測して reuse にしない）。
 - start / transition では origin ExecutionRun を `_attach_execution_run_tx` で新 Activity へ付け替える（`refinement_approved`
   経路と同一規約）。他の ExecutionRun は変更しない。復旧は `refinement_approved` event も `implementation_pr_observed` event も作らない。
 - `native_operator` は managed bootstrap（`/task`）が作る汎用の operator Activity であり workflow phase ではない。DONE にされる

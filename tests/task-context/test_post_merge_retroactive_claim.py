@@ -582,6 +582,19 @@ def test_activity_state_pure_function_covers_all_18_cells(active, impl, merge_ac
         assert (decision["disposition"], decision["reason_code"]) == reason
 
 
+@pytest.mark.parametrize("merge_accepted", [False, True])
+def test_activity_state_active_implementation_with_active_status_reuses_for_every_merge_accepted_value(merge_accepted):
+    assert workflow_signals.decide_activity_action("implementation", "ACTIVE", merge_accepted) == {"action": "reuse"}
+
+
+@pytest.mark.parametrize("impl", ["none", "terminal"])
+@pytest.mark.parametrize("merge_accepted", [False, True])
+def test_activity_state_active_implementation_without_an_active_row_is_inconsistent_not_guessed(impl, merge_accepted):
+    decision = workflow_signals.decide_activity_action("implementation", impl, merge_accepted)
+    assert decision["action"] == "reject"
+    assert (decision["disposition"], decision["reason_code"]) == INCONSISTENT
+
+
 def test_activity_state_pure_function_has_exactly_7_non_constructible_cells():
     inconsistent = [
         (a, i)
@@ -1328,6 +1341,8 @@ def test_skill_contract_fresh_snapshot_rule_and_merge_identity_are_stated():
         "MERGE_IDENTITY_MISMATCH",
         "40 hex",
         "closingIssuesReferences",
+        "repository identity の束縛範囲",
+        "snapshot identity と closing relation",
     ):
         assert token in section, token
     assert "`--phase recover`" in section and "`--phase local-only`" in section
@@ -1407,18 +1422,22 @@ def test_skill_contract_frozen_wire_is_distinguished_from_the_changed_orchestrat
         assert token in paragraph, token
 
 
-def test_skill_contract_runtime_prompt_fixture_is_read_only_and_declares_the_ordered_markers():
-    fixture = (REPO_ROOT / "tests/task-context/fixtures/post_merge_local_only_runtime_prompt.md").read_text(
-        encoding="utf-8"
-    )
-    positions = [fixture.index(f"POST_MERGE_ROUTE_{x}=") for x in "ABC"]
-    assert positions == sorted(positions)
-    for marker in (
-        "POST_MERGE_ROUTE_A=normal_dispatch",
-        "POST_MERGE_ROUTE_B=local_only",
-        "POST_MERGE_ROUTE_C=stop_human_review",
-    ):
-        assert marker in fixture
+_RUNTIME_PROMPT_FIXTURE = "tests/task-context/fixtures/post_merge_local_only_runtime_prompt.md"
+_EXPECTED_ROUTES = ("normal_dispatch", "local_only", "stop_human_review")
+
+
+def _runtime_prompt_fixture() -> str:
+    return (REPO_ROOT / _RUNTIME_PROMPT_FIXTURE).read_text(encoding="utf-8")
+
+
+def _explore_request_section(fixture: str) -> str:
+    start = fixture.index("### Explore への依頼")
+    end = fixture.index("## 手順 3: 最終応答")
+    return fixture[start:end]
+
+
+def test_skill_contract_runtime_prompt_fixture_is_read_only_and_asks_for_one_explore():
+    fixture = _runtime_prompt_fixture()
     for token in (
         ".claude/skills/post-merge-cleanup/SKILL.md",
         "`Explore`",
@@ -1429,6 +1448,55 @@ def test_skill_contract_runtime_prompt_fixture_is_read_only_and_declares_the_ord
     ):
         assert token in fixture, token
     assert "post-merge-cleanup-worker` の起動は一切行いません" in fixture
+
+
+def test_skill_contract_runtime_prompt_fixture_requires_markers_in_the_child_output_in_order():
+    fixture = _runtime_prompt_fixture()
+    request = _explore_request_section(fixture)
+    # (1) the Explore request itself demands the three ordered marker lines as ITS OWN answer end
+    positions = [request.index(f"POST_MERGE_ROUTE_{x}=<route>") for x in "ABC"]
+    assert positions == sorted(positions)
+    assert "回答の最後は" in request
+    assert "3 行ちょうど" in request
+    assert "この 3 行より後ろには何も書かないでください" in request
+    # (2) the main session ALSO prints the same three lines, in order A -> B -> C, after the child step
+    final_step = fixture[fixture.index("## 手順 3: 最終応答") :]
+    final_positions = [final_step.index(f"POST_MERGE_ROUTE_{x}=<route>") for x in "ABC"]
+    assert final_positions == sorted(final_positions)
+    assert "最終応答の末尾" in final_step
+    assert fixture.index("### Explore への依頼") < fixture.index("## 手順 3: 最終応答")
+
+
+def test_skill_contract_runtime_prompt_fixture_never_leaks_the_expected_answers():
+    fixture = _runtime_prompt_fixture()
+    request = _explore_request_section(fixture)
+    # the route must be derived by Explore from the SKILL text: no ready-made
+    # ``POST_MERGE_ROUTE_X=<route name>`` line anywhere in the fixture, and no
+    # case-to-route binding in the Explore request.
+    for route in _EXPECTED_ROUTES:
+        for marker in "ABC":
+            assert f"POST_MERGE_ROUTE_{marker}={route}" not in fixture
+    assert re.search(r"POST_MERGE_ROUTE_[ABC]=(?!<route>)\S", fixture) is None
+    # route NAMES may be listed only as the closed answer vocabulary, never bound to A/B/C
+    for route in _EXPECTED_ROUTES:
+        assert not re.search(rf"[ABC]\s*[:=\-]\s*`?{route}", request), route
+
+
+def test_skill_contract_skill_text_yields_the_three_synthetic_routes_the_fixture_expects():
+    text = _skill()
+    table_start = text.index("### 決定表（`--phase merged` の結果")
+    table = text[table_start : text.index("`recovery_rejected` は", table_start)]
+    rows = {
+        line.split("|")[1].strip(): line.split("|")[2].strip() for line in table.splitlines() if line.startswith("| `")
+    }
+    selected = next(v for k, v in rows.items() if k.startswith("`selected`"))
+    not_ready = rows["`deferred/IMPLEMENTATION_NOT_READY`"]
+    # A: selected -> normal dispatch (no local-only)
+    assert "通常経路: worker dispatch" in selected
+    # B: not ready without a recovery request -> local-only
+    assert not_ready.startswith("local-only")
+    # C: deferred/unbound + origin_ambiguous -> stop for a human, never local-only
+    assert "| `origin_ambiguous` | 停止して人間判断（`human_review_required: true`）。local-only に入らない |" in text
 
 
 # ===========================================================================
@@ -1451,6 +1519,8 @@ def test_docs_contract_recovery_and_local_only_sections_are_documented():
             "closingIssuesReferences",
             "暗黙",
             "推測",
+            "repository identity の束縛範囲",
+            "snapshot identity と closing relation",
         ],
         "claim ownership matrix": [
             "FACT_TASK_IDENTITY_CONFLICT",
@@ -1472,6 +1542,8 @@ def test_docs_contract_recovery_and_local_only_sections_are_documented():
             "18 セル",
             "11 組",
             "ux_activities_active_per_task",
+            "`merge_accepted` が `true` でも",
+            "`(implementation, none)` と `(implementation, terminal)`",
         ],
         "merge signal → recovery / local-only 決定表": [
             "deferred/IMPLEMENTATION_NOT_READY",

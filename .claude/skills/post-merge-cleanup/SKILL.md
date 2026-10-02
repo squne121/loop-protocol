@@ -41,6 +41,7 @@ outcome は `cleanup_completed` を emit せず dispatch も再開しない。ad
 
 - 「fresh」とは、その invocation（`--phase recover` または `--phase local-only`）の直前に orchestrator が取得した snapshot を指す。adapter は GitHub I/O を行わないため、検証可能な定義として **snapshot file の mtime が adapter 起動時刻から 300 秒以内**を要求し、超過した場合は `deferred` / `SNAPSHOT_STALE`（書き込み 0）になる。
 - **前回 invocation の snapshot の再利用は禁止**する。`--phase merged` で使った snapshot を `--phase recover` や `--phase local-only` へ流用せず、毎回直前に取得し直す。
+- repository identity の束縛範囲は、snapshot 自身の `repository.nameWithOwner` と `closingIssuesReferences` node の `repository.nameWithOwner` との一致（snapshot identity と closing relation）だけである。adapter は GitHub I/O を行わず、ローカル checkout の remote は検証しないため、snapshot を正しい repository から取得する責務は orchestrator が負う。
 - `--merge-identity <40 hex>` は必須で、snapshot の merge OID と完全一致し、かつ `^[0-9a-f]{40}$` に一致しなければ `rejected_evidence` / `MERGE_IDENTITY_MISMATCH` になる。PR 本文の `Closes #N` 文字列は authority にしない（`closingIssuesReferences` だけを使う）。
 
 ### 決定表（`--phase merged` の結果 → 復旧 / local-only）
@@ -114,7 +115,7 @@ merge signal apply が unbound
 Task Context に紐づかないままマージされた PR について、Issue claim / PR claim の欠落を **整合する場合だけ**原子的に復旧する。暗黙には実行せず、通常 hook・prompt 自動 rebind・暗黙 attach からは呼ばない。人間のキー入力は要求しないが、対象 PR・Issue・effective origin・復旧意図が明示された要求を受けた Agent の実行に限る。Task を推測して attach しない。
 
 ```bash
-uv run python3 .claude/skills/post-merge-cleanup/scripts/task_context_workflow_signal.py \
+uv run --locked python3 .claude/skills/post-merge-cleanup/scripts/task_context_workflow_signal.py \
   --snapshot-file "$SNAPSHOT" --issue-number "$ISSUE_NUMBER" --pr-number "$PR_NUMBER" \
   --phase recover --merge-identity "$MERGE_OID" --explicit-recovery --origin-session-id "$ORIGIN_SESSION_ID"
 ```
@@ -130,7 +131,7 @@ uv run python3 .claude/skills/post-merge-cleanup/scripts/task_context_workflow_s
 Task Context を復旧できない / しない場合に、Task Context の lifecycle を開始・完了したと偽らず、安全判定済みのローカル cleanup だけを継続する経路。adapter は Task Context への ctl 呼び出し・DB 書き込み・events 追加を一切行わない。
 
 ```bash
-uv run python3 .claude/skills/post-merge-cleanup/scripts/task_context_workflow_signal.py \
+uv run --locked python3 .claude/skills/post-merge-cleanup/scripts/task_context_workflow_signal.py \
   --snapshot-file "$SNAPSHOT" --issue-number "$ISSUE_NUMBER" --pr-number "$PR_NUMBER" \
   --phase local-only --merge-identity "$MERGE_OID" --task-context-outcome "$OUTCOME" \
   --worktree-path "$WORKTREE_PATH" --branch-name "$BRANCH_NAME"
