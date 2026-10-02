@@ -324,6 +324,14 @@ class _OuterTimeoutFaultInjection:
     and only after the fixture's readiness markers are observed. It does
     not stub, re-implement, or bypass the supervisor's SIGTERM, grace wait,
     SIGKILL escalation, reap, or typed timeout result construction.
+
+    Internal validation failures (timeout value mismatch, readiness wait
+    failure) are RECORDED in `validation_failures` and NEVER propagated out
+    of `fire()`: `fire()` always ends by raising `TimeoutExpired`, so the
+    production `except subprocess.TimeoutExpired` cleanup branch (SIGTERM ->
+    grace -> SIGKILL -> reap) always runs to completion and no wrapper / VC
+    tree is orphaned. The recorded failures are surfaced as test failures by
+    the caller only AFTER cleanup has been verified (Issue #2883 P2).
     """
 
     def __init__(
@@ -341,6 +349,16 @@ class _OuterTimeoutFaultInjection:
         self.fired = False
         self.readiness_absent_while_held = None
         self.readiness_observed_before_fire = False
+        self.validation_failures = []
+
+    def raise_validation_failures(self):
+        """Surface recorded injection failures as a test failure. Call only
+        after the production cleanup has been verified."""
+        failures = list(self.validation_failures)
+        if not self.fired:
+            failures.append("fault injection never intercepted the supervisor's outer timeout")
+        if failures:
+            raise AssertionError("fault injection validation failed: " + "; ".join(failures))
 
     def matches(self, popen, timeout) -> bool:
         argv = popen.args
@@ -353,27 +371,35 @@ class _OuterTimeoutFaultInjection:
 
     def fire(self, popen, timeout):
         self.fired = True
-        assert timeout == self.expected_timeout_seconds, (
-            "fault injection must intercept the supervisor's own outer "
-            f"communicate(timeout=...) arm point; got timeout={timeout!r}"
-        )
+        if timeout != self.expected_timeout_seconds:
+            self.validation_failures.append(
+                "fault injection must intercept the supervisor's own outer "
+                f"communicate(timeout=...) arm point; got timeout={timeout!r}, "
+                f"expected {self.expected_timeout_seconds!r}"
+            )
         armed_at = time.monotonic()
 
-        if self.hold_release_for_seconds is not None:
-            # Deterministic delayed-readiness: the fixture is blocked on the
-            # release file, so readiness CANNOT exist yet. Hold past the
-            # retired fixed deadline (lower bound only; no upper bound is
-            # asserted, so CPU load cannot break this) to prove the injected
-            # timeout waits for readiness rather than for elapsed time.
-            remaining = self.hold_release_for_seconds - (time.monotonic() - armed_at)
-            if remaining > 0:
-                threading.Event().wait(remaining)
-            self.readiness_absent_while_held = not any(p.exists() for p in self.readiness_paths)
-            self.release_path.write_text("release", encoding="utf-8")
+        try:
+            if self.hold_release_for_seconds is not None:
+                # Deterministic delayed-readiness: the fixture is blocked on
+                # the release file, so readiness CANNOT exist yet. Hold past
+                # the retired fixed deadline (lower bound only; no upper
+                # bound is asserted, so CPU load cannot break this) to prove
+                # the injected timeout waits for readiness rather than for
+                # elapsed time.
+                remaining = self.hold_release_for_seconds - (time.monotonic() - armed_at)
+                if remaining > 0:
+                    threading.Event().wait(remaining)
+                self.readiness_absent_while_held = not any(p.exists() for p in self.readiness_paths)
+                self.release_path.write_text("release", encoding="utf-8")
 
-        for path in self.readiness_paths:
-            _wait_for_file(path, timeout=_READINESS_FAILURE_BOUND_SECONDS)
-        self.readiness_observed_before_fire = True
+            for path in self.readiness_paths:
+                _wait_for_file(path, timeout=_READINESS_FAILURE_BOUND_SECONDS)
+            self.readiness_observed_before_fire = True
+        except Exception as exc:  # noqa: BLE001 - recorded, surfaced after cleanup
+            self.validation_failures.append(f"readiness wait failed: {exc!r}")
+
+        # ALWAYS raise, so the production cleanup branch runs to completion.
         raise subprocess.TimeoutExpired(cmd=popen.args, timeout=timeout)
 
 
@@ -448,12 +474,25 @@ def _build_immortal_grandchild_fixture_source(
 
 
 def _run_outer_timeout_fault_injection_iteration(
-    tmp_path, *, iteration, interpreter, install_fault_injection, delay_readiness
+    tmp_path,
+    *,
+    iteration,
+    interpreter,
+    install_fault_injection,
+    delay_readiness,
+    expected_timeout_seconds=_OUTER_TIMEOUT_NEVER_ELAPSES_SECONDS,
+    expect_validation_failure=False,
 ):
     """One fault-injection integration invocation (Issue #2883): ready real
     process tree -> production outer-timeout handling branch -> SIGTERM
     handler marker -> wrapper / VC leader / grandchild full reap -> typed
-    timeout result, all inside ONE `run_baseline_vc_preflight()` call."""
+    timeout result, all inside ONE `run_baseline_vc_preflight()` call.
+
+    Injection-internal validation failures never abort the production
+    cleanup branch; they are asserted AFTER reap is confirmed. With
+    `expect_validation_failure=True` (Issue #2883 AC8 regression) the helper
+    instead asserts that a failure WAS recorded and surfaces as an
+    `AssertionError` after cleanup."""
     marker_dir = tmp_path / f"iter_{iteration}"
     marker_dir.mkdir()
 
@@ -490,7 +529,7 @@ def _run_outer_timeout_fault_injection_iteration(
                 if delay_readiness
                 else None
             ),
-            expected_timeout_seconds=_OUTER_TIMEOUT_NEVER_ELAPSES_SECONDS,
+            expected_timeout_seconds=expected_timeout_seconds,
         )
     )
 
@@ -503,18 +542,6 @@ def _run_outer_timeout_fault_injection_iteration(
                 "BASELINE_VC_PREFLIGHT_TEST_SIGTERM_MARKER_PATH": str(sigterm_marker_path),
             },
         )
-
-        # The injected timeout must have fired through the supervisor's own
-        # outer arm point, and only after readiness was observed.
-        assert injection.fired, "fault injection never intercepted the supervisor's outer timeout"
-        assert injection.readiness_observed_before_fire, (
-            f"outer timeout fired before readiness was observed (iteration {iteration})"
-        )
-        if delay_readiness:
-            assert injection.readiness_absent_while_held is True, (
-                "readiness markers existed before the fixture was released; the "
-                "delayed-readiness condition was not actually established"
-            )
 
         # Typed runtime_error payload (Issue #2165 P0-1 / Issue #2207 OWNER
         # P0-1): never a plain `errors: ["timeout"]` blocked payload.
@@ -533,11 +560,14 @@ def _run_outer_timeout_fault_injection_iteration(
         wrapper_pid = int(marker_content.strip().split("pid=", 1)[1])
 
         # Readiness was already observed synchronously by the injection
-        # BEFORE the timeout branch ran, so these files exist: the process
-        # tree was genuinely alive when the production path reaped it.
-        assert self_pid_path.exists() and grandchild_pid_path.exists()
-        vc_leader_pid = int(self_pid_path.read_text().strip())
-        grandchild_pid = int(grandchild_pid_path.read_text().strip())
+        # BEFORE the timeout branch ran, so these files normally exist: the
+        # process tree was genuinely alive when the production path reaped
+        # it. If readiness was NOT observed, only the wrapper is checked
+        # here and the recorded readiness failure surfaces below.
+        tree_pids = []
+        for pid_path in (self_pid_path, grandchild_pid_path):
+            if pid_path.exists():
+                tree_pids.append(int(pid_path.read_text().strip()))
 
         # Full absence of wrapper / VC-leader / grandchild, confirmed via
         # bounded poll (reap is asynchronous relative to
@@ -547,14 +577,32 @@ def _run_outer_timeout_fault_injection_iteration(
             f"wrapper (baseline_vc_preflight.py, pid={wrapper_pid}) was not reaped "
             f"after the outer timeout (iteration {iteration})"
         )
-        assert _wait_until_dead(vc_leader_pid, timeout=5.0), (
-            f"VC leader (pid={vc_leader_pid}) was not reaped after the outer "
-            f"timeout (iteration {iteration})"
-        )
-        assert _wait_until_dead(grandchild_pid, timeout=5.0), (
-            f"SIGTERM-ignoring grandchild (pid={grandchild_pid}) was not reaped "
-            f"after the outer timeout (iteration {iteration}) -- process group leak"
-        )
+        for tree_pid in tree_pids:
+            assert _wait_until_dead(tree_pid, timeout=5.0), (
+                f"fixture process (pid={tree_pid}) was not reaped after the outer "
+                f"timeout (iteration {iteration}) -- process group leak"
+            )
+
+        # Injection-internal validation is checked AFTER reap (never before:
+        # a failing injection must not bypass production cleanup).
+        if expect_validation_failure:
+            assert injection.validation_failures, (
+                "expected the injection to record a validation failure but none was recorded"
+            )
+            assert len(tree_pids) == 2, "expected the full process tree to have been ready and reaped"
+            with pytest.raises(AssertionError, match="fault injection validation failed"):
+                injection.raise_validation_failures()
+        else:
+            injection.raise_validation_failures()
+            assert injection.readiness_observed_before_fire, (
+                f"outer timeout fired before readiness was observed (iteration {iteration})"
+            )
+            if delay_readiness:
+                assert injection.readiness_absent_while_held is True, (
+                    "readiness markers existed before the fixture was released; the "
+                    "delayed-readiness condition was not actually established"
+                )
+        return injection
     finally:
         # Never leak a fixture tree on a failing iteration.
         for p in (self_pid_path, grandchild_pid_path):
@@ -605,8 +653,9 @@ def test_outer_timeout_fault_injection_reaps_full_process_tree(
     `baseline_vc_preflight_aggregate` payload (never a plain `errors: [...]`
     blocked payload) within ONE invocation, repeated
     `_OUTER_DEADLINE_REPEAT_COUNT` times to catch register/unregister
-    ordering races. Real elapsed-timeout coverage lives in
-    `test_scaled_fault_injection_inner_timeout_precedes_outer_deadline`."""
+    ordering races. Real elapsed-timeout coverage (the supervisor's
+    `communicate(timeout=...)` timing out by itself) lives in
+    `test_outer_timeout_natural_elapsed_timeout_returns_typed_timeout_result`."""
     interpreter = _venv_python3_interpreter()
     for iteration in range(_OUTER_DEADLINE_REPEAT_COUNT):
         _run_outer_timeout_fault_injection_iteration(
@@ -637,6 +686,100 @@ def test_outer_timeout_fault_injection_waits_for_ready_process_tree(
         install_fault_injection=outer_timeout_fault_injection,
         delay_readiness=True,
     )
+
+
+def test_outer_timeout_fault_injection_validation_failure_still_reaps_process_tree(
+    tmp_path, outer_timeout_fault_injection
+):
+    """Issue #2883 AC8 regression: when the fault injection's own internal
+    validation fails (here: an intentionally mismatched
+    `expected_timeout_seconds`), `fire()` must STILL raise `TimeoutExpired`
+    so the production cleanup branch (SIGTERM -> grace -> SIGKILL -> reap)
+    runs to completion. The iteration helper then asserts BOTH that (a) the
+    validation failure was recorded and surfaces as a test failure only
+    after cleanup, and (b) the typed timeout result plus full reap of the
+    wrapper / VC leader / grandchild still hold. A reap-only assertion would
+    not be enough: it would pass for an injection that silently swallowed
+    the mismatch."""
+    injection = _run_outer_timeout_fault_injection_iteration(
+        tmp_path,
+        iteration=0,
+        interpreter=_venv_python3_interpreter(),
+        install_fault_injection=outer_timeout_fault_injection,
+        delay_readiness=False,
+        expected_timeout_seconds=_OUTER_TIMEOUT_NEVER_ELAPSES_SECONDS + 1.0,
+        expect_validation_failure=True,
+    )
+    assert injection.fired
+    assert any("got timeout=" in failure for failure in injection.validation_failures), (
+        injection.validation_failures
+    )
+
+
+def test_outer_timeout_natural_elapsed_timeout_returns_typed_timeout_result(tmp_path):
+    """Issue #2883 AC7: NATURAL outer-timeout coverage. No fault injection,
+    no readiness marker / readiness wait: a real
+    `run_baseline_vc_preflight()` is given a VC that runs far longer than a
+    small `override_timeout_seconds`, so the production supervisor's
+    `communicate(timeout=...)` times out on REAL elapsed time. This is what
+    proves the timeout argument actually reaches the supervisor's timer
+    (the fault-injection tests above only exercise the handling branch that
+    runs AFTER `TimeoutExpired`; their grandchild readiness / full-reap
+    guarantees are theirs, not this test's).
+
+    Asserts the typed timeout result and a LOWER bound on elapsed time only;
+    no upper bound or startup-speed assumption, so CPU load cannot flake it.
+    The VC sleeps a finite time and is reaped by the production cleanup, so
+    no orphan is intended; a best-effort pid-file kill is still done in
+    `finally` as insurance (readiness is never asserted)."""
+    timeout_seconds = 2.0
+    grace_seconds = 0.2
+    pid_path = tmp_path / "natural_timeout_fixture.pid"
+
+    fixture_path = tmp_path / "test_natural_timeout_fixture.py"
+    fixture_path.write_text(
+        "import os\n"
+        "import time\n"
+        "\n"
+        "\n"
+        "def test_sleep_longer_than_outer_timeout():\n"
+        f"    with open({str(pid_path)!r}, \"w\") as f:\n"
+        "        f.write(str(os.getpid()))\n"
+        "    time.sleep(45.0)\n",
+        encoding="utf-8",
+    )
+    body = (
+        "## Verification Commands\n\n"
+        "```bash\n"
+        f"$ {_venv_python3_interpreter()} -m pytest {fixture_path} -q -s\n"
+        "```\n"
+    )
+
+    try:
+        start = time.monotonic()
+        result, exit_code = crc.run_baseline_vc_preflight(
+            body,
+            override_timeout_seconds=timeout_seconds,
+            override_grace_seconds=grace_seconds,
+        )
+        elapsed = time.monotonic() - start
+
+        assert result["status"] == "runtime_error", result
+        assert result["failure_class"] == "timeout", result
+        assert result["timeout_phase"] == "baseline_vc_preflight_aggregate", result
+        assert result["retryable"] is False, result
+        assert exit_code == -1
+        # Lower bound only: the production timer really elapsed.
+        assert elapsed >= timeout_seconds, (elapsed, timeout_seconds)
+    finally:
+        # Best-effort insurance only; not an assertion condition.
+        if pid_path.exists():
+            try:
+                pid = int(pid_path.read_text().strip())
+                if _pid_alive(pid):
+                    os.kill(pid, signal.SIGKILL)
+            except (ValueError, OSError):
+                pass
 
 
 def test_kill_process_group_reaps_sigterm_ignoring_grandchild(tmp_path):
