@@ -661,3 +661,283 @@ def test_given_pre_fix_behavior_restored_when_classified_then_regression_cases_f
 
     # Each representative case fails once the pre-fix behavior is restored.
     assert {name: check() for name, check in checks.items()} == dict.fromkeys(checks, False)
+
+
+# ---------------------------------------------------------------------------
+# Issue #2864: (W1) marker 列挙判定から二乗経路 (a) / (b) を除去、(W2) marker より
+# 後ろに参照を持つ segment からのみ後続 segment へ降格を伝播、(W3) path / URL 内の
+# `#N` を現在 repo の参照にしない。既存の #2850 test の assertion は変更しない。
+# ---------------------------------------------------------------------------
+
+
+class _CountingOccurrence:
+    """``_Occurrence`` の代替。``start`` の参照回数だけを数える（計数 test 専用）。
+
+    実装が occurrence の開始位置を何回読むかは、除去対象の二乗経路 (a)
+    （segment ごとに全 occurrence を走査）と (b)（occurrence ごとに全 marker
+    segment を走査）で ``start`` の読み出しが入力サイズの二乗に増えることを使って
+    検出する。実時間ではなく読み出し回数なので環境に依存せず決定論的である。"""
+
+    def __init__(self, occurrence, counter):
+        self.target = occurrence.target
+        self.end = occurrence.end
+        self.form = occurrence.form
+        self._start = occurrence.start
+        self._counter = counter
+
+    @property
+    def start(self):
+        self._counter[0] += 1
+        return self._start
+
+
+def _start_reads(prompt: str) -> int:
+    """``_primary_occurrences`` が ``prompt`` の occurrence の ``start`` を読んだ回数。"""
+    authority_text = classifier._strip_authority_exclusions(prompt)
+    occurrences = classifier._find_occurrences(authority_text, REPO)
+    assert occurrences, prompt
+    counter = [0]
+    counted = [_CountingOccurrence(o, counter) for o in occurrences]
+    counter[0] = 0  # 構築時の読み出しは数えない
+    classifier._primary_occurrences(authority_text, counted)
+    return counter[0]
+
+
+_PATHOLOGICAL_MARKER_LISTS = (
+    # (b) だけを通る: 各 segment 自身が marker を含むので (a) の経路には入らない。
+    ("参考#1、", lambda n: "参考#1、" * n),
+    # (a) と (b) の両方を通る: W2 修正後も marker segment 内の `#1` が marker より後ろにあるため、
+    # 列挙が後続 segment へ伝播して (a) の segment 判定に入る。
+    ("参考: #1、#1...", lambda n: "参考: #1" + "、#1" * n),
+)
+
+
+@pytest.mark.parametrize(("label", "build"), _PATHOLOGICAL_MARKER_LISTS, ids=[x[0] for x in _PATHOLOGICAL_MARKER_LISTS])
+def test_given_pathological_marker_list_when_classified_then_not_quadratic(label, build):
+    # 入力サイズを 2 倍にしたとき ``start`` 参照回数が 3 倍以下であること（二乗なら約 4 倍）。
+    # 実装は ``bisect`` ベースで O(n log n)（線形ではない）。参照回数は occurrence あたり定数回なので
+    # 比は約 2 になる。
+    sizes = (1000, 2000, 4000)
+    reads = [_start_reads(build(n)) for n in sizes]
+    # 非 vacuous: 少なくとも occurrence ごとに 1 回は読まれており、サイズに応じて増える。
+    assert reads[0] >= sizes[0], (label, reads)
+    for smaller, larger in zip(reads, reads[1:], strict=False):
+        assert larger <= 3 * smaller, (label, reads)
+    # 入力を実際に分類しても結果は崩れていない（全 reference が marker に束縛された REFERENCE_ONLY）。
+    result = classifier.classify(build(50), current_repo=REPO)
+    assert result.kind == classifier.KIND_REFERENCE_ONLY, label
+    assert not _eligible(build(50)), label
+
+
+def _reference_primary_occurrences(authority_text, occurrences):
+    """W2 / W1 の新意味論を素朴（全 occurrence 走査・二乗）に書いた reference implementation。
+
+    旧実装のコピーではなく、規則を文字通りに実装している:
+      * clause を `、` / `,` で segment に分ける
+      * marker（参考 / 関連資料）を含む segment 内の参照は marker の前後を問わず降格する
+      * 降格が後続 segment へ伝播するのは、marker segment 内に marker より後ろから始まる
+        参照がある場合だけ。伝播は「先頭 token が参照（任意で Issue / PR 等の prefix 語付き）」の
+        segment で続き、それ以外の segment で止まる
+      * occurrence の返却順は変えない
+    """
+    markers = ("参考", "関連資料")
+    lead_word = re.compile(r"(?:(?:issue|pr|pull request|イシュー|プルリクエスト|プルリク)\s*)?", re.IGNORECASE)
+    demoted: set[int] = set()
+    for clause_start, clause_end in classifier._clause_spans(authority_text):
+        segments = []
+        segment_start = clause_start
+        for index in range(clause_start, clause_end):
+            if authority_text[index] in "、,":
+                segments.append((segment_start, index + 1))
+                segment_start = index + 1
+        if segment_start < clause_end:
+            segments.append((segment_start, clause_end))
+        in_list = False
+        for seg_start, seg_end in segments:
+            seg = authority_text[seg_start:seg_end]
+            marker_ends = [seg_start + seg.find(m) + len(m) for m in markers if m in seg]
+            inside = [i for i, o in enumerate(occurrences) if seg_start <= o.start < seg_end]
+            if marker_ends:
+                demoted.update(inside)
+                marker_end = min(marker_ends)
+                in_list = any(occurrences[i].start >= marker_end for i in inside)
+                continue
+            first = seg_start + (len(seg) - len(seg.lstrip()))
+            leads_with_reference = any(
+                first <= occurrences[i].start and lead_word.fullmatch(authority_text[first : occurrences[i].start])
+                for i in inside
+            )
+            if in_list and leads_with_reference:
+                demoted.update(inside)
+            else:
+                in_list = False
+    return [o for i, o in enumerate(occurrences) if i not in demoted]
+
+
+_MARKER_LIST_CORPUS = [
+    # #2850 AC4: marker 直後の reference list
+    "参考: #10、#11を実装して",
+    "参考: #10, #11を実装して",
+    "参考: #10、#11 を実装して",
+    "参考: #10、Issue #11 を実装して",
+    "関連資料: #10、#11",
+    # #2850 AC5: marker 前の primary 維持
+    "Issue #2827を対象にレビューして、関連資料: #2826、#2829",
+    "Issue #2827 を対象にレビューして、関連資料: #2826、#2829",
+    "Issue #12を対象にレビューして、関連資料: #10、#11",
+    # #2850 AC6: sentence boundary / list 終端
+    "参考: #10、#11。Issue #12を実装して",
+    "参考: #10、#11\nIssue #12を実装して",
+    "参考: #10、#11. Issue #12を実装して",
+    "参考: #10、#11？Issue #12を実装して",
+    "参考: #10、それとは別に Issue #12を実装して",
+    "関連資料: #2826、Issue #2827 を対象にレビューして",
+    # #2827: marker 自身の segment
+    "Issue #3 を参考に実装して",
+    "参考#1、#2",
+    # marker 複数 / 別 clause の marker
+    "参考: #1、#2。関連資料: #3、#4",
+    "参考に #1、参考: #2、#3を実装して",
+    "参考 #1、関連資料 #2、#3、それとは別に #4",
+    # marker 無し / occurrence 無し / marker のみ
+    "#12を実装して",
+    "Issue #1 と Issue #2 を実装して",
+    "参考にして実装して",
+    "",
+    # occurrence が開始位置昇順でない入力（owner/repo は bare より先に追加される）
+    "参考: #10、owner/repo#11、#12",
+    "参考: owner/repo#11、#12、https://github.com/owner/repo/issues/13",
+    "#5、owner/repo#6 を参考に、#7を実装して",
+    # W2 の 2 入力
+    "参考に、#13を実装して",
+    "Issue #5を参考に、#13を実装して",
+    # W3 の 4 入力
+    "foo/あ#12",
+    "src/ファイル#12を実装して",
+    "https://x.com/あ#12",
+    "https://x.com/あ#12を実装して",
+    "owner/repo#12",
+]
+
+
+def _run_pipeline(prompt: str):
+    result = classifier.classify(prompt, current_repo=REPO)
+    projection = classifier.active_rebind_projection(prompt, result, current_repo=REPO)
+    return result, projection
+
+
+def test_given_marker_list_inputs_when_classified_then_same_as_reference_implementation(monkeypatch):
+    production = classifier._primary_occurrences
+    actual = {prompt: _run_pipeline(prompt) for prompt in _MARKER_LIST_CORPUS}
+
+    # occurrence の返却順を含め、``_primary_occurrences`` 自体が reference implementation と一致する。
+    for prompt in _MARKER_LIST_CORPUS:
+        authority_text = classifier._strip_authority_exclusions(prompt)
+        occurrences = classifier._find_occurrences(authority_text, REPO)
+        assert production(authority_text, occurrences) == _reference_primary_occurrences(authority_text, occurrences), (
+            prompt
+        )
+
+    # 分類結果（kind / target / targets の順序 / projection）も、``_primary_occurrences`` だけを
+    # reference implementation に差し替えた同一 pipeline の結果と一致する。
+    monkeypatch.setattr(classifier, "_primary_occurrences", _reference_primary_occurrences)
+    assert classifier._primary_occurrences is not production
+    for prompt in _MARKER_LIST_CORPUS:
+        assert _run_pipeline(prompt) == actual[prompt], prompt
+    monkeypatch.undo()
+
+    # 非 vacuous: corpus は REFERENCE_ONLY / INFERRED / EXPLICIT / AMBIGUOUS / NONE を全て含み、
+    # 開始位置が昇順でない occurrence 列を実際に含む。
+    assert {result.kind for result, _ in actual.values()} >= {
+        classifier.KIND_REFERENCE_ONLY,
+        classifier.KIND_INFERRED,
+        classifier.KIND_EXPLICIT,
+        classifier.KIND_AMBIGUOUS,
+        classifier.KIND_NONE,
+    }
+    unordered = classifier._find_occurrences("参考: #10、owner/repo#11、#12", REPO)
+    assert [o.start for o in unordered] != sorted(o.start for o in unordered)
+    # 順序は変更されない: target / targets は occurrence の追加順（owner/repo が bare より先）。
+    result, _ = actual["参考: #10、owner/repo#11、#12"]
+    assert [t.ref_number for t in result.targets] == [11, 10, 12]
+    # W2 / W3 の新期待値が reference implementation 側でも成立している（旧実装との差分を拾う入力）。
+    assert actual["参考に、#13を実装して"][0].kind == classifier.KIND_INFERRED
+    assert actual["Issue #5を参考に、#13を実装して"][0].kind == classifier.KIND_INFERRED
+    for prompt in ("foo/あ#12", "src/ファイル#12を実装して", "https://x.com/あ#12", "https://x.com/あ#12を実装して"):
+        assert actual[prompt][0].kind == classifier.KIND_NONE, prompt
+
+
+_W2_NEXT_PRIMARY_KEPT = [
+    "参考に、#13を実装して",
+    "Issue #5を参考に、#13を実装して",
+    "参考に、Issue #13を実装して",
+    "参考にしつつ、PR #13 を対象にレビューして",
+]
+_W2_MARKER_LIST_STILL_REFERENCE_ONLY = [
+    "参考: #10、#11を実装して",
+    "参考#1、#2",
+    "関連資料: #2826、Issue #2827 を対象にレビューして",
+    # marker 自身の segment 内の参照は marker の前後を問わず降格される（伝播開始条件とは別）。
+    "Issue #3 を参考に実装して",
+    "参考 Issue #3 を実装して",
+]
+
+
+def test_given_marker_without_reference_after_it_when_classified_then_next_primary_kept():
+    for prompt in _W2_NEXT_PRIMARY_KEPT:
+        result = classifier.classify(prompt, current_repo=REPO)
+        assert result.kind == classifier.KIND_INFERRED, prompt
+        # marker の前の参照（#5）は参考先として降格され、依頼対象 #13 だけが primary。
+        assert [t.ref_number for t in result.targets] == [13], prompt
+        assert result.target == result.targets[0] and result.target.repo == REPO, prompt
+        projection = _projection(prompt)
+        assert projection["active_rebind_primary_eligible"] is True, prompt
+        assert projection["active_rebind_target_repo"] == REPO, prompt
+        assert projection["active_rebind_target_ref_number"] == 13, prompt
+    # 伝播開始条件を狭めても、marker 直後から参照が並ぶ入力と marker 自身の segment 内の参照は降格のまま。
+    for prompt in _W2_MARKER_LIST_STILL_REFERENCE_ONLY:
+        result = classifier.classify(prompt, current_repo=REPO)
+        assert result.kind == classifier.KIND_REFERENCE_ONLY, prompt
+        assert result.targets, prompt
+        assert _projection(prompt) == {"active_rebind_primary_eligible": False}, prompt
+
+
+_W3_NOT_CURRENT_REPO_PRIMARY = [
+    "foo/あ#12",
+    "src/ファイル#12を実装して",
+    "https://x.com/あ#12",
+    "https://x.com/あ#12を実装して",
+    "src/あIssue#12を実装して",
+]
+_W3_POSITIVE_CONTROLS = [
+    # path / URL 判定が通常の参照を巻き込んでいない
+    ("#12を実装して", classifier.KIND_INFERRED, REPO, 12),
+    ("Issue #12を実装して", classifier.KIND_INFERRED, REPO, 12),
+    ("owner/repo#12", classifier.KIND_EXPLICIT, "owner/repo", 12),
+    ("other/repo#12を実装して", classifier.KIND_EXPLICIT, "other/repo", 12),
+    # 句読点・空白は path token を切る: path の後ろの別 token にある `#13` は参照のまま
+    ("src/foo.pyを直して、#13を実装して", classifier.KIND_INFERRED, REPO, 13),
+    ("src/foo.py を直して #13を実装して", classifier.KIND_INFERRED, REPO, 13),
+    # owner/repo の文字集合は ASCII。直前の日本語は owner に取り込まれない
+    ("リポジトリother/repo#12を実装して", classifier.KIND_EXPLICIT, "other/repo", 12),
+    # GitHub URL は URL 形として EXPLICIT のまま
+    ("https://github.com/other/repo/issues/12を実装して", classifier.KIND_EXPLICIT, "other/repo", 12),
+]
+
+
+def test_given_url_or_path_embedded_hash_when_classified_then_not_current_repo_primary():
+    for prompt in _W3_NOT_CURRENT_REPO_PRIMARY:
+        # 現在 repo の Issue #12 を primary にせず、AMBIGUOUS にもせず、ACTIVE rebind 候補にもしない。
+        result = classifier.classify(prompt, current_repo=REPO)
+        assert result.kind == classifier.KIND_NONE, prompt
+        assert result.target is None and result.targets == (), prompt
+        assert _projection(prompt) == {"active_rebind_primary_eligible": False}, prompt
+        assert classifier.needs_current_repo_resolution(prompt) is False, prompt
+        assert classifier._find_occurrences(classifier._strip_authority_exclusions(prompt), REPO) == [], prompt
+    # positive control: 上の判定が全入力を NONE にする vacuous な実装でないこと。
+    for prompt, kind, repo, ref_number in _W3_POSITIVE_CONTROLS:
+        result = classifier.classify(prompt, current_repo=REPO)
+        assert result.kind == kind, prompt
+        assert (result.target.repo, result.target.ref_number) == (repo, ref_number), prompt
+        assert result.targets == (result.target,), prompt
+        assert _eligible(prompt) is True, prompt

@@ -19,6 +19,7 @@ be persisted (AC7's ``events`` metadata allowlist).
 from __future__ import annotations
 
 import re
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 
 KIND_SLASH_TASK = "SLASH_TASK"
@@ -78,7 +79,17 @@ _GITHUB_URL_RE = re.compile(
 # full-width digits) are intentionally unchanged, so the trailing lookahead also
 # rejects a following Unicode digit (``[\d...]``): otherwise ``#１２abc`` would
 # backtrack to ``#１`` and succeed on a truncated number.
-_OWNER_REPO_HASH_RE = re.compile(r"\b([\w.-]+/[\w.-]+)#(\d+)(?![\dA-Za-z_])")
+#
+# Issue #2864 (W3): the owner/repo token is ASCII only. The character set is
+# ``[A-Za-z0-9_.-]`` and the leading boundary is the ASCII word boundary
+# ``(?<![A-Za-z0-9_])(?=[A-Za-z0-9_])`` (the Unicode ``\b`` / ``[\w.-]`` used
+# before treated ``foo/あ`` / ``src/ファイル`` as an owner/repo form, which then
+# overlapped the bare ``#N`` form and produced AMBIGUOUS). ``re.ASCII`` is NOT
+# applied to the whole regex: ``\d`` (full-width digits, decided by #2850) and the
+# trailing ``(?![\dA-Za-z_])`` stay exactly as they were.
+_OWNER_REPO_HASH_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?=[A-Za-z0-9_])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)(?![\dA-Za-z_])"
+)
 _BARE_HASH_RE = re.compile(r"(?<![A-Za-z0-9_/])#(\d+)(?![\dA-Za-z_])")
 # Issue #2850 closed-prefix adjacency (OWNER-approved policy): ``Issue#12`` /
 # ``PR#34`` (no space between the prefix word and ``#``) is accepted as a
@@ -157,6 +168,41 @@ def _inside_any_span(position: int, spans: list[tuple[int, int]]) -> bool:
     return any(start <= position < end for start, end in spans)
 
 
+# Issue #2864 (W3): a ``#N`` that sits inside a path / URL-like token is not a
+# GitHub Issue reference (a file path or an external URL fragment is not GitHub
+# reference syntax), so it must never become a bare / adjacent-prefix reference
+# of the CURRENT repo. A "token" is a whitespace-free run that is also not cut by
+# a Japanese / ASCII sentence punctuation mark or a bracket; a ``#N`` is
+# path-embedded when its token contains a ``/`` before the ``#``. A valid ASCII
+# ``owner/repo#N`` and a GitHub URL are recognised by their own regexes (their
+# ``#N`` tail is never a separate bare reference), so only the leftover
+# non-ASCII / non-GitHub path forms (``src/ファイル#12``, ``https://x.com/あ#12``)
+# are affected. Known limitation (accepted by the Issue): a Japanese prompt that
+# glues a ``/`` word to a ``#N`` without whitespace or punctuation
+# (``A/Bテストの#12を実装して``) is treated as path-embedded too.
+# Complexity: one linear regex pass + ``str.find`` per token; the result is a
+# sorted list of disjoint spans queried with ``bisect`` (O(log n) per lookup).
+_PATH_TOKEN_RE = re.compile(r"[^\s、。，．！？,;；「」『』（）()]+")
+
+
+def _path_token_spans(text: str) -> list[tuple[int, int]]:
+    """Sorted disjoint ``(slash_index, token_end)`` spans: a ``#N`` whose start
+    is inside such a span has a ``/`` earlier in the same token."""
+    spans: list[tuple[int, int]] = []
+    if "#" not in text or "/" not in text:
+        return spans
+    for token in _PATH_TOKEN_RE.finditer(text):
+        slash = text.find("/", token.start(), token.end())
+        if slash != -1:
+            spans.append((slash, token.end()))
+    return spans
+
+
+def _inside_path_token(position: int, spans: list[tuple[int, int]]) -> bool:
+    index = bisect_right(spans, (position, float("inf"))) - 1
+    return index >= 0 and spans[index][0] < position < spans[index][1]
+
+
 def _find_occurrences(authority_text: str, current_repo: str | None) -> list[_Occurrence]:
     occurrences: list[_Occurrence] = []
 
@@ -173,11 +219,16 @@ def _find_occurrences(authority_text: str, current_repo: str | None) -> list[_Oc
         target = Target(repo=repo, ref_kind=ref_kind, ref_number=number, explicit_repo=True)
         occurrences.append(_Occurrence(target, match.start(), match.end(), REF_FORM_EXPLICIT))
 
+    path_spans = _path_token_spans(authority_text)
     for match in _BARE_HASH_RE.finditer(authority_text):
         # Skip bare "#N" occurrences that are actually the tail of an
         # "owner/repo#N" match already captured above.
         start = match.start()
         if start > 0 and authority_text[start - 1] == "/":
+            continue
+        # Issue #2864 (W3): a ``#N`` inside a path / URL-like token is not a
+        # current-repo reference.
+        if _inside_path_token(start, path_spans):
             continue
         number = int(match.group(1))
         prefix = authority_text[max(0, start - 20) : start]
@@ -192,6 +243,9 @@ def _find_occurrences(authority_text: str, current_repo: str | None) -> list[_Oc
         # A prefix word inside an already recognised ``owner/repo#N`` span
         # (``owner/my-issue#12``) is part of the repo name, not a second ref.
         if _inside_any_span(match.start(), owner_repo_spans):
+            continue
+        # Issue #2864 (W3): ``src/あIssue#12`` is a path-embedded ``#N`` as well.
+        if _inside_path_token(match.end(1), path_spans):
             continue
         ref_kind = "issue" if match.group(1).lower() == "issue" else "pr"
         target = Target(repo=current_repo, ref_kind=ref_kind, ref_number=int(match.group(2)), explicit_repo=False)
@@ -280,46 +334,100 @@ def _marker_segment_spans(text: str, clause: tuple[int, int]) -> list[tuple[int,
 _REFERENCE_LEAD_PREFIX_RE = re.compile(r"(?:issue|pr|pull request|イシュー|プルリクエスト|プルリク)\s*", re.IGNORECASE)
 
 
-def _segment_starts_with_reference(text: str, segment: tuple[int, int], occurrences: list[_Occurrence]) -> bool:
+# Issue #2864 (W2): which marker segment STARTS the list that propagates to the
+# following segments. A marker segment always demotes the references that share
+# its own segment (before or after the marker: ``Issue #3 を参考に実装して`` stays
+# REFERENCE_ONLY), but the demotion only propagates to the next segments when
+# that marker segment itself holds a valid reference that starts AFTER the marker
+# (``参考: #10、#11`` / ``参考#1、#2``). ``参考に、#13を実装して`` and
+# ``Issue #5を参考に、#13を実装して`` have no reference after the marker in the
+# marker's own segment, so the following ``#13`` is the request target and is not
+# demoted. No new terminator (``対象`` / ``レビュー`` / ``実装``) is added.
+#
+# Issue #2864 (W1): complexity of the marker binding. ``_find_occurrences()``
+# returns occurrences in a kind-by-kind order that is NOT ascending in ``start``
+# and that order is externally observable (``target`` / ``targets``), so it is
+# never sorted or reordered. Instead a SEARCH-ONLY ascending list of the start
+# positions is built once (O(n log n) sort) and both former quadratic paths use
+# ``bisect`` on it / on the sorted marker-segment spans:
+#   (a) "does this segment start with a reference" -> one ``bisect`` per segment
+#       instead of scanning every occurrence per segment;
+#   (b) the final "is this occurrence inside a marker segment" exclusion -> one
+#       ``bisect`` per occurrence on the (already ascending, disjoint) marker
+#       segment spans instead of scanning every marker segment per occurrence.
+# Overall O(n log n) in the number of occurrences / segments (NOT linear); the
+# remaining text scans (clause / segment splitting, ``str.find``) are linear.
+
+
+def _has_start_in(starts: list[int], low: int, high: int) -> bool:
+    """True when some occurrence start lies in ``[low, high)`` (``starts`` is the
+    ascending search-only start index)."""
+    index = bisect_left(starts, low)
+    return index < len(starts) and starts[index] < high
+
+
+def _first_marker_end(text: str, segment: tuple[int, int]) -> int | None:
+    """End index of the earliest Japanese reference-only marker inside
+    ``segment`` (``None`` when the segment holds no marker)."""
+    start, end = segment
+    ends = [
+        found + len(marker) for marker in _JA_REFERENCE_ONLY_MARKERS if (found := text.find(marker, start, end)) != -1
+    ]
+    return min(ends) if ends else None
+
+
+def _segment_starts_with_reference(text: str, segment: tuple[int, int], starts: list[int]) -> bool:
     start, end = segment
     position = start
     while position < end and text[position].isspace():
         position += 1
     if position >= end:
         return False
-    for occurrence in occurrences:
-        if not position <= occurrence.start < end:
-            continue
-        head = text[position : occurrence.start]
-        if head == "" or _REFERENCE_LEAD_PREFIX_RE.fullmatch(head):
-            return True
-    return False
+    # The reference may start right at the first non-space character, or right
+    # after one closed-set prefix word (``Issue `` / ``PR`` / ``イシュー`` ...).
+    if _has_start_in(starts, position, position + 1):
+        return True
+    lead = _REFERENCE_LEAD_PREFIX_RE.match(text, position, end)
+    return lead is not None and lead.end() < end and _has_start_in(starts, lead.end(), lead.end() + 1)
 
 
 def _primary_occurrences(authority_text: str, occurrences: list[_Occurrence]) -> list[_Occurrence]:
     """Drop the occurrences demoted by a Japanese reference-only marker: a
     reference is demoted when it shares a marker-local segment (its clause split
     at `、` / `,`) with ``参考`` or ``関連資料``, or when it is an element of the
-    reference list that directly follows that segment (Issue #2850, see the
-    comment above). References before the marker and after the list end stay
-    primary candidates."""
+    reference list that directly follows a marker segment holding a reference
+    after the marker (Issue #2850 / #2864, see the comments above). References
+    before the marker and after the list end stay primary candidates. The input
+    order of ``occurrences`` is preserved."""
     spans = _clause_spans(authority_text)
+    # Search-only index (never exposed): ascending occurrence start positions.
+    starts = sorted(o.start for o in occurrences)
     marker_segments: list[tuple[int, int]] = []
     for clause in spans:
         if not any(marker in authority_text[clause[0] : clause[1]] for marker in _JA_REFERENCE_ONLY_MARKERS):
             continue
         in_list = False
         for segment in _marker_segment_spans(authority_text, clause):
-            if any(marker in authority_text[segment[0] : segment[1]] for marker in _JA_REFERENCE_ONLY_MARKERS):
+            marker_end = _first_marker_end(authority_text, segment)
+            if marker_end is not None:
                 marker_segments.append(segment)
-                in_list = True
-            elif in_list and _segment_starts_with_reference(authority_text, segment, occurrences):
+                # W2: propagate only when a reference starts after the marker.
+                in_list = _has_start_in(starts, marker_end, segment[1])
+            elif in_list and _segment_starts_with_reference(authority_text, segment, starts):
                 marker_segments.append(segment)
             else:
                 in_list = False
     if not marker_segments:
         return list(occurrences)
-    return [o for o in occurrences if not any(start <= o.start < end for start, end in marker_segments)]
+    # ``marker_segments`` is ascending and disjoint (clauses and their segments
+    # are visited left to right), so one ``bisect`` per occurrence is enough.
+    segment_starts = [start for start, _ in marker_segments]
+
+    def demoted(occurrence: _Occurrence) -> bool:
+        index = bisect_right(segment_starts, occurrence.start) - 1
+        return index >= 0 and occurrence.start < marker_segments[index][1]
+
+    return [o for o in occurrences if not demoted(o)]
 
 
 def _has_reference_only_marker(text: str) -> bool:
@@ -520,15 +628,19 @@ def needs_current_repo_resolution(prompt: str) -> bool:
         )
 
     authority_text = _strip_authority_exclusions(prompt)
+    path_spans = _path_token_spans(authority_text)
     for match in _BARE_HASH_RE.finditer(authority_text):
         start = match.start()
         if start > 0 and authority_text[start - 1] == "/":
+            continue
+        # Issue #2864 (W3): keep in sync with ``_find_occurrences``.
+        if _inside_path_token(start, path_spans):
             continue
         return True
     # Issue #2850: ``Issue#12`` / ``PR#34`` also resolve against ``current_repo``.
     owner_repo_spans = [m.span() for m in _OWNER_REPO_HASH_RE.finditer(authority_text)]
     return any(
-        not _inside_any_span(match.start(), owner_repo_spans)
+        not _inside_any_span(match.start(), owner_repo_spans) and not _inside_path_token(match.end(1), path_spans)
         for match in _ADJACENT_PREFIX_HASH_RE.finditer(authority_text)
     )
 
