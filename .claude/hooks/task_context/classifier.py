@@ -186,15 +186,42 @@ _PATH_TOKEN_RE = re.compile(r"[^\s、。，．！？,;；「」『』（）()]+"
 
 
 def _path_token_spans(text: str) -> list[tuple[int, int]]:
-    """Sorted disjoint ``(slash_index, token_end)`` spans: a ``#N`` whose start
-    is inside such a span has a ``/`` earlier in the same token."""
+    """Sorted disjoint ``(slash_index, segment_end)`` spans: a ``#N`` whose start
+    is inside such a span has a path ``/`` earlier in the same token.
+
+    A ``/`` that belongs to an already recognised ASCII ``owner/repo#N`` or
+    GitHub URL does not open a path context, and such a recognised span ends the
+    path context (a ``#N`` glued after it by Japanese text, e.g.
+    ``owner/repo#12と#13``, keeps the classification it had before W3). Each
+    token is therefore cut into segments at the recognised spans and only a
+    ``/`` in the segment that precedes the ``#N`` counts."""
     spans: list[tuple[int, int]] = []
     if "#" not in text or "/" not in text:
         return spans
+    recognised = sorted(
+        [m.span() for m in _GITHUB_URL_RE.finditer(text)] + [m.span() for m in _OWNER_REPO_HASH_RE.finditer(text)]
+    )
+    cursor = 0
     for token in _PATH_TOKEN_RE.finditer(text):
-        slash = text.find("/", token.start(), token.end())
-        if slash != -1:
-            spans.append((slash, token.end()))
+        while cursor < len(recognised) and recognised[cursor][1] <= token.start():
+            cursor += 1
+        seg_start = token.start()
+        index = cursor
+        while True:
+            # Next recognised span that starts inside this token (if any).
+            while index < len(recognised) and recognised[index][0] < seg_start:
+                index += 1
+            boundary = recognised[index] if index < len(recognised) and recognised[index][0] < token.end() else None
+            seg_end = boundary[0] if boundary else token.end()
+            slash = text.find("/", seg_start, seg_end)
+            if slash != -1:
+                spans.append((slash, seg_end))
+            if boundary is None:
+                break
+            seg_start = boundary[1]
+            index += 1
+            if seg_start >= token.end():
+                break
     return spans
 
 

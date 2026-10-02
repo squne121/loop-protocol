@@ -774,6 +774,42 @@ def _reference_primary_occurrences(authority_text, occurrences):
     return [o for i, o in enumerate(occurrences) if i not in demoted]
 
 
+def _reference_bare_hash_starts(authority_text):
+    """W3 の「path-embedded な `#N` は current repo の bare 参照にしない」規則を素朴に書いた reference。
+
+    production の ``_path_token_spans`` / ``bisect`` は使わず、1 文字ずつ次の規則を文字通り判定する:
+      * token は空白・日本語/ASCII の文末記号・括弧で切れる
+      * 認識済みの ASCII ``owner/repo#N`` と GitHub URL の範囲は path context を作らず、
+        その範囲の終端で path context は終わる
+      * `#N` の前に、同じ token 内かつ「直前の認識済み範囲の終端より後」に `/` があれば path-embedded
+    返すのは、bare 参照として残る `#N` の開始位置（直前が ASCII word 文字 / `/`、直後が ASCII word 文字は対象外）。
+    """
+    delimiters = set(" \t\r\n\f\v\u3000、。，．！？,;；「」『』（）()")
+    recognised = [
+        m.span()
+        for m in re.finditer(
+            r"(?<![A-Za-z0-9_])(?=[A-Za-z0-9_])[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#\d+(?![\dA-Za-z_])", authority_text
+        )
+    ] + [
+        m.span()
+        for m in re.finditer(r"https?://github\.com/[\w.-]+/[\w.-]+/(?:issues|pull)/\d+", authority_text, re.I)
+    ]
+    survivors = []
+    for m in re.finditer(r"(?<![A-Za-z0-9_/])#\d+(?![\dA-Za-z_])", authority_text):
+        hash_at = m.start()
+        # 直前の認識済み範囲の終端（path context の起点の下限）。
+        floor = max([end for _, end in recognised if end <= hash_at], default=0)
+        index = hash_at - 1
+        path_embedded = False
+        while index >= floor and authority_text[index] not in delimiters:
+            if authority_text[index] == "/" and not any(a <= index < b for a, b in recognised):
+                path_embedded = True
+            index -= 1
+        if not path_embedded:
+            survivors.append(hash_at)
+    return survivors
+
+
 _MARKER_LIST_CORPUS = [
     # #2850 AC4: marker 直後の reference list
     "参考: #10、#11を実装して",
@@ -817,6 +853,14 @@ _MARKER_LIST_CORPUS = [
     "https://x.com/あ#12",
     "https://x.com/あ#12を実装して",
     "owner/repo#12",
+    # W3 fix_delta 1: 認識済み owner/repo#N / GitHub URL の後ろに日本語等で続く `#N` は path 扱いにしない
+    "owner/repo#12と#13を実装して",
+    "https://github.com/o/r/issues/5と#13を実装して",
+    "owner/repo#12→#13を実装して",
+    "owner/repo#12:#13",
+    "owner/repo#12を参考に#13を実装して",
+    "#13とowner/repo#12を実装して",
+    "src/あ#12とowner/repo#5",
 ]
 
 
@@ -845,6 +889,17 @@ def test_given_marker_list_inputs_when_classified_then_same_as_reference_impleme
     for prompt in _MARKER_LIST_CORPUS:
         assert _run_pipeline(prompt) == actual[prompt], prompt
     monkeypatch.undo()
+
+    # W3: path-embedded 判定も reference implementation（素朴な 1 文字走査）と一致する。bare 形の occurrence の
+    # 開始位置集合（`#` から始まる bare / Issue 等の prefix 語付き形）が、reference の残す `#N` と一致する。
+    for prompt in _MARKER_LIST_CORPUS:
+        authority_text = classifier._strip_authority_exclusions(prompt)
+        production_bare = sorted(
+            o.start
+            for o in classifier._find_occurrences(authority_text, REPO)
+            if o.form != classifier.REF_FORM_EXPLICIT and authority_text[o.start] == "#"
+        )
+        assert production_bare == _reference_bare_hash_starts(authority_text), prompt
 
     # 非 vacuous: corpus は REFERENCE_ONLY / INFERRED / EXPLICIT / AMBIGUOUS / NONE を全て含み、
     # 開始位置が昇順でない occurrence 列を実際に含む。
@@ -909,6 +964,17 @@ _W3_NOT_CURRENT_REPO_PRIMARY = [
     "https://x.com/あ#12を実装して",
     "src/あIssue#12を実装して",
 ]
+# W3 fix_delta 1: 認識済み owner/repo#N / GitHub URL の後ろに日本語等で続く `#N` は path 扱いにしない。
+# main の fail-safe（AMBIGUOUS / REFERENCE_ONLY、ACTIVE rebind 不可）より悪化しないこと。
+_W3_GLUED_AFTER_RECOGNISED_REF = [
+    ("owner/repo#12と#13を実装して", classifier.KIND_AMBIGUOUS, ["owner/repo#12", f"{REPO}#13"]),
+    ("https://github.com/o/r/issues/5と#13を実装して", classifier.KIND_AMBIGUOUS, ["o/r#5", f"{REPO}#13"]),
+    ("owner/repo#12→#13を実装して", classifier.KIND_AMBIGUOUS, ["owner/repo#12", f"{REPO}#13"]),
+    ("owner/repo#12:#13", classifier.KIND_AMBIGUOUS, ["owner/repo#12", f"{REPO}#13"]),
+    ("owner/repo#12を参考に#13を実装して", classifier.KIND_REFERENCE_ONLY, ["owner/repo#12", f"{REPO}#13"]),
+    # 対称形（#N が先）も main / head とも AMBIGUOUS のまま
+    ("#13とowner/repo#12を実装して", classifier.KIND_AMBIGUOUS, ["owner/repo#12", f"{REPO}#13"]),
+]
 _W3_POSITIVE_CONTROLS = [
     # path / URL 判定が通常の参照を巻き込んでいない
     ("#12を実装して", classifier.KIND_INFERRED, REPO, 12),
@@ -941,3 +1007,20 @@ def test_given_url_or_path_embedded_hash_when_classified_then_not_current_repo_p
         assert (result.target.repo, result.target.ref_number) == (repo, ref_number), prompt
         assert result.targets == (result.target,), prompt
         assert _eligible(prompt) is True, prompt
+    # W3 fix_delta 1: 認識済み参照の後ろに続く `#N` を path 扱いして main より悪化させない（AC5 の VC に含める）。
+    test_given_hash_glued_after_recognised_reference_when_classified_then_not_worse_than_fail_safe()
+
+
+def test_given_hash_glued_after_recognised_reference_when_classified_then_not_worse_than_fail_safe():
+    for prompt, kind, expected_targets in _W3_GLUED_AFTER_RECOGNISED_REF:
+        result = classifier.classify(prompt, current_repo=REPO)
+        assert result.kind == kind, prompt
+        # #13（current repo）が path 扱いで消えていない。
+        found = {f"{t.repo}#{t.ref_number}" for t in result.targets}
+        assert set(expected_targets) <= found, prompt
+        assert f"{REPO}#13" in found, prompt
+        # 単一 EXPLICIT target にならず、ACTIVE rebind 候補にもならない（wrong-target の防止）。
+        assert result.kind != classifier.KIND_EXPLICIT, prompt
+        assert _projection(prompt) == {"active_rebind_primary_eligible": False}, prompt
+        # `#13` は current repo を必要とするので、解決要否も同じ規則に従う。
+        assert classifier.needs_current_repo_resolution(prompt) is True, prompt
