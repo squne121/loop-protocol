@@ -669,6 +669,7 @@ envelope 検証をスキップし、payload を `{}` として扱う。
 ```
 task-contextctl hook <event>
 task-contextctl signal apply
+task-contextctl signal recover   # Issue #2817: 明示的な遡及 claim 復旧（adapter の --phase recover 専用）
 task-contextctl query current
 task-contextctl projection flush
 task-contextctl smoke seed
@@ -1743,3 +1744,229 @@ end-to-end 実証は PR #2731 の Real Herdr canary が別途行った実績を
 使わない）。live handoff の 2 causal boundary は、本 Issue の
 実装時点で Herdr 0.9.1 CLI surface に safe な local trigger が存在
 しないため常に SKIP であり、manual/runtime-unverified 領域として扱う。
+
+## 遡及 claim 復旧経路と local-only cleanup 経路（Issue #2817）
+
+別 Task / fork したセッションで実装・マージされた PR は、Issue claim / PR claim が Task Context に記録されないまま
+`post-merge-cleanup` に到達することがある（再現事例: PR #2814 / #2816 / #2833 / #2847 / #2856）。既存の
+`--phase merged` は `IMPLEMENTATION_NOT_READY`（claim 欠落）または `FACT_TASK_IDENTITY_CONFLICT`（claim 分裂）で
+worker dispatch 前に止まり、手動の `cleanup_exec` 実行になっていた。本節は、(a) 所有関係が整合する場合だけ明示要求で
+claim を原子的に復旧して通常経路へ戻す経路と、(b) 復旧できない場合でも Task Context を偽装せずに安全判定済みの
+ローカル cleanup だけを継続する経路を定義する。
+
+凍結するもの（変更しない）: Issue #2565 / #2790 の公開 signal wire（`signal_kind` 集合、closed key、`disposition` /
+`reason_code` の既存値）、既存 `--phase merged` / `--phase completed` の出力意味、`cleanup_completed` のセマンティクス。
+変更するもの: `post-merge-cleanup` SKILL の orchestrator 方針、adapter への additive な `--phase recover` /
+`--phase local-only`、復旧用の repository-local service 操作 `recover_implementation_claims`
+（`scripts/task-context/task_context_workflow_signals.py`）と machine CLI `task-contextctl signal recover`。
+新テーブル・新 schema・新 gate・新 `signal_kind`・lock daemon・承認 layer は追加しない。
+
+### 復旧経路 `--phase recover` と安全条件
+
+adapter `.claude/skills/post-merge-cleanup/scripts/task_context_workflow_signal.py` に `--phase recover` を追加する。
+入力は対象 PR 番号・Issue 番号・fresh な merged snapshot・effective origin（`--origin-session-id`）・
+`--merge-identity <40 hex>`・`--explicit-recovery`。通常 hook・暗黙 attach・prompt 自動 rebind からは呼ばない（「明示」とは
+復旧対象と復旧意図が明示された要求に基づくことを指し、人間のキー入力は要求しない。明示要求を受けた Agent の実行は許容する）。
+Task を推測して attach しない。`task-contextctl signal recover` も payload の `explicit_recovery` が JSON の `true` でなければ
+`EXPLICIT_RECOVERY_REQUIRED` で拒否し、caller が Task / Activity / Binding / session を選ぶ field を持たない。
+
+| 引数 | merged / completed | recover | local-only |
+|---|---|---|---|
+| `--merge-identity <40 hex>` | 不要（snapshot の OID を使う従来動作） | 必須 | 必須 |
+| `--explicit-recovery` | 不要 | 必須 | 不要 |
+| `--origin-session-id` | 任意（既存: 無ければ ambient env） | 必須（ambient env へ fallback しない） | 不要（Task Context を呼ばない） |
+| `--task-context-outcome` | 不要 | 不要 | 必須（closed enum） |
+| `--worktree-path` / `--branch-name` | 不要 | 不要 | 必須（非空） |
+
+必須引数の欠落は `{"disposition": "rejected_evidence", "reason_code": "MISSING_REQUIRED_ARGUMENT"}`（exit 0、書き込み 0）。
+
+安全条件:
+
+- **fresh snapshot**: 「fresh」はその invocation の直前に取得した snapshot を指す。adapter は GitHub I/O を行わないため、
+  snapshot file の mtime が adapter 起動時刻から 300 秒以内であることを検証可能な定義とし、超過は
+  `deferred` / `SNAPSHOT_STALE`（書き込み 0）。前回 invocation の snapshot の再利用は禁止する。
+- **merge identity**: snapshot の merge OID が `^[0-9a-f]{40}$` に一致しない、または `--merge-identity` と不一致なら
+  `rejected_evidence` / `MERGE_IDENTITY_MISMATCH`。
+- **snapshot の安全条件**: 既存 `_merged_evidence` の検証（`closingIssuesReferences(first: 2)`、repository identity、
+  merge OID）を再利用する。PR 本文の `Closes #N` 文字列は authority にしない。新しい証明書・署名・長寿命 token は追加しない。
+- **repository identity の束縛範囲**: AC1 が検証する repository identity は、snapshot 自身の `repository.nameWithOwner` と
+  `closingIssuesReferences` の node の `repository.nameWithOwner` が（大文字小文字を除き）一致すること、すなわち
+  snapshot identity と closing relation との束縛だけである。adapter は GitHub I/O を行わず、ローカル checkout の
+  remote や caller の cwd の repository を独立には検証しない。snapshot 自体を取得した repository の正しさは
+  fresh snapshot を取得する orchestrator の責務であり、adapter が保証する範囲には含まれない。
+- **評価順（全て書き込み前）**: 引数 → snapshot / merge identity → origin 解決 → claim ownership matrix → recovery dedupe →
+  Activity 判定 → 書き込み。書き込み（claim 付与、Activity start / transition、origin run の付け替え、復旧記録 append、
+  projection bump）は既存の `db.write_transaction`（`BEGIN IMMEDIATE`）1 つにまとめ、外側から BEGIN で包まない。
+  transaction 内で GitHub を再取得しない。`BEGIN IMMEDIATE` の競合は既存の `TemporarilyUnavailableError` 経路で扱う。
+
+`--phase recover` の結果 wire（既存 `_outcome()` の disposition 規約に従う）:
+
+| 状況 | disposition / reason_code |
+|---|---|
+| 成功（claim / Activity を書いた） | `applied` / `RECOVERED`（`activity_action` / `claims_attached` を含む） |
+| 同一 Task の再実行 | `duplicate_noop` / `SAME_TASK_SAME_FACT` |
+| Activity 判定の no-op | `duplicate_noop` / `MERGE_FACT_ALREADY_ACCEPTED` |
+| claim 判定 1/2 | `conflict` / `FACT_TASK_IDENTITY_CONFLICT`（owner 診断 key を含む） |
+| claim 判定 3 | `conflict` / `OUT_OF_ORDER_SIGNAL` |
+| Activity reject | `conflict` / `IMPLEMENTATION_ACTIVITY_TERMINAL`・`ACTIVITY_KIND_NOT_RECOVERABLE`・`ACTIVITY_STATE_INCONSISTENT` |
+| recovery dedupe key が別 Task で accepted 済み | `conflict` / `FACT_TASK_IDENTITY_CONFLICT`（所有 Task を additive な `conflicting_task_id` で返す） |
+| accepted 済みの merge fact が別 Task 所有 | `conflict` / `FACT_TASK_IDENTITY_CONFLICT`（所有 Task を additive な `conflicting_task_id` で返す） |
+| 競合 race による `ux_events_dedupe_key` の `IntegrityError` | `conflict` / `FACT_TASK_IDENTITY_CONFLICT`（所有 Task が不明なため `conflicting_task_id` は出さない） |
+| `--explicit-recovery` なし | `rejected_evidence` / `EXPLICIT_RECOVERY_REQUIRED` |
+| merge identity 不一致・HEX40 不正 | `rejected_evidence` / `MERGE_IDENTITY_MISMATCH` |
+| 必須引数の欠落 | `rejected_evidence` / `MISSING_REQUIRED_ARGUMENT` |
+| snapshot 不正・errors 混在 | 既存の deferred reason code（`RELATION_UNAVAILABLE` / `MERGED_SNAPSHOT_INVALID` / `RELATION_ISSUE_MISMATCH` / `MERGE_OID_INVALID`） |
+| snapshot が 300 秒より古い | `deferred` / `SNAPSHOT_STALE` |
+| origin 解決不能 | `deferred` / `unbound`（frozen public wire。具体原因は `diagnose-origin`） |
+
+### claim ownership matrix（claim の所有関係の判定表）
+
+X = origin Task T 以外の Task。「T の別 claim」= T が保持する、対象と異なる live claim。released claim
+（`released_at IS NOT NULL`）は owner として数えない。Task の状態に関わらず live claim の保持者を owner とする。
+判定は `_validate_implementation_claims_tx` と同じ判定・同じ reason code で、判定順は 1 → 2 → 3 → 4。
+
+| 判定順 | 条件 | 結果 | 書き込み |
+|---|---|---|---|
+| 1 | 対象 Issue claim の owner が X、または対象 PR claim の owner が X | `conflict` / `FACT_TASK_IDENTITY_CONFLICT`（`issue_claim_owner_task_id` / `pr_claim_owner_task_id` を含む） | 0 |
+| 2 | T が別 Issue の live claim を保持 | `conflict` / `FACT_TASK_IDENTITY_CONFLICT`（`origin_other_issue_number` を含む） | 0 |
+| 3 | T が同 repo の別 PR の live claim を保持 | `conflict` / `OUT_OF_ORDER_SIGNAL`（`origin_other_pr_number` を含む） | 0 |
+| 4 | 上記のいずれにも該当しない（各 claim は「なし」または「T」） | 欠けている claim だけを T に付与（両方 T なら付与なし） | 欠けた分のみ |
+
+- 「partial repair 禁止」= 判定順 1 に該当する状態（一方を X が保持）で他方だけを T へ付与しないこと。一方が T で他方が
+  「なし」の場合に欠けた側を付与するのは判定順 4 の通常動作であり partial repair ではない。claim の移転・Task の統合・
+  released claim の復活は行わない。
+- 復旧は既存 signal の `IMPLEMENTATION_NOT_READY` を「安全に補える」という判定に使わず、存在する claim の所有 Task を先に確認する。
+- 実装上の追加ガード（契約本文には無い安全側の補足）: 同じ `(repo, pr_number, merge_commit_oid)` の `pr_merged_observed` が
+  既に別 Task で accepted 済みの場合は、recovery dedupe の段階で `conflict` / `FACT_TASK_IDENTITY_CONFLICT` として拒否する。
+  この拒否と、accepted 済み merge fact が別 Task 所有の拒否では、既に読み込んだ行の所有 Task ID を追加の DB 参照なしに
+  additive な診断 key `conflicting_task_id` として返す（既存の `signal_kind`・closed key・disposition / reason_code は変更しない）。
+
+### implementation Activity 状態表
+
+入力: `active` = Task の ACTIVE Activity の kind（`none | implementation | refine | native_operator | cleanup | other`。
+`ux_activities_active_per_task` により最大 1 件）、`impl_history` = Task の implementation 行の履歴（`none` / `terminal`）、
+`merge_accepted` = 同一 `(repo, pr_number, merge_commit_oid)` の `pr_merged_observed` がこの Task で accepted 済みか。
+優先順で 1 回だけ判定する。
+
+| 優先順 | 条件 | 結果 |
+|---|---|---|
+| 1 | `active == implementation` | reuse（書き込みなし。履歴は無関係。origin run は付け替えない） |
+| 2 | `impl_history == terminal` | `merge_accepted` なら `duplicate_noop` / `MERGE_FACT_ALREADY_ACCEPTED`、そうでなければ `conflict` / `IMPLEMENTATION_ACTIVITY_TERMINAL`。terminal を ACTIVE に戻さず、新規 implementation も作らない |
+| 3 | `active == none` | start（新規 implementation Activity を開始） |
+| 4 | `active ∈ {refine, native_operator}` | transition（現在の ACTIVE を DONE にして implementation を開始。prior の Activity id / kind を復旧記録へ） |
+| 5 | `active ∈ {cleanup, other}` | `conflict` / `ACTIVITY_KIND_NOT_RECOVERABLE` |
+
+- DB で構成可能な組は `active ∈ {none, refine, native_operator, cleanup, other} × impl_history ∈ {none, terminal}` の 10 組 +
+  `active == implementation` の 1 組 = 11 組。
+- それ以外の組は `ux_activities_active_per_task` により DB では構成できない（raw SQL でも不可）。純関数
+  `decide_activity_action(active_kind, impl_latest_status, merge_accepted)` を `(active ∈ 6 値) × (impl_latest_status ∈ {none, ACTIVE, terminal})`
+  の 18 セル直積で受けた場合、構成不能な 7 セルは `conflict` / `ACTIVITY_STATE_INCONSISTENT` を返す。`impl_latest_status` は
+  ACTIVE な implementation 行が存在すれば `ACTIVE`（`active == implementation` と同じ事実）として導出するため、
+  `active == implementation` の行は履歴によらず優先順 1 の reuse になり、`(implementation, none)` と
+  `(implementation, terminal)` の 2 セルは入力としては矛盾（構成不能）として扱う。
+  明示すると、`active == implementation` かつ `impl_latest_status == ACTIVE` の組は `merge_accepted` が `true` でも
+  `false` でも常に reuse（書き込みなし）であり、`duplicate_noop` や `IMPLEMENTATION_ACTIVITY_TERMINAL` にはならない。
+  一方 `(implementation, none)` と `(implementation, terminal)` は「ACTIVE な implementation 行が存在するのに履歴が無い /
+  terminal のみ」という自己矛盾であり、契約の「DB で構成できないセルは `ACTIVITY_STATE_INCONSISTENT`」に従って
+  `conflict` / `ACTIVITY_STATE_INCONSISTENT` を返す（推測して reuse にしない）。
+- start / transition では origin ExecutionRun を `_attach_execution_run_tx` で新 Activity へ付け替える（`refinement_approved`
+  経路と同一規約）。他の ExecutionRun は変更しない。復旧は `refinement_approved` event も `implementation_pr_observed` event も作らない。
+- `native_operator` は managed bootstrap（`/task`）が作る汎用の operator Activity であり workflow phase ではない。DONE にされる
+  `refine` を refinement 承認と読む consumer は存在しない（承認の根拠は `refinement_approved` event と GitHub 上の Issue）。
+
+### merge signal → recovery / local-only 決定表
+
+「明示復旧要求」= 呼び出し元（人間または明示要求を受けた Agent）が対象 PR・Issue・effective origin を指定して復旧を要求した場合。
+復旧を暗黙に自動実行しない。表の「local-only」は該当する outcome を `--task-context-outcome` に埋めて `--phase local-only` を呼ぶことを指す。
+
+| `--phase merged` の結果 | 既定（復旧要求なし） | 明示復旧要求あり |
+|---|---|---|
+| `selected` | 通常経路: worker dispatch | 復旧不要。通常経路 |
+| `duplicate_noop/activity_terminal`、`late_noop/CLEANUP_ALREADY_BEGUN` | 停止（dispatch なし、local-only なし） | 復旧は呼ばない。停止 |
+| `deferred/IMPLEMENTATION_NOT_READY` | local-only（outcome `deferred/IMPLEMENTATION_NOT_READY`）。復旧が可能であることを報告 | `--phase recover` を 1 回実行。`applied` / `duplicate_noop` → 同じ origin で `--phase merged` を 1 回だけ再実行。reject → local-only（outcome `recovery_rejected`） |
+| `conflict/FACT_TASK_IDENTITY_CONFLICT`、`conflict/OUT_OF_ORDER_SIGNAL` | local-only（outcome は同名の `conflict/...`） | `--phase recover` を 1 回実行。reject → local-only（outcome `recovery_rejected`） |
+| `deferred/unbound` | `diagnose-origin` で原因を取得し、SKILL の diagnose-origin 結果表に従う | recover は origin 解決を要するため reject。以降は diagnose-origin 結果表に従う |
+| snapshot 不正、`ADAPTER_UNAVAILABLE` など Task Context が応答しない結果 | 停止（local-only なし、削除なし）。無応答は 1 回だけ bounded retry して停止 | 停止（recover も呼ばない） |
+
+`recovery_rejected` は `--phase recover` が `conflict/*` を返した場合だけを指す。`deferred/*`、`rejected_evidence/*`、
+`ADAPTER_UNAVAILABLE` は停止で、削除に進まない。復旧後の `--phase merged` 再実行結果が `selected` でない場合は、その結果が
+許可集合に含まれるときだけ同じ結果を outcome として local-only に進み、含まれなければ停止する。
+
+### local-only 経路の位置付けと残余状態
+
+入口は adapter の `--phase local-only`。Task Context への ctl 呼び出し・DB 書き込み・events 追加を一切行わない。
+`_merged_evidence` で fresh snapshot と `--merge-identity` を検証し、成功し、かつ gate が許可した場合だけ結果を print する。
+
+gate は `--task-context-outcome` の closed enum である。許可集合（Task Context に記録できない場合のみ、10 値）:
+
+- `deferred/IMPLEMENTATION_NOT_READY` — claim または implementation Activity が未整備
+- `conflict/FACT_TASK_IDENTITY_CONFLICT` — claim が別 Task に分裂している
+- `conflict/OUT_OF_ORDER_SIGNAL` — merge fact の前提が順序不整合
+- `recovery_rejected` — `--phase recover` が `conflict/*` で拒否された
+- `unbound/origin_session_missing` — origin の session id が無い
+- `unbound/origin_run_not_found` — origin の ExecutionRun が見つからない
+- `unbound/origin_run_ended` — origin の ExecutionRun が終了済み
+- `unbound/origin_run_kind_mismatch` — origin の run_kind が managed ではない
+- `unbound/origin_task_unattached` — origin に Task が紐づいていない
+- `unbound/origin_binding_session_mismatch` — Binding の session が一致しない
+
+許可集合外（`selected`、`duplicate_noop/activity_terminal`、`late_noop/CLEANUP_ALREADY_BEGUN`、`unbound/origin_ambiguous`、
+`unbound/resolved`、`adapter_unavailable`、未知の値）は `{"disposition": "refused", "reason_code": "LOCAL_ONLY_NOT_PERMITTED"}` のみを
+print する（fields・authority を一切出さない、書き込み 0）。
+
+**outcome は caller 申告値である。** orchestrator が直前の `--phase merged` / `diagnose-origin` / `--phase recover` の実結果から
+埋める値で、adapter は検証できない。この gate は fail-closed な local guardrail であって security boundary ではない
+（security 上の保護は `cleanup_exec.py` の認可境界と branch protection / CI / repository permission が担う）。
+
+成功時の結果は closed key のみ: `disposition: "local_only"`、`reason_code: "LOCAL_ONLY_PERMITTED"`（cleanup の許可ではなく
+「Task Context 記録不能を理由とする local-only 継続が permitted」の意味）、`task_context: "unrecorded"`、`authority`
+（`cleanup_completed` / `parent_issue_close` / `superseded_pr_close` がすべて `false`）、`repo`、`issue_number`、`pr_number`、
+`merge_commit_oid`、`worktree_path`、`branch_name`。`cleanup_exec_argv` は出さない（worker が自身の executor 手順で
+`cleanup_exec.py` を呼ぶため、orchestrator が組み立てる argv は drift 源になる）。
+
+残余状態: 復旧が reject された場合の local-only 報告には reject 結果の owner Task id・保持 claim 番号を含める。local-only 後は
+Task / implementation Activity が ACTIVE のまま残る既知の残余状態であり、本経路はそれらを cleanup しない（人間が owner Task を解決する）。
+`LOCAL_ONLY_PERMITTED` は worker dispatch を許可する routing decision（実行許可）であり、cleanup 成功の根拠ではない。
+報告は worker が返す実行結果で決める: `status: ok` かつ `unresolved_cleanup_items` 空・`errors` 空・完了確認済みなら
+「ローカル cleanup 成功 / Task Context 未記録」、`status: partial`（または一部 unresolved）なら「ローカル cleanup 部分成功 /
+残件と理由 / Task Context 未記録」、`status: failed`・refused・完了未確認なら「ローカル cleanup 未完了 / 理由 /
+Task Context 未記録」。いずれも `cleanup_completed`、親 Issue close、別 PR close の根拠にしない。
+local-only 実行後に復旧が明示要求された場合は `--phase recover` を実行してよいが、同一 invocation で
+worker の再 dispatch や `--phase completed` は行わない。
+
+### TOCTOU と both-missing の残余リスク
+
+- **TOCTOU**: GitHub の merged 状態と merge commit OID は不可逆。snapshot 取得から `BEGIN IMMEDIATE` までの窓は同一 invocation 内
+  （秒単位）に限定され、transaction 内で GitHub を再取得しない（外部 I/O を transaction に入れない）。取得後に closing relation が
+  変わっても検出しない残余リスクは受容する。復旧記録は `merge_commit_oid` に束縛される。
+- **both-missing**: 両 claim が無い場合の effective origin は呼び出し元が明示した managed origin であり、関連性の追加 guard は設けない
+  （通常 producer `_attach_implementation_claims_tx` も同じく origin Task に両 claim を付与するため）。T が別 Issue / 別 PR の
+  live claim を持つ場合は判定順 2/3 で reject される。claim を持たない無関係 Task を origin に指定した場合の取り違えは受容する残余リスク。
+
+### 復旧記録の recovery journal（14 key）と allowlist 追加
+
+復旧記録は既存 `events` journal への append-only。event_type は `recovery:implementation_claims`（`workflow:` prefix を使わず
+`_has_cleanup_started_tx` 等の既存 workflow helper に読まれない。新 `signal_kind` ではない）。metadata の closed key は次の 14 個のみ:
+`operation`（固定値 `retroactive_claim_recovery`）、`source`（`post-merge-cleanup`。`open-pr` 等の通常 producer は名乗らない）、
+`source_schema_version`（`v1`）、`repo`、`issue_number`、`pr_number`、`merge_commit_oid`、`task_id`、`execution_run_id`、
+`activity_id`（復旧後の implementation Activity）、`prior_activity_id`、`prior_activity_kind`、`claims_attached`
+（`none` / `issue` / `pr` / `issue,pr`）、`activity_action`（`started` / `reused` / `transitioned`）。
+
+`ALLOWED_EVENT_METADATA_KEYS` への追加は、既存に無かった `prior_activity_id` / `prior_activity_kind` / `claims_attached` /
+`activity_action` の 4 key だけである（他の 10 key は既存）。dedupe_key は
+`task-context-v1:retroactive_claim_recovery:{repo}:{pr_number}:{merge_commit_oid}` で、既存の `task-context-v1:{signal_kind}:...`
+形式と衝突しない。同一 Task の再実行は `duplicate_noop` / `SAME_TASK_SAME_FACT`、別 Task で accepted 済みなら書き込み前に
+`conflict` / `FACT_TASK_IDENTITY_CONFLICT`、`ux_events_dedupe_key` の `sqlite3.IntegrityError`（`db.write_transaction` が rollback 後に
+`ConflictError` へ変換する）も同じ reject へ正規化する。
+
+### `/task <issue>` bootstrap 案の不採用理由
+
+一般 `/task <issue>` に implementation Activity / PR claim の bootstrap まで背負わせる案は採用しない。`/task` による接続回復は
+Issue 側の Task を作るだけで PR claim を補えず、Issue と PR の両方で `/task` を実行すると claim が分裂する実例がある（#2856）。
+二重実行を復旧手順として案内せず、整合する場合だけ本節の明示復旧操作で欠けた claim を補う。
+
+### #2825 との責務分担
+
+通常の PR 作成時に claim を記録する producer `.claude/skills/open-pr/scripts/open_pr.py::emit_implementation_pr_observed()` の
+GraphQL query 波括弧不均衡は #2825（OPEN）が所有し、本 Issue（#2817）は `open_pr.py` を変更しない。本節は「既に記録漏れがある状態からの復旧と
+cleanup 継続」を所有する。#2825 の完了は本機能の着手条件ではなく、#2825 が直れば本経路の需要が減るだけで、本経路は独立して有効である。
