@@ -1112,3 +1112,294 @@ def test_given_fix_delta_1_and_w2_inputs_when_classified_after_fix_delta_2_then_
         assert result.kind == kind, prompt
         # current repo の `#N` を含むので、解決要否は常に True。
         assert classifier.needs_current_repo_resolution(prompt) is True, prompt
+
+
+# ---------------------------------------------------------------------------
+# Issue #2871: active_rebind_projection() clause processing must not be
+# quadratic. Deterministic work counting only -- no wall-clock thresholds and
+# no call-count-only criteria (an unfixed projection calls each predicate once
+# per occurrence, so only the *characters passed* / *substring volume* /
+# *position-lookup work* reveal the quadratic path).
+#
+# Scope note: only the projection's clause processing is measured. The scanner
+# front-end (``_find_occurrences`` / owner-repo prefix slicing) is stubbed with
+# precomputed occurrences on purpose; its residual cost belongs to #2875.
+# ---------------------------------------------------------------------------
+
+_PERF_REPO = "o/r"
+_PERF_SMALL_N = 200
+_PERF_LARGE_N = 400
+_PERF_MAX_RATIO = 3
+
+
+class _CountingStr(str):
+    """``str`` whose slices are counted, so the substring volume *requested* by
+    the projection is visible regardless of CPython's full-length-slice
+    special case. Integer indexing (used by ``_clause_spans``) is not a clause
+    substring and is not counted."""
+
+    counters: dict[str, int]
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            self.counters["substring_chars"] += len(range(*key.indices(len(self))))
+        return str.__getitem__(self, key)
+
+
+class _CountingSpans(list):
+    """``list`` whose element accesses (iteration + indexing) are counted.
+    This seam counts the same thing for a linear search and for a ``bisect``
+    based lookup that is built on the spans."""
+
+    counters: dict[str, int]
+
+    def __iter__(self):
+        for item in list.__iter__(self):
+            self.counters["lookup_work"] += 1
+            yield item
+
+    def __getitem__(self, key):
+        self.counters["lookup_work"] += 1
+        return list.__getitem__(self, key)
+
+
+def _measure_projection_work(monkeypatch, prompt: str) -> dict[str, int]:
+    """Run ``active_rebind_projection`` once with instrumentation and return
+    the work counters. ``classify`` and the scanner run un-instrumented; the
+    projection's occurrence loop is isolated with precomputed occurrences."""
+    classification = classifier.classify(prompt, current_repo=_PERF_REPO)
+    # The corpus must reach the projection occurrence loop (not return early).
+    assert classification.kind in (classifier.KIND_EXPLICIT, classifier.KIND_INFERRED), prompt[:40]
+    assert classification.target is not None and classification.target.repo
+
+    real_strip = classifier._strip_authority_exclusions
+    real_spans = classifier._clause_spans
+    real_target = classifier._clause_has_target_phrase
+    real_creation = classifier._clause_has_creation_or_reply_phrase
+
+    authority_text = real_strip(prompt)
+    occurrences = classifier._find_occurrences(authority_text, _PERF_REPO)
+    primary_all = classifier._primary_occurrences(authority_text, occurrences)
+    target_key = classifier._target_key(classification.target)
+    assert [o for o in primary_all if classifier._target_key(o.target) == target_key], prompt[:40]
+    unstubbed = classifier.active_rebind_projection(prompt, classification, current_repo=_PERF_REPO)
+
+    counters = {
+        "target_chars": 0,
+        "target_calls": 0,
+        "creation_chars": 0,
+        "creation_calls": 0,
+        "substring_chars": 0,
+        "lookup_work": 0,
+    }
+    _CountingStr.counters = counters
+    _CountingSpans.counters = counters
+
+    def counting_strip(text):
+        return _CountingStr(real_strip(text))
+
+    def counting_spans(text):
+        return _CountingSpans(real_spans(text))
+
+    def counting_target(clause):
+        counters["target_calls"] += 1
+        counters["target_chars"] += len(clause)
+        return real_target(clause)
+
+    def counting_creation(clause):
+        counters["creation_calls"] += 1
+        counters["creation_chars"] += len(clause)
+        return real_creation(clause)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(classifier, "_strip_authority_exclusions", counting_strip)
+        patch.setattr(classifier, "_find_occurrences", lambda *_a, **_k: occurrences)
+        patch.setattr(classifier, "_primary_occurrences", lambda *_a, **_k: primary_all)
+        patch.setattr(classifier, "_clause_spans", counting_spans)
+        patch.setattr(classifier, "_clause_has_target_phrase", counting_target)
+        patch.setattr(classifier, "_clause_has_creation_or_reply_phrase", counting_creation)
+        measured = classifier.active_rebind_projection(prompt, classification, current_repo=_PERF_REPO)
+
+    assert measured == unstubbed, prompt[:40]
+    return counters
+
+
+_PERF_CORPORA = [
+    ("reference_marker_commas", lambda n: "参考: " + "、#1" * n, False),
+    ("owner_repo_commas", lambda n: "o/r#1、" * n, False),
+    ("owner_repo_commas_then_creation", lambda n: "o/r#1、" * n + "を対象に follow-up を起票して", True),
+    ("preceding_clause_then_commas", lambda n: "説明。" + "o/r#1、" * n, False),
+    ("many_short_clauses", lambda n: "Issue #1。" * n, False),
+]
+
+
+@pytest.mark.parametrize(
+    ("build_prompt", "expects_creation"),
+    [(build, creation) for _name, build, creation in _PERF_CORPORA],
+    ids=[name for name, _build, _creation in _PERF_CORPORA],
+)
+def test_given_pathological_clause_when_active_rebind_projection_then_not_quadratic(
+    monkeypatch, build_prompt, expects_creation
+):
+    small = _measure_projection_work(monkeypatch, build_prompt(_PERF_SMALL_N))
+    large = _measure_projection_work(monkeypatch, build_prompt(_PERF_LARGE_N))
+
+    # A count of 0 would make the ratio vacuous: every measurement that this
+    # corpus is supposed to exercise must be non-zero.
+    for key in ("target_calls", "target_chars", "substring_chars", "lookup_work"):
+        assert small[key] > 0 and large[key] > 0, (key, small, large)
+    if expects_creation:
+        # The creation/reply predicate is only reached when the target phrase
+        # matched; this corpus must make it run at least once.
+        assert small["creation_calls"] >= 1 and large["creation_calls"] >= 1, (small, large)
+        assert small["creation_chars"] > 0 and large["creation_chars"] > 0, (small, large)
+
+    measured_keys = ["target_chars", "substring_chars", "lookup_work"]
+    if expects_creation:
+        measured_keys.append("creation_chars")
+    for key in measured_keys:
+        ratio = large[key] / small[key]
+        assert ratio <= _PERF_MAX_RATIO, (
+            f"{key} grew {ratio:.2f}x (> {_PERF_MAX_RATIO}x) when the input doubled "
+            f"(n={_PERF_SMALL_N}->{_PERF_LARGE_N}): small={small} large={large}"
+        )
+
+
+def _reference_active_rebind_projection(prompt, classification, *, current_repo=None):
+    """Verbatim copy of the pre-#2871 (naive) ``active_rebind_projection`` --
+    the behavioural reference for the equivalence test below. It must not be
+    edited to follow future changes of the production function."""
+    ineligible = {"active_rebind_primary_eligible": False}
+    if (
+        classification.kind not in (classifier.KIND_EXPLICIT, classifier.KIND_INFERRED)
+        or classification.target is None
+    ):
+        return ineligible
+    target = classification.target
+    if not target.repo:
+        return ineligible
+
+    prompt = prompt or ""
+    authority_text = classifier._strip_authority_exclusions(prompt)
+    occurrences = classifier._find_occurrences(authority_text, current_repo)
+    primary = [
+        o
+        for o in classifier._primary_occurrences(authority_text, occurrences)
+        if classifier._target_key(o.target) == classifier._target_key(target)
+    ]
+    if not primary:
+        return ineligible
+
+    ref_form = None
+    if classifier._is_whole_prompt_single_explicit_reference(prompt) and len(occurrences) == 1:
+        if primary[0].form in (classifier.REF_FORM_EXPLICIT, classifier.REF_FORM_PREFIXED):
+            ref_form = primary[0].form
+    if ref_form is None:
+        spans = classifier._clause_spans(authority_text)
+        for occurrence in primary:
+            start, end = spans[classifier._clause_index(spans, occurrence.start)]
+            clause = authority_text[start:end]
+            if classifier._clause_has_target_phrase(clause) and not classifier._clause_has_creation_or_reply_phrase(
+                clause
+            ):
+                ref_form = occurrence.form
+                break
+    if ref_form is None:
+        return ineligible
+
+    return {
+        "active_rebind_primary_eligible": True,
+        "active_rebind_target_repo": target.repo,
+        "active_rebind_target_ref_kind": target.ref_kind,
+        "active_rebind_target_ref_number": target.ref_number,
+        "active_rebind_ref_form": ref_form,
+    }
+
+
+_PROJECTION_EQUIVALENCE_CORPUS = [
+    # single occurrence
+    "#1を実装して",
+    "#1 を対象にレビューして",
+    # multiple occurrences in the same clause
+    "#1、#1、#1を実装して",
+    "o/r#1、o/r#1を対象に作業して",
+    # clause splits (target phrase in a different clause than the reference)
+    "#1です。を実装して",
+    "説明。#1を実装して。別件。",
+    "別件です。\n#1を修正して",
+    # no target phrase
+    "参考: #1",
+    "#1 についてどう思う?",
+    "Issue #1。",
+    # creation/reply phrase present
+    "#1を実装して、follow-up を起票して",
+    "#1に返信して",
+    "o/r#1、o/r#1を対象に follow-up を起票して",
+    "work on #1 and create an issue",
+    # whole-prompt single explicit reference
+    "o/r#1",
+    "o/r#1。",
+    "Issue #1",
+    "https://github.com/o/r/issues/1",
+    "#1",
+    # empty / blank prompt
+    "",
+    "   ",
+    # primary order is not position order (mixed forms)
+    "Issue#1を実装して。#1を実装して",
+    "#1を実装して。Issue#1を実装して",
+    # an earlier clause is ineligible (creation/reply) but a later one is eligible
+    "#1を実装して、follow-up を起票して。#1を実装して",
+    "Issue #1を実装して、に返信して。#1を対象に作業して",
+    "o/r#1を対象に起票して。説明。o/r#1を実装して",
+    # trailing text with no delimiter / English clause
+    "please implement #1. Then reply to it.",
+    "please reply to #1. Then implement #1.",
+]
+
+
+@pytest.mark.parametrize("prompt", _PROJECTION_EQUIVALENCE_CORPUS)
+def test_given_projection_corpus_when_evaluated_then_same_as_reference_implementation(prompt):
+    classification = classifier.classify(prompt, current_repo=_PERF_REPO)
+    expected = _reference_active_rebind_projection(prompt, classification, current_repo=_PERF_REPO)
+    actual = classifier.active_rebind_projection(prompt, classification, current_repo=_PERF_REPO)
+    assert actual == expected, prompt
+
+
+def test_given_projection_equivalence_corpus_when_inspected_then_covers_both_outcomes_and_bare_form():
+    # Guard against a vacuous corpus: it must contain eligible and ineligible
+    # cases, and pin the primary-order-dependent ``bare`` form.
+    outcomes = set()
+    for prompt in _PROJECTION_EQUIVALENCE_CORPUS:
+        classification = classifier.classify(prompt, current_repo=_PERF_REPO)
+        outcomes.add(
+            classifier.active_rebind_projection(prompt, classification, current_repo=_PERF_REPO)[
+                "active_rebind_primary_eligible"
+            ]
+        )
+    assert outcomes == {True, False}
+
+    mixed = "Issue#1を実装して。#1を実装して"
+    classification = classifier.classify(mixed, current_repo=_PERF_REPO)
+    projection = classifier.active_rebind_projection(mixed, classification, current_repo=_PERF_REPO)
+    assert projection["active_rebind_primary_eligible"] is True
+    assert projection["active_rebind_ref_form"] == "bare"
+    assert projection == _reference_active_rebind_projection(mixed, classification, current_repo=_PERF_REPO)
+
+    # Earlier clause ineligible by creation/reply, later clause eligible: the
+    # projection must still become eligible (a "first occurrence wins" shortcut
+    # would wrongly stay ineligible).
+    later = "#1を実装して、follow-up を起票して。#1を実装して"
+    classification = classifier.classify(later, current_repo=_PERF_REPO)
+    projection = classifier.active_rebind_projection(later, classification, current_repo=_PERF_REPO)
+    assert projection["active_rebind_primary_eligible"] is True
+
+
+def test_given_spans_when_clause_index_from_ends_then_same_as_linear_clause_index():
+    for text in ["", "abc", "一。二。三", "一。二。三。", "a.\nb? c!", "。。。", "\n"]:
+        spans = classifier._clause_spans(text)
+        ends = [end for _, end in spans]
+        for position in range(-2, len(text) + 3):
+            assert classifier._clause_index_from_ends(ends, position) == classifier._clause_index(
+                spans, position
+            ), (text, position)
