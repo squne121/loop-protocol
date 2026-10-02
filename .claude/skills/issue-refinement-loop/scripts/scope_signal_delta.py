@@ -1554,32 +1554,44 @@ def is_safe_contract_patch_append(operation: dict, *, anchor_body: str | None = 
     if not isinstance(text, str) or not text.strip() or "\x00" in text or "\r" in text:
         return False
     lines = text.split("\n")
-    if len(lines) > 1 and (section != "Acceptance Criteria" or not all(
-        line.startswith(("  ", "\t")) and line.strip() and not line.lstrip().startswith("##")
-        for line in lines[1:]
-    )):
+    if any(not line.strip() or line.lstrip().startswith("##") for line in lines):
         return False
     if section == "Allowed Paths":
-        match = re.fullmatch(r"- `([^`\n]+)`", text)
-        return bool(match and _normalize_exact_repository_path_literal(match.group(1)) == match.group(1))
+        for line in lines:
+            match = re.fullmatch(r"- `([^`\n]+)`", line)
+            if not match or _normalize_exact_repository_path_literal(match.group(1)) != match.group(1):
+                return False
+        return True
     if section == "Acceptance Criteria":
-        # Neither a Revised AC heading nor evidence provenance substitutes for
-        # an AC number: never append an unnumbered, unbulleted prose line.
-        return bool(_AC_LINE_RE.fullmatch(lines[0]))
+        # A structured numbered AC may have indented continuations, or a
+        # pre-existing plan may contain several independently numbered ACs.
+        # Never promote raw prose (or a new H2) merely because the first line
+        # is well formed.
+        if not _AC_LINE_RE.fullmatch(lines[0]):
+            return False
+        return all(_AC_LINE_RE.fullmatch(line) or line.startswith(("  ", "\t"))
+                   for line in lines[1:])
     if section == "Stop Conditions":
-        # An inline request marker does not turn its raw-prose payload into a
-        # section-bound Stop Condition merely by prefixing the whole request.
-        if _STOP_DIRECTIVE_RE.fullmatch(text.removeprefix("- ").strip()):
-            return False
-        # A traversal/absolute/backslash literal is never silently copied as
-        # a legitimate directive even when other structured operations exist.
-        if any(_is_unsafe_path_literal(token) for token in re.findall(r"`([^`]+)`", text)):
-            return False
-        return bool(re.fullmatch(r"-\s+\S.+", text))
+        for line in lines:
+            # A pre-existing plan must not bypass the producer's conflicting
+            # H2/inline Allowed Paths check by presenting the request as Stop.
+            if _ALLOWED_PATHS_DIRECTIVE_RE.search(line):
+                return False
+            # An inline request marker does not turn its raw-prose payload into
+            # a section-bound Stop Condition merely by prefixing the request.
+            if _STOP_DIRECTIVE_RE.fullmatch(line.removeprefix("- ").strip()):
+                return False
+            if any(_is_unsafe_path_literal(token) for token in re.findall(r"`([^`]+)`", line)):
+                return False
+            if not re.fullmatch(r"-\s+\S.+", line):
+                return False
+        return True
     if section == "Verification Commands":
-        return bool(re.fullmatch(r"(?:-\s+)?\$\s+\S.+|(?:-\s+)(?:uv|pnpm|python3|node|git|rg)\s+\S.+", text))
+        return all(re.fullmatch(
+            r"(?:-\s+)?\$\s+\S.+|(?:-\s+)(?:uv|pnpm|python3|node|git|rg)\s+\S.+", line
+        ) for line in lines)
     if section in {"In Scope", "Out of Scope"}:
-        return bool(re.fullmatch(r"-\s+\S.+", text))
+        return all(re.fullmatch(r"-\s+\S.+", line) for line in lines)
     return False
 
 
@@ -1625,6 +1637,11 @@ def derive_contract_patch_operations(evidence_list: list, *, source_body: str | 
                 ]
             if len(inline_sections) > 1 and (explicit_section is None or explicit_section not in inline_sections):
                 return []  # A mixed, ambiguous section request is not a partial plan.
+            # An H2 Stop/VC context cannot authorize a path expansion just
+            # because its bullet says "Allowed Paths ...". Do not silently
+            # append that bullet as a Stop/VC item or apply earlier safe items.
+            if explicit_section and explicit_section != "Allowed Paths" and "Allowed Paths" in inline_sections:
+                return []
             section = explicit_section or (inline_sections[0] if len(inline_sections) == 1 else None)
             # A Revised AC H2 is context, not an override for a different
             # explicitly labelled bullet. Numbered ACs above still stay ACs,

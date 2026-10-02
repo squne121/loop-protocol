@@ -5,7 +5,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import run_refinement_preflight as preflight  # noqa: E402
-from scope_signal_delta import derive_contract_patch_operations, extract_directive_items, extract_sections  # noqa: E402
+from scope_signal_delta import (  # noqa: E402
+    derive_contract_patch_operations,
+    extract_directive_items,
+    extract_directive_markers,
+    extract_sections,
+    is_safe_contract_patch_append,
+)
 
 REPO = "squne121/loop-protocol"
 ISSUE = 2827
@@ -176,6 +182,44 @@ def test_given_mixed_inline_sections_under_revised_ac_when_derived_and_consumed_
                    if name != op["section"])
 
 
+def test_given_stop_heading_and_inline_allowed_paths_request_when_derived_then_no_partial_write():
+    comment = ("## Stop Conditions\n"
+               "- Stop if required tests fail.\n"
+               "- Allowed Paths に `scripts/agent-guards/skill_runtime_exec.py` を追加してください。\n")
+    evidence = {"directive_markers": extract_directive_markers(comment),
+                "extracted_directives": extract_directive_items(comment)}
+    assert derive_contract_patch_operations([evidence], source_body=comment) == []
+    original = BODY + "\n## Stop Conditions\n\n- existing\n"
+    state, calls = {"body": original}, []
+    result = _consumer([], state, calls, anchor_body=comment,
+                       known_context={"scope_delta_authority_evidence": [evidence],
+                                      "human_context_comment_urls": [URL]})
+    assert (result["status"], result["failure"], result["writes"]) == (
+        "blocked", "unsafe_unstructured_patch_operation", 0)
+    assert state["body"] == original and calls == []
+
+
+def test_given_direct_stop_plan_with_inline_path_request_when_consumed_then_no_write():
+    state = {"body": BODY + "\n## Stop Conditions\n\n- existing\n"}
+    original, calls = state["body"], []
+    plan = [{"section": "Stop Conditions", "op": "append",
+             "text": "- Stop if required tests fail.\n"
+                     "- Allowed Paths に `scripts/agent-guards/skill_runtime_exec.py` を追加してください。"}]
+    result = _consumer(plan, state, calls)
+    assert (result["status"], result["failure"], result["writes"]) == (
+        "blocked", "unsafe_unstructured_patch_operation", 0)
+    assert state["body"] == original and calls == []
+
+
+def test_given_allowed_paths_heading_with_exact_path_when_derived_then_section_is_preserved():
+    comment = "## Allowed Paths\n- `scripts/agent-guards/skill_runtime_exec.py`\n"
+    evidence = {"directive_markers": extract_directive_markers(comment),
+                "extracted_directives": extract_directive_items(comment)}
+    operations = derive_contract_patch_operations([evidence], source_body=comment)
+    assert [(op["section"], op["text"]) for op in operations] == [
+        ("Allowed Paths", "- `scripts/agent-guards/skill_runtime_exec.py`")]
+
+
 def test_given_mixed_inline_sections_with_unsafe_item_when_derived_then_whole_plan_rejected():
     comment = ("## Revised Acceptance Criteria\n"
                "- AC19: safe\n"
@@ -279,6 +323,41 @@ def test_given_structured_section_bound_ac_when_consumer_runs_then_existing_writ
     assert result["writes"] == 1
     assert calls == ["write"]
     assert "- [ ] AC19: structured" in state["body"]
+
+
+def test_given_preexisting_structured_multiline_plan_when_consumer_runs_then_one_write_in_correct_sections():
+    ac = "- [ ] AC20: A\n- [ ] AC21: B"
+    paths = "- `src/a.ts`\n- `src/b.ts`"
+    plan = [{"section": "Acceptance Criteria", "op": "append", "text": ac},
+            {"section": "Allowed Paths", "op": "append", "text": paths}]
+    assert all(is_safe_contract_patch_append(op) for op in plan)
+    state, calls = {"body": BODY}, []
+    result = _consumer(plan, state, calls)
+    assert (result["status"], result["writes"], calls) == ("applied", 1, ["write"])
+    sections = extract_sections(state["body"])
+    assert sections["Acceptance Criteria"].splitlines()[-2:] == ac.splitlines()
+    assert sections["Allowed Paths"].splitlines()[-2:] == paths.splitlines()
+    assert all(path not in sections["Acceptance Criteria"] for path in paths.splitlines())
+    assert all(line not in sections["Allowed Paths"] for line in ac.splitlines())
+
+
+def test_given_mixed_unsafe_multiline_plan_when_consumer_runs_then_no_partial_write():
+    invalid = [
+        ("Acceptance Criteria", "- [ ] AC20: A\nraw prose"),
+        ("Acceptance Criteria", "- [ ] AC20: A\n## Allowed Paths\n- `src/b.ts`"),
+        ("Allowed Paths", "- `src/a.ts`\n- `../../escape.ts`"),
+        ("Allowed Paths", "- `src/a.ts`\n- `/absolute.ts`"),
+        ("Allowed Paths", "- `src/a.ts`\nraw prose"),
+    ]
+    for section, text in invalid:
+        plan = [{"section": "Acceptance Criteria", "op": "append", "text": "- [ ] AC19: safe"},
+                {"section": section, "op": "append", "text": text}]
+        assert not is_safe_contract_patch_append(plan[1])
+        state, calls = {"body": BODY}, []
+        result = _consumer(plan, state, calls)
+        assert (result["status"], result["failure"], result["writes"]) == (
+            "blocked", "unsafe_unstructured_patch_operation", 0)
+        assert state["body"] == BODY and calls == []
 
 
 def test_given_structured_section_replacement_when_consumer_runs_then_existing_write_path_survives():
