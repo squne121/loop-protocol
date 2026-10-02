@@ -468,5 +468,160 @@ def test_proxy_identity_display_has_no_malformed_v_prefix(tmp_path):
     assert "proxy=v" not in result.stderr
 
 
+# --- Issue #2840: launcher-owned fixed value `subagent-name-resume` ---------------
+
+
+def _read_settings(tmp_path: Path) -> dict:
+    settings_path = tmp_path / "claude-gpt-home" / "claude" / "settings.local.json"
+    return json.loads(settings_path.read_text(encoding="utf-8"))
+
+
+def test_named_subagent_resume_fixed_value_drops_only_sendmessage_deny(tmp_path):
+    """The new fixed value drops ONLY the blanket SendMessage deny; ListAgents deny,
+    crossSessionInbound: refuse and the generic observation hook set are kept, the
+    existing fixed values keep their exact peer policy, and unknown values / caller
+    --settings / --permission-mode gain no new route."""
+    result = _run_check_only(
+        tmp_path, extra_env={"CLAUDE_GPT_RUNTIME_SMOKE_HOOKS": "subagent-name-resume"}
+    )
+    assert result.returncode == 0, result.stderr
+    settings = _read_settings(tmp_path)
+    deny = settings["permissions"]["deny"]
+    assert settings["crossSessionInbound"] == "refuse"
+    assert "SendMessage" not in deny
+    assert deny[-1] == "ListAgents" and deny.count("ListAgents") == 1
+    # the only other deny entries are the pre-existing proxy-directory Read denials
+    assert all(entry.startswith("Read(") for entry in deny[:-1])
+
+    # generic observation hook set only (cat sinks), no Task Context verdict / authorization hook
+    hooks = settings["hooks"]
+    cat_group = {"hooks": [{"type": "command", "command": "cat"}]}
+    assert hooks["SubagentStart"] == [cat_group]
+    assert hooks["SubagentStop"] == [cat_group]
+    assert hooks["PostToolUse"] == [{"matcher": "Agent", **cat_group}]
+    assert hooks["PreToolUse"] == [{"matcher": "SendMessage", **cat_group}]
+    assert "task_context" not in json.dumps(hooks)
+
+    # the launcher's fixed hook set equals the runner scenario overlay's hook set
+    runner_path = SCRIPT_DIR.parent / "agent-ops" / "run_worktree_agent_runtime_smoke.py"
+    runner_text = runner_path.read_text(encoding="utf-8")
+    assert '("PostToolUse", "Agent")' in runner_text and '("PreToolUse", "SendMessage")' in runner_text
+
+    # existing fixed values: peer policy unchanged, and no PostToolUse registration leaks in
+    for value in ("subagent-start-stop", "hook-sink-multi-turn"):
+        existing_env = {"CLAUDE_GPT_RUNTIME_SMOKE_HOOKS": value}
+        if value == "hook-sink-multi-turn":
+            existing_env["CLAUDE_GPT_HOOK_SINK_NONCE"] = "test-nonce"
+        existing_dir = tmp_path / value
+        existing_dir.mkdir()
+        res = _run_check_only(existing_dir, extra_env=existing_env)
+        assert res.returncode == 0, res.stderr
+        existing = _read_settings(existing_dir)
+        assert existing["permissions"]["deny"][-2:] == ["SendMessage", "ListAgents"]
+        assert existing["crossSessionInbound"] == "refuse"
+        assert "PostToolUse" not in existing["hooks"]
+        assert existing["hooks"]["PreToolUse"] == []
+
+    # unknown value: no peer policy, no new hook registration, no new route
+    unknown_dir = tmp_path / "unknown"
+    unknown_dir.mkdir()
+    res = _run_check_only(unknown_dir, extra_env={"CLAUDE_GPT_RUNTIME_SMOKE_HOOKS": "subagent-name-resume-x"})
+    assert res.returncode == 0, res.stderr
+    unknown = _read_settings(unknown_dir)
+    assert "crossSessionInbound" not in unknown
+    assert "SendMessage" not in unknown["permissions"]["deny"]
+    assert "ListAgents" not in unknown["permissions"]["deny"]
+    assert "PostToolUse" not in unknown["hooks"] and unknown["hooks"]["PreToolUse"] == []
+
+    # caller --settings / --permission-mode bypass stay rejected even with the new fixed value
+    forbidden_env = dict(os.environ, CLAUDE_GPT_RUNTIME_SMOKE_HOOKS="subagent-name-resume")
+    for flags, reason_flag in (
+        (["--settings", '{"crossSessionInbound":"accept"}'], "--settings"),
+        (["--permission-mode", "default"], "--permission-mode"),
+        (["--permission-mode", "bypassPermissions"], "--permission-mode"),
+        (["--dangerously-skip-permissions"], "--dangerously-skip-permissions"),
+    ):
+        rejected = subprocess.run(
+            [str(LAUNCH_SH), "--", *flags], cwd=str(SCRIPT_DIR), capture_output=True, text=True,
+            env=forbidden_env,
+        )
+        assert rejected.returncode == 2
+        assert '"reason":"policy_weakening_flag_rejected"' in rejected.stderr
+        assert reason_flag in rejected.stderr
+
+
+# argv recorder + `--version` / `auto-mode defaults|config` readback responder. launch.sh runs
+# `preflight.sh --auto-mode-check` (readback) before the real invocation, so a recorder that
+# only dumps argv could never reach the final claude invocation under test.
+FAKE_CLAUDE_FORWARD_SOURCE = r"""#!/usr/bin/env python3
+import json
+import os
+import sys
+
+argv = sys.argv[1:]
+if argv and argv[0] == "--version":
+    print("2.1.211 (Claude Code)")
+    sys.exit(0)
+if "auto-mode" in argv:
+    subcommand = argv[argv.index("auto-mode") + 1]
+    baseline = {
+        "environment": ["defaults-env-baseline"],
+        "allow": ["defaults-allow-baseline"],
+        "hard_deny": ["defaults-hard-deny-baseline"],
+        "soft_deny": ["defaults-soft-deny-baseline"],
+        "classifyAllShell": False,
+    }
+    if subcommand == "defaults":
+        print(json.dumps(baseline))
+        sys.exit(0)
+    config = dict(baseline)
+    settings_path = argv[argv.index("--settings") + 1] if "--settings" in argv else None
+    if settings_path and os.path.exists(settings_path):
+        auto_mode = json.load(open(settings_path, encoding="utf-8")).get("autoMode", {})
+        for key in ("environment", "allow", "hard_deny"):
+            entries = auto_mode.get(key)
+            if entries is not None:
+                merged = []
+                for entry in entries:
+                    merged.extend(baseline[key] if entry == "$defaults" else [entry])
+                config[key] = merged
+        if auto_mode.get("classifyAllShell"):
+            config["classifyAllShell"] = True
+    print(json.dumps(config))
+    sys.exit(0)
+json.dump(argv, open(os.environ["FAKE_CLAUDE_ARGV_FILE"], "w", encoding="utf-8"))
+sys.exit(0)
+"""
+
+
+def test_launcher_forwards_append_system_prompt_file_to_claude_argv(tmp_path):
+    """argv readback: the launcher accepts the CLI's own --append-system-prompt-file and
+    forwards it, unchanged, to the Claude Code argv (so no launcher change is needed)."""
+    claude_gpt_home = tmp_path / "claude-gpt-home"
+    fake_proxy = _write_executable(tmp_path / "fake-claude-code-proxy", FAKE_PROXY_SOURCE)
+    fake_claude = _write_executable(tmp_path / "fake-claude", FAKE_CLAUDE_FORWARD_SOURCE)
+    recorded = tmp_path / "claude-argv.json"
+    compat = tmp_path / "compat.md"
+    compat.write_text("compat\n", encoding="utf-8")
+    env = dict(os.environ)
+    env.update({
+        "CLAUDE_GPT_HOME": str(claude_gpt_home),
+        "CLAUDE_GPT_PROXY_BIN": str(fake_proxy),
+        "CLAUDE_GPT_CLAUDE_BIN": str(fake_claude),
+        "CLAUDE_GPT_RUNTIME_SMOKE_HOOKS": "subagent-name-resume",
+        "FAKE_CLAUDE_ARGV_FILE": str(recorded),
+    })
+    result = subprocess.run(
+        [str(LAUNCH_SH), "--", "-p", "--append-system-prompt-file", str(compat)],
+        cwd=str(SCRIPT_DIR), env=env, capture_output=True, text=True, timeout=90, input="hello\n",
+    )
+    assert result.returncode == 0, result.stderr
+    forwarded = json.loads(recorded.read_text(encoding="utf-8"))
+    assert "--append-system-prompt-file" in forwarded
+    assert forwarded[forwarded.index("--append-system-prompt-file") + 1] == str(compat)
+    assert forwarded[forwarded.index("--permission-mode") + 1] == "auto"
+    assert not any(token.startswith("--dangerously") for token in forwarded)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
