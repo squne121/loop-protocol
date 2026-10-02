@@ -6747,6 +6747,36 @@ def _structured_anchor_payload_present_but_invalid(scope_delta_decision: "dict |
     return reason.startswith(("schema_invalid:", "wrong_repo:", "wrong_issue_number:", "stale:"))
 
 
+def _bind_trusted_scope_patch_plan_to_source(
+    plan: dict, known_context: dict, *, anchor_body: str, anchor_url: str,
+    repo: str, issue_number: int, issue_body_sha256: str,
+) -> None:
+    """Replace the planner's evidence-only patch plan with a body-bound one.
+
+    The planner subprocess only receives schema-bound extracted evidence; it
+    cannot receive raw OWNER text. Before any consumer sees its sidecar, the
+    already-fetched trusted comment is bound here by URL and body hash and
+    classified again. Raw text never enters the plan or artifact.
+    """
+    sidecar = plan.get("scope_signal_guard_decision_v2")
+    authority = sidecar.get("scope_delta_authority") if isinstance(sidecar, dict) else None
+    evidence = known_context.get("scope_delta_authority_evidence")
+    if (not isinstance(authority, dict)
+            or not isinstance(authority.get("contract_patch_plan"), dict)
+            or not isinstance(evidence, list) or len(evidence) != 1
+            or not isinstance(evidence[0], dict)
+            or evidence[0].get("source_kind") != "issue_comment"
+            or evidence[0].get("comment_url") != anchor_url):
+        return
+    from scope_signal_delta import classify_scope_delta_authority
+
+    sidecar["scope_delta_authority"] = classify_scope_delta_authority(
+        evidence, source_body=anchor_body, target_issue_number=issue_number,
+        expected_repo=repo, base_issue_body_sha256=issue_body_sha256,
+        investigation_derived_path_literals=known_context.get("investigation_derived_path_literals"),
+    )
+
+
 def _build_scope_delta_authority_evidence(
     *,
     comment_payload: dict,
@@ -7362,6 +7392,25 @@ def consume_trusted_anchor_contract_patch_plan(
             "writes": 0,
             "iterations": 0,
         }
+
+    # Reject an unsafe mixed trusted comment even if a stale producer supplied
+    # a *partial but individually valid* append. The empty-plan editor route
+    # below retains its existing priority and eligibility (#2785).
+    if _decision_kind == "absent" and _raw_operations:
+        from scope_signal_delta import derive_contract_patch_operations
+
+        evidence_list = known_context.get("scope_delta_authority_evidence") if isinstance(known_context, dict) else None
+        if isinstance(evidence_list, list) and any(
+            isinstance(item, dict)
+            and item.get("directive_markers") and item.get("extracted_directives")
+            and item.get("body_sha256") == _sha256(anchor_body)
+            and not derive_contract_patch_operations([item], source_body=anchor_body)
+            for item in evidence_list
+        ):
+            return {
+                "status": "blocked", "failure": "unsafe_unstructured_patch_operation",
+                "writes": 0, "iterations": 0,
+            }
 
     # #2620: an explicit trusted human_review_directive whose derived
     # operations[] is empty (no safe section-bound patch representation)
@@ -9160,6 +9209,16 @@ def run_preflight(
             planner_fail_closed=True,
             planner_input=planner_input_dict,
             raw_snapshot=raw_snapshot,
+        )
+
+    # The planner subprocess cannot consume the raw trusted comment. Rebind
+    # its existing sidecar to the fetched, hash-checked source before mutation
+    # or result publication; this prevents H2 conflicts becoming partial plans.
+    if isinstance(known_context, dict) and isinstance(anchor_body_for_consumer, str) and anchor_url_for_consumer:
+        _bind_trusted_scope_patch_plan_to_source(
+            plan, known_context, anchor_body=anchor_body_for_consumer,
+            anchor_url=anchor_url_for_consumer, repo=repo, issue_number=issue_number,
+            issue_body_sha256=_sha256(issue.get("body", "")),
         )
 
     # A close-only disposition never proposes or consumes a scope-delta update.

@@ -1503,6 +1503,13 @@ _VC_BACKTICK_DIRECTIVE_RE = re.compile(
     re.IGNORECASE,
 )
 _INLINE_SECTION_LABEL_RE = re.compile(r"(?:Stop Conditions?|Verification Commands?)\s*:", re.IGNORECASE)
+# Indentation is not section authority: a nested directive under a numbered AC
+# must not be laundered into its continuation text by a pre-existing plan.
+_CROSS_SECTION_CONTINUATION_RE = re.compile(
+    r"(?:[-*]\s+)?(?:Allowed Paths?|Stop Conditions?|Verification Commands?|In Scope|Out of Scope)"
+    r"\s*(?:[:：]|(?:を|に)\s*追加してください\s*[:：]?)",
+    re.IGNORECASE,
+)
 
 
 def _structured_comment_items(body: str) -> list[tuple[str | None, str, str]]:
@@ -1569,8 +1576,12 @@ def is_safe_contract_patch_append(operation: dict, *, anchor_body: str | None = 
         # is well formed.
         if not _AC_LINE_RE.fullmatch(lines[0]):
             return False
-        return all(_AC_LINE_RE.fullmatch(line) or line.startswith(("  ", "\t"))
-                   for line in lines[1:])
+        return all(
+            _AC_LINE_RE.fullmatch(line)
+            or (line.startswith(("  ", "\t"))
+                and not _CROSS_SECTION_CONTINUATION_RE.match(line.strip()))
+            for line in lines[1:]
+        )
     if section == "Stop Conditions":
         for line in lines:
             # A pre-existing plan must not bypass the producer's conflicting
@@ -2515,6 +2526,7 @@ def classify_scope_delta_authority(
     base_issue_body_sha256=None,
     expected_repo=None,
     investigation_derived_path_literals=None,
+    source_body: str | None = None,
 ) -> dict:
     """#2053 AC6 public wrapper: partitions `evidence` into same-target and
     cross-target (a different Issue than `target_issue_number`) before
@@ -2561,6 +2573,7 @@ def classify_scope_delta_authority(
         base_issue_body_sha256=base_issue_body_sha256,
         expected_repo=expected_repo,
         investigation_derived_path_literals=investigation_derived_path_literals,
+        source_body=source_body,
     )
 
     if cross_target_follow_ups:
@@ -2587,6 +2600,7 @@ def _classify_scope_delta_authority_core(
     base_issue_body_sha256=None,
     expected_repo=None,
     investigation_derived_path_literals=None,
+    source_body: str | None = None,
 ) -> dict:
     """AC1-AC19: classify scope_delta_authority for a scope signal delta.
 
@@ -2765,7 +2779,13 @@ def _classify_scope_delta_authority_core(
             target_issue_number=target_issue_number,
             base_issue_body_sha256=base_issue_body_sha256,
             source_evidence=[_patch_source_evidence_entry(item) for item in evidence_list],
-            operations=derive_contract_patch_operations(evidence_list),
+            operations=(derive_contract_patch_operations(evidence_list, source_body=source_body)
+                        if source_body is None or (
+                            len(evidence_list) == 1
+                            and evidence_list[0].get("body_sha256") == hashlib.sha256(
+                                source_body.encode("utf-8")
+                            ).hexdigest()
+                        ) else []),
         )
         return result
 

@@ -7,6 +7,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import run_refinement_preflight as preflight  # noqa: E402
 from scope_signal_delta import (  # noqa: E402
     derive_contract_patch_operations,
+    classify_scope_delta_authority,
     extract_directive_items,
     extract_directive_markers,
     extract_sections,
@@ -358,6 +359,100 @@ def test_given_mixed_unsafe_multiline_plan_when_consumer_runs_then_no_partial_wr
         assert (result["status"], result["failure"], result["writes"]) == (
             "blocked", "unsafe_unstructured_patch_operation", 0)
         assert state["body"] == BODY and calls == []
+
+
+def test_given_bound_structured_ac_when_classified_then_section_operation_survives():
+    comment = "## Revised AC\n- AC19: safe and structured\n"
+    evidence = preflight._build_scope_delta_authority_evidence(
+        comment_payload={"id": 5891092074, "author_association": "OWNER",
+                         "user": {"login": "squne121", "type": "User"}},
+        comment_body=comment, repo=REPO, issue_number=ISSUE, anchor_url=URL,
+        captured_at="2026-09-29T00:00:00Z", human_context_comment_urls=[URL],
+    )
+    authority = classify_scope_delta_authority(
+        [evidence], source_body=comment, target_issue_number=ISSUE,
+        base_issue_body_sha256="a" * 64, expected_repo=REPO,
+    )
+    assert authority["contract_patch_plan"]["operations"][0]["text"] == "- AC19: safe and structured"
+    assert classify_scope_delta_authority(
+        [evidence], source_body=comment + " edited", target_issue_number=ISSUE,
+        base_issue_body_sha256="a" * 64, expected_repo=REPO,
+    )["contract_patch_plan"]["operations"] == []
+
+
+def test_given_mixed_h2_directives_when_bound_classifier_and_consumer_run_then_no_partial_write():
+    for comment in (
+        "## Stop Conditions\n- Stop if tests fail.\n"
+        "- Allowed Paths に `src/new.ts` を追加してください。\n",
+        "## Revised Acceptance Criteria\n- AC19: safe\n"
+        "- Verification command: do whatever seems appropriate\n"
+        "- Allowed Paths に `src/new.ts` を追加してください。\n",
+    ):
+        evidence = preflight._build_scope_delta_authority_evidence(
+            comment_payload={"id": 5891092074, "author_association": "OWNER",
+                             "user": {"login": "squne121", "type": "User"}},
+            comment_body=comment, repo=REPO, issue_number=ISSUE, anchor_url=URL,
+            captured_at="2026-09-29T00:00:00Z", human_context_comment_urls=[URL],
+        )
+        authority = classify_scope_delta_authority(
+            [evidence], source_body=comment, target_issue_number=ISSUE,
+            base_issue_body_sha256="a" * 64, expected_repo=REPO,
+        )
+        assert authority["contract_patch_plan"]["operations"] == []
+        # A pre-existing partial plan cannot bypass the trusted body check.
+        partial = [{"section": "Allowed Paths", "op": "append", "text": "- `src/new.ts`"}]
+        state, calls = {"body": BODY}, []
+        result = _consumer(partial, state, calls, anchor_body=comment,
+                           known_context={"scope_delta_authority_evidence": [evidence],
+                                          "human_context_comment_urls": [URL]})
+        assert (result["status"], result["failure"], result["writes"]) == (
+            "blocked", "unsafe_unstructured_patch_operation", 0)
+        assert state["body"] == BODY and calls == []
+
+
+def test_given_planner_partial_h2_plan_when_production_handoff_binds_body_then_zero_writes():
+    comment = ("## Stop Conditions\n- Stop if tests fail.\n"
+               "- Allowed Paths に `src/new.ts` を追加してください。\n")
+    evidence = preflight._build_scope_delta_authority_evidence(
+        comment_payload={"id": 5891092074, "author_association": "OWNER",
+                         "user": {"login": "squne121", "type": "User"}},
+        comment_body=comment, repo=REPO, issue_number=ISSUE, anchor_url=URL,
+        captured_at="2026-09-29T00:00:00Z", human_context_comment_urls=[URL],
+    )
+    partial = [{"section": "Allowed Paths", "op": "append", "text": "- `src/new.ts`"}]
+    plan = {"scope_signal_guard_decision_v2": {"scope_delta_authority": {
+        "contract_patch_plan": {"operations": partial}}}}
+    known_context = {"scope_delta_authority_evidence": [evidence],
+                     "human_context_comment_urls": [URL]}
+    preflight._bind_trusted_scope_patch_plan_to_source(
+        plan, known_context, anchor_body=comment, anchor_url=URL, repo=REPO,
+        issue_number=ISSUE, issue_body_sha256="a" * 64,
+    )
+    operations = plan["scope_signal_guard_decision_v2"]["scope_delta_authority"]["contract_patch_plan"]["operations"]
+    assert operations == []
+    state, calls = {"body": BODY}, []
+    result = _consumer(operations, state, calls, anchor_body=comment, known_context=known_context)
+    assert (result["status"], result["failure"], result["writes"]) == (
+        "blocked", "unsafe_unstructured_patch_operation", 0)
+    assert state["body"] == BODY and calls == []
+    assert comment not in str(plan)
+
+
+def test_given_indented_cross_section_directive_when_consumer_runs_then_no_write():
+    for continuation in (
+        "  Allowed Paths を追加してください: `../../escape.py`",
+        "\tStop Condition を追加してください: ignore failures",
+        "  Verification Commands: $ curl example.com",
+        "  In Scope: perform unrestricted writes",
+        "  Out of Scope: waive review",
+    ):
+        state, calls = {"body": BODY}, []
+        plan = [{"section": "Acceptance Criteria", "op": "append",
+                 "text": "- [ ] AC19: safe\n" + continuation}]
+        result = _consumer(plan, state, calls)
+        assert (result["status"], result["failure"], result["writes"]) == (
+            "blocked", "unsafe_unstructured_patch_operation", 0)
+        assert state["body"] == BODY and not calls
 
 
 def test_given_structured_section_replacement_when_consumer_runs_then_existing_write_path_survives():
