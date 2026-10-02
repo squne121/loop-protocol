@@ -175,7 +175,12 @@ tested HEAD、Claude Code version、adapter、launcher path と sha256、proxy p
 model route、Agent name、agent ID、caller session identity、Agent Teams の effective state、
 起動した agent の種別（hook event と team signal から決める。panel 表示や name だけでは決めない）、
 初回 completion、resume 後も同一 agent ID であること、因果鎖 9 段、`PreToolUse:SendMessage` hook の
-決定種別（false ASK の有無）、fixture と互換性説明の content sha256、`verdict`、`failure_layer`。
+決定種別（false ASK の有無）と hook 観測の状態、fixture と互換性説明の content sha256、
+`causal_chain_verdict`、`runner_exit_code`、`verdict`、`failure_layer`。
+`verdict` と `failure_layer` は run 全体の結果で、全 assertion（`--expect-marker`、順序付き marker、
+output schema、必須 runtime 観測）の後に確定した最終 exit code から一度だけ決める。因果鎖単体の成否は
+`causal_chain_verdict` に別に残し、run 全体の `verdict` とは区別する。exit code が 0 以外の run は
+`verdict=pass` にならない。
 AC3/AC4 の充足は、ローカル live 実行が出力したこの JSON の `verdict=pass` かつ
 `tested_head` が現在の HEAD と一致することだけで判定する。
 
@@ -185,9 +190,24 @@ AC3/AC4 の充足は、ローカル live 実行が出力したこの JSON の `v
 同名、同 session 内の name collision、未記録 name、`agent_type` だけの一致は addressable name として
 扱わず、一意解決もしない。
 
+各段は event identity と順序で結ぶ。`PostToolUse:Agent` の記録は元の `Agent` 呼び出しと `tool_use_id`
+と name の両方が一致するときだけ使う。初回の `SubagentStart` と `SubagentStop`、resume 後の
+`SubagentStart` と `SubagentStop` は同じ agent ID のものを使い、child の結果テキストは
+その agent を起動した呼び出しの `parent_tool_use_id` を持つ `text` block（または handback）だけを数える。
+`Grep(pattern=<marker>)` のような任意 tool の入力文字列は結果として扱わない。resume marker は
+その agent の resume 開始より後でなければならず、別の child や別の event から段を寄せ集めても成立しない。
+
+`PreToolUse:SendMessage` hook は、その `SendMessage` に対応する応答（同じ `tool_use_id` を持つ観測）が
+あり、かつ全応答が正常に実行された（`exit_code=0` かつ `decision` が `error` でない）場合だけ「観測できた」
+とする。応答が無い場合（観測不能）と実行失敗は、`SendMessage` 自体が続行できても本 smoke の PASS にしない
+（`failure_layer=hook_lifecycle`）。これは本 smoke の合否だけの区別で、通常作業に新たな承認 gate を足さない。
+
 失敗時は `failure_layer` を `client_schema` / `launcher_config` / `proxy_translation` /
 `backend_model_emission` / `hook_lifecycle` / `unclassified` のいずれかに分類する。`unclassified` は
-失敗であり、PASS にならない。
+失敗であり、PASS にならない。`proxy_translation` は、実際の error event（`result` の API error や
+stderr の translation error 文字列）に結び付く場合だけ選ぶ。proxy の製品名や launcher の正常な起動行
+（`launcher=... proxy=<version>`）は根拠にしない。根拠がなければ `hook_lifecycle` または
+`unclassified` に留める。
 
 ### evidence の再利用規則（freshness、AC8）
 
@@ -201,6 +221,8 @@ tested HEAD から final HEAD までの `git diff --name-only`（`compute_change
 交わらず、記録された Claude Code version・proxy version・model route・launcher hash・fixture と互換性説明の
 sha256 が現在値と一致する場合に限り、旧 evidence を再利用できる。allowlist 外の無関係な commit だけを
 live canary の再実行理由にしない。古い evidence を final state の evidence と偽装しない。
+再利用できるのは、`runner_exit_code=0` かつ `verdict=pass` の evidence だけである（`runner_exit_code` が
+無い、または 0 以外の evidence は再利用しない）。
 
 ### Task Context の判定を呼び出す手順
 

@@ -6932,11 +6932,22 @@ _NAMED_RESUME_CLIENT_SCHEMA_ERROR_RE = re.compile(
     r"Invalid input|schema validation|unknown (?:parameter|field)",
     re.IGNORECASE,
 )
+# Proxy translation evidence: only strings that describe an actual error.  The bare
+# product name (``claude-code-proxy``) is deliberately NOT a pattern: it appears in the
+# launcher's normal ``launcher=... proxy=<version>`` startup line, and a normal log line
+# must never change which layer a failure is attributed to.
 _NAMED_RESUME_PROXY_ERROR_RE = re.compile(
     r"invalid_request_error|API Error: *(?:4\d\d|5\d\d)|"
-    r"tool[^\n]{0,40}schema|strict[^\n]{0,40}(?:tool|function)|claude-code-proxy",
+    r"tool[^\n]{0,40}schema|strict[^\n]{0,40}(?:tool|function)",
     re.IGNORECASE,
 )
+# A ``result`` error event carrying one of these API statuses is a request the upstream
+# rejected as malformed (the shape of a translation fault).  Other statuses (auth, rate
+# limit, overload) say nothing about translation.
+_NAMED_RESUME_TRANSLATION_API_STATUSES = frozenset({400, 422})
+_NAMED_RESUME_LAUNCHER_STARTUP_LINE_PREFIX = "launcher="
+# Hook execution outcomes that are a normal run of the hook.
+_NAMED_RESUME_HOOK_OK_OUTCOMES = frozenset({None, "success"})
 _HOME_PATH_RE = re.compile(r"/(?:home|root|Users)/[^\s\"']+")
 
 
@@ -6973,9 +6984,10 @@ def _nr_file_sha256(path: str | None) -> str | None:
 
 
 def _nr_text_blocks(message: object) -> list[str]:
-    """Plain text carried by one assistant/user message body: text blocks and
-    string values inside ``tool_use`` inputs (a child SubAgent reports through
-    ``SubagentHandback(message=...)``)."""
+    """Plain text a (child) assistant message *reports*: ``text`` blocks and the
+    ``message`` of a ``SubagentHandback`` tool_use (the handback form).  The input
+    strings of any other ``tool_use`` (e.g. ``Grep(pattern=<marker>)``) are what the
+    model asked a tool to do, never a result, and are not returned."""
     texts: list[str] = []
     if not isinstance(message, dict):
         return texts
@@ -6990,10 +7002,11 @@ def _nr_text_blocks(message: object) -> list[str]:
             continue
         if block.get("type") == "text" and isinstance(block.get("text"), str):
             texts.append(block["text"])
-        elif block.get("type") == "tool_use" and isinstance(block.get("input"), dict):
-            for value in block["input"].values():
-                if isinstance(value, str):
-                    texts.append(value)
+        elif (
+            block.get("type") == "tool_use" and block.get("name") == "SubagentHandback"
+            and isinstance(block.get("input"), dict) and isinstance(block["input"].get("message"), str)
+        ):
+            texts.append(block["input"]["message"])
     return texts
 
 
@@ -7144,6 +7157,10 @@ def extract_named_subagent_resume_observations(stdout: str) -> dict:
                     "exit_code": event.get("exit_code") if isinstance(event.get("exit_code"), int) else None,
                     "outcome": event.get("outcome") if isinstance(event.get("outcome"), str) else None,
                     "decision": _nr_hook_decision(event),
+                    "payload_tool_use_id": (
+                        payload.get("tool_use_id") if payload is not None
+                        and isinstance(payload.get("tool_use_id"), str) else None
+                    ),
                 })
                 if payload is not None and payload.get("tool_name") == "SendMessage":
                     tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
@@ -7201,7 +7218,11 @@ def extract_named_subagent_resume_observations(stdout: str) -> dict:
             texts = _nr_text_blocks(message)
             bucket = "parent_texts" if parent_tool_use_id is None else "child_texts"
             for text in texts:
-                obs[bucket].append({"index": index, "text": text})
+                record = {"index": index, "text": text}
+                if parent_tool_use_id is not None:
+                    # provenance: which Agent/Task call's child produced this text
+                    record["parent_tool_use_id"] = parent_tool_use_id if isinstance(parent_tool_use_id, str) else None
+                obs[bucket].append(record)
             continue
         if etype == "user":
             message = event.get("message")
@@ -7335,10 +7356,22 @@ def evaluate_named_subagent_resume_chain(
         return _break("no_agent_call")
     steps["agent_call_with_name"] = any(call["name"] for call in obs["agent_calls"])
 
+    # Identity: a ``PostToolUse:Agent`` record only counts when it answers a REAL Agent
+    # invocation (same tool_use_id, same ``name``, issued earlier in the stream).  A
+    # record that answers no invocation, or answers one with another name, is never used.
+    calls_by_tuid = {call["tool_use_id"]: call for call in obs["agent_calls"] if call["tool_use_id"]}
+
+    def _linked_call(record: dict) -> dict | None:
+        call = calls_by_tuid.get(record["tool_use_id"]) if isinstance(record["tool_use_id"], str) else None
+        if call is None or call["index"] >= record["index"]:
+            return None
+        return call
+
     # Caller-session records only: a record another session produced is never used.
     own_records = [
         record for record in obs["name_records"]
         if record["session_id"] == caller and record["name"] and record["agent_id"]
+        and (call := _linked_call(record)) is not None and call["name"] == record["name"]
     ]
     own_agent_ids = {
         record["agent_id"] for record in obs["name_records"]
@@ -7378,44 +7411,104 @@ def evaluate_named_subagent_resume_chain(
             return _break("sendmessage_target_is_agent_type_only")
         if not steps["agent_call_with_name"]:
             return _break("agent_call_without_name")
-        return _break("sendmessage_target_not_recorded_name")
+        if not same_name_calls:
+            # No Agent invocation actually carried this name.
+            return _break("sendmessage_target_not_recorded_name")
+        # The name was really passed to an Agent call but no PostToolUse:Agent record
+        # answers THAT invocation (tool_use_id / name): the name <-> agent ID pair is
+        # not established by the hook channel.
+        return _break("agent_call_post_tool_use_unlinked")
     result["addressing"] = addressing
     result["agent_id"] = agent_id
+    steps["agent_call_with_name"] = addressing == "name"
     steps["name_agent_id_recorded"] = bool(own_records) and addressing == "name"
     if addressing == "agent_id":
         steps["name_agent_id_recorded"] = False
+        steps["agent_call_with_name"] = any(call["name"] for call in obs["agent_calls"])
 
-    # --- first completion of A, strictly before the SendMessage call ---
-    first_stops = [s for s in obs["agent_stops"] if s["agent_id"] == agent_id and s["index"] < send["index"]]
+    # --- spawn identity of A: the Agent call whose PostToolUse:Agent returned agentId A ---
     spawn_record = next(
-        (r for r in obs["name_records"] if r["session_id"] == caller and r["agent_id"] == agent_id), None
+        (
+            r for r in obs["name_records"]
+            if r["session_id"] == caller and r["agent_id"] == agent_id and _linked_call(r) is not None
+            and (addressing != "name" or r["name"] == target)
+        ),
+        None,
     )
-    first_marker_from_child = any(
-        first_marker in text["text"] for text in obs["child_texts"] if text["index"] < send["index"]
-    ) or bool(
-        spawn_record and any(first_marker in text for text in spawn_record["response_texts"])
+    spawn_call = _linked_call(spawn_record) if spawn_record else None
+    owner_tuids: set[str] = set()
+    if spawn_call is not None and isinstance(spawn_call["tool_use_id"], str):
+        owner_tuids.add(spawn_call["tool_use_id"])
+    if isinstance(send["tool_use_id"], str):
+        owner_tuids.add(send["tool_use_id"])
+    owner_tuids |= {
+        t["tool_use_id"] for t in obs["task_started"]
+        if t["task_id"] == agent_id and isinstance(t["tool_use_id"], str)
+    }
+    spawn_index = spawn_call["index"] if spawn_call is not None else None
+
+    # --- first completion of A: its own SubagentStart -> child result -> SubagentStop,
+    #     all after the Agent call that created A and before the SendMessage call ---
+    first_starts = [
+        s for s in obs["agent_starts"]
+        if s["agent_id"] == agent_id and spawn_index is not None and spawn_index < s["index"] < send["index"]
+    ]
+    first_stops = [
+        s for s in obs["agent_stops"]
+        if first_starts and s["agent_id"] == agent_id and first_starts[0]["index"] < s["index"] < send["index"]
+    ]
+    first_marker_from_child = bool(first_starts) and (
+        any(
+            first_marker in text["text"] for text in obs["child_texts"]
+            if text.get("parent_tool_use_id") in owner_tuids
+            and first_starts[0]["index"] < text["index"] < send["index"]
+        )
+        or bool(spawn_record and any(first_marker in text for text in spawn_record["response_texts"]))
     )
     result["first_completion_marker_from_child"] = first_marker_from_child
-    steps["first_completion"] = bool(first_stops) and first_marker_from_child
+    steps["first_completion"] = bool(first_starts) and bool(first_stops) and first_marker_from_child
 
-    # --- SendMessage issued / hook decisions / accepted ---
+    # --- SendMessage issued / hook observation / accepted ---
     steps["sendmessage_to_name_issued"] = addressing == "name"
-    window_decisions = [d for d in obs["sendmessage_decisions"] if d["index"] > send["index"]]
+    send_results = [r for r in obs["sendmessage_results"] if r["tool_use_id"] == send["tool_use_id"]]
+    accepted_result = send_results[0] if send_results else None
+    # The PreToolUse hooks that ran for THIS SendMessage sit between the call and its result.
+    window_end = accepted_result["index"] if accepted_result is not None else float("inf")
+    window_decisions = [d for d in obs["sendmessage_decisions"] if send["index"] < d["index"] < window_end]
     result["sendmessage_decisions"] = [
         {"hook_name": d["hook_name"], "decision": d["decision"], "exit_code": d["exit_code"], "outcome": d["outcome"]}
         for d in window_decisions[:8]
     ]
-    send_results = [r for r in obs["sendmessage_results"] if r["tool_use_id"] == send["tool_use_id"]]
-    accepted_result = send_results[0] if send_results else None
+    # Observation of the hook itself, separate from whether the SendMessage went through:
+    # observed (a hook response echoing this tool_use_id, all responses ran normally),
+    # unobserved (no hook response for this call), failed (a response did not run normally).
+    correlated = [
+        p for p in obs["sendmessage_pretool"]
+        if p["tool_use_id"] == send["tool_use_id"] and send["index"] < p["index"] < window_end
+    ]
+    failed_hooks = [
+        d for d in window_decisions
+        if d["decision"] == "error"
+        or (d["exit_code"] is not None and d["exit_code"] != 0)
+        or d["outcome"] not in _NAMED_RESUME_HOOK_OK_OUTCOMES
+    ]
+    hook_status = "failed" if failed_hooks else ("observed" if correlated else "unobserved")
+    result["hook_observation"] = {
+        "status": hook_status, "response_count": len(window_decisions), "failed_count": len(failed_hooks),
+    }
     steps["sendmessage_accepted"] = bool(
         accepted_result and accepted_result["success"]
         and not any(d["decision"] in _NAMED_RESUME_NON_ALLOW_DECISIONS for d in window_decisions)
-    )
+    )  # whether the call went through; whether this smoke may PASS on it is ``hook_status``
     result["agent_id_lane"]["agent_id"] = agent_id if addressing == "agent_id" else None
     if any(d["decision"] in _NAMED_RESUME_NON_ALLOW_DECISIONS for d in window_decisions):
         return _break("pretooluse_sendmessage_non_allow_decision")
     if not steps["first_completion"]:
         return _break("first_completion_not_observed")
+    if hook_status == "failed":
+        return _break("pretooluse_sendmessage_hook_failed")
+    if hook_status == "unobserved":
+        return _break("pretooluse_sendmessage_hook_unobserved")
     if accepted_result is None or not accepted_result["success"]:
         return _break("sendmessage_not_accepted")
     resumed_id = accepted_result["resumed_agent_id"]
@@ -7438,14 +7531,15 @@ def evaluate_named_subagent_resume_chain(
     if not steps["same_agent_id_resumed"]:
         return _break("resume_subagent_start_missing")
 
-    # --- resume completion and parent retrieval ---
-    resume_stops = [
-        s for s in obs["agent_stops"]
-        if s["agent_id"] == agent_id and resume_starts and s["index"] > resume_starts[0]["index"]
+    # --- resume completion (A's own resume lifecycle) and parent retrieval ---
+    resume_start_index = resume_starts[0]["index"]
+    resume_stops = [s for s in obs["agent_stops"] if s["agent_id"] == agent_id and s["index"] > resume_start_index]
+    resume_marker_indexes = [
+        text["index"] for text in obs["child_texts"]
+        if resume_marker in text["text"] and text.get("parent_tool_use_id") in owner_tuids
+        and text["index"] > resume_start_index
     ]
-    resume_marker_from_child = any(
-        resume_marker in text["text"] for text in obs["child_texts"] if text["index"] > send["index"]
-    )
+    resume_marker_from_child = bool(resume_marker_indexes)
     result["resume_completion_marker_from_child"] = resume_marker_from_child
     steps["resume_completion"] = bool(resume_stops) and resume_marker_from_child
     if not resume_stops:
@@ -7453,10 +7547,10 @@ def evaluate_named_subagent_resume_chain(
     if not resume_marker_from_child:
         return _break("resume_marker_not_from_child")
 
-    completion_index = resume_stops[0]["index"]
+    completion_index = max(resume_stops[0]["index"], min(resume_marker_indexes))
     notifications = [
         n for n in obs["task_notifications"]
-        if n["task_id"] == agent_id and n["status"] == "completed" and n["index"] > resume_starts[0]["index"]
+        if n["task_id"] == agent_id and n["status"] == "completed" and n["index"] > resume_start_index
     ]
     if notifications:
         completion_index = max(completion_index, notifications[0]["index"])
@@ -7469,9 +7563,24 @@ def evaluate_named_subagent_resume_chain(
     if addressing != "name":
         # Native success of the agent-ID lane alone is never a name-resume PASS.
         return _break("agent_id_lane_only_not_name_resume")
+    if hook_status != "observed" or not all(steps.values()):
+        # Defence in depth only: every step above already broke the chain on its own
+        # evidence; this never turns a missing step into a pass.
+        return _break("causal_step_missing:" + ",".join(k for k, v in steps.items() if not v))
     result["verdict"] = NAMED_RESUME_VERDICT_PASS
     result["chain_break"] = None
     return result
+
+
+def _nr_stderr_error_text(stderr_text: str) -> str:
+    """stderr minus the launcher's own startup diagnostic line (``launcher=... proxy=<version>``).
+
+    That line is a normal start-up record, not an error event, so it is never evidence
+    for a failure layer."""
+    return "\n".join(
+        line for line in (stderr_text or "").splitlines()
+        if not line.lstrip().startswith(_NAMED_RESUME_LAUNCHER_STARTUP_LINE_PREFIX)
+    )
 
 
 def classify_named_subagent_resume_failure_layer(
@@ -7508,15 +7617,19 @@ def classify_named_subagent_resume_failure_layer(
     if adapter == "claude-gpt" and (
         any(
             r["is_error"] and (
-                isinstance(r["api_error_status"], int) or _NAMED_RESUME_PROXY_ERROR_RE.search(r["text"] or "")
+                r["api_error_status"] in _NAMED_RESUME_TRANSLATION_API_STATUSES
+                or _NAMED_RESUME_PROXY_ERROR_RE.search(r["text"] or "")
             )
             for r in obs["result_events"]
         )
-        or _NAMED_RESUME_PROXY_ERROR_RE.search(stderr_text or "")
+        or _NAMED_RESUME_PROXY_ERROR_RE.search(_nr_stderr_error_text(stderr_text))
     ):
         return "proxy_translation"
     if reason in (
         "pretooluse_sendmessage_non_allow_decision",
+        "pretooluse_sendmessage_hook_failed",
+        "pretooluse_sendmessage_hook_unobserved",
+        "agent_call_post_tool_use_unlinked",
         "resume_subagent_start_missing",
         "resume_subagent_stop_missing",
         "first_completion_not_observed",
@@ -7641,6 +7754,12 @@ def evaluate_evidence_freshness(recorded: dict, current: dict) -> dict:
             reasons.append(f"current_key_missing:{key}")
     if recorded.get("verdict") != NAMED_RESUME_VERDICT_PASS:
         reasons.append("recorded_verdict_not_pass")
+    # Producer/consumer contract: only the evidence of a run whose FINAL exit code was 0
+    # (``finalize_named_resume_evidence``) is a reusable success.  A missing exit code is
+    # a pre-finalization record and is never reusable.
+    exit_recorded = recorded.get("runner_exit_code")
+    if isinstance(exit_recorded, bool) or not isinstance(exit_recorded, int) or exit_recorded != EXIT_OK:
+        reasons.append("recorded_runner_exit_code_not_zero")
     heads_differ = bool(recorded.get("tested_head")) and recorded.get("tested_head") != current.get("head")
     if heads_differ and current.get("changed_paths_base") != recorded.get("tested_head"):
         reasons.append("changed_paths_base_mismatch")
@@ -7697,6 +7816,7 @@ def freshness_record_from_evidence(evidence: dict) -> dict:
     return {
         "adapter": evidence.get("adapter"),
         "verdict": evidence.get("verdict"),
+        "runner_exit_code": evidence.get("runner_exit_code"),
         "tested_head": evidence.get("tested_head"),
         "claude_code_version": evidence.get("claude_code_version"),
         "model_route": route.get("observed_main_model"),
@@ -7797,8 +7917,13 @@ def build_named_subagent_resume_evidence(
     caller = obs["init"]["session_id"]
     evidence: dict = {
         "schema": NAMED_SUBAGENT_RESUME_EVIDENCE_SCHEMA,
+        # ``verdict`` / ``failure_layer`` are the RUN-level result.  Here they are provisional
+        # (stream-only); ``finalize_named_resume_evidence`` fixes them once from the final
+        # exit code, after every later assertion ran.  ``causal_chain_verdict`` is the
+        # causal chain's own result and stays separate from the run-level verdict.
         "verdict": verdict,
         "failure_layer": layer,
+        "causal_chain_verdict": chain["verdict"],
         "chain_break": chain["chain_break"],
         "tested_head": tested_head,
         "claude_code_version": claude_code_version,
@@ -7838,6 +7963,7 @@ def build_named_subagent_resume_evidence(
         "causal_chain": dict(chain["steps"]),
         "agent_id_lane": chain["agent_id_lane"],
         "sendmessage_hook_decisions": chain["sendmessage_decisions"],
+        "sendmessage_hook_observation": chain.get("hook_observation"),
         "false_ask_observed": any(
             d["decision"] in _NAMED_RESUME_NON_ALLOW_DECISIONS for d in chain["sendmessage_decisions"]
         ),
@@ -7862,6 +7988,40 @@ def build_named_subagent_resume_evidence(
         "launcher_receipt": _nr_launcher_receipt_public(launcher_receipt),
     }
     return _nr_assert_public_safe(evidence)
+
+
+def finalize_named_resume_evidence(evidence: dict, exit_code: int) -> dict:
+    """Fix the run-level ``verdict`` / ``failure_layer`` / ``runner_exit_code`` ONCE, from the
+    runner's FINAL exit code (after every assertion -- ``--expect-marker``, ordered markers,
+    output schema, required runtime observations -- has had its say).
+
+    ``causal_chain_verdict`` (the chain's own result) is kept untouched and separate.  The
+    exit code is authoritative: a run that exits non-zero is never ``pass`` and a run that
+    exits 0 is ``pass`` only when the stream-level verdict is ``pass``."""
+    final = dict(evidence)
+    provisional = final.get("verdict")
+    final["causal_chain_verdict"] = final.get("causal_chain_verdict", provisional)
+    final["runner_exit_code"] = exit_code
+    if exit_code == EXIT_OK:
+        if provisional != NAMED_RESUME_VERDICT_PASS:
+            final["verdict"] = NAMED_RESUME_VERDICT_FAIL
+            final["failure_layer"] = final.get("failure_layer") or "unclassified"
+            final["chain_break"] = final.get("chain_break") or "runner_exit_ok_without_chain_pass"
+        else:
+            final["failure_layer"] = None
+    elif exit_code == EXIT_SKIP:
+        final["verdict"] = NAMED_RESUME_VERDICT_SKIP
+        if provisional != NAMED_RESUME_VERDICT_SKIP:
+            final["failure_layer"] = None
+            final["chain_break"] = "runner_skipped_before_chain_evaluation"
+    else:
+        final["verdict"] = NAMED_RESUME_VERDICT_FAIL
+        if provisional == NAMED_RESUME_VERDICT_PASS:
+            final["failure_layer"] = "unclassified"
+            final["chain_break"] = "runner_outcome_not_ok_despite_chain"
+        elif not final.get("failure_layer"):
+            final["failure_layer"] = "unclassified"
+    return final
 
 
 def _nr_assert_public_safe(evidence: dict) -> dict:
@@ -9157,14 +9317,9 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                     launcher_receipt=schema_summary.get("claude_gpt_launcher_receipt"),
                 )
-                if exit_code == EXIT_SKIP and named_resume_evidence["verdict"] != NAMED_RESUME_VERDICT_SKIP:
-                    named_resume_evidence["verdict"] = NAMED_RESUME_VERDICT_SKIP
-                    named_resume_evidence["failure_layer"] = None
-                    named_resume_evidence["chain_break"] = "runner_skipped_before_chain_evaluation"
-                elif exit_code == EXIT_FAIL and named_resume_evidence["verdict"] == NAMED_RESUME_VERDICT_PASS:
-                    named_resume_evidence["verdict"] = NAMED_RESUME_VERDICT_FAIL
-                    named_resume_evidence["failure_layer"] = "unclassified"
-                    named_resume_evidence["chain_break"] = "runner_outcome_not_ok_despite_chain"
+                # The evidence's run-level verdict is NOT adjusted here: later assertions
+                # may still change ``exit_code``.  It is finalised once, from the final
+                # exit code, where ``schema_summary["exit_code"]`` is set.
                 schema_summary["named_subagent_resume"] = named_resume_evidence
                 if exit_code == EXIT_OK:
                     if named_resume_evidence["verdict"] == NAMED_RESUME_VERDICT_SKIP:
@@ -9750,6 +9905,12 @@ def main(argv: list[str] | None = None) -> int:
 
     schema_summary["errors"] = errors
     schema_summary["exit_code"] = exit_code
+    if isinstance(schema_summary.get("named_subagent_resume"), dict):
+        # Issue #2840 (PR #2879 review): run-level verdict / failure_layer / runner_exit_code
+        # are fixed once, here, from the final exit code.
+        schema_summary["named_subagent_resume"] = finalize_named_resume_evidence(
+            schema_summary["named_subagent_resume"], exit_code
+        )
 
     write_evidence(output_dir, schema_summary=schema_summary)
 
@@ -9776,12 +9937,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[WARN] could not write --evidence-json to {args.evidence_json}: {exc}", file=sys.stderr)
 
     # Issue #2840: dedicated public-safe evidence (ids / hashes / versions /
-    # booleans only), written last so the verdict mirrors the final exit code.
+    # booleans only).  Already finalised from the final exit code above.
     if args.named_resume_evidence_json:
         named_resume_payload = schema_summary.get("named_subagent_resume")
         if isinstance(named_resume_payload, dict):
-            named_resume_payload = dict(named_resume_payload)
-            named_resume_payload["runner_exit_code"] = exit_code
             try:
                 Path(args.named_resume_evidence_json).write_text(
                     json.dumps(_nr_assert_public_safe(named_resume_payload), indent=2, sort_keys=True) + "\n",

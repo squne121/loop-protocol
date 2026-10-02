@@ -87,11 +87,11 @@ class Stream:
         return "\n".join(self.lines) + "\n"
 
     def _hook(self, hook_event: str, hook_name: str, payload: dict | None, *, exit_code: int = 0,
-              raw_stdout: str | None = None) -> "Stream":
+              raw_stdout: str | None = None, outcome: str = "success") -> "Stream":
         stdout = raw_stdout if raw_stdout is not None else (json.dumps(payload) if payload is not None else "")
         return self.add({
             "type": "system", "subtype": "hook_response", "hook_event": hook_event, "hook_name": hook_name,
-            "stdout": stdout, "output": stdout, "stderr": "", "exit_code": exit_code, "outcome": "success",
+            "stdout": stdout, "output": stdout, "stderr": "", "exit_code": exit_code, "outcome": outcome,
             "session_id": self.session,
         })
 
@@ -147,18 +147,21 @@ class Stream:
         })
 
     def pretool_send(self, to: str, *, decision: str | None = None, session: str | None = None,
-                     tool_use_id: str = "toolu_send_1") -> "Stream":
+                     tool_use_id: str = "toolu_send_1", echo_exit_code: int = 0, project_exit_code: int = 0,
+                     project_outcome: str = "success") -> "Stream":
         self._hook("PreToolUse", "PreToolUse:SendMessage", {
             "hook_event_name": "PreToolUse", "session_id": session or self.session, "tool_name": "SendMessage",
             "tool_input": {"to": to}, "tool_use_id": tool_use_id,
-        })
+        }, exit_code=echo_exit_code)
         # A second hook on the same matcher (the repository's own project hook): empty
         # stdout means "no decision"; a decision object is a generic permission decision.
         raw = ""
         if decision is not None:
             raw = json.dumps({"hookSpecificOutput": {
                 "hookEventName": "PreToolUse", "permissionDecision": decision}})
-        return self._hook("PreToolUse", "PreToolUse:SendMessage", None, raw_stdout=raw)
+        return self._hook(
+            "PreToolUse", "PreToolUse:SendMessage", None, raw_stdout=raw,
+            exit_code=project_exit_code, outcome=project_outcome)
 
     def send_result(self, tool_use_id: str, *, success: bool = True, resumed: str | None = None,
                     pin_name: str | None = None) -> "Stream":
@@ -191,7 +194,8 @@ class Stream:
 
 def full_chain(
     *, name: str | None = NAME, agent_id: str = "agent-A", send_to: str | None = None,
-    pretool_decision: str | None = None, session: str = "sess-main",
+    pretool_decision: str | None = None, session: str = "sess-main", pretool: bool = True,
+    pretool_kwargs: dict | None = None,
 ) -> Stream:
     """A complete, correct spawn -> complete -> name resume -> complete stream."""
     stream = Stream(session)
@@ -201,7 +205,10 @@ def full_chain(
     stream.stop(agent_id)
     stream.post_agent("toolu_agent_1", name, agent_id, handback=FIRST)
     stream.send_call("toolu_send_1", send_to if send_to is not None else (name or agent_id))
-    stream.pretool_send(send_to if send_to is not None else (name or agent_id), decision=pretool_decision)
+    if pretool:
+        stream.pretool_send(
+            send_to if send_to is not None else (name or agent_id), decision=pretool_decision,
+            **(pretool_kwargs or {}))
     stream.send_result("toolu_send_1", resumed=agent_id, pin_name=name)
     stream.start(agent_id)
     stream.child_text(SECOND)
@@ -825,7 +832,7 @@ def test_failure_layer_classification_never_passes_unclassified():
 _NATIVE_RECORDED = {
     "adapter": "native", "verdict": "pass", "tested_head": "a" * 40, "claude_code_version": "2.1.287",
     "model_route": "claude-sonnet-5-5", "proxy_version": None, "launcher_sha256": None,
-    "fixture_sha256": "f" * 64, "compat_note_sha256": "c" * 64,
+    "fixture_sha256": "f" * 64, "compat_note_sha256": "c" * 64, "runner_exit_code": 0,
 }
 _GPT_RECORDED = {
     **_NATIVE_RECORDED, "adapter": "claude-gpt", "model_route": "gpt-6-sol[1m]",
@@ -1114,3 +1121,236 @@ def test_cli_rejects_invalid_scenario_flag_combinations(tmp_path, hermetic_workt
             MODULE.main([*base, *extra])
         assert exc.value.code == 2, extra
     capsys.readouterr()
+
+
+# ---------------------------------------------------------------------------
+# PR #2879 fix_delta: every negative control below differs from the normal control
+# (``_causal_control()``) by exactly one fact and must never be a PASS.
+# ---------------------------------------------------------------------------
+
+CALL_TUID = "toolu_agent_1"
+
+
+def _causal_control(
+    *, call_name: str | None = NAME, post_tuid: str = CALL_TUID, first_start: bool = True,
+    resume_marker_position: str = "after_start", resume_marker_via: str = "child_text",
+    first_marker_via: str = "child_text", foreign_child: bool = False, pretool: bool = True,
+    pretool_kwargs: dict | None = None,
+) -> Stream:
+    """Spawn -> complete -> SendMessage(to=name) -> resume -> complete, with explicit identities.
+
+    Defaults are the correct chain; each keyword flips exactly one fact."""
+    stream = Stream()
+    stream.agent_call(CALL_TUID, call_name)
+    if first_start:
+        stream.start("agent-A")
+    if first_marker_via == "child_text":
+        stream.child_text(FIRST)
+    else:  # a tool_use whose *input* merely contains the marker (e.g. Grep(pattern=marker))
+        stream.add({
+            "type": "assistant", "parent_tool_use_id": CALL_TUID, "session_id": stream.session,
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_grep_1", "name": "Grep", "input": {"pattern": FIRST}}]},
+        })
+    stream.stop("agent-A")
+    stream.post_agent(post_tuid, NAME, "agent-A", handback=FIRST if first_marker_via == "child_text" else None)
+    if foreign_child:
+        # B is a different child: its own earlier Agent call and no SubagentStart/Stop hook.
+        stream.agent_call("toolu_agent_2", "other-name")
+    stream.send_call("toolu_send_1", NAME)
+    if pretool:
+        stream.pretool_send(NAME, **(pretool_kwargs or {}))
+    stream.send_result("toolu_send_1", resumed="agent-A", pin_name=NAME)
+    if resume_marker_position == "before_start":
+        stream.child_text(SECOND)
+    stream.start("agent-A")
+    if foreign_child:
+        # the resume marker comes from B's event, not from A's resumed run
+        stream.child_text(SECOND, parent_tool_use_id="toolu_agent_2")
+    elif resume_marker_position == "after_start":
+        if resume_marker_via == "child_text":
+            stream.child_text(SECOND)
+        else:
+            stream.add({
+                "type": "assistant", "parent_tool_use_id": CALL_TUID, "session_id": stream.session,
+                "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_grep_2", "name": "Grep", "input": {"pattern": SECOND}}]},
+            })
+    stream.stop("agent-A")
+    stream.notification("agent-A")
+    stream.parent_text(f"resumed agent returned {SECOND}")
+    stream.result()
+    return stream
+
+
+def test_causal_control_is_a_pass():
+    assert evaluate(_causal_control())["verdict"] == "pass"
+
+
+@pytest.mark.parametrize("label,kwargs", [
+    ("agent_call_name_removed", {"call_name": None}),
+    ("first_subagent_start_removed", {"first_start": False}),
+    ("post_tool_use_tool_use_id_swapped", {"post_tuid": "toolu_other"}),
+    ("resume_marker_before_resume_start", {"resume_marker_position": "before_start"}),
+    ("resume_marker_only_in_grep_pattern", {"resume_marker_via": "tool_use_input"}),
+    ("first_marker_only_in_grep_pattern", {"first_marker_via": "tool_use_input"}),
+    ("resume_marker_from_other_child_event", {"foreign_child": True}),
+])
+def test_named_resume_chain_requires_identity_and_order_not_collected_steps(label, kwargs):
+    stream = _causal_control(**kwargs)
+    chain = evaluate(stream)
+    assert chain["verdict"] != "pass", (label, chain["chain_break"], chain["steps"])
+    assert chain["chain_break"] is not None, label
+    # the persisted evidence mirrors it: never a pass, always a classified layer
+    evidence = _evidence(stream)
+    assert evidence["verdict"] != "pass", label
+    assert evidence["failure_layer"] in set(MODULE.NAMED_RESUME_FAILURE_LAYERS), label
+
+
+def test_text_blocks_do_not_treat_arbitrary_tool_use_inputs_as_child_results():
+    grep = {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "t", "name": "Grep", "input": {"pattern": SECOND}}]}
+    bash = {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "t", "name": "Bash", "input": {"command": f"echo {SECOND}"}}]}
+    assert not any(SECOND in str(block) for block in MODULE._nr_text_blocks(grep))
+    assert not any(SECOND in str(block) for block in MODULE._nr_text_blocks(bash))
+    handback = {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "t", "name": "SubagentHandback", "input": {"message": SECOND}}]}
+    assert any(SECOND in str(block) for block in MODULE._nr_text_blocks(handback))
+    plain = {"role": "assistant", "content": [{"type": "text", "text": SECOND}]}
+    assert any(SECOND in str(block) for block in MODULE._nr_text_blocks(plain))
+
+
+def test_extracted_child_observations_keep_provenance():
+    obs = MODULE.extract_named_subagent_resume_observations(_causal_control().text())
+    assert obs["child_texts"], "child texts must be extracted"
+    for record in obs["child_texts"]:
+        assert record["parent_tool_use_id"] == CALL_TUID
+        assert isinstance(record["index"], int)
+
+
+# F2: PreToolUse:SendMessage hook normal / unobservable / execution failure -------------
+
+
+@pytest.mark.parametrize("label,kwargs", [
+    ("hook_observation_missing", {"pretool": False}),
+    ("echo_hook_exit_1", {"pretool_kwargs": {"echo_exit_code": 1}}),
+    ("project_hook_exit_1", {"pretool_kwargs": {"project_exit_code": 1}}),
+    ("project_hook_outcome_error", {"pretool_kwargs": {"project_outcome": "error"}}),
+    ("hook_response_only_for_another_tool_use_id", {"pretool_kwargs": {"tool_use_id": "toolu_other"}}),
+])
+def test_sendmessage_hook_missing_or_failed_is_never_a_pass(label, kwargs):
+    stream = _causal_control(**kwargs)
+    chain, layer = _classify(stream)
+    assert chain["verdict"] != "pass", label
+    assert layer == "hook_lifecycle", (label, chain["chain_break"], layer)
+    evidence = _evidence(stream)
+    assert evidence["verdict"] != "pass" and evidence["failure_layer"] == "hook_lifecycle", label
+    # the SendMessage itself still went through: only this smoke's verdict is withheld
+    if label != "hook_observation_missing":
+        assert chain["steps"]["sendmessage_accepted"] is True
+
+
+def test_sendmessage_hook_normal_observation_and_deliberate_decision():
+    ok = evaluate(_causal_control())
+    assert ok["verdict"] == "pass" and ok["hook_observation"]["status"] == "observed"
+    # a deliberate hook decision keeps its own classification (existing behaviour kept)
+    asked = evaluate(_causal_control(pretool_kwargs={"decision": "ask"}))
+    assert asked["chain_break"] == "pretooluse_sendmessage_non_allow_decision"
+
+
+def test_sendmessage_hook_failure_outside_the_send_window_is_not_blamed():
+    stream = _causal_control()
+    # a later, unrelated PreToolUse:SendMessage hook failure belongs to another call
+    stream._hook("PreToolUse", "PreToolUse:SendMessage", None, exit_code=1, outcome="error")
+    assert evaluate(stream)["verdict"] == "pass"
+
+
+# F4: a normal launcher startup line must not change the failure layer ---------------------
+
+
+def test_normal_proxy_startup_line_does_not_turn_hook_failure_into_proxy_translation():
+    no_resume_hooks = Stream()
+    no_resume_hooks.agent_call("toolu_agent_1", NAME).start("agent-A").child_text(FIRST).stop("agent-A")
+    no_resume_hooks.post_agent("toolu_agent_1", NAME, "agent-A", handback=FIRST)
+    no_resume_hooks.send_call("toolu_send_1", NAME).pretool_send(NAME)
+    no_resume_hooks.send_result("toolu_send_1", resumed="agent-A", pin_name=NAME)
+    startup = "launcher=/x/scripts/claude-gpt/launch.sh git=abc1234 dirty=false proxy=claude-code-proxy 0.1.42\n"
+    bare = _classify(no_resume_hooks, adapter="claude-gpt", stderr="")
+    with_startup = _classify(no_resume_hooks, adapter="claude-gpt", stderr=startup)
+    assert bare[0]["chain_break"] == with_startup[0]["chain_break"] == "resume_subagent_start_missing"
+    assert bare[1] == with_startup[1] == "hook_lifecycle"
+    # the product name alone, outside the launcher's own startup line, is not evidence either
+    product_only = _classify(no_resume_hooks, adapter="claude-gpt", stderr="claude-code-proxy listening\n")
+    assert product_only[1] == "hook_lifecycle"
+    # a real translation error on stderr keeps being attributed to the proxy
+    translation = _classify(
+        no_resume_hooks, adapter="claude-gpt",
+        stderr=startup + "API Error: 400 invalid_request_error: tool schema strict function\n")
+    assert translation[1] == "proxy_translation"
+    # the launcher line is still the source of the recorded proxy version
+    assert MODULE._nr_stderr_proxy_version(startup) == "claude-code-proxy 0.1.42"
+    assert _evidence(no_resume_hooks, adapter="claude-gpt", stderr=startup)["failure_layer"] == "hook_lifecycle"
+
+
+# F5: run-level verdict is finalised once from the final exit code --------------------------
+
+
+def test_late_assertion_failure_is_reflected_in_saved_verdict_and_freshness(tmp_path, hermetic_worktree):
+    compat = tmp_path / "compat.md"
+    compat.write_text("compat note\n", encoding="utf-8")
+    with_compat = ["--append-system-prompt-file", str(compat)]
+    code, evidence, _ = _run_main(
+        tmp_path, hermetic_worktree, _causal_control(), name="late-fail",
+        extra=[*with_compat, "--expect-marker", "MARKER_THAT_IS_NEVER_PRODUCED"])
+    assert code != 0
+    assert evidence["runner_exit_code"] == code
+    assert evidence["verdict"] != "pass", "run-level verdict must reflect the final exit code"
+    assert evidence["failure_layer"] in set(MODULE.NAMED_RESUME_FAILURE_LAYERS)
+    # the causal chain itself was fine: kept in its own field, distinct from the run verdict
+    assert evidence["causal_chain_verdict"] == "pass"
+    record = MODULE.freshness_record_from_evidence(evidence)
+    current = {
+        "head": evidence["tested_head"], "changed_paths": [], "claude_code_version": record["claude_code_version"],
+        "model_route": record["model_route"], "fixture_sha256": record["fixture_sha256"],
+        "compat_note_sha256": record["compat_note_sha256"],
+    }
+    assert MODULE.evaluate_evidence_freshness(record, current)["reusable"] is False
+    # the passing control stays reusable (no over-blocking)
+    code_ok, ok_evidence, _ = _run_main(
+        tmp_path, hermetic_worktree, _causal_control(), name="late-ok", extra=with_compat)
+    assert code_ok == 0 and ok_evidence["verdict"] == "pass" and ok_evidence["causal_chain_verdict"] == "pass"
+    ok_record = MODULE.freshness_record_from_evidence(ok_evidence)
+    ok_current = {
+        "head": ok_evidence["tested_head"], "changed_paths": [],
+        "claude_code_version": ok_record["claude_code_version"], "model_route": ok_record["model_route"],
+        "fixture_sha256": ok_record["fixture_sha256"], "compat_note_sha256": ok_record["compat_note_sha256"],
+    }
+    ok_reuse = MODULE.evaluate_evidence_freshness(ok_record, ok_current)
+    assert ok_reuse["reusable"] is True, ok_reuse["reasons"]
+    # ... and the failed run is rejected for the exit code / verdict, not for an unrelated gap
+    bad_reuse = MODULE.evaluate_evidence_freshness(record, current)
+    assert "recorded_runner_exit_code_not_zero" in bad_reuse["reasons"]
+    assert "recorded_verdict_not_pass" in bad_reuse["reasons"]
+
+
+def test_freshness_rejects_recorded_evidence_of_a_failed_run():
+    base = {
+        "adapter": "native", "verdict": "pass", "tested_head": "a" * 40, "claude_code_version": "2.1.287",
+        "model_route": "claude-sonnet-5-5", "proxy_version": None, "launcher_sha256": None,
+        "fixture_sha256": "f" * 64, "compat_note_sha256": "c" * 64, "runner_exit_code": 0,
+    }
+    current = {
+        "head": "a" * 40, "changed_paths": [], "claude_code_version": "2.1.287",
+        "model_route": "claude-sonnet-5-5", "fixture_sha256": "f" * 64, "compat_note_sha256": "c" * 64,
+    }
+    assert MODULE.evaluate_evidence_freshness(base, current)["reusable"] is True
+    for label, recorded in (
+        ("exit_code_1", {**base, "runner_exit_code": 1}),
+        ("exit_code_missing", {k: v for k, v in base.items() if k != "runner_exit_code"}),
+        ("verdict_fail_exit_0", {**base, "verdict": "fail"}),
+    ):
+        assert MODULE.evaluate_evidence_freshness(recorded, current)["reusable"] is False, label
+    # producer/consumer contract: the flat record carries the run-level exit code
+    evidence = {"adapter": "native", "verdict": "pass", "runner_exit_code": 1}
+    assert MODULE.freshness_record_from_evidence(evidence)["runner_exit_code"] == 1
