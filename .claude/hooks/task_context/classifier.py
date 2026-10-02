@@ -333,6 +333,18 @@ def _clause_index(spans: list[tuple[int, int]], position: int) -> int:
     return len(spans) - 1 if spans else 0
 
 
+def _clause_index_from_ends(clause_ends: list[int], position: int) -> int:
+    """``_clause_index()`` over a precomputed list of clause end positions,
+    using ``bisect`` instead of a linear scan. ``_clause_spans`` spans are
+    contiguous from 0, so ``start <= position < end`` holds for the first end
+    greater than ``position``. Out-of-range (or negative) positions fall back
+    to the last clause and an empty list to 0, exactly like ``_clause_index``."""
+    if not clause_ends:
+        return 0
+    index = bisect_right(clause_ends, position) if position >= 0 else len(clause_ends)
+    return index if index < len(clause_ends) else len(clause_ends) - 1
+
+
 # Issue #2827 marker-local segments: a clause that contains a Japanese
 # reference-only marker is split further at `、` and ASCII `,`. Only a
 # reference in the same segment as the marker is demoted. This is deliberately
@@ -612,11 +624,29 @@ def active_rebind_projection(
         if primary[0].form in (REF_FORM_EXPLICIT, REF_FORM_PREFIXED):
             ref_form = primary[0].form
     if ref_form is None:
+        # Issue #2871: clause processing only (NOT the scanner front-end, NOT
+        # classify() / the hook as a whole). With input length N, primary
+        # occurrence count K and clause count C this part is
+        # O(N + K log(C + 1)): the clause end positions are materialised once,
+        # each occurrence's clause is located by ``bisect`` (same fallback as
+        # ``_clause_index()``), and each clause is sliced and scanned by the
+        # target / creation-reply predicates at most once per call. The cache
+        # is invocation-local and keyed by clause index; hits are decided by
+        # key presence so a cached ``False`` is reused. ``primary`` is walked in
+        # its own list order (never sorted by position) so the first
+        # occurrence in that order that qualifies still decides ``ref_form``.
         spans = _clause_spans(authority_text)
+        clause_ends = [end for _, end in spans]
+        clause_eligible: dict[int, bool] = {}
         for occurrence in primary:
-            start, end = spans[_clause_index(spans, occurrence.start)]
-            clause = authority_text[start:end]
-            if _clause_has_target_phrase(clause) and not _clause_has_creation_or_reply_phrase(clause):
+            index = _clause_index_from_ends(clause_ends, occurrence.start)
+            if index not in clause_eligible:
+                start, end = spans[index]
+                clause = authority_text[start:end]
+                clause_eligible[index] = _clause_has_target_phrase(
+                    clause
+                ) and not _clause_has_creation_or_reply_phrase(clause)
+            if clause_eligible[index]:
                 ref_form = occurrence.form
                 break
     if ref_form is None:
