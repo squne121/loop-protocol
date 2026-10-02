@@ -2706,12 +2706,13 @@ def _hc_pretool_window(
     denied_id: str | None = None, missing_response_id: str | None = None,
     extra_unmatched_response_id: str | None = None,
     reverse_response_order: bool = False, duplicate_started_id: str | None = None,
+    command: str = "echo hi",
 ) -> list[str]:
     """One complete positive-or-deny scenario window (Issue #2663 AC5/AC6):
     a Bash tool_use line immediately followed by the PreToolUse hook_started
     /hook_response cluster (observer + siblings), immediately followed by
     the tool_result line -- exactly the contiguous shape confirmed live."""
-    lines = [_hc_bash_tool_use_line(tool_use_id)]
+    lines = [_hc_bash_tool_use_line(tool_use_id, command=command)]
     started_ids = [observer_id] + [sid for sid in sibling_ids if sid != missing_response_id]
     if duplicate_started_id:
         started_ids.append(duplicate_started_id)
@@ -3721,3 +3722,449 @@ class TestExtension3PermissionDenialsExposure:
 
         params = list(inspect.signature(module.extract_claude_permission_denials).parameters)
         assert params == ["stdout"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #2865: handler-level ``if`` conditional hooks in the hook-chain
+# evidence expected count (match / nonmatch / unknown, evaluated per Bash
+# tool_use window). Synthetic-stream regression tests only -- the live
+# runtime confirmation (AC4/AC5) is a separate post-implementation step.
+# ---------------------------------------------------------------------------
+
+_HC_IF_SENTINEL = "SENTINEL_2865_DO_NOT_LEAK"
+_HC_IF_DENY_COMMAND = "whoami"
+
+
+def _hc_settings_with_if_hook(if_value: object = "Bash(herdr *)", *, with_if_key: bool = True) -> dict:
+    """Current-settings-equivalent PreToolUse/Bash cohort: the four
+    unconditional hooks plus one extra Bash command hook that carries a
+    handler-level ``if`` (mirrors the ``Bash(herdr *)`` hook)."""
+    import copy
+
+    settings = copy.deepcopy(_HC_FOUR_HOOK_SETTINGS)
+    hook: dict = {"type": "command", "command": f"{_HC_HOOKS_DIR}/herdr_conditional_hook.sh"}
+    if with_if_key:
+        hook["if"] = if_value
+    settings["hooks"]["PreToolUse"].append({"matcher": "Bash", "hooks": [hook]})
+    return settings
+
+
+def _hc_if_worktree(root: Path, settings: dict) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    worktree = root / "wt"
+    worktree.mkdir()
+    _hc_write_settings(worktree, settings)
+    return worktree
+
+
+def _hc_siblings(prefix: str, count: int) -> list[str]:
+    return [f"{prefix}-H{i}" for i in range(1, count + 1)]
+
+
+def _hc_if_stdout(windows: list[dict]) -> str:
+    """Build a stream of separate-assistant-message windows. Each spec:
+    ``{"id", "command", "siblings", "denied"?, "raw_input"?}``."""
+    lines = [_system_init_line()]
+    for n, spec in enumerate(windows):
+        sibling_ids = _hc_siblings(spec["id"], spec["siblings"])
+        window = _hc_pretool_window(
+            spec["id"], sibling_ids=sibling_ids, observer_id=f"OBS{n}",
+            denied_id=sibling_ids[0] if spec.get("denied") else None,
+            command=spec.get("command", "echo hi"),
+        )
+        if "raw_input" in spec:
+            window[0] = json.dumps({
+                "type": "assistant", "session_id": "fixture-session",
+                "message": {"content": [
+                    {"type": "tool_use", "id": spec["id"], "name": "Bash", "input": spec["raw_input"]}
+                ]},
+            })
+        lines.extend(window)
+    lines.append(_result_event_line())
+    return "\n".join(lines)
+
+
+def _hc_if_shared_stdout(calls: list[dict]) -> str:
+    """ONE assistant message declaring several Bash calls (shared
+    stream_index); each call keeps its own observer + sibling cohort."""
+    lines = [
+        _system_init_line(),
+        _hc_bash_tool_use_line_multi([c["id"] for c in calls], [c["command"] for c in calls]),
+    ]
+    for n, call in enumerate(calls):
+        sibling_ids = _hc_siblings(call["id"], call["siblings"])
+        lines.extend(_hc_pretool_window_shared(
+            call["id"], sibling_ids=sibling_ids, observer_id=f"OBS{n}",
+            denied_id=sibling_ids[0] if call.get("denied") else None,
+        ))
+    lines.append(_result_event_line())
+    return "\n".join(lines)
+
+
+def test_hook_chain_if_nonmatch_window_passes_with_four_expected(tmp_path: Path) -> None:
+    """AC1: an ``if`` hook that provably does not fire for a simple command
+    is excluded from THAT window's expected set (4, not 5)."""
+    module = _load_module()
+    worktree = _hc_if_worktree(tmp_path / "main", _hc_settings_with_if_hook())
+
+    for positive_command in ("echo smoke", "X=1 echo smoke", "git status", "ls -la"):
+        stdout = _hc_if_stdout([
+            {"id": "tu-pos", "command": positive_command, "siblings": 4},
+            {"id": "tu-deny", "command": _HC_IF_DENY_COMMAND, "siblings": 4, "denied": True},
+        ])
+        result = module.evaluate_all_matching_hooks_observed(stdout, str(worktree))
+        assert result["status"] == "pass", (positive_command, result)
+        assert result["passed"] is True
+        assert result["expected_count"] == 4
+        assert result["positive_window_count"] == 1
+        assert result["deny_window_count"] == 1
+        for window in result["windows"]:
+            assert window["status"] == "pass"
+            assert window["expected_count"] == 4
+            assert window["observed_count"] == 4
+
+    # Mixed (same assistant message) calls that are BOTH nonmatch: each is
+    # evaluated against its own tool_use_id, 4 / 4.
+    stdout = _hc_if_shared_stdout([
+        {"id": "tu-a", "command": "echo smoke", "siblings": 4},
+        {"id": "tu-b", "command": _HC_IF_DENY_COMMAND, "siblings": 4, "denied": True},
+    ])
+    result = module.evaluate_all_matching_hooks_observed(stdout, str(worktree))
+    assert result["status"] == "pass", result
+    assert [w["expected_count"] for w in result["windows"]] == [4, 4]
+    assert result["expected_count"] == 4
+
+    # A nonmatch window that nevertheless shows 5 non-observer executions
+    # is not silently promoted to pass (existing unattributable-extra rule).
+    stdout = _hc_if_stdout([
+        {"id": "tu-pos", "command": "echo smoke", "siblings": 5},
+        {"id": "tu-deny", "command": _HC_IF_DENY_COMMAND, "siblings": 4, "denied": True},
+    ])
+    result = module.evaluate_all_matching_hooks_observed(stdout, str(worktree))
+    assert result["windows"][0]["status"] == "unverified"
+    assert result["windows"][0]["reason"] == "unattributable_extra_hook_execution"
+    assert result["status"] == "unverified"
+
+    # A cohort whose extra hook has NO ``if`` key is unchanged: all 5 required.
+    plain = _hc_if_worktree(tmp_path / "plain", _hc_settings_with_if_hook(with_if_key=False))
+    stdout = _hc_if_stdout([
+        {"id": "tu-pos", "command": "echo smoke", "siblings": 5},
+        {"id": "tu-deny", "command": _HC_IF_DENY_COMMAND, "siblings": 5, "denied": True},
+    ])
+    result = module.evaluate_all_matching_hooks_observed(stdout, str(plain))
+    assert result["status"] == "pass", result
+    assert result["expected_count"] == 5
+    stdout = _hc_if_stdout([
+        {"id": "tu-pos", "command": "echo smoke", "siblings": 4},
+        {"id": "tu-deny", "command": _HC_IF_DENY_COMMAND, "siblings": 5, "denied": True},
+    ])
+    result = module.evaluate_all_matching_hooks_observed(stdout, str(plain))
+    assert result["windows"][0]["reason"] == "missing_handler_evidence"
+
+
+def test_hook_chain_if_match_window_requires_conditional_hook_evidence(tmp_path: Path) -> None:
+    """AC2: an ``if`` hook that matches the window's command is part of that
+    window's expected set (5); its missing evidence fails the window."""
+    module = _load_module()
+    worktree = _hc_if_worktree(tmp_path / "main", _hc_settings_with_if_hook())
+
+    for match_command in ("herdr list", "herdr", "X=1 herdr x"):
+        # All 5 present -> pass; top-level expected_count differs per window.
+        stdout = _hc_if_stdout([
+            {"id": "tu-pos", "command": match_command, "siblings": 5},
+            {"id": "tu-deny", "command": _HC_IF_DENY_COMMAND, "siblings": 4, "denied": True},
+        ])
+        result = module.evaluate_all_matching_hooks_observed(stdout, str(worktree))
+        assert result["status"] == "pass", (match_command, result)
+        assert [w["expected_count"] for w in result["windows"]] == [5, 4]
+        assert [w["observed_count"] for w in result["windows"]] == [5, 4]
+        assert result["expected_count"] is None
+
+        # Conditional hook evidence missing (4 observed) -> fail.
+        stdout = _hc_if_stdout([
+            {"id": "tu-pos", "command": match_command, "siblings": 4},
+            {"id": "tu-deny", "command": _HC_IF_DENY_COMMAND, "siblings": 4, "denied": True},
+        ])
+        result = module.evaluate_all_matching_hooks_observed(stdout, str(worktree))
+        assert result["status"] == "fail", (match_command, result)
+        assert result["windows"][0]["status"] == "fail"
+        assert result["windows"][0]["reason"] == "missing_handler_evidence"
+        assert result["windows"][0]["expected_count"] == 5
+        assert result["windows"][0]["observed_count"] == 4
+
+    # Same assistant message mixing nonmatch / match calls, both orders:
+    # each tool_use_id is evaluated with its own expected count (4 / 5).
+    for calls in (
+        [
+            {"id": "tu-non", "command": "echo smoke", "siblings": 4, "denied": True},
+            {"id": "tu-match", "command": "herdr list", "siblings": 5},
+        ],
+        [
+            {"id": "tu-match", "command": "herdr list", "siblings": 5},
+            {"id": "tu-non", "command": "echo smoke", "siblings": 4, "denied": True},
+        ],
+    ):
+        result = module.evaluate_all_matching_hooks_observed(_hc_if_shared_stdout(calls), str(worktree))
+        assert result["status"] == "pass", result
+        assert [w["expected_count"] for w in result["windows"]] == [
+            5 if c["command"].startswith("herdr") else 4 for c in calls
+        ]
+        assert [w["observed_count"] for w in result["windows"]] == [c["siblings"] for c in calls]
+        assert result["expected_count"] is None
+
+    # The match call missing its conditional evidence fails while the
+    # nonmatch sibling call in the same message stays pass (no mix-up).
+    result = module.evaluate_all_matching_hooks_observed(_hc_if_shared_stdout([
+        {"id": "tu-non", "command": "echo smoke", "siblings": 4, "denied": True},
+        {"id": "tu-match", "command": "herdr list", "siblings": 4},
+    ]), str(worktree))
+    assert result["status"] == "fail"
+    assert result["windows"][0]["status"] == "pass"
+    assert result["windows"][1]["status"] == "fail"
+    assert result["windows"][1]["reason"] == "missing_handler_evidence"
+
+    # Delayed hook_response: the first (match) call's responses are flushed
+    # after the second (nonmatch) call's tool_use line.
+    first_ids = _hc_siblings("tu-match", 5)
+    second_ids = _hc_siblings("tu-non", 4)
+    lines = [_system_init_line(), _hc_bash_tool_use_line("tu-match", command="herdr list")]
+    for hid in ["OBS-A", *first_ids]:
+        lines.append(_hc_hook_started_line(hid, "PreToolUse"))
+    lines.append(_hc_bash_tool_use_line("tu-non", command="echo smoke"))
+    for hid in ["OBS-B", *second_ids]:
+        lines.append(_hc_hook_started_line(hid, "PreToolUse"))
+    lines.append(_hc_hook_response_line(
+        "OBS-A", "PreToolUse", self_echo_payload=_hc_pretool_observer_payload("tu-match")
+    ))
+    for hid in first_ids:
+        lines.append(_hc_hook_response_line(hid, "PreToolUse"))
+    lines.append(_hc_hook_response_line(
+        "OBS-B", "PreToolUse", self_echo_payload=_hc_pretool_observer_payload("tu-non")
+    ))
+    for n, hid in enumerate(second_ids):
+        lines.append(_hc_hook_response_line(hid, "PreToolUse", exit_code=2 if n == 0 else 0))
+    lines.append(_result_event_line())
+    result = module.evaluate_all_matching_hooks_observed("\n".join(lines), str(worktree))
+    assert result["status"] == "pass", result
+    assert [w["expected_count"] for w in result["windows"]] == [5, 4]
+    assert [w["observed_count"] for w in result["windows"]] == [5, 4]
+
+
+def test_hook_chain_if_unknown_window_is_unverified(tmp_path: Path) -> None:
+    """AC3: an undecidable ``if`` evaluation never reads as pass (even when
+    the observed count coincides with an expected candidate), never adds the
+    conditional hook to the expected count, never leaks command bodies, and
+    leaves the pre-existing verdicts / Stop consumer intact."""
+    module = _load_module()
+    worktree = _hc_if_worktree(tmp_path / "main", _hc_settings_with_if_hook())
+
+    unknown_commands = [
+        "echo smoke && echo ok", "echo a | cat", "echo a; echo b", "echo $(date)", "echo `date`",
+        'echo "smoke"', "echo 'smoke'", "echo a > out.txt", "echo a\necho b", "echo ${HOME}",
+        "/usr/bin/herdr list", "./tool run", '"herdr" list', "timeout 5 herdr list",
+        "sudo herdr list", "env herdr list", "bash -c x", "xargs echo", "nohup echo x",
+        "X=$(date) echo hi",
+    ]
+    # --- unknown windows are unverified, never pass ----------------------
+    def _assert_unknown(stdout: str, settings_dir: Path, label: str) -> None:
+        result = module.evaluate_all_matching_hooks_observed(stdout, str(settings_dir))
+        window = result["windows"][0]
+        assert window["status"] == "unverified", (label, window)
+        assert window["reason"] == "if_condition_unverifiable", (label, window)
+        assert window["expected_count"] is None, (label, window)
+        assert result["status"] == "unverified", (label, result)
+        assert result["passed"] is False
+
+    for command in unknown_commands:
+        for siblings in (4, 5):  # coincides with either expected candidate
+            stdout = _hc_if_stdout([
+                {"id": "tu-pos", "command": command, "siblings": siblings},
+                {"id": "tu-deny", "command": _HC_IF_DENY_COMMAND, "siblings": 4, "denied": True},
+            ])
+            _assert_unknown(stdout, worktree, command)
+
+    for label, raw_input in (
+        ("missing_command", {}),
+        ("none_command", {"command": None}),
+        ("int_command", {"command": 7}),
+        ("list_command", {"command": ["herdr", "list"]}),
+    ):
+        for siblings in (4, 5):
+            stdout = _hc_if_stdout([
+                {"id": "tu-pos", "siblings": siblings, "raw_input": raw_input},
+                {"id": "tu-deny", "command": _HC_IF_DENY_COMMAND, "siblings": 4, "denied": True},
+            ])
+            _assert_unknown(stdout, worktree, label)
+
+    for n, bad_if in enumerate((123, "Bash(herdr:*)", "Read(foo *)", "", ["Bash(herdr *)"])):
+        bad_dir = _hc_if_worktree(tmp_path / f"bad-if-{n}", _hc_settings_with_if_hook(bad_if))
+        for siblings in (4, 5):
+            stdout = _hc_if_stdout([
+                {"id": "tu-pos", "command": "echo smoke", "siblings": siblings},
+                {"id": "tu-deny", "command": _HC_IF_DENY_COMMAND, "siblings": 4, "denied": True},
+            ])
+            _assert_unknown(stdout, bad_dir, repr(bad_if))
+
+    # An unknown window and a nonmatch window in the same message stay
+    # independent: only the unknown one is unverified.
+    result = module.evaluate_all_matching_hooks_observed(_hc_if_shared_stdout([
+        {"id": "tu-unk", "command": "echo a && echo b", "siblings": 4},
+        {"id": "tu-non", "command": _HC_IF_DENY_COMMAND, "siblings": 4, "denied": True},
+    ]), str(worktree))
+    assert result["windows"][0]["status"] == "unverified"
+    assert result["windows"][1]["status"] == "pass"
+    assert result["windows"][1]["expected_count"] == 4
+    assert result["status"] == "unverified"
+
+    # --- pre-existing verdicts keep their meaning ------------------------
+    lines = _hc_if_stdout([
+        {"id": "tu-pos", "command": "echo smoke", "siblings": 4},
+        {"id": "tu-deny", "command": _HC_IF_DENY_COMMAND, "siblings": 4, "denied": True},
+    ]).split("\n")
+    lines.insert(len(lines) - 1, _hc_hook_response_line("GHOST", "PreToolUse"))
+    result = module.evaluate_all_matching_hooks_observed("\n".join(lines), str(worktree))
+    assert result["status"] == "fail"
+    assert result["windows"][-1]["reason"] == "unmatched_hook_response"
+
+    no_observer = [_system_init_line(), _hc_bash_tool_use_line("tu-x", command="echo smoke")]
+    for hid in ["OBS", *_hc_siblings("tu-x", 4)]:
+        no_observer.append(_hc_hook_started_line(hid, "PreToolUse"))
+    for hid in ["OBS", *_hc_siblings("tu-x", 4)]:
+        no_observer.append(_hc_hook_response_line(hid, "PreToolUse"))
+    result = module.evaluate_all_matching_hooks_observed("\n".join(no_observer), str(worktree))
+    assert result["windows"][0]["reason"] == "observer_self_echo_not_uniquely_identified"
+
+    result = module.evaluate_all_matching_hooks_observed(
+        "\n".join([_system_init_line(), _result_event_line()]), str(worktree)
+    )
+    assert result["reason"] == "no_bash_tool_use_observed"
+
+    # --- 3-valued condition evaluation (pure function) -------------------
+    evaluate = module._evaluate_hook_if_condition
+    rule = "Bash(herdr *)"
+    for command in ("herdr list", "herdr", "X=1 herdr x", "A=1 B=2 herdr", "herdr list && echo ok"):
+        assert evaluate(rule, "Bash", command) == "match", command
+    for command in ("echo smoke", "X=1 echo smoke", "git status", "herdrx list", "ls -la", "whoami"):
+        assert evaluate(rule, "Bash", command) == "nonmatch", command
+    for command in unknown_commands:
+        assert evaluate(rule, "Bash", command) == "unknown", repr(command)
+    for command in ("", "   ", "X=1"):
+        assert evaluate(rule, "Bash", command) == "unknown", repr(command)
+    assert evaluate(rule, "Bash", None) == "unknown"
+    assert evaluate(rule, "Bash", 123) == "unknown"
+    assert evaluate(rule, "Read", "herdr list") == "unknown"
+    assert evaluate(rule, None, "echo smoke") == "unknown"
+    for bad_rule in (123, None, ["Bash(herdr *)"], "", "Bash(herdr:*)", "Bash(*)", "Read(herdr *)",
+                     "Bash(herdr list *)", "Bash(herdr *) ", "Bash(herdr*)"):
+        assert evaluate(bad_rule, "Bash", "echo smoke") == "unknown", repr(bad_rule)
+
+
+    # --- loader: records keep command + if, wrapper stays list[str] -------
+    settings = _hc_settings_with_if_hook()
+    commands = module._load_command_hooks_for_event(settings, "PreToolUse", "Bash")
+    assert isinstance(commands, list) and all(isinstance(c, str) for c in commands)
+    assert len(commands) == 5
+    records = module._load_command_hook_records_for_event(settings, "PreToolUse", "Bash")
+    assert [r["command"] for r in records] == commands
+    assert [r.get("if") for r in records].count("Bash(herdr *)") == 1
+    stop_commands = module._load_command_hooks_for_event(settings, "Stop", None)
+    assert len(stop_commands) == 1 and "session_manifest_coordinator.sh" in stop_commands[0]
+
+    # --- Stop consumer: target handler stays configured -------------------
+    side_effect = module.evaluate_sibling_side_effect_inventory(
+        str(worktree), "\n".join(_hc_stop_window(stop_hook_active=True)), [], [],
+    )
+    assert side_effect["reason"] != "target_handler_not_configured"
+    assert side_effect["status"] == "pass"
+
+    # --- no command body leaks into any summary / evidence ----------------
+    sentinel_commands = [
+        f"echo {_HC_IF_SENTINEL}",                       # nonmatch
+        f"herdr list {_HC_IF_SENTINEL}",                 # match
+        f"echo {_HC_IF_SENTINEL} && echo second",        # unknown (compound)
+        f'echo "{_HC_IF_SENTINEL}"',                     # unknown (quote)
+    ]
+    for command in sentinel_commands:
+        for siblings in (4, 5):
+            stdout = _hc_if_stdout([
+                {"id": "tu-pos", "command": command, "siblings": siblings},
+                {"id": "tu-deny", "command": f"{_HC_IF_DENY_COMMAND} {_HC_IF_SENTINEL}",
+                 "siblings": 4, "denied": True},
+            ])
+            aggregate = module.evaluate_hook_chain_evidence(stdout, str(worktree), [], [])
+            assert _HC_IF_SENTINEL not in json.dumps(aggregate), command
+            assert _HC_IF_SENTINEL not in repr(aggregate)
+
+
+# Issue #2865 PR #2867 fix_delta: Bash words are separated only by space/tab
+# (newline separates commands). Python-only whitespace (NBSP, CR, VT, FF,
+# FS/GS/RS/US, U+2028, ...) is part of a Bash word, so such commands must be
+# ``unknown`` (never ``match`` through ``str.split()``).
+_HC_IF_SPECIAL_WS = {
+    "nbsp": " ",
+    "cr": "\r",
+    "vt": "\x0b",
+    "ff": "\x0c",
+    "fs": "\x1c",
+    "gs": "\x1d",
+    "rs": "\x1e",
+    "us": "\x1f",
+    "nel": "\x85",
+    "ls": " ",
+    "ideographic": "　",
+}
+
+
+def _hc_if_special_ws_commands() -> list[tuple[str, str]]:
+    commands: list[tuple[str, str]] = []
+    for name, ws in _HC_IF_SPECIAL_WS.items():
+        commands.append((f"{name}-joined", f"herdr{ws}list"))
+        commands.append((f"{name}-trailing", f"herdr{ws} --version"))
+        commands.append((f"{name}-leading", f"{ws}herdr list"))
+        commands.append((f"{name}-nonmatch-shape", f"echo{ws}smoke"))
+        commands.append((f"{name}-sentinel", f"echo {_HC_IF_SENTINEL}{ws}x"))
+    return commands
+
+
+def test_hook_if_special_whitespace_command_is_unknown_unit() -> None:
+    module = _load_module()
+    evaluate = module._evaluate_hook_if_condition
+    rule = "Bash(herdr *)"
+    for label, command in _hc_if_special_ws_commands():
+        assert evaluate(rule, "Bash", command) == "unknown", (label, repr(command))
+
+    # Supported separators keep their pre-existing semantics.
+    assert evaluate(rule, "Bash", "herdr list") == "match"
+    assert evaluate(rule, "Bash", "herdr\tlist") == "match"
+    assert evaluate(rule, "Bash", "  herdr   list  ") == "match"
+    assert evaluate(rule, "Bash", "herdr") == "match"
+    assert evaluate(rule, "Bash", "X=1 herdr x") == "match"
+    assert evaluate(rule, "Bash", "herdr list && echo ok") == "match"
+    assert evaluate(rule, "Bash", "echo smoke") == "nonmatch"
+    assert evaluate(rule, "Bash", "echo\tsmoke") == "nonmatch"
+    assert evaluate(rule, "Bash", "git status") == "nonmatch"
+    assert evaluate(rule, "Bash", "") == "unknown"
+    assert evaluate(rule, "Bash", "   ") == "unknown"
+
+
+def test_hook_if_special_whitespace_window_is_unverified_and_leak_free(tmp_path: Path) -> None:
+    module = _load_module()
+    worktree = _hc_if_worktree(tmp_path / "main", _hc_settings_with_if_hook())
+
+    for label, command in _hc_if_special_ws_commands():
+        for siblings in (4, 5):
+            stdout = _hc_if_stdout([
+                {"id": "tu-pos", "command": command, "siblings": siblings},
+                {"id": "tu-deny", "command": _HC_IF_DENY_COMMAND, "siblings": 4, "denied": True},
+            ])
+            result = module.evaluate_all_matching_hooks_observed(stdout, str(worktree))
+            window = result["windows"][0]
+            assert window["status"] == "unverified", (label, siblings, window)
+            assert window["reason"] == "if_condition_unverifiable", (label, siblings, window)
+            assert window["expected_count"] is None, (label, siblings, window)
+            assert result["status"] == "unverified", (label, siblings, result)
+            assert result["passed"] is False
+
+            aggregate = module.evaluate_hook_chain_evidence(stdout, str(worktree), [], [])
+            assert _HC_IF_SENTINEL not in json.dumps(aggregate), (label, siblings)
+            assert _HC_IF_SENTINEL not in repr(aggregate), (label, siblings)
