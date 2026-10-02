@@ -81,6 +81,10 @@ uv run --locked python3 scripts/agent-ops/run_worktree_agent_runtime_smoke.py \
 - exit `0` は因果鎖が全て成立（evidence の `verdict=pass`）、`1` は失敗、`77` は SKIP である。SKIP は
   PASS ではない。causal evidence が観測できない場合（例: #2846 の `no_evidence`）も 77 とし、
   fixture・static schema・別 backend・agent ID lane への fallback による成功は FAIL として扱う。
+- pytest ラッパ（`test_live_native_named_subagent_resume` / `test_live_claude_gpt_named_subagent_resume`）は
+  既存の `claude_live` marker 付きで、通常の `pytest` では default `addopts` により deselect される。
+  実 live 実行は `uv run --locked pytest -m claude_live <node id>` で明示的に opt-in する（`CI` 環境変数の
+  偽装は不要）。
 - Claude-GPT adapter は caller `--settings` を受け付けない。launcher 固定値
   `CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-name-resume` が `SendMessage` の deny だけを外し、
   `ListAgents` deny と `crossSessionInbound: refuse` を維持する。既存の固定値

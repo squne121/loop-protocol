@@ -153,11 +153,13 @@ for ADAPTER in native claude-gpt; do
 done
 ```
 
-pytest ラッパ経由の入口は次のとおり（CI では skip され、その skip は PASS ではない）。
+pytest ラッパ経由の入口は次のとおり。live 実行の 2 件は既存の `claude_live` marker 付きで、
+default `addopts` により通常の `pytest` では deselect される（`CI=1` を偽装する必要はない）。
+live 実行は `-m claude_live` で明示的に opt-in する。CI では skip され、その skip は PASS ではない。
 
 ```bash
-uv run --locked pytest scripts/agent-ops/tests/test_run_worktree_agent_runtime_smoke_named_subagent_resume.py::test_live_native_named_subagent_resume
-uv run --locked pytest scripts/agent-ops/tests/test_run_worktree_agent_runtime_smoke_named_subagent_resume.py::test_live_claude_gpt_named_subagent_resume
+uv run --locked pytest -m claude_live scripts/agent-ops/tests/test_run_worktree_agent_runtime_smoke_named_subagent_resume.py::test_live_native_named_subagent_resume
+uv run --locked pytest -m claude_live scripts/agent-ops/tests/test_run_worktree_agent_runtime_smoke_named_subagent_resume.py::test_live_claude_gpt_named_subagent_resume
 ```
 
 exit code は `0`=因果鎖が全て成立（verdict=pass）／`1`=失敗／`77`=SKIP（runtime・auth・launcher・proxy

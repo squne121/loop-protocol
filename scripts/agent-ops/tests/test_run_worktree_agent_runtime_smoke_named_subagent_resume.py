@@ -17,9 +17,13 @@ Task Context resolver semantics stay owned by ``tests/task-context/``; nothing h
 re-implements the resolver.
 
 Live tests need an authenticated ``claude`` (Native), the repository-owned launcher
-and its proxy.  They are skipped when the environment variable ``CI`` is set: that
-skip is NOT a PASS (the reason carries ``RUNTIME_VERIFICATION_SKIPPED_NOT_PASS``) and
-AC3/AC4 are judged only from the evidence JSON a local live run writes.
+and its proxy.  Only the two live test functions carry ``@pytest.mark.claude_live``:
+the default ``addopts`` deselects them, so a plain ``pytest`` never launches a live
+run and nobody has to fake ``CI`` to avoid it; opt in with ``-m claude_live``.  The
+offline regressions stay in the default selection.  The wrapper's ``CI`` skip is
+kept as defence in depth: that skip is NOT a PASS (the reason carries
+``RUNTIME_VERIFICATION_SKIPPED_NOT_PASS``) and AC3/AC4 are judged only from the
+evidence JSON a local live run writes.
 """
 
 from __future__ import annotations
@@ -504,12 +508,14 @@ def _live_artifacts_dir() -> Path:
     return path
 
 
+@pytest.mark.claude_live
 def test_live_native_named_subagent_resume():
     evidence = _run_live_wrapper("native", out_root=_live_artifacts_dir())
     assert evidence["agent_kind"]["kind"] == "ordinary_subagent"
     assert evidence["same_agent_id_after_resume"] is True
 
 
+@pytest.mark.claude_live
 def test_live_claude_gpt_named_subagent_resume():
     evidence = _run_live_wrapper("claude-gpt", out_root=_live_artifacts_dir())
     assert evidence["agent_kind"]["kind"] == "ordinary_subagent"
