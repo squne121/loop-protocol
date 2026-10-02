@@ -1433,3 +1433,380 @@ def test_given_spans_when_clause_index_from_ends_then_same_as_linear_clause_inde
             assert classifier._clause_index_from_ends(ends, position) == classifier._clause_index(
                 spans, position
             ), (text, position)
+
+
+# ---------------------------------------------------------------------------
+# Issue #2875: `_find_occurrences()` の `_OWNER_REPO_HASH_RE` ループ内の
+# prefix 前段処理（match ごとの先頭からの prefix 切り出しと分割）から二乗経路を除去する。
+#
+# 計数 test は #2877 の `_measure_projection_work` と同型の seam で、`_OWNER_REPO_HASH_RE`
+# proxy の match を消費している間だけ、決定論的な作業量モデルとして 2 つの値を数える。
+#   - `copy_chars`: authority_text への slice 要求が返した結果文字数。実メモリコピー量の
+#     計測ではない（`split()` / `partition()` が生成する substring の文字数は加算しない）。
+#   - `lookup_work`: find / index / split / count 等が走査した文字数の見積りと
+#     `_PR_PREFIX_RE` の search 範囲長。
+# 呼び出し回数だけを合否指標にしない。実時間の閾値は使わない。
+#
+# Scope note: 計数対象は owner/repo ループ内の prefix 前段処理のみ。
+# `_OWNER_REPO_HASH_RE.finditer` 自体の走査（match 0 件の `"a." * n` で二乗になる経路）は
+# #2881 の所有で、ここでは計数にも合否にも含めない。したがって本 test の PASS は
+# scanner 全体 / `classify()` / hook 全体の非二乗性を示さない。
+# 観測できない経路: 新規 compiled regex、`+` / join など plain str を返す演算、
+# `split()` / `partition()` が生成する substring の実コピー。
+# 未対応の str メソッド / regex メソッドがループ内で呼ばれた場合は
+# `unobserved_calls` に計上され、各 test が 0 であることを assert する
+# （観測できない経路を黙って見逃さない）。残る穴は mutant 感度 test で補う。
+# ---------------------------------------------------------------------------
+
+_OWNER_REPO_CORPORA = [
+    ("owner_repo_commas", lambda n: "o/r#1、" * n),
+    ("long_leading_text_then_owner_repo_commas", lambda n: "x" * (6 * n) + "、" + "o/r#1、" * n),
+]
+
+_OWNER_REPO_STR_PUBLIC_METHODS = frozenset(name for name in dir(str) if not name.startswith("_"))
+
+
+def _owner_repo_str_class(counters, state):
+    """Return a ``str`` subclass counting a deterministic work model while ``state['on']``.
+
+    ``copy_chars`` is the summed result length of slice requests only; it is not the total
+    memory copied (``split()`` / ``partition()`` substrings are not added to it). ``lookup_work``
+    is an estimate of the characters scanned by the observed methods."""
+
+    class _OwnerRepoCountingStr(str):
+        def _range(self, start, end):
+            return len(range(*slice(start, end).indices(len(self))))
+
+        def __getattribute__(self, name):
+            if state["on"] and name in _unobserved:
+                counters["unobserved_calls"] += 1
+            return str.__getattribute__(self, name)
+
+        def __getitem__(self, key):
+            result = str.__getitem__(self, key)
+            if state["on"]:
+                if isinstance(key, slice):
+                    counters["copy_chars"] += len(result)
+                else:
+                    counters["lookup_work"] += 1
+            # Derived strings stay observable (e.g. ``prefix.split("/")``).
+            return _OwnerRepoCountingStr(result) if isinstance(key, slice) else result
+
+        def find(self, sub, start=None, end=None):
+            result = str.find(self, sub, start, end)
+            if state["on"]:
+                scanned = self._range(start, end)
+                if result >= 0:
+                    scanned = result - slice(start, end).indices(len(self))[0] + len(sub)
+                counters["lookup_work"] += max(scanned, 0)
+            return result
+
+        def index(self, sub, start=None, end=None):
+            result = str.index(self, sub, start, end)
+            if state["on"]:
+                counters["lookup_work"] += result - slice(start, end).indices(len(self))[0] + len(sub)
+            return result
+
+        def rfind(self, sub, start=None, end=None):
+            result = str.rfind(self, sub, start, end)
+            if state["on"]:
+                begin, stop, _ = slice(start, end).indices(len(self))
+                counters["lookup_work"] += max(stop - result if result >= 0 else stop - begin, 0)
+            return result
+
+        def count(self, sub, start=None, end=None):
+            if state["on"]:
+                counters["lookup_work"] += self._range(start, end)
+            return str.count(self, sub, start, end)
+
+        def split(self, sep=None, maxsplit=-1):
+            if state["on"]:
+                counters["lookup_work"] += len(self)
+            return [_OwnerRepoCountingStr(p) for p in str.split(self, sep, maxsplit)]
+
+        def partition(self, sep):
+            if state["on"]:
+                counters["lookup_work"] += len(self)
+            return tuple(_OwnerRepoCountingStr(p) for p in str.partition(self, sep))
+
+        def __contains__(self, item):
+            if state["on"]:
+                counters["lookup_work"] += len(self)
+            return str.__contains__(self, item)
+
+    _observed = {"find", "index", "rfind", "count", "split", "partition"}
+    _unobserved = _OWNER_REPO_STR_PUBLIC_METHODS - _observed
+    return _OwnerRepoCountingStr
+
+
+class _OwnerRepoCountingRegex:
+    """Counting proxy for ``_PR_PREFIX_RE``: the searched range length is the work."""
+
+    def __init__(self, real, counters, state):
+        self._real, self._counters, self._state = real, counters, state
+
+    def _count(self, string, pos, endpos):
+        if self._state["on"]:
+            self._counters["lookup_work"] += len(range(*slice(pos, endpos).indices(len(string))))
+
+    def search(self, string, pos=0, endpos=None):
+        endpos = len(string) if endpos is None else endpos
+        self._count(string, pos, endpos)
+        return self._real.search(string, pos, endpos)
+
+    def match(self, string, pos=0, endpos=None):
+        endpos = len(string) if endpos is None else endpos
+        self._count(string, pos, endpos)
+        return self._real.match(string, pos, endpos)
+
+    def __getattr__(self, name):
+        if self._state["on"]:
+            self._counters["unobserved_calls"] += 1
+        return getattr(self._real, name)
+
+
+class _OwnerRepoFinditerProxy:
+    """Stands in for ``_OWNER_REPO_HASH_RE``. The counting is enabled only while the
+    consumer's loop body runs (between the yield and the next ``next()``), so the
+    ``finditer`` scan itself (#2881) is excluded. Because this proxy replaces the module-level
+    ``_OWNER_REPO_HASH_RE``, every consumer of it is observed, not only the main owner/repo
+    loop: ``_path_token_spans()`` and the later ``owner_repo_spans`` construction as well."""
+
+    def __init__(self, real, state):
+        self._real, self._state = real, state
+
+    def finditer(self, string, *args):
+        iterator = self._real.finditer(string, *args)
+        try:
+            while True:
+                self._state["on"] = False
+                try:
+                    found = next(iterator)
+                except StopIteration:
+                    return
+                self._state["on"] = True
+                yield found
+        finally:
+            self._state["on"] = False
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _measure_owner_repo_prefix_work(monkeypatch, prompt, find_occurrences=None) -> dict[str, int]:
+    """Run ``find_occurrences`` (default: the production ``_find_occurrences``) once on
+    ``prompt`` with the ``_OWNER_REPO_HASH_RE`` consumers instrumented; return the work counters.
+    ``loop_iterations`` counts matches yielded to all of those consumers (the main owner/repo
+    loop plus the auxiliary scans), so it alone does not prove the main loop ran n times."""
+    counters = {"copy_chars": 0, "lookup_work": 0, "unobserved_calls": 0, "loop_iterations": 0}
+    state = {"on": False}
+    counting_str = _owner_repo_str_class(counters, state)
+    authority_text = counting_str(prompt)
+
+    real_finditer_owner = classifier._OWNER_REPO_HASH_RE
+
+    class _IterationCounter(_OwnerRepoFinditerProxy):
+        def finditer(self, string, *args):
+            for found in super().finditer(string, *args):
+                counters["loop_iterations"] += 1
+                yield found
+
+    with monkeypatch.context() as patch:
+        patch.setattr(classifier, "_OWNER_REPO_HASH_RE", _IterationCounter(real_finditer_owner, state))
+        patch.setattr(
+            classifier, "_PR_PREFIX_RE", _OwnerRepoCountingRegex(classifier._PR_PREFIX_RE, counters, state)
+        )
+        (find_occurrences or classifier._find_occurrences)(authority_text, _PERF_REPO)
+    assert state["on"] is False
+    return counters
+
+
+def _reference_find_occurrences(authority_text, current_repo):
+    """Verbatim copy of the pre-#2875 (naive) ``_find_occurrences`` -- the behavioural
+    reference for the equivalence test and the "old implementation" mutant (a) of the
+    sensitivity test. It must not be edited to follow future changes of the
+    production function."""
+    occurrences = []
+
+    for match in classifier._GITHUB_URL_RE.finditer(authority_text):
+        repo, kind_word, number = match.group(1), match.group(2), int(match.group(3))
+        ref_kind = "pr" if kind_word.lower() == "pull" else "issue"
+        target = classifier.Target(repo=repo, ref_kind=ref_kind, ref_number=number, explicit_repo=True)
+        occurrences.append(classifier._Occurrence(target, match.start(), match.end(), classifier.REF_FORM_EXPLICIT))
+
+    for match in classifier._OWNER_REPO_HASH_RE.finditer(authority_text):
+        repo, number = match.group(1), int(match.group(2))
+        prefix = authority_text[: match.start()]
+        ref_kind = "pr" if classifier._PR_PREFIX_RE.search(prefix.split("/")[0][-20:] or "") else "issue"
+        target = classifier.Target(repo=repo, ref_kind=ref_kind, ref_number=number, explicit_repo=True)
+        occurrences.append(classifier._Occurrence(target, match.start(), match.end(), classifier.REF_FORM_EXPLICIT))
+
+    path_spans = classifier._path_token_spans(authority_text)
+    for match in classifier._BARE_HASH_RE.finditer(authority_text):
+        start = match.start()
+        if start > 0 and authority_text[start - 1] == "/":
+            continue
+        if classifier._inside_path_token(start, path_spans):
+            continue
+        number = int(match.group(1))
+        prefix = authority_text[max(0, start - 20) : start]
+        is_pr = bool(classifier._PR_PREFIX_RE.search(prefix))
+        ref_kind = "pr" if is_pr else "issue"
+        form = (
+            classifier.REF_FORM_PREFIXED
+            if (is_pr or classifier._ISSUE_PREFIX_RE.search(prefix))
+            else classifier.REF_FORM_BARE
+        )
+        target = classifier.Target(repo=current_repo, ref_kind=ref_kind, ref_number=number, explicit_repo=False)
+        occurrences.append(classifier._Occurrence(target, match.start(), match.end(), form))
+
+    owner_repo_spans = [m.span() for m in classifier._OWNER_REPO_HASH_RE.finditer(authority_text)]
+    for match in classifier._ADJACENT_PREFIX_HASH_RE.finditer(authority_text):
+        if classifier._inside_any_span(match.start(), owner_repo_spans):
+            continue
+        if classifier._inside_path_token(match.end(1), path_spans):
+            continue
+        ref_kind = "issue" if match.group(1).lower() == "issue" else "pr"
+        target = classifier.Target(
+            repo=current_repo, ref_kind=ref_kind, ref_number=int(match.group(2)), explicit_repo=False
+        )
+        occurrences.append(classifier._Occurrence(target, match.start(), match.end(), classifier.REF_FORM_PREFIXED))
+
+    return occurrences
+
+
+def _mutant_first_slash_search_in_loop(authority_text, current_repo):
+    """Mutant (b): the per-match prefix copy is gone, but the first-"/" search is moved
+    back into the occurrence loop (``find("/", 0, start)`` rescans from 0 per match).
+    Owner/repo loop only (minimal loop copy)."""
+    occurrences = []
+    for match in classifier._OWNER_REPO_HASH_RE.finditer(authority_text):
+        repo, number = match.group(1), int(match.group(2))
+        start = match.start()
+        slash = authority_text.find("/", 0, start)
+        head_end = start if slash == -1 else slash
+        tail = authority_text[max(0, head_end - 20) : head_end]
+        ref_kind = "pr" if classifier._PR_PREFIX_RE.search(tail) else "issue"
+        target = classifier.Target(repo=repo, ref_kind=ref_kind, ref_number=number, explicit_repo=True)
+        occurrences.append(classifier._Occurrence(target, start, match.end(), classifier.REF_FORM_EXPLICIT))
+    return occurrences
+
+
+def _owner_repo_work_ratios(monkeypatch, build_prompt, find_occurrences=None):
+    small = _measure_owner_repo_prefix_work(monkeypatch, build_prompt(_PERF_SMALL_N), find_occurrences)
+    large = _measure_owner_repo_prefix_work(monkeypatch, build_prompt(_PERF_LARGE_N), find_occurrences)
+    ratios = {key: large[key] / small[key] for key in ("copy_chars", "lookup_work") if small[key] and large[key]}
+    return small, large, ratios
+
+
+@pytest.mark.parametrize(
+    "build_prompt", [build for _name, build in _OWNER_REPO_CORPORA], ids=[name for name, _ in _OWNER_REPO_CORPORA]
+)
+def test_given_owner_repo_prefix_corpus_when_find_occurrences_then_work_not_quadratic(monkeypatch, build_prompt):
+    small, large, ratios = _owner_repo_work_ratios(monkeypatch, build_prompt)
+    # 0 計数の測定は無効（vacuous）。比を取る key は両サイズで非ゼロでなければならない。
+    for key in ("copy_chars", "lookup_work"):
+        assert small[key] > 0 and large[key] > 0, (key, small, large)
+    assert small["unobserved_calls"] == 0 and large["unobserved_calls"] == 0, (small, large)
+    for key in ("copy_chars", "lookup_work"):
+        assert ratios[key] <= _PERF_MAX_RATIO, (
+            f"{key} grew {ratios[key]:.2f}x (> {_PERF_MAX_RATIO}x) when the input doubled "
+            f"(n={_PERF_SMALL_N}->{_PERF_LARGE_N}): small={small} large={large}"
+        )
+
+
+@pytest.mark.parametrize(
+    "build_prompt", [build for _name, build in _OWNER_REPO_CORPORA], ids=[name for name, _ in _OWNER_REPO_CORPORA]
+)
+def test_given_scanner_work_counter_when_input_reaches_owner_repo_loop_then_count_is_nonzero(
+    monkeypatch, build_prompt
+):
+    for n in (_PERF_SMALL_N, _PERF_LARGE_N):
+        measured = _measure_owner_repo_prefix_work(monkeypatch, build_prompt(n))
+        # 各 corpus が owner/repo の match を生成して consumer に到達し、copy / lookup の key が
+        # 非ゼロである。loop_iterations は補助走査（_path_token_spans / owner_repo_spans）の
+        # yield も含むため、主ループの n 回実行の証明ではない。主ループへの到達は非ゼロの
+        # copy_chars / lookup_work と mutant 感度 test が裏付ける。
+        assert measured["loop_iterations"] >= n, measured
+        assert measured["copy_chars"] > 0, measured
+        assert measured["lookup_work"] > 0, measured
+        assert measured["unobserved_calls"] == 0, measured
+
+
+def test_given_naive_prefix_mutants_when_measured_by_same_harness_then_work_ratio_exceeds_bound(monkeypatch):
+    # (a) 旧実装（prefix 全切り出し）: どちらの corpus でも copy / lookup が二乗。
+    for name, build in _OWNER_REPO_CORPORA:
+        small, large, ratios = _owner_repo_work_ratios(monkeypatch, build, _reference_find_occurrences)
+        assert small["copy_chars"] > 0 and small["lookup_work"] > 0, (name, small)
+        assert ratios["copy_chars"] > _PERF_MAX_RATIO, (name, small, large)
+        assert ratios["lookup_work"] > _PERF_MAX_RATIO, (name, small, large)
+
+    # (b) 最初の "/" 検索だけを loop 内へ戻した変異: 最初の "/" が遠い corpus (2) でのみ二乗
+    # （corpus (1) は最初の "/" が先頭付近で find が即終了するため一定。corpus を 2 種類
+    # 持つ理由）。copy は ≤20 文字 slice のままなので lookup_work の比だけが上限を超える。
+    _name, long_leading = _OWNER_REPO_CORPORA[1]
+    small, large, ratios = _owner_repo_work_ratios(monkeypatch, long_leading, _mutant_first_slash_search_in_loop)
+    assert small["lookup_work"] > 0 and small["copy_chars"] > 0, small
+    assert ratios["lookup_work"] > _PERF_MAX_RATIO, (small, large)
+
+    # mutant は意味論を保つ性能のみの変異である（owner/repo ループ分の出力が reference と一致）。
+    for _name, build in _OWNER_REPO_CORPORA:
+        prompt = build(5)
+        reference = _reference_find_occurrences(prompt, _PERF_REPO)
+        expected = [o for o in reference if o.form == classifier.REF_FORM_EXPLICIT]
+        assert _mutant_first_slash_search_in_loop(prompt, _PERF_REPO) == expected
+
+
+_OWNER_REPO_EQUIVALENCE_CORPUS = [
+    "",
+    "   ",
+    "pr#1",
+    "PR /x o/r#2",
+    "o/r#1、PR x/y#2",
+    "pr#1 と pr#2 を o/r#3、a/b#4、PR c/d#5 と比較",
+    # 最初の "/" より前が 20 文字超の長い prefix
+    "あ" * 30 + " PR /x o/r#2",
+    "a" * 25 + " pr x/y#3",
+    "a" * 25 + " pr " + "b" * 30 + "/c o/r#4",
+    "pull request x/y#1、pr x/y#2、prx/y#3",
+    "プルリク o/r#1、プルリクエスト o/r#2、イシュー o/r#3",
+    # 最初の "/" が match より前 / match 内
+    "src/a.py pr o/r#1",
+    "a/b pr o/r#1 pr c/d#2",
+    # 全角数字 (Unicode \d の意味論。#2850 の判断を変えない)
+    "o/r#１",
+    "pr o/r#１、o/r#12",
+    # slice と search(text, pos, endpos) で結果が分かれる反例
+    "xpr" + " " * 18 + "o/r#1",
+    "xpr" + " " * 18 + "o/r#1、xpr" + " " * 17 + "o/r#2",
+]
+# prefix 語の直前の空白数を 17〜20 近傍で振った 20 文字境界の前後入力
+for _spaces in range(14, 25):
+    for _lead in ("", "x", "xx", "あ", "a/"):
+        for _word in ("pr", "PR", "pull request", "プルリク"):
+            _OWNER_REPO_EQUIVALENCE_CORPUS.append(f"{_lead}{_word}{' ' * _spaces}o/r#1")
+            _OWNER_REPO_EQUIVALENCE_CORPUS.append(f"{_lead}{' ' * _spaces}{_word} o/r#1")
+            _OWNER_REPO_EQUIVALENCE_CORPUS.append(f"{_lead}x{_word}{' ' * _spaces}o/r#1")
+
+
+@pytest.mark.parametrize("current_repo", [None, _PERF_REPO])
+def test_given_owner_repo_corpus_when_find_occurrences_then_same_as_reference_implementation(current_repo):
+    ref_kinds = set()
+    for prompt in _OWNER_REPO_EQUIVALENCE_CORPUS:
+        expected = _reference_find_occurrences(prompt, current_repo)
+        actual = classifier._find_occurrences(prompt, current_repo)
+        # ref_kind・順序・form・target・span を含む全体の完全一致（期待値は hard-code しない）。
+        assert actual == expected, prompt
+        ref_kinds.update(o.target.ref_kind for o in actual if o.target.explicit_repo)
+    # 非 vacuous: corpus は pr / issue の両結果を実際に生む。
+    assert ref_kinds == {"pr", "issue"}
+
+
+def test_given_twenty_char_boundary_counterexample_when_classified_then_slice_semantics_preserved():
+    # `Pattern.search(text, pos, endpos)` は末尾 20 文字 slice と同値ではない（左文脈で \b が変わる）。
+    text = "xpr" + " " * 18 + "o/r#1"
+    start = text.index("o/r#1")
+    assert classifier._PR_PREFIX_RE.search(text[max(0, start - 20) : start])  # slice 方式: pr
+    assert not classifier._PR_PREFIX_RE.search(text, max(0, start - 20), start)  # pos/endpos 方式: issue
+    (occurrence,) = classifier._find_occurrences(text, None)
+    assert occurrence.target.ref_kind == "pr"

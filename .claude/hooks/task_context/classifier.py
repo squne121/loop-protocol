@@ -255,10 +255,22 @@ def _find_occurrences(authority_text: str, current_repo: str | None) -> list[_Oc
         target = Target(repo=repo, ref_kind=ref_kind, ref_number=number, explicit_repo=True)
         occurrences.append(_Occurrence(target, match.start(), match.end(), REF_FORM_EXPLICIT))
 
+    # Issue #2875: ``authority_text[: start].split("/")[0]`` is the text before the
+    # first "/" of the whole text (or the whole prefix when that "/" is not before
+    # ``start``), so the first "/" is located once here instead of re-slicing and
+    # re-splitting the full prefix per match. ``_PR_PREFIX_RE`` is still applied to a
+    # materialised <=20-char tail slice (NOT ``search(text, pos, endpos)``, whose
+    # left context differs: ``"xpr" + " " * 18 + "o/r#1"``). The per-match work of
+    # this prefix processing is therefore O(1) (at most 20 chars). This claim covers
+    # only this prefix processing, not ``_OWNER_REPO_HASH_RE.finditer`` itself
+    # (zero-match scan cost is owned by #2881) nor the scanner / classify() overall.
+    first_slash = authority_text.find("/")
     for match in _OWNER_REPO_HASH_RE.finditer(authority_text):
         repo, number = match.group(1), int(match.group(2))
-        prefix = authority_text[: match.start()]
-        ref_kind = "pr" if _PR_PREFIX_RE.search(prefix.split("/")[0][-20:] or "") else "issue"
+        start = match.start()
+        head_end = start if first_slash < 0 or first_slash >= start else first_slash
+        tail = authority_text[max(0, head_end - 20) : head_end]
+        ref_kind = "pr" if _PR_PREFIX_RE.search(tail) else "issue"
         target = Target(repo=repo, ref_kind=ref_kind, ref_number=number, explicit_repo=True)
         occurrences.append(_Occurrence(target, match.start(), match.end(), REF_FORM_EXPLICIT))
 
