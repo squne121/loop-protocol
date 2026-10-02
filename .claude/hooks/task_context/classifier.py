@@ -182,7 +182,23 @@ def _inside_any_span(position: int, spans: list[tuple[int, int]]) -> bool:
 # (``A/Bテストの#12を実装して``) is treated as path-embedded too.
 # Complexity: one linear regex pass + ``str.find`` per token; the result is a
 # sorted list of disjoint spans queried with ``bisect`` (O(log n) per lookup).
-_PATH_TOKEN_RE = re.compile(r"[^\s、。，．！？,;；「」『』（）()]+")
+#
+# Issue #2864 (W3 fix_delta 2): the token range has two lexical forms.
+#   1. an external URL token (``http(s)://...``) in which ASCII ``?`` / ``!`` are
+#      allowed, so a query string / fragment such as ``https://x.com/あ?あ#12``
+#      stays inside ONE URL range (the ``#12`` is a URL fragment, not a reference);
+#   2. an ordinary prose token in which ASCII ``!`` ``?`` ``[`` ``]`` are token
+#      boundaries just like the Japanese punctuation (``src/ファイルの不具合です!#13``
+#      and ``[src/foo.py]の修正は#13`` end the path context at ``!`` / ``]``). It
+#      also stops before a URL start so an ``http(s)://`` glued after prose still
+#      opens its own URL token.
+# Known limitation (accepted): a scheme-less ``x.com/a?b#12`` is ordinary prose,
+# not a URL, so ``?`` ends its path context and the ``#12`` stays a bare reference.
+_PATH_TOKEN_RE = re.compile(
+    r"https?://[^\s、。，．！？,;；「」『』（）()\[\]]+"
+    r"|(?:(?!https?://)[^\s、。，．！？!?,;；「」『』（）()\[\]])+",
+    re.IGNORECASE,
+)
 
 
 def _path_token_spans(text: str) -> list[tuple[int, int]]:

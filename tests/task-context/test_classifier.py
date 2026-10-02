@@ -1024,3 +1024,91 @@ def test_given_hash_glued_after_recognised_reference_when_classified_then_not_wo
         assert _projection(prompt) == {"active_rebind_primary_eligible": False}, prompt
         # `#13` は current repo を必要とするので、解決要否も同じ規則に従う。
         assert classifier.needs_current_repo_resolution(prompt) is True, prompt
+
+
+# ---------------------------------------------------------------------------
+# Issue #2864 (W3 fix_delta 2): ASCII `!` `?` `[` `]` は通常文の token 境界であり、
+# path 抑制が文境界 / 括弧を越えて正当な current-repo `#N` を落とさない。外部 URL の
+# query / fragment（`https://x.com/あ?あ#12`）は引き続き URL 内の `#N` として NONE。
+# 期待値は production の delimiter 表を参照せず、リテラルで直接固定する。
+# ---------------------------------------------------------------------------
+
+# 現在 repo の `#13` 単独の通常文。ASCII `!` `?` `[` `]` の直後 / 直前でも INFERRED になる。
+_W3_FIX2_SINGLE_CURRENT_REPO_13 = [
+    "src/ファイルの不具合です!#13を実装して",
+    "src/ファイルの不具合です?#13を実装して",
+    "[src/ファイル]の修正は#13を実装して",
+    "[src/foo.py]の修正は#13を実装して",
+]
+
+# 明示 owner/repo#12 と、ASCII 境界の後ろの current-repo #13 が共存する入力。
+_W3_FIX2_MULTI_PROMPTS = [
+    "owner/repo#12をレビュー。[src/ファイル]の修正は#13を実装して",
+    "owner/repo#12をレビュー。src/ファイルの不具合です!#13を実装して",
+]
+
+# 外部 URL の query / fragment と path 内の `#N` は current repo の参照ではない。
+_W3_FIX2_URL_OR_PATH_NONE = [
+    "https://x.com/あ?あ#12を実装して",
+    "https://x.com/a?b=1#12を実装して",
+    "src/ファイル#12を実装して",
+]
+
+
+def test_given_ascii_sentence_or_bracket_boundary_before_hash_when_classified_then_current_repo_inferred():
+    for prompt in _W3_FIX2_SINGLE_CURRENT_REPO_13:
+        result = classifier.classify(prompt, current_repo=REPO)
+        assert result.kind == classifier.KIND_INFERRED, prompt
+        assert result.target == classifier.Target(REPO, "issue", 13), prompt
+        assert [(t.repo, t.ref_kind, t.ref_number) for t in result.targets] == [(REPO, "issue", 13)], prompt
+        projection = _projection(prompt)
+        assert projection["active_rebind_primary_eligible"] is True, prompt
+        assert projection["active_rebind_target_repo"] == REPO, prompt
+        assert projection["active_rebind_target_ref_number"] == 13, prompt
+        # `#13` は current repo の解決を必要とする（pre-W3 の bare `#N` と同じ）。
+        assert classifier.needs_current_repo_resolution(prompt) is True, prompt
+
+
+def test_given_explicit_ref_then_ascii_boundary_before_current_repo_hash_when_classified_then_ambiguous():
+    current_repo = "squne121/loop-protocol"
+    for prompt in _W3_FIX2_MULTI_PROMPTS:
+        result = classifier.classify(prompt, current_repo=current_repo)
+        assert result.kind == classifier.KIND_AMBIGUOUS, prompt
+        assert {(t.repo, t.ref_number) for t in result.targets} == {
+            ("owner/repo", 12),
+            ("squne121/loop-protocol", 13),
+        }, prompt
+        # 単一 EXPLICIT (owner/repo#12) に潰れて wrong-target rebind しない。
+        projection = classifier.active_rebind_projection(prompt, result, current_repo=current_repo)
+        assert projection == {"active_rebind_primary_eligible": False}, prompt
+        assert classifier.needs_current_repo_resolution(prompt) is True, prompt
+
+
+def test_given_url_query_or_path_embedded_hash_when_classified_then_still_none():
+    for prompt in _W3_FIX2_URL_OR_PATH_NONE:
+        result = classifier.classify(prompt, current_repo=REPO)
+        assert result.kind == classifier.KIND_NONE, prompt
+        assert result.target is None and result.targets == (), prompt
+        assert _projection(prompt) == {"active_rebind_primary_eligible": False}, prompt
+        assert classifier.needs_current_repo_resolution(prompt) is False, prompt
+
+
+def test_given_fix_delta_1_and_w2_inputs_when_classified_after_fix_delta_2_then_unchanged():
+    expected_kinds = {
+        "owner/repo#12と#13を実装して": classifier.KIND_AMBIGUOUS,
+        "https://github.com/o/r/issues/5と#13を実装して": classifier.KIND_AMBIGUOUS,
+        "owner/repo#12→#13を実装して": classifier.KIND_AMBIGUOUS,
+        "owner/repo#12:#13": classifier.KIND_AMBIGUOUS,
+        "owner/repo#12を参考に#13を実装して": classifier.KIND_REFERENCE_ONLY,
+        "参考に、#13を実装して": classifier.KIND_INFERRED,
+        "Issue #5を参考に、#13を実装して": classifier.KIND_INFERRED,
+        "参考: #10、#11を実装して": classifier.KIND_REFERENCE_ONLY,
+        "参考#1、#2": classifier.KIND_REFERENCE_ONLY,
+        "関連資料: #2826、Issue #2827 を対象にレビューして": classifier.KIND_REFERENCE_ONLY,
+    }
+    current_repo = "squne121/loop-protocol"
+    for prompt, kind in expected_kinds.items():
+        result = classifier.classify(prompt, current_repo=current_repo)
+        assert result.kind == kind, prompt
+        # current repo の `#N` を含むので、解決要否は常に True。
+        assert classifier.needs_current_repo_resolution(prompt) is True, prompt
