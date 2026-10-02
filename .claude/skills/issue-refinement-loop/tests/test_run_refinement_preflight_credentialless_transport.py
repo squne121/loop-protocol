@@ -895,6 +895,82 @@ def test_selector_is_constant_and_ignores_every_auth_signal(tmp_path, monkeypatc
     monkeypatch.delenv("GH_TOKEN")
     monkeypatch.delenv("GH_CONFIG_DIR")
     assert preflight._select_read_transport() is first
+    assert first is preflight._NATIVE_GH_READ_TRANSPORT
+
+
+def test_default_and_explicit_fetch_call_paths_land_on_one_transport_instance(tmp_path, monkeypatch):
+    """Call-recording proof that the process-wide constant selector cannot
+    split authority (Issue #2872 AC3): the production constant is swapped for
+    ONE recording instance, then the `transport=None` default fetchers
+    (`_fetch_issue` / `_fetch_issue_comments` / `_fetch_single_comment`), the
+    explicit-`transport=` default-fetcher call sites added for the
+    repair-apply / trusted-anchor lane, and a real `run_preflight()` all run.
+    Every recorded read lands on that single instance and nothing reaches the
+    anonymous credentialless authority."""
+    used = _forbid_credentialless_authority(monkeypatch)
+    recorder = _RecordingTransport(comments=[dict(_ANCHOR_PAYLOAD)], anchor=dict(_ANCHOR_PAYLOAD))
+    monkeypatch.setattr(preflight, "_NATIVE_GH_READ_TRANSPORT", recorder)
+    assert preflight._select_read_transport() is recorder
+
+    # `transport=None` default fetchers resolve the one constant instance.
+    assert preflight._fetch_issue(REPO, ISSUE_NUMBER) == (dict(_ISSUE_PAYLOAD), "")
+    assert preflight._fetch_issue_comments(REPO, ISSUE_NUMBER) == ([dict(_ANCHOR_PAYLOAD)], "")
+    assert preflight._fetch_single_comment(REPO, ANCHOR_COMMENT_ID) == (dict(_ANCHOR_PAYLOAD), "")
+    # An explicitly passed instance is honoured as-is (explicit threading).
+    explicit = _RecordingTransport()
+    preflight._fetch_issue(REPO, ISSUE_NUMBER, transport=explicit)
+    assert [name for name, _ in explicit.calls] == ["read_issue"]
+    assert [name for name, _ in recorder.calls] == ["read_issue", "list_issue_comments", "read_issue_comment"]
+
+    # A real production invocation: Issue, comments (anchor resolved out of
+    # the complete traversal) all land on the same instance.
+    recorder.calls.clear()
+    monkeypatch.setattr(preflight, "_find_repo_root", lambda: tmp_path)
+    preflight.run_preflight(issue_number=ISSUE_NUMBER, repo=REPO, anchor_comment_urls=[ANCHOR_URL], fixture_path=None)
+    assert [name for name, _ in recorder.calls][:2] == ["read_issue", "list_issue_comments"], recorder.calls
+    assert used == []
+
+
+def test_unthreaded_read_call_sites_are_a_closed_set_resolving_the_constant_selector():
+    """Structural guard: every call site of the three `_fetch_*` readers that
+    does NOT pass `transport=` is a known, closed set of functions. Those
+    sites resolve the `transport=None` default, which is the one
+    process-wide constant instance (see
+    `test_default_and_explicit_fetch_call_paths_land_on_one_transport_instance`).
+    They are intentionally not threaded explicitly: pre-existing tests
+    outside this module's Allowed Paths (e.g.
+    `test_structural_repair_action_apply_consumer.py`,
+    `test_evidence_index_preflight_integration.py`) patch the readers with
+    fixed-arity doubles. A NEW un-threaded call site must be threaded or
+    consciously added here -- it cannot silently pick its own authority."""
+    import ast
+
+    tree = ast.parse(Path(preflight.__file__).read_text(encoding="utf-8"))
+    readers = {"_fetch_issue", "_fetch_issue_comments", "_fetch_single_comment"}
+    unthreaded: list[tuple[str, str]] = []
+
+    class _Visitor(ast.NodeVisitor):
+        def __init__(self):
+            self.stack: list[str] = []
+
+        def visit_FunctionDef(self, node):
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def visit_Call(self, node):
+            name = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", None)
+            if name in readers and "transport" not in {kw.arg for kw in node.keywords}:
+                unthreaded.append((name, self.stack[-1] if self.stack else "<module>"))
+            self.generic_visit(node)
+
+    _Visitor().visit(tree)
+    assert {fn for _, fn in unthreaded} <= {
+        "run_preflight",
+        "_default_fetch_current",
+        "_revalidate_owner_anchor_sources_before_dispatch",
+        "fetch_current",
+    }, unthreaded
 
 
 def test_gh_exit_4_is_projected_as_gh_auth_required():
