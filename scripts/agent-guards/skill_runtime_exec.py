@@ -1184,6 +1184,16 @@ def _sanitize_env(project_root: str, command_id: str = "") -> dict[str, str]:
     gh_config_dir_carrier_command_ids = frozenset(
         {
             "preflight.run",
+            # Issue #2872: the production anchor/human-context/agent-report
+            # preflight profiles' actual child (`run_refinement_preflight.py`)
+            # reads Issue/comments/anchor through native `gh`, so a stored
+            # `gh auth login` configuration (reached only via the launcher's
+            # fixed `GH_CONFIG_DIR`) must reach it the same way bare
+            # `preflight.run` already does (#2403). The fixture lane
+            # (`preflight.run.fixture.*`) never invokes `gh` and stays out.
+            "preflight.run.with_anchor",
+            "preflight.run.with_human_context",
+            "preflight.run.with_agent_report",
             "contract_update.run.with_anchor",
             "contract_update.run.with_human_context",
             "repair_action.apply",

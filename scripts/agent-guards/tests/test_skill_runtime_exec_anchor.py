@@ -1385,13 +1385,34 @@ def test_contract_update_phase_reaches_fake_transaction_and_fresh_handoff(tmp_pa
         json.loads(line)
         for line in (artifact_dir / "fake_gh_config_states.jsonl").read_text(encoding="utf-8").splitlines()
     ]
-    assert operations == [
+    # Issue #2872: since #2299 the production preflight reads Issue / comments /
+    # anchor through native `gh` (the launcher shares GitHub auth), so the fake
+    # gh also records the preflight read operations around the controlled
+    # mutation. The controlled mutation operation sequence itself is unchanged
+    # and still asserted exactly (a single contiguous block, exactly one patch).
+    controlled_mutation = [
         "issue_view",
         "issue_content_read",
         "issue_content_patch",
         "issue_content_read",
         "issue_view",
     ]
+    preflight_read_operations = {"issue_view", "issue_comments_read", "issue_comment_read"}
+    patch_index = operations.index("issue_content_patch")
+    mutation_start = patch_index - 2
+    assert operations.count("issue_content_patch") == 1, operations
+    assert operations[mutation_start : mutation_start + len(controlled_mutation)] == controlled_mutation, operations
+    before_mutation = operations[:mutation_start]
+    after_mutation = operations[mutation_start + len(controlled_mutation) :]
+    # The initial and the fresh (post-mutation) preflight both read natively
+    # and never perform content reads/patches themselves.
+    assert before_mutation and set(before_mutation) <= preflight_read_operations, before_mutation
+    assert after_mutation and set(after_mutation) <= preflight_read_operations, after_mutation
+    assert "issue_comments_read" in before_mutation and "issue_comment_read" in before_mutation
+    assert "issue_comments_read" in after_mutation or "issue_comment_read" in after_mutation
+    # Every fake-gh invocation (preflight reads + controlled mutation) receives
+    # the test-owned config-only GH_CONFIG_DIR: the production preflight child
+    # now carries it (Issue #2872 AC2).
     assert config_states == ["expected_path"] * len(operations)
     result = json.loads((artifact_dir / "refinement_preflight_result_v1.json").read_text())
     assert result["contract_update"] == {
