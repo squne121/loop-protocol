@@ -2164,6 +2164,100 @@ def test_g2_g3_per_run_side_summary_and_runtime_wrapper_diagnostics_are_sanitize
     assert _run_diagnostics(detail) == []
 
 
+def test_h1_h3_body_file_path_kind_fake_edit_calls_and_worker_result_facts_are_sanitized(tmp_path):
+    """GIVEN worker が update_pr.py を異なる --body-file (fixture 相対 / worktree 絶対 / 別 path / tmp / なし) で
+         複数回呼び、fake gh が fixture と一致しない body の pr edit を受けた stream
+    WHEN sanitized evidence を作る
+    THEN body_file_path_kind は allowlist 値だけで path 文字列は漏れず、複数呼び出しが保持される。fake_edit_calls は
+         body が fixture と一致したかだけ、worker 結果は E_* code と binding の 4 boolean だけを出す
+    """
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    shim_dir = tmp_path.resolve()
+    rel = canary.CANONICAL_WORKFLOW_FIXTURE_BODY_RELPATH
+    base = "uv run --locked python3 .claude/skills/open-pr/scripts/update_pr.py --pr-number 2147483647"
+    commands = {
+        "fixture_relpath": f"{base} --body-file {rel}",
+        "fixture_abspath_in_worktree": f"cd {worktree} && {base} --body-file '{worktree / rel}'",
+        "fixture_relpath ": f"{base} --body-file=./{rel}",
+        "other_relative": f"{base} --body-file notes/my-own-body.md",
+        "other_absolute": f"{base} --body-file /home/someone/private/body.md",
+        "tmp": f"{base} --body-file /tmp/worker-made-body.md",
+        "none": base,
+    }
+    events = _base_events()
+    # 既定の toolu_bash (update_pr.py) を除き、上記の command を順に実行する。
+    events = [e for e in events if "toolu_bash" not in json.dumps(e)]
+    insert_at = 1
+    for index, command in enumerate(commands.values()):
+        call_id = f"toolu_up{index}"
+        events.insert(insert_at, _tool_use_event(call_id, "Bash", {"command": command}, parent="toolu_agent"))
+        events.insert(insert_at + 1, _tool_result_event(call_id, "UPDATED=true"))
+        insert_at += 2
+    worker_text = (
+        "IMPLEMENTATION_WORKER_RESULT_V2:\n  status: failed\n  mode: update_pr_body_hygiene\n  pr_number: 2147483647\n"
+        "  wrapper_used: true\n  errors:\n    - E_PR_BODY_JAPANESE_VALIDATION_FAILED /home/u/secret free text\n"
+    )
+    events = [e for e in events if e.get("type") != "assistant" or "toolu_handback" not in json.dumps(e)]
+    events.insert(
+        insert_at, _tool_use_event("toolu_handback", "SubagentHandback", {"message": worker_text}, parent="toolu_agent")
+    )
+    fixture_sha = canary._sha256_text(canary.CANONICAL_WORKFLOW_FIXTURE_BODY)
+    records = [
+        {"resolved_path": str(shim_dir / "gh"), "argv": ["pr", "edit", "2147483647", "--repo", canary.TRUSTED_REPO,
+                                                         "--body-file", "/tmp/x"], "handled": True,
+         "body_sha256": "0" * 64},
+        {"resolved_path": str(shim_dir / "gh"), "argv": ["pr", "edit", "2147483647"], "handled": False},
+        {"resolved_path": str(shim_dir / "gh"), "argv": ["pr", "edit", "2147483647"], "handled": True,
+         "body_sha256": fixture_sha},
+    ]
+    evidence = canary.analyze_canonical_workflow_stream(_stream_of(events), records, shim_dir, worktree)
+
+    calls = evidence["update_pr_calls"]
+    assert [c["body_file_path_kind"] for c in calls] == [
+        "fixture_relpath", "fixture_abspath_in_worktree", "fixture_relpath", "other_relative", "other_absolute",
+        "tmp", "none",
+    ]
+    assert [c["body_file_is_fixture_path"] for c in calls] == [True, True, True, False, False, False, None]
+    assert all(c["outcome"] == "ok" and c["updated"] is True for c in calls)
+    serialized = json.dumps(evidence["update_pr_calls"])
+    for leaked in ("my-own-body", "someone", "worker-made-body", str(worktree), rel, "notes/"):
+        assert leaked not in serialized, leaked
+    # worktree を渡さない場合、絶対 path は fixture と断定しない。
+    no_worktree = canary.analyze_canonical_workflow_stream(_stream_of(events), records, shim_dir)
+    unresolved = no_worktree["update_pr_calls"][1]
+    assert unresolved["body_file_path_kind"] in ("other_absolute", "tmp")  # tmp_path は /tmp 配下
+    assert unresolved["body_file_is_fixture_path"] is False
+
+    assert evidence["fake_edit_calls"] == [
+        {"handled": True, "body_matches_fixture": False},
+        {"handled": False, "body_matches_fixture": False},
+        {"handled": True, "body_matches_fixture": True},
+    ]
+    assert evidence["fixture_update_confirmed"] is True  # 既存の意味は不変 (handled な fixture 一致 edit が 1 件以上)
+    assert evidence["worker_result_error_codes"] == ["E_PR_BODY_JAPANESE_VALIDATION_FAILED"]
+    assert evidence["worker_result_binding_facts"] == {
+        "status_ok": False, "mode_matches": True, "pr_number_matches": True, "wrapper_used_true": True,
+    }
+    assert "/home/u/secret" not in json.dumps(evidence) and "free text" not in json.dumps(evidence)
+    many = [{"resolved_path": str(shim_dir / "gh"), "argv": ["pr", "edit", "1"], "handled": False}] * 12
+    assert len(canary.analyze_canonical_workflow_stream("", many, shim_dir)["fake_edit_calls"]) == 8
+    # worker 結果なし: binding の 4 boolean は全て False、error code は空。
+    empty = canary.analyze_canonical_workflow_stream("", [], None)
+    assert empty["worker_result_binding_facts"] == {
+        "status_ok": False, "mode_matches": False, "pr_number_matches": False, "wrapper_used_true": False,
+    }
+    assert empty["worker_result_error_codes"] == [] and empty["fake_edit_calls"] == []
+
+    # H4: side summary と runtime wrapper の allowlist に per-run で含まれる。
+    summary = canary._side_run_summary(evidence, None)
+    for key in ("fake_edit_calls", "worker_result_error_codes", "worker_result_binding_facts"):
+        assert key in _RUN_DIAGNOSTIC_SIDE_KEYS and summary[key] == evidence[key], key
+    diag = _run_diagnostics({"observation_run_outcomes": [{"run_index": 1, "current_side": summary}]})
+    assert diag[0]["current"]["update_pr_calls"][1]["body_file_path_kind"] == "fixture_abspath_in_worktree"
+    assert diag[0]["current"]["worker_result_binding_facts"]["status_ok"] is False
+
+
 def test_g5_fake_gh_serves_pr_and_issue_facts_beyond_the_minimum_and_keeps_unknown_fail_closed(tmp_path):
     """GIVEN canonical route / worker が PR の事実確認に使いうる gh pr view --json field
     WHEN fake gh へ問い合わせる
@@ -2217,7 +2311,8 @@ _EXIT_SKIP_UNAVAILABLE = 77
 _RUN_DIAGNOSTIC_SIDE_KEYS = (
     "launcher_exit_code", "timed_out", "parent_agent_delegation_observed", "target_worker_lineage_observed",
     "wrapper_reached", "worker_result_status", "worker_result_reason_code", "classifier_denial_surfaces",
-    "fake_gh_undefined_argv_count", "fake_gh_undefined_argv_shapes", "update_pr_calls", "chain_stop_reason",
+    "fake_gh_undefined_argv_count", "fake_gh_undefined_argv_shapes", "update_pr_calls", "fake_edit_calls",
+    "fixture_update_confirmed", "worker_result_error_codes", "worker_result_binding_facts", "chain_stop_reason",
     "unavailable_reason",
 )
 

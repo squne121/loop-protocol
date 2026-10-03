@@ -1868,8 +1868,47 @@ def _target_denial_surface(
     return None
 
 
+def _update_pr_body_file_arg(command: str) -> str | None:
+    """`update_pr.py` を実行している shell segment の `--body-file` 引数 (値)。無ければ None。"""
+    for segment in _SHELL_SEGMENT_SPLIT_RE.split(command):
+        if not _command_invokes_update_pr(segment):
+            continue
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            tokens = segment.split()
+        for index, token in enumerate(tokens):
+            if token == "--body-file" and index + 1 < len(tokens):
+                return tokens[index + 1]
+            if token.startswith("--body-file="):
+                return token.partition("=")[2]
+    return None
+
+
+def _body_file_path_kind(value: str | None, worktree: Path | None) -> str:
+    """`--body-file` 引数の path 種別 (allowlist)。path の文字列そのものは evidence に載せない。
+    `fixture_relpath` | `fixture_abspath_in_worktree` | `other_relative` | `other_absolute` | `tmp` | `none`。"""
+    if not value:
+        return "none"
+    if not value.startswith(("/", "~")):
+        normalized = os.path.normpath(value)
+        return "fixture_relpath" if normalized == os.path.normpath(CANONICAL_WORKFLOW_FIXTURE_BODY_RELPATH) else (
+            "other_relative"
+        )
+    if worktree is not None:
+        normalized = os.path.normpath(value)
+        for root in {str(worktree), str(worktree.resolve())}:
+            if normalized == os.path.normpath(os.path.join(root, CANONICAL_WORKFLOW_FIXTURE_BODY_RELPATH)):
+                return "fixture_abspath_in_worktree"
+    normalized = os.path.normpath(value)
+    tmp_roots = {"/tmp", "/var/tmp", tempfile.gettempdir()}
+    if any(normalized == root or normalized.startswith(root.rstrip("/") + "/") for root in tmp_roots):
+        return "tmp"
+    return "other_absolute"
+
+
 def analyze_canonical_workflow_stream(
-    stdout: str, fake_records: list[dict], shim_dir: Path | None
+    stdout: str, fake_records: list[dict], shim_dir: Path | None, worktree: Path | None = None
 ) -> dict:
     """AC4 の因果連鎖を structured event と fake gh 記録から機械的に判定する。raw output は
     メモリ内でのみ検査し、返り値は boolean / digest / 数値のみ。"""
@@ -2013,6 +2052,23 @@ def analyze_canonical_workflow_stream(
         and worker_result.get("pr_number") == CANONICAL_WORKFLOW_FIXTURE_PR_NUMBER
         and worker_result.get("wrapper_used") is True
     )
+    worker_result_binding_facts = {
+        "status_ok": worker_result.get("status") == "ok",
+        "mode_matches": worker_result.get("mode") == CANONICAL_WORKFLOW_WORKER_MODE,
+        "pr_number_matches": worker_result.get("pr_number") == CANONICAL_WORKFLOW_FIXTURE_PR_NUMBER,
+        "wrapper_used_true": worker_result.get("wrapper_used") is True,
+    }
+    # worker 結果本文 (marker 以降) の `E_*` error code だけ (自由文は載せない)。
+    worker_result_error_codes = sorted(
+        {
+            code
+            for source_text in result_sources
+            if "IMPLEMENTATION_WORKER_RESULT_V2" in source_text
+            for code in _UPDATE_PR_ERROR_CODE_RE.findall(
+                source_text[source_text.find("IMPLEMENTATION_WORKER_RESULT_V2"):]
+            )
+        }
+    )[:4]
     parent_terminal_completion = bool(
         child_result_index is not None
         and any(
@@ -2096,9 +2152,28 @@ def analyze_canonical_workflow_stream(
 
     update_pr_result: dict = {"invoked": update_pr_invoked, "outcome": None, "updated": False, "error_codes": []}
     # child lineage の update_pr.py 呼び出しごとの結果 (最後の 1 件だけでは再試行の失敗原因が残らない)。
-    update_pr_calls = [_update_pr_call(node) for node in update_pr_nodes[:8]]
+    def _update_pr_call_with_body_file(node: dict) -> dict:
+        kind = _body_file_path_kind(_update_pr_body_file_arg(str(node["input"].get("command", ""))), worktree)
+        return {
+            **_update_pr_call(node),
+            "body_file_is_fixture_path": (
+                None if kind == "none" else kind in ("fixture_relpath", "fixture_abspath_in_worktree")
+            ),
+            "body_file_path_kind": kind,
+        }
+
+    update_pr_calls = [_update_pr_call_with_body_file(node) for node in update_pr_nodes[:8]]
     if update_pr_nodes:
         update_pr_result.update(_update_pr_call(update_pr_nodes[-1]))
+    fixture_body_sha = _sha256_text(CANONICAL_WORKFLOW_FIXTURE_BODY)
+    fake_edit_calls = [
+        {
+            "handled": record.get("handled") is True,
+            "body_matches_fixture": record.get("body_sha256") == fixture_body_sha,
+        }
+        for record in fake_records
+        if isinstance(record.get("argv"), list) and record["argv"][:2] == ["pr", "edit"]
+    ][:8]
     fake_undefined_count = sum(1 for record in fake_records if record.get("handled") is not True)
 
     if not delegation_observed:
@@ -2172,6 +2247,9 @@ def analyze_canonical_workflow_stream(
             if record.get("handled") is not True
         ][:8],
         "update_pr_calls": update_pr_calls,
+        "fake_edit_calls": fake_edit_calls,
+        "worker_result_error_codes": worker_result_error_codes,
+        "worker_result_binding_facts": worker_result_binding_facts,
         "fake_gh_calls": [
             {
                 "argv_head": [str(item) for item in record.get("argv", [])[:3]],
@@ -2493,7 +2571,9 @@ def _run_canonical_workflow_side(
         except OSError:
             return {}, "claude_gpt_auto_runtime_unavailable"
 
-        evidence = analyze_canonical_workflow_stream(stdout, _read_fake_gh_records(log_path), shim_dir)
+        evidence = analyze_canonical_workflow_stream(
+            stdout, _read_fake_gh_records(log_path), shim_dir, worktree
+        )
         outcome = classify_canonical_workflow_side(evidence, launcher_exit_code=launcher_exit, timed_out=timed_out)
         detail = {
             "side_outcome": outcome,
@@ -2585,6 +2665,10 @@ def _side_run_summary(side: dict | None, unavailable_reason: str | None) -> dict
         "worker_result_reason_code": side.get("worker_result_reason_code"),
         "fake_gh_undefined_argv_shapes": side.get("fake_gh_undefined_argv_shapes"),
         "update_pr_calls": side.get("update_pr_calls"),
+        "fake_edit_calls": side.get("fake_edit_calls"),
+        "fixture_update_confirmed": side.get("fixture_update_confirmed"),
+        "worker_result_error_codes": side.get("worker_result_error_codes"),
+        "worker_result_binding_facts": side.get("worker_result_binding_facts"),
         # target worker lineage に束縛済みの classifier denial surface。
         "classifier_denial_surfaces": sorted(side.get("classifier_denial_surfaces") or []),
         "nontarget_classifier_denial_count": side.get("nontarget_classifier_denial_count"),
