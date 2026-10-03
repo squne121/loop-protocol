@@ -9,6 +9,8 @@ import types
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[4]
 SCRIPT = ROOT / ".claude/skills/impl-review-loop/scripts/implementation_landed_evidence.py"
 spec = importlib.util.spec_from_file_location("implementation_landed_evidence", SCRIPT)
@@ -1819,3 +1821,346 @@ def test_parse_marker_unparsable_marker_fence_is_invalid_not_missing():
         result, errors = mod._parse_marker(body, issue_number=issue_number)
         assert result is None
         assert errors == invalid
+
+
+# ---------------------------------------------------------------------------
+# #2893: historical merged later_scope_expansion carve-out. A merged,
+# main-reachable `verified_cross_reference` candidate whose own valid
+# same-Issue marker records `later_scope_expansion` stops counting as a
+# conflict against a unique fresh exact open/draft candidate -- and nothing
+# else changes.
+# ---------------------------------------------------------------------------
+
+_HISTORICAL_MERGED_BODY = "## Allowed Paths\n- `.claude/a.py`\n"
+_EXPANDED_LIVE_BODY = "## Allowed Paths\n- `.claude/a.py`\n- `.claude/b.py`\n"
+
+
+def _real_marker_coverage(*, merged_body: str, live_body: str, marker_issue: int = ISSUE):
+    """Candidate-local coverage produced by the production marker path
+    (`build_scope_coverage_marker()` / `render_scope_coverage_marker()` ->
+    `coverage_from_pr_body()`), never a hand-built status dict."""
+    marker = mod.render_scope_coverage_marker(
+        mod.build_scope_coverage_marker(issue_number=marker_issue, issue_body=merged_body, pr_head_sha=SHA)
+    )
+    return mod.coverage_from_pr_body(pr_body=marker, issue_number=ISSUE, live_issue_body=live_body)
+
+
+def _historical_coverage():
+    return _real_marker_coverage(merged_body=_HISTORICAL_MERGED_BODY, live_body=_EXPANDED_LIVE_BODY)
+
+
+def _current_exact_coverage():
+    return _real_marker_coverage(merged_body=_EXPANDED_LIVE_BODY, live_body=_EXPANDED_LIVE_BODY)
+
+
+def _historical_merged(**overrides):
+    kwargs = {
+        "lifecycle": "merged",
+        "provenance": "verified_cross_reference",
+        "pr_number": 2851,
+        "scope_coverage": _historical_coverage(),
+    }
+    kwargs.update(overrides)
+    return _candidate(**kwargs)
+
+
+def _current_exact(**overrides):
+    kwargs = {
+        "lifecycle": "draft",
+        "provenance": "verified_cross_reference",
+        "pr_number": 2888,
+        "ownership": False,
+        "scope_coverage": _current_exact_coverage(),
+    }
+    kwargs.update(overrides)
+    return _candidate(**kwargs)
+
+
+def _disposition(candidates, **evidence_kwargs):
+    return mod.derive_landing_disposition(
+        _evidence(candidates=candidates, **evidence_kwargs), repo=REPO, issue_number=ISSUE
+    )
+
+
+def test_ac1_historical_merged_later_scope_expansion_with_unique_current_exact_resumes():
+    """GIVEN the #2851/#2888 shape (no closing relation; merged
+    `later_scope_expansion` + one fresh exact draft) WHEN routed THEN the
+    draft is the `existing_pr_resume` authority, not a false conflict."""
+    assert _historical_coverage()["status"] == "later_scope_expansion"
+    assert _current_exact_coverage()["status"] == "covered_exactly"
+    for order in ((_historical_merged(), _current_exact()), (_current_exact(), _historical_merged())):
+        result = _disposition(list(order))
+        assert result["disposition"] == "existing_pr_resume"
+        assert result["reason_codes"] == []
+        assert result["candidate"]["pr"]["number"] == 2888
+    # `open` current candidates are equivalent to `draft`.
+    open_result = _disposition([_historical_merged(), _current_exact(lifecycle="open")])
+    assert open_result["disposition"] == "existing_pr_resume"
+    assert open_result["candidate"]["lifecycle"] == "open"
+
+
+def test_ac2_historical_candidate_is_retained_in_evidence():
+    """GIVEN the same shape WHEN routed THEN the historical candidate stays in
+    `evidence["candidates"]` untouched (only conflict counting changes)."""
+    evidence = _evidence(candidates=[_historical_merged(), _current_exact()])
+    before = json.dumps(evidence, sort_keys=True)
+    result = mod.derive_landing_disposition(evidence, repo=REPO, issue_number=ISSUE)
+    assert result["disposition"] == "existing_pr_resume"
+    assert result["candidate"]["pr"]["number"] == 2888
+    assert json.dumps(evidence, sort_keys=True) == before
+    assert [c["pr"]["number"] for c in evidence["candidates"]] == [2851, 2888]
+    retained = evidence["candidates"][0]
+    assert retained["lifecycle"] == "merged"
+    assert retained["scope_coverage"]["status"] == "later_scope_expansion"
+    assert "qualified_candidate_conflict" not in result["reason_codes"]
+
+
+def test_ac3_two_current_exact_candidates_keep_conflict():
+    """GIVEN a historical merged candidate and two current exact open/draft
+    candidates WHEN routed THEN the conflict is preserved."""
+    for second in ({"lifecycle": "draft"}, {"lifecycle": "open"}):
+        result = _disposition(
+            [_historical_merged(), _current_exact(pr_number=2888), _current_exact(pr_number=2890, **second)]
+        )
+        assert result["disposition"] == "reconciliation_required"
+        assert result["reason_codes"] == ["qualified_candidate_conflict"]
+        assert result["candidate"] is None
+    # Without the historical candidate the two current candidates conflict too.
+    bare = _disposition([_current_exact(pr_number=2888), _current_exact(pr_number=2890)])
+    assert bare["reason_codes"] == ["qualified_candidate_conflict"]
+
+
+def _ac4_merged_exact_current_plus_draft():
+    exact_merged = _historical_merged(scope_coverage=_current_exact_coverage())
+    return _evidence(candidates=[exact_merged, _current_exact()]), "qualified_candidate_conflict"
+
+
+def _ac4_malformed_marker():
+    malformed = {"status": "invalid", "errors": ["scope_coverage_manifest_digest_mismatch"]}
+    return (
+        _evidence(candidates=[_historical_merged(scope_coverage=malformed), _current_exact()]),
+        "qualified_candidate_conflict",
+    )
+
+
+def _ac4_marker_attached_with_other_issue_identity():
+    other_issue = _historical_coverage()
+    other_issue["marker"] = dict(other_issue["marker"], issue_number=ISSUE + 1)
+    return (
+        _evidence(candidates=[_historical_merged(scope_coverage=other_issue), _current_exact()]),
+        "qualified_candidate_conflict",
+    )
+
+
+def _ac4_candidate_target_identity_mismatch():
+    merged = _historical_merged()
+    merged["target"] = {"repo": REPO, "issue_number": ISSUE + 1}
+    return _evidence(candidates=[merged, _current_exact()]), "candidate[0]:candidate_target_identity_mismatch"
+
+
+def _ac4_stale_evidence():
+    return (
+        _evidence(candidates=[_historical_merged(), _current_exact()], freshness="stale"),
+        "evidence_stale_or_missing_freshness",
+    )
+
+
+def _ac4_stale_current_head():
+    return (
+        _evidence(candidates=[_historical_merged(), _current_exact(fresh=False)]),
+        "qualified_candidate_conflict",
+    )
+
+
+def _ac4_not_main_reachable():
+    return (
+        _evidence(candidates=[_historical_merged(ancestry=False), _current_exact()]),
+        "candidate[0]:merged_candidate_main_ancestry_unverified",
+    )
+
+
+def _ac4_verified_but_unreachable_from_main():
+    merged = _historical_merged()
+    merged["main_ancestry"] = {"verified": True, "reachable": False}
+    return _evidence(candidates=[merged, _current_exact()]), "qualified_candidate_conflict"
+
+
+def _ac4_markerless_merged():
+    markerless = {"status": "missing_marker", "errors": ["scope_coverage_marker_missing"]}
+    return (
+        _evidence(candidates=[_historical_merged(scope_coverage=markerless), _current_exact()]),
+        "qualified_candidate_conflict",
+    )
+
+
+def _ac4_current_candidate_not_exact():
+    return (
+        _evidence(candidates=[_historical_merged(), _current_exact(scope_coverage=_historical_coverage())]),
+        "qualified_candidate_conflict",
+    )
+
+
+def _ac4_current_candidate_other_issue_marker():
+    other_issue = _current_exact_coverage()
+    other_issue["marker"] = dict(other_issue["marker"], issue_number=ISSUE + 1)
+    return (
+        _evidence(candidates=[_historical_merged(), _current_exact(scope_coverage=other_issue)]),
+        "qualified_candidate_conflict",
+    )
+
+
+def _ac4_extra_closed_unmerged_candidate():
+    return (
+        _evidence(
+            candidates=[
+                _historical_merged(),
+                _current_exact(),
+                _candidate(lifecycle="closed_unmerged", provenance="verified_cross_reference", pr_number=2700),
+            ]
+        ),
+        "qualified_candidate_conflict",
+    )
+
+
+def _ac4_contradictory_evidence():
+    return (
+        _evidence(candidates=[_historical_merged(), _current_exact()], contradictory=True),
+        "evidence_contradictory",
+    )
+
+
+@pytest.mark.parametrize(
+    "build_case",
+    [
+        _ac4_merged_exact_current_plus_draft,
+        _ac4_malformed_marker,
+        _ac4_marker_attached_with_other_issue_identity,
+        _ac4_candidate_target_identity_mismatch,
+        _ac4_stale_evidence,
+        _ac4_stale_current_head,
+        _ac4_not_main_reachable,
+        _ac4_verified_but_unreachable_from_main,
+        _ac4_markerless_merged,
+        _ac4_current_candidate_not_exact,
+        _ac4_current_candidate_other_issue_marker,
+        _ac4_extra_closed_unmerged_candidate,
+        _ac4_contradictory_evidence,
+    ],
+)
+def test_ac4_non_historical_merged_states_keep_fail_closed(build_case):
+    """GIVEN a merged candidate that is exact-current / malformed / identity
+    mismatched / stale / not main-reachable / markerless (or an unsafe current
+    candidate) WHEN routed THEN the carve-out does not apply and the existing
+    fail-closed semantics hold."""
+    evidence, expected_reason = build_case()
+    result = mod.derive_landing_disposition(evidence, repo=REPO, issue_number=ISSUE)
+    assert result["disposition"] == "reconciliation_required"
+    assert expected_reason in result["reason_codes"]
+    assert result["disposition"] != "existing_pr_resume"
+
+
+def test_ac5_closing_relation_precedence_is_unchanged():
+    """GIVEN a `closing_relation` candidate WHEN routed THEN the structured
+    closing authority keeps its existing precedence and the new carve-out is
+    never applied (not even to a historical-shaped cross-reference)."""
+    # Closing merged candidate recording later_scope_expansion wins over the
+    # cross-reference draft: legacy/later-scope -> ordinary dispatch. If the
+    # carve-out leaked into the closing branch this would become a resume.
+    closing_merged = _historical_merged(provenance="closing_relation", pr_number=2851)
+    result = _disposition([closing_merged, _current_exact()])
+    assert result["disposition"] == "ordinary_dispatch_or_explicit_recovery"
+    assert result["reason_codes"] == ["legacy_or_later_scope_expansion"]
+    assert result["candidate"]["pr"]["number"] == 2851
+
+    # A closing open candidate alongside the historical cross-reference is the
+    # sole authority (existing precedence, historical candidate not consulted).
+    closing_open = _current_exact(provenance="closing_relation", pr_number=2900)
+    assert _disposition([_historical_merged(), closing_open])["candidate"]["pr"]["number"] == 2900
+
+    # Two closing candidates keep the same-authority conflict even when one is
+    # historical-shaped.
+    closing_historical = _historical_merged(provenance="closing_relation")
+    conflict = _disposition([closing_historical, _current_exact(provenance="closing_relation", pr_number=2900)])
+    assert conflict["disposition"] == "reconciliation_required"
+    assert conflict["reason_codes"] == ["qualified_candidate_conflict"]
+
+
+def test_ac6_existing_carveouts_and_legacy_behavior_are_unchanged():
+    """GIVEN pre-#2893 shapes WHEN routed THEN dispositions are unchanged:
+    #2750 sibling carve-out, markerless legacy, closed-unmerged,
+    implementation_already_landed and already_satisfied precedence."""
+    # #2750: irrelevant siblings are excluded, a valid draft still resumes.
+    sibling = _candidate(
+        lifecycle="merged",
+        provenance="verified_cross_reference",
+        pr_number=2735,
+        scope_coverage=_sibling_identity_mismatch_coverage(other_issue_number=2725),
+    )
+    sibling_only = _disposition([sibling])
+    assert sibling_only["reason_codes"] == ["no_qualified_candidate"]
+    sibling_plus_draft = _disposition([sibling, _current_exact()])
+    assert sibling_plus_draft["disposition"] == "existing_pr_resume"
+    assert sibling_plus_draft["candidate"]["pr"]["number"] == 2888
+
+    # Markerless legacy merged: ordinary dispatch; with an extra open
+    # candidate the pre-existing conflict is retained (not a historical carve-out).
+    legacy = _candidate(lifecycle="merged", provenance="verified_cross_reference", pr_number=2137)
+    legacy_result = _disposition(
+        [legacy], coverage=mod.coverage_from_pr_body(pr_body="", issue_number=ISSUE, live_issue_body="x")
+    )
+    assert legacy_result["reason_codes"] == ["legacy_or_later_scope_expansion"]
+    legacy_conflict = _disposition(
+        [legacy, _candidate(lifecycle="open", provenance="verified_cross_reference", pr_number=2888)]
+    )
+    assert legacy_conflict["reason_codes"] == ["qualified_candidate_conflict"]
+
+    # Closed-unmerged alone stays ordinary dispatch.
+    closed = _disposition([_candidate(lifecycle="closed_unmerged", provenance="verified_cross_reference")])
+    assert closed["reason_codes"] == ["closed_unmerged_candidate"]
+
+    # A lone historical merged candidate (no current exact candidate) keeps the
+    # existing state-specific meaning.
+    lone = _disposition([_historical_merged()])
+    assert lone["disposition"] == "ordinary_dispatch_or_explicit_recovery"
+    assert lone["reason_codes"] == ["legacy_or_later_scope_expansion"]
+
+    # implementation_already_landed: merged exact-current alone.
+    landed = _disposition([_historical_merged(scope_coverage=_current_exact_coverage())])
+    assert landed["disposition"] == "implementation_already_landed"
+
+    # already_satisfied precedence still composes over no-authority results
+    # (no candidate / closed-unmerged) and never overrides a legacy merged
+    # candidate's `legacy_or_later_scope_expansion` result.
+    for no_authority in (_disposition([]), closed):
+        composed = mod.apply_already_satisfied_precedence(
+            no_authority,
+            next_action_route="proceed_to_step_1",
+            product_spec_routing_action="continue",
+            pr_exists=False,
+            base_ac_satisfied=True,
+            route_loop_verdict_v2_module=route_mod,
+        )
+        assert composed["disposition"] == "already_satisfied"
+    assert (
+        mod.apply_already_satisfied_precedence(
+            lone,
+            next_action_route="proceed_to_step_1",
+            product_spec_routing_action="continue",
+            pr_exists=False,
+            base_ac_satisfied=True,
+            route_loop_verdict_v2_module=route_mod,
+        )
+        == lone
+    )
+    resumed = _disposition([_historical_merged(), _current_exact()])
+    assert (
+        mod.apply_already_satisfied_precedence(
+            resumed,
+            next_action_route="proceed_to_step_1",
+            product_spec_routing_action="continue",
+            pr_exists=True,
+            base_ac_satisfied=True,
+            route_loop_verdict_v2_module=route_mod,
+        )
+        == resumed
+    )

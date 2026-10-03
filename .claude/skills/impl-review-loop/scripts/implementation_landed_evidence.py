@@ -362,6 +362,105 @@ def _is_irrelevant_cross_reference(candidate: Mapping[str, Any]) -> bool:
     return list(coverage.get("errors") or []) == ["scope_coverage_issue_identity_mismatch"]
 
 
+def _has_valid_same_issue_scope_coverage(candidate: Mapping[str, Any], issue_number: int) -> bool:
+    """Candidate-local scope coverage derived from a valid same-Issue marker.
+
+    Reads only `candidate["scope_coverage"]` (never the evidence-level
+    fallback of `_coverage_for()`), so the decision can never be satisfied by
+    an unrelated global coverage. A valid coverage has a coverage status
+    (`covered_exactly` / `later_scope_expansion`, i.e. neither `invalid` nor
+    `missing_marker`), no errors, and -- when the parsed marker is attached --
+    a marker that names the current target Issue.
+    """
+    coverage = candidate.get("scope_coverage")
+    if not isinstance(coverage, Mapping):
+        return False
+    if coverage.get("status") not in {"covered_exactly", "later_scope_expansion"} or coverage.get("errors"):
+        return False
+    if "marker" in coverage:
+        marker = coverage["marker"]
+        return isinstance(marker, Mapping) and marker.get("issue_number") == issue_number
+    return True
+
+
+def _is_historical_merged_later_scope_candidate(candidate: Mapping[str, Any], issue_number: int) -> bool:
+    """True only for a main-reachable merged candidate whose own valid
+    same-Issue marker records `later_scope_expansion` (and not exact coverage)."""
+    if (
+        candidate.get("provenance", {}).get("kind") != "verified_cross_reference"
+        or candidate.get("lifecycle") != "merged"
+    ):
+        return False
+    if not _has_valid_same_issue_scope_coverage(candidate, issue_number):
+        return False
+    ancestry = candidate.get("main_ancestry")
+    if (
+        not isinstance(ancestry, Mapping)
+        or ancestry.get("verified") is not True
+        or ancestry.get("reachable") is not True
+    ):
+        return False
+    coverage = candidate["scope_coverage"]
+    return coverage.get("later_scope_expansion") is True and coverage.get("exact_coverage") is not True
+
+
+def _is_current_exact_resume_candidate(candidate: Mapping[str, Any], issue_number: int) -> bool:
+    """True only for a fresh open/draft candidate whose own valid same-Issue
+    marker exactly covers the current scope."""
+    return (
+        candidate.get("provenance", {}).get("kind") == "verified_cross_reference"
+        and candidate.get("lifecycle") in {"open", "draft"}
+        and candidate.get("head_fresh") is True
+        and _has_valid_same_issue_scope_coverage(candidate, issue_number)
+        and candidate["scope_coverage"].get("exact_coverage") is True
+    )
+
+
+def _exclude_historical_merged_later_scope_expansion(
+    qualified: list[dict[str, Any]], issue_number: int
+) -> list[dict[str, Any]]:
+    """#2893 historical merged later_scope_expansion carve-out.
+
+    A second, bounded exclusion applied (after the #2750 irrelevant-sibling
+    exclusion) to the local `qualified` list used for conflict counting and
+    authority selection, only when no `closing_relation` candidate exists.
+    A merged candidate is a *historical* candidate -- excluded from conflict
+    counting, never from `evidence["candidates"]` (the evidence object is not
+    mutated, so the candidate stays available for debug/audit) -- only when
+    ALL of the following hold:
+
+    - `provenance.kind == verified_cross_reference` and `lifecycle == merged`;
+    - its own candidate-local `scope_coverage` is valid (status is not
+      `invalid`/`missing_marker`, no errors) and carries a valid marker for
+      the same target Issue;
+    - `main_ancestry` is verified and reachable from current main;
+    - `scope_coverage.later_scope_expansion is True` and
+      `exact_coverage is not True`;
+
+    AND, after removing every such historical candidate, exactly one
+    qualified candidate remains and it is a current exact resume candidate:
+    lifecycle `open`/`draft`, `verified_cross_reference`, `head_fresh is
+    True`, a valid same-Issue marker, and `exact_coverage is True`.
+
+    Non-change conditions (the list is returned untouched, i.e. existing
+    fail-closed semantics): two or more current exact open/draft candidates
+    (`qualified_candidate_conflict` stays); any other remaining candidate
+    (e.g. closed-unmerged); a merged candidate that is exact-current,
+    malformed/invalid, stale, identity-mismatched, markerless, or not
+    main-reachable; a non-exact or stale open/draft candidate. This helper
+    is never reached when a `closing_relation` candidate exists, adds no
+    schema/registry/flag/override, and the surviving candidate still goes
+    through the existing single-candidate open/draft path.
+    """
+    historical = [c for c in qualified if _is_historical_merged_later_scope_candidate(c, issue_number)]
+    if not historical:
+        return qualified
+    remaining = [c for c in qualified if not any(c is h for h in historical)]
+    if len(remaining) == 1 and _is_current_exact_resume_candidate(remaining[0], issue_number):
+        return remaining
+    return qualified
+
+
 def derive_landing_disposition(
     raw: Any, *, repo: str, issue_number: int, now: dt.datetime | None = None
 ) -> dict[str, Any]:
@@ -387,6 +486,11 @@ def derive_landing_disposition(
         # qualified lifecycle: merged/open/draft/closed_unmerged) is what
         # prevents #2727-shaped false `qualified_candidate_conflict` stops.
         qualified = [c for c in qualified if not _is_irrelevant_cross_reference(c)]
+        # #2893 historical merged later_scope_expansion carve-out: a second
+        # bounded exclusion, same no-closing-candidate precondition (see
+        # `_exclude_historical_merged_later_scope_expansion()`). It only
+        # narrows this local list; `evidence["candidates"]` is untouched.
+        qualified = _exclude_historical_merged_later_scope_expansion(qualified, issue_number)
     if len(qualified) > 1:
         return {
             "disposition": "reconciliation_required",

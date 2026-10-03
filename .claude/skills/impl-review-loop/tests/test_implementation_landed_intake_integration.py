@@ -710,3 +710,196 @@ def test_collect_candidate_inputs_production_shaped_2727_sibling_cross_reference
         "start_data_plane": False,
         "action": "suppress_worker_worktree_new_pr",
     }
+
+
+# ---------------------------------------------------------------------------
+# #2893: historical merged `later_scope_expansion` candidate (PR #2851) vs a
+# unique current exact draft candidate (PR #2888) for target Issue #2843 --
+# the real incident shape, driven through the production producer/intake
+# path with a fake `gh` transport only (no producer decision logic is
+# re-implemented here).
+# ---------------------------------------------------------------------------
+
+_INCIDENT_REPO = "squne121/loop-protocol"
+_INCIDENT_ISSUE = 2843
+_INCIDENT_EARLIER_BODY = "## Allowed Paths\n- `.claude/skills/a.py`\n"
+_INCIDENT_LIVE_BODY = "## Allowed Paths\n- `.claude/skills/a.py`\n- `.claude/skills/b.py`\n"
+_INCIDENT_MERGE_OID = "a" * 40
+_INCIDENT_DRAFT_HEAD = "b" * 40
+
+
+def _incident_markers(landed_evidence) -> tuple[str, str]:
+    """Genuine durable markers produced by the production marker builder:
+    PR #2851 recorded the earlier scope, PR #2888 the current (expanded)
+    scope -- both name the target Issue #2843."""
+    merged_marker = landed_evidence.render_scope_coverage_marker(
+        landed_evidence.build_scope_coverage_marker(
+            issue_number=_INCIDENT_ISSUE, issue_body=_INCIDENT_EARLIER_BODY, pr_head_sha=_INCIDENT_MERGE_OID
+        )
+    )
+    draft_marker = landed_evidence.render_scope_coverage_marker(
+        landed_evidence.build_scope_coverage_marker(
+            issue_number=_INCIDENT_ISSUE, issue_body=_INCIDENT_LIVE_BODY, pr_head_sha=_INCIDENT_DRAFT_HEAD
+        )
+    )
+    return merged_marker, draft_marker
+
+
+def _incident_run(landed_evidence, main_sha: str, *, fallback=None, ancestry_calls: list | None = None):
+    """Fake `gh` transport for the #2851 (merged) / #2888 (draft) incident:
+    both are `verified_cross_reference` timeline candidates (no
+    `closingIssuesReferences`, the draft is `Refs #2843`)."""
+    merged_marker, draft_marker = _incident_markers(landed_evidence)
+    repo = _INCIDENT_REPO
+    timeline = [
+        {
+            "event": "cross-referenced",
+            "source": {
+                "issue": {
+                    "number": number,
+                    "pull_request": {"url": f"https://api.github.com/repos/{repo}/pulls/{number}"},
+                    "repository_url": f"https://api.github.com/repos/{repo}",
+                }
+            },
+        }
+        for number in (2851, 2888)
+    ]
+    full = {
+        "2851": {
+            "number": 2851,
+            "url": f"https://github.com/{repo}/pull/2851",
+            "state": "MERGED",
+            "isDraft": False,
+            "mergedAt": "2026-10-01T00:00:00Z",
+            "mergeCommit": {"oid": _INCIDENT_MERGE_OID},
+            "headRefOid": _INCIDENT_MERGE_OID,
+            "closingIssuesReferences": [],
+            "body": merged_marker,
+            "files": [],
+        },
+        "2888": {
+            "number": 2888,
+            "url": f"https://github.com/{repo}/pull/2888",
+            "state": "OPEN",
+            "isDraft": True,
+            "mergedAt": None,
+            "mergeCommit": None,
+            "headRefOid": _INCIDENT_DRAFT_HEAD,
+            "closingIssuesReferences": [],
+            "body": "Refs #2843\n\n" + draft_marker,
+            "files": [],
+        },
+    }
+
+    def run(argv):
+        if argv[:3] == ["gh", "pr", "list"]:
+            return (
+                0,
+                json.dumps([{"number": n, "closingIssuesReferences": []} for n in (2851, 2888)]),
+                "",
+            )
+        if argv[:2] == ["gh", "api"] and "timeline" in argv[-1]:
+            return 0, json.dumps(timeline), ""
+        if argv[:3] == ["gh", "pr", "view"] and argv[3] in full:
+            payload = full[argv[3]]
+            if argv[-1] == _LIVE_CANDIDATE_REFRESH_FIELDS:
+                payload = {
+                    key: payload[key]
+                    for key in ("headRefOid", "mergedAt", "mergeCommit", "body", "closingIssuesReferences")
+                }
+            return 0, json.dumps(payload), ""
+        if argv[:2] == ["gh", "api"] and len(argv) > 2 and "compare" in argv[2]:
+            if ancestry_calls is not None:
+                ancestry_calls.append(argv)
+            return 0, "ahead\n", ""
+        if argv[:3] == ["gh", "issue", "view"] and "body" in argv and argv[argv.index("--json") + 1] == "body":
+            return 0, json.dumps({"body": _INCIDENT_LIVE_BODY}), ""
+        if argv[:2] == ["gh", "api"] and len(argv) > 2 and "commits/main" in argv[2]:
+            return 0, main_sha + "\n", ""
+        if fallback is not None:
+            return fallback(argv)
+        return 1, "", "unexpected argv: " + " ".join(argv)
+
+    return run
+
+
+def test_ac7_incident_shaped_2851_2888_intake_resumes_existing_pr(monkeypatch):
+    """#2893 AC7: GIVEN the production-shaped incident (PR #2851 merged
+    `later_scope_expansion` + PR #2888 draft `covered_exactly`, both
+    `verified_cross_reference`, no closing relation) WHEN the production
+    candidate collection and the canonical intake composition
+    (`build_intake_capsule.py::_collect_implementation_landed_evidence()`)
+    run THEN the draft PR #2888 is the `existing_pr_resume` authority --
+    never `qualified_candidate_conflict` -- and the historical PR #2851 is
+    retained in the candidate evidence."""
+    landed_evidence = _load(LANDED_EVIDENCE, "implementation_landed_evidence_for_2893_integration_test")
+    main_sha = "9" * 40
+    ancestry_calls: list = []
+    run = _incident_run(landed_evidence, main_sha, ancestry_calls=ancestry_calls)
+
+    evidence = landed_evidence.collect_candidate_inputs(
+        repo=_INCIDENT_REPO, issue_number=_INCIDENT_ISSUE, current_scope=_INCIDENT_LIVE_BODY, run_command=run
+    )
+    by_number = {c["pr"]["number"]: c for c in evidence["candidates"]}
+    assert set(by_number) == {2851, 2888}
+    assert by_number[2851]["lifecycle"] == "merged"
+    assert by_number[2851]["scope_coverage"]["status"] == "later_scope_expansion"
+    assert by_number[2851]["main_ancestry"] == {"verified": True, "reachable": True}
+    assert by_number[2888]["lifecycle"] == "draft"
+    assert by_number[2888]["scope_coverage"]["status"] == "covered_exactly"
+    assert {c["provenance"]["kind"] for c in evidence["candidates"]} == {"verified_cross_reference"}
+
+    result = landed_evidence.derive_landing_disposition(evidence, repo=_INCIDENT_REPO, issue_number=_INCIDENT_ISSUE)
+    assert result["disposition"] == "existing_pr_resume"
+    assert result["reason_codes"] == []
+    assert result["candidate"]["pr"]["number"] == 2888
+    # The historical candidate is excluded from conflict counting only.
+    assert [c["pr"]["number"] for c in evidence["candidates"]] == [2851, 2888]
+
+    build_capsule = _load(BUILD_CAPSULE, "build_intake_capsule_for_2893_integration_test")
+    monkeypatch.setattr(build_capsule, "_run_command", run)
+    production_evidence = build_capsule._collect_implementation_landed_evidence(
+        issue_number=_INCIDENT_ISSUE,
+        repo=_INCIDENT_REPO,
+        issue_body=_INCIDENT_LIVE_BODY,
+        command_log=[],
+        next_action_route="proceed_to_step_1",
+    )
+    landing = production_evidence["landing_disposition"]
+    assert landing["reason_codes"] != ["qualified_candidate_conflict"]
+    assert landing["disposition"] == "existing_pr_resume"
+    assert landing["candidate"]["pr"]["number"] == 2888
+    assert production_evidence["pre_step1_data_plane"]["action"] == "resume_existing_pr"
+
+
+def test_ac8_intake_capsule_pre_step1_data_plane_resumes_existing_pr(monkeypatch):
+    """#2893 AC8: GIVEN the incident shape fed through the PUBLIC
+    `build_intake_capsule()` production path (fake transport only) WHEN the
+    capsule is built THEN `pre_step1_data_plane` routes `resume_existing_pr`
+    (not `suppress_worker_worktree_new_pr`) and the selected candidate is the
+    current draft PR #2888."""
+    landed_evidence = _load(LANDED_EVIDENCE, "implementation_landed_evidence_for_2893_capsule_test")
+    build_capsule = _load(BUILD_CAPSULE, "build_intake_capsule_for_2893_capsule_test")
+    main_sha = "9" * 40
+    base_run = _no_candidate_already_satisfied_run(_INCIDENT_LIVE_BODY, main_sha)
+    monkeypatch.setattr(
+        build_capsule,
+        "_run_command",
+        _incident_run(landed_evidence, main_sha, fallback=base_run),
+    )
+
+    capsule, _artifact, exit_code = build_capsule.build_intake_capsule(
+        _INCIDENT_ISSUE,
+        _INCIDENT_REPO,
+        None,
+        include_implementation_landed_evidence=True,
+    )
+
+    assert exit_code == 0
+    landed = capsule["implementation_landed_evidence"]
+    assert landed["landing_disposition"]["disposition"] == "existing_pr_resume"
+    assert landed["landing_disposition"]["reason_codes"] == []
+    assert landed["landing_disposition"]["candidate"]["pr"]["number"] == 2888
+    assert landed["pre_step1_data_plane"]["action"] == "resume_existing_pr"
+    assert landed["pre_step1_data_plane"]["action"] != "suppress_worker_worktree_new_pr"
+    assert set(landed["pre_step1_data_plane"]) == {"start_data_plane", "action"}
