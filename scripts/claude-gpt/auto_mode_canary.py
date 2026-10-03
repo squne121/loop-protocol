@@ -2118,7 +2118,11 @@ def analyze_canonical_workflow_stream(
         target_surface_by_id.get(tool_use_id) == "parent_agent_outbound" for tool_use_id in target_classifier_ids
     )
     any_classifier_denial = bool(denied_ids)
-    delegation_started = delegation_observed and not agent_delegation_classifier_denied
+    # target Agent への denial は kind (classifier / unattributed / hook_block) を問わず「denial なしに開始した」
+    # とは言えない。classifier 以外の denial を allow と数えない (`agent_delegation_classifier_denied` の意味は
+    # classifier のみのまま)。target 外の denial は影響させない。
+    target_agent_denied_any_kind = any(tool_use_id in target_agent_ids for tool_use_id in denial_kinds)
+    delegation_started = delegation_observed and not target_agent_denied_any_kind
     target_worker_lineage_observed = delegation_observed and any(
         lineage is not None and lineage in target_lineage_ids for _name, lineage, _input in tool_index.values()
     )
@@ -2344,6 +2348,8 @@ def analyze_canonical_workflow_stream(
         chain_stop_reason = "agent_delegation_classifier_denied"
     elif target_unattributed_ids:
         chain_stop_reason = "target_denial_unattributed"
+    elif target_agent_denied_any_kind:
+        chain_stop_reason = "agent_delegation_hook_blocked"
     elif not request_v2_bound:
         chain_stop_reason = "request_v2_not_bound"
     elif not child_bash:
@@ -2439,7 +2445,13 @@ def classify_canonical_workflow_side(evidence: dict, *, launcher_exit_code: int 
     導出済みの値で、表示用の件数制限の影響を受けない。別 SubAgent の denial は
     `nontarget_classifier_denial_count` に件数だけが残り、ここでは使わない。classifier 証拠の無い
     (rule / mode / 不明な理由の) target lineage 上の denial (`target_unattributed_denial_count`) は
-    classifier 起因と断定せず、`full_chain_pass` にもしない (chain failure として保持する)。"""
+    classifier 起因と断定せず、`full_chain_pass` にもしない (chain failure として保持する)。
+
+    target lineage 上の `child_other` surface (Bash 以外の子 tool) の classifier denial は、Issue 契約が
+    classifier_denied の対象を `parent_agent_outbound` / `child_bash` に限定している
+    (`CLASSIFIER_DENIAL_CHAIN_SURFACES`) ため side_outcome を変えない意図的な仕様。evidence の
+    `classifier_denial_surfaces` / `chain_stop_reason` (`target_classifier_denial_observed`) には残り、
+    可視性は失わない。"""
     # classifier denial は親 Agent outbound だけでなく、子 implementation-worker の Bash
     # (update_pr.py 実行) も required chain 上の false-deny として classifier_denied に数える。
     # hook block は classifier denial ではない (analyze 側で classifier のみ surface に載る)。

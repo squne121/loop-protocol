@@ -1755,6 +1755,91 @@ def test_f2_unattributed_denial_on_target_lineage_is_a_failure_but_not_a_classif
     assert evidence["nontarget_unattributed_denial_count"] == 1 and evidence["target_unattributed_denial_count"] == 0
 
 
+def test_j2_any_denial_on_the_target_agent_is_not_counted_as_an_allowed_delegation(tmp_path):
+    """GIVEN target `implementation-worker` の Agent tool_use id に対する denial
+         (unattributed / hook_block / classifier)
+         と、target 外 Agent の denial
+    WHEN side を分類し、旧 policy 側 (baseline) の outcome を求める
+    THEN target Agent の unattributed / hook_block denial は delegation_started_without_denial=False となり baseline は
+         allow にならず unavailable (side は chain_failed_without_classifier_denial のまま、classifier とは断定しない)。
+         classifier denial は従来どおり classifier_denied / deny_observed。target 外 Agent の denial は影響しない
+    """
+    def evaluate(events):
+        outcome, evidence = _analyze_and_classify(events, tmp_path)
+        return outcome, evidence, canary.baseline_outcome_from_side(outcome, evidence)
+
+    outcome, evidence, baseline = evaluate(_base_events())  # 対照: denial なし
+    assert (outcome, baseline) == ("full_chain_pass", "allow") and evidence["delegation_started_without_denial"] is True
+
+    # (a) target Agent が reason なしで result.permission_denials に載る (unattributed)。
+    unattributed = _base_events()
+    unattributed[-1] = {
+        **unattributed[-1], "permission_denials": [{"tool_name": "Agent", "tool_use_id": "toolu_agent"}]
+    }
+    outcome, evidence, baseline = evaluate(unattributed)
+    assert outcome == "chain_failed_without_classifier_denial"
+    assert evidence["chain_stop_reason"] == "target_denial_unattributed"
+    assert evidence["target_unattributed_denial_count"] == 1 and evidence["target_classifier_denial_count"] == 0
+    assert evidence["agent_delegation_classifier_denied"] is False and evidence["classifier_denial_surfaces"] == []
+    assert evidence["delegation_started_without_denial"] is False
+    assert baseline == "unavailable"
+    # 構造化 event の rule / mode でも同じ。
+    for reason_type in ("rule", "mode"):
+        events = _base_events()
+        events.insert(1, {**_denial_event("toolu_agent", reason_type, "plain reason"), "tool_name": "Agent"})
+        outcome, evidence, baseline = evaluate(events)
+        assert outcome == "chain_failed_without_classifier_denial" and baseline == "unavailable", reason_type
+
+    # (b) target Agent の hook block (PreToolUse hook error 文言 / decision_reason_type=hook)。
+    hook_text = "PreToolUse:Agent hook error: [${CLAUDE_PROJECT_DIR}/.claude/hooks/guard.sh]: blocked"
+    hook_by_text = _base_events()
+    hook_by_text.insert(-1, _tool_result_event("toolu_agent", hook_text, is_error=True))  # 最後の tool_result が有効
+    hook_by_text[-1] = {
+        **hook_by_text[-1], "permission_denials": [{"tool_name": "Agent", "tool_use_id": "toolu_agent"}]
+    }
+    hook_by_type = _base_events()
+    hook_by_type.insert(1, {**_denial_event("toolu_agent", "hook"), "tool_name": "Agent"})
+    for events in (hook_by_text, hook_by_type):
+        outcome, evidence, baseline = evaluate(events)
+        assert evidence["hook_block_count"] >= 1 and evidence["any_classifier_denial_observed"] is False
+        assert evidence["agent_delegation_classifier_denied"] is False
+        assert evidence["delegation_started_without_denial"] is False
+        assert outcome == "chain_failed_without_classifier_denial", evidence["chain_stop_reason"]
+        assert baseline == "unavailable"
+        assert evidence["chain_stop_reason"] == "agent_delegation_hook_blocked"
+
+    # (c) target 外 Agent の denial は delegation_started にも baseline にも影響しない。
+    for denial in (
+        _denial_event("toolu_other", "classifier", "[External System Writes] other"),
+        {"type": "result", "subtype": "success", "is_error": False,
+         "permission_denials": [{"tool_name": "Agent", "tool_use_id": "toolu_other"}]},
+        {**_denial_event("toolu_other", "hook"), "tool_name": "Agent"},
+    ):
+        events = _base_events()
+        events[1:1] = [_tool_use_event("toolu_other", "Agent", {"subagent_type": "test-runner", "prompt": "x"}), denial]
+        outcome, evidence, baseline = evaluate(events)
+        assert evidence["delegation_started_without_denial"] is True
+        assert (outcome, baseline) == ("full_chain_pass", "allow")
+
+    # (d) target Agent の classifier denial は従来どおり。
+    classifier = _base_events()
+    classifier.insert(
+        1, {**_denial_event("toolu_agent", "classifier", "[External System Writes] x"), "tool_name": "Agent"}
+    )
+    outcome, evidence, baseline = evaluate(classifier)
+    assert (outcome, baseline) == ("classifier_denied", "deny_observed")
+    assert evidence["agent_delegation_classifier_denied"] is True
+    assert evidence["delegation_started_without_denial"] is False
+
+    # aggregate: denial された baseline が allow に数えられず、current が全 run full_chain_pass でも
+    # comparison_incomplete (77) になり、not_reproduced (0) へ誤って倒れない。
+    unattributed_outcome, unattributed_evidence, unattributed_baseline = evaluate(unattributed)
+    aggregate = canary.ac5_aggregate_decide(
+        [{"baseline_outcome": unattributed_baseline, "current_outcome": "full_chain_pass"}]
+    )
+    assert aggregate["comparison_result"] == "comparison_incomplete" and aggregate["exit_code"] == 77
+
+
 def test_f1_fake_gh_serves_the_reads_the_canonical_route_issues_and_fails_closed_otherwise(tmp_path):
     """GIVEN canary 所有の fake gh (disposable worktree の実 branch / HEAD sha を渡した)
     WHEN canonical route が実際に使う read (issue view / pr view の --json、--jq 付き、repo view) を実行する
