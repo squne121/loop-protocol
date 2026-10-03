@@ -588,6 +588,263 @@ def readiness_status_to_failure_class(readiness_status: Optional[str]) -> Option
     return None
 
 
+# ---------------------------------------------------------------------------
+# Issue #2897: bounded `timeout_diagnostics` projection (review merge side).
+#
+# A readiness `human_judgment` result caused by a command-level VC timeout
+# does not become a deterministic `structured_blockers` entry (and must not:
+# `failure_class` / the operator-only route are unchanged). Without this
+# projection its identity collapses to a `blocking_issues` string. This only
+# COPIES values the readiness result already holds (which in turn only copies
+# the original `baseline_vc_preflight/v1` result item); it never estimates,
+# recomputes, or back-derives a budget (e.g. from `duration_ms` or from the
+# current history store) and never reads `parsed_vc_commands`.
+# ---------------------------------------------------------------------------
+
+TIMEOUT_DIAGNOSTICS_SCHEMA_VERSION = "TIMEOUT_DIAGNOSTICS_V1"
+TIMEOUT_DIAGNOSTICS_MAX_OCCURRENCES = 16
+# `reviewer_transport.STDOUT_CAP` is 65,536 bytes; staying well below it keeps
+# the diagnostic from turning a merged result into a transport capture_failure.
+TIMEOUT_DIAGNOSTICS_MAX_SERIALIZED_BYTES = 16 * 1024
+
+TIMEOUT_ATTRIBUTION_ATTRIBUTED = "attributed"
+TIMEOUT_ATTRIBUTION_UNKNOWN = "unknown"
+TIMEOUT_REASON_BINDING_VERIFIED = "binding_verified"
+TIMEOUT_UNKNOWN_REASON_CODES = (
+    "plan_digest_missing",
+    "plan_digest_mismatch",
+    "provenance_missing",
+    "execution_key_missing",
+    "dedup_binding_invalid",
+    "occurrence_index_out_of_range",
+)
+
+_TIMEOUT_PROVENANCE_SOURCES = frozenset(
+    {"explicit_override", "static_policy", "static_fallback", "history_estimate"}
+)
+_TIMEOUT_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_TIMEOUT_ESTIMATOR_VERSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+_TIMEOUT_MAX_SECONDS = 86_400
+_TIMEOUT_MAX_INDEX = 1_000_000
+_TIMEOUT_EXECUTION_SOURCES = frozenset({"executed", "dedup_replay"})
+
+
+def _timeout_plain_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _timeout_index(value: object) -> Optional[int]:
+    if _timeout_plain_int(value) and 0 <= value <= _TIMEOUT_MAX_INDEX:  # type: ignore[operator]
+        return value  # type: ignore[return-value]
+    return None
+
+
+def _timeout_sha256(value: object) -> Optional[str]:
+    if isinstance(value, str) and _TIMEOUT_SHA256_RE.match(value):
+        return value
+    return None
+
+
+def _timeout_bounded_provenance(raw: object) -> Optional[dict]:
+    if not isinstance(raw, dict):
+        return None
+    timeout_seconds = raw.get("timeout_seconds")
+    cleanup_tail_seconds = raw.get("cleanup_tail_seconds")
+    source = raw.get("source")
+    estimator_version = raw.get("estimator_version")
+    estimator_input_digest = _timeout_sha256(raw.get("estimator_input_digest"))
+    if not (_timeout_plain_int(timeout_seconds) and 0 < timeout_seconds <= _TIMEOUT_MAX_SECONDS):  # type: ignore[operator]
+        return None
+    if not (_timeout_plain_int(cleanup_tail_seconds) and 0 <= cleanup_tail_seconds <= _TIMEOUT_MAX_SECONDS):  # type: ignore[operator]
+        return None
+    if source not in _TIMEOUT_PROVENANCE_SOURCES:
+        return None
+    if not (isinstance(estimator_version, str) and _TIMEOUT_ESTIMATOR_VERSION_RE.match(estimator_version)):
+        return None
+    if estimator_input_digest is None:
+        return None
+    return {
+        "timeout_seconds": timeout_seconds,
+        "cleanup_tail_seconds": cleanup_tail_seconds,
+        "source": source,
+        "estimator_version": estimator_version,
+        "estimator_input_digest": estimator_input_digest,
+    }
+
+
+def _timeout_error_payload(error: dict) -> dict:
+    payload = error.get("source_payload")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _timeout_unknown_reason(
+    *,
+    top_level_digest: Optional[str],
+    results_count: Optional[int],
+    error_digest: Optional[str],
+    occurrence_index: Optional[int],
+    provenance: Optional[dict],
+    execution_key_hash: Optional[str],
+    execution_source: Optional[str],
+    dedup_source_index: Optional[int],
+    executed_key_by_index: dict,
+) -> Optional[str]:
+    """Return the bounded `unknown` reason code, or `None` if the occurrence
+    binding is verified. Pure comparison of values already held by the
+    readiness result; nothing is recomputed."""
+    if top_level_digest is None:
+        return "plan_digest_missing"
+    if error_digest != top_level_digest:
+        return "plan_digest_mismatch"
+    if (
+        occurrence_index is None
+        or results_count is None
+        or occurrence_index >= results_count
+    ):
+        return "occurrence_index_out_of_range"
+    if provenance is None:
+        return "provenance_missing"
+    if execution_key_hash is None:
+        return "execution_key_missing"
+    if execution_source == "executed":
+        if dedup_source_index is not None:
+            return "dedup_binding_invalid"
+    elif execution_source == "dedup_replay":
+        if (
+            dedup_source_index is None
+            or dedup_source_index >= results_count
+            or dedup_source_index >= occurrence_index
+            or executed_key_by_index.get(dedup_source_index) != execution_key_hash
+        ):
+            return "dedup_binding_invalid"
+    else:
+        return "dedup_binding_invalid"
+    return None
+
+
+def build_timeout_diagnostics(
+    readiness_result: dict, *, body_sha256: str
+) -> Optional[dict]:
+    """Project command-level VC timeout readiness errors into a bounded
+    `TIMEOUT_DIAGNOSTICS_V1` object (Issue #2897), or `None` if there is no
+    timeout occurrence.
+
+    Occurrences are listed in the readiness result's own (canonical result)
+    order. `occurrence_index` -- the position in the unfiltered `results`
+    array -- is the primary identifier; `line` is block-relative and only
+    auxiliary. An occurrence whose binding cannot be verified is recorded as
+    `attribution: unknown` with a bounded reason code and carries no
+    provenance / execution identity (never completed from another VC or from
+    a recomputed budget).
+    """
+    errors = readiness_result.get("errors") or []
+    top_level_digest = _timeout_sha256(readiness_result.get("canonical_plan_digest"))
+    raw_results_count = readiness_result.get("results_count")
+    results_count = (
+        raw_results_count
+        if _timeout_plain_int(raw_results_count) and 0 <= raw_results_count <= _TIMEOUT_MAX_INDEX
+        else None
+    )
+
+    # `executed` result items by canonical index (any category), used to
+    # check that a dedup replay points at an actual execution source with the
+    # same execution key.
+    executed_key_by_index: dict = {}
+    for error in errors:
+        if not isinstance(error, dict):
+            continue
+        payload = _timeout_error_payload(error)
+        index = _timeout_index(payload.get("occurrence_index"))
+        key = _timeout_sha256(payload.get("execution_key_hash"))
+        if index is not None and key is not None and payload.get("execution_source") == "executed":
+            executed_key_by_index[index] = key
+
+    timeout_errors = [
+        error
+        for error in errors
+        if isinstance(error, dict)
+        and error.get("category") == "timeout"
+        and error.get("source_check") == "baseline_vc_preflight"
+    ]
+    if not timeout_errors:
+        return None
+
+    occurrences: list[dict] = []
+    for error in timeout_errors:
+        payload = _timeout_error_payload(error)
+        occurrence_index = _timeout_index(payload.get("occurrence_index"))
+        line = _timeout_index(error.get("line_start"))
+        command_hash = _timeout_sha256(payload.get("command_hash"))
+        execution_key_hash = _timeout_sha256(payload.get("execution_key_hash"))
+        execution_source = payload.get("execution_source")
+        if execution_source not in _TIMEOUT_EXECUTION_SOURCES:
+            execution_source = None
+        dedup_source_index = _timeout_index(payload.get("dedup_source_result_index"))
+        provenance = _timeout_bounded_provenance(payload.get("timeout_provenance"))
+
+        reason = _timeout_unknown_reason(
+            top_level_digest=top_level_digest,
+            results_count=results_count,
+            error_digest=_timeout_sha256(payload.get("canonical_plan_digest")),
+            occurrence_index=occurrence_index,
+            provenance=provenance,
+            execution_key_hash=execution_key_hash,
+            execution_source=execution_source,
+            dedup_source_index=dedup_source_index,
+            executed_key_by_index=executed_key_by_index,
+        )
+        if reason is None:
+            occurrences.append(
+                {
+                    "attribution": TIMEOUT_ATTRIBUTION_ATTRIBUTED,
+                    "reason_code": TIMEOUT_REASON_BINDING_VERIFIED,
+                    "occurrence_index": occurrence_index,
+                    "line": line,
+                    "line_coordinate": "block_relative",
+                    "command_hash": command_hash,
+                    "execution_key_hash": execution_key_hash,
+                    "execution_source": execution_source,
+                    "dedup_source_result_index": dedup_source_index,
+                    "timeout_provenance": provenance,
+                }
+            )
+        else:
+            occurrences.append(
+                {
+                    "attribution": TIMEOUT_ATTRIBUTION_UNKNOWN,
+                    "reason_code": reason,
+                    "occurrence_index": None,
+                    "line": line,
+                    "line_coordinate": "block_relative",
+                    "command_hash": command_hash,
+                    "execution_key_hash": None,
+                    "execution_source": None,
+                    "dedup_source_result_index": None,
+                    "timeout_provenance": None,
+                }
+            )
+
+    total = len(occurrences)
+    kept = occurrences[:TIMEOUT_DIAGNOSTICS_MAX_OCCURRENCES]
+    diagnostics = {
+        "schema_version": TIMEOUT_DIAGNOSTICS_SCHEMA_VERSION,
+        "body_sha256": body_sha256,
+        "canonical_plan_digest": top_level_digest,
+        "results_count": results_count,
+        "total_timeout_occurrences": total,
+        "truncated_count": total - len(kept),
+        "occurrences": kept,
+    }
+    # Structural fields are already bounded; this is a last-resort guard so
+    # the serialized size limit can never be exceeded.
+    while kept and len(json.dumps(diagnostics, ensure_ascii=True).encode("utf-8")) > (
+        TIMEOUT_DIAGNOSTICS_MAX_SERIALIZED_BYTES
+    ):
+        kept.pop()
+        diagnostics["truncated_count"] = total - len(kept)
+    return diagnostics
+
+
 def merge_readiness_into_review_result(
     review_result: dict,
     readiness_result: dict,
@@ -691,6 +948,16 @@ def merge_readiness_into_review_result(
             failure_class = readiness_status_to_failure_class(readiness_status)
             if failure_class:
                 merged["failure_class"] = failure_class
+                # Issue #2897: bounded timeout occurrence / applied-budget
+                # identity. Additive optional field only -- no blocker, no
+                # failure_class / route change. Reached only after the
+                # body_sha256 fail-closed check above, so a mismatched
+                # readiness result never produces a diagnostic.
+                timeout_diagnostics = build_timeout_diagnostics(
+                    readiness_result, body_sha256=review_body_sha256
+                )
+                if timeout_diagnostics is not None:
+                    merged["timeout_diagnostics"] = timeout_diagnostics
                 # `compact_review_result.py` checks `verdict == "approve"` first
                 # and short-circuits to `NEXT_ACTION: proceed` before it ever
                 # looks at `failure_class` (Issue #1791 review remediation
