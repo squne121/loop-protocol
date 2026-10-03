@@ -322,21 +322,48 @@ qualified list に限って、次の 2 種類の除外を **別分類** とし�
 - **適用順**: closing candidate なし → (a) #2750 の除外 → (b) #2893 の historical 除外、の
   順に評価する。
 
-fail-closed の既存 semantics はいずれの除外でも緩めない。current exact open/draft candidate
-が複数ある場合は `qualified_candidate_conflict` を維持し、malformed / stale / markerless
-legacy / identity mismatch（(a) の単独 error 以外）/ main 非到達の candidate は除外の対象
-にならない。除外条件を満たさない場合、qualified list は変更されず従来の判定がそのまま
-適用される。
+**共通条件**（2 種の除外に共通する条件はこれだけである）: 除外は closing candidate が 0 件の
+ときのみ適用する。除外は conflict counting / authority selection 用の local set だけを狭め、
+fail-closed の既存 semantics は緩めない。current exact open/draft candidate が複数ある場合は
+`qualified_candidate_conflict` を維持し、malformed / stale / markerless legacy candidate は
+除外の対象にならない。除外条件を満たさない場合、qualified list は変更されず従来の判定が
+そのまま適用される。
 
-**decision-time semantic refresh（既存 producer が取得した live 値の消費）**:
-`resolve_landing_disposition_with_freshness_rebind()` は、判定対象 candidate の **live PR
-body** と `closingIssuesReferences` から scope coverage と closing authority の意味を
-decision-time に再導出する。PR body 全体の byte equality は追加 gate にしないため、
-prose や verification-result のみの PR body 更新では不要な停止をしない。一方、Issue body
-sha256・candidate の head または merge OID・current main sha に対する既存の bounded
-freshness rebind は上記 AC9 のとおり維持する。この説明は新しい API call や新しい
-freshness classifier の導入を意味せず、既存 producer が取得済みの live 値を消費するもの
-である。
+**各除外に固有の条件（混ぜない）**:
+
+- (a) #2750 の除外は、上記 (a) に書いた candidate-local な marker / provenance による既存の
+  限定条件（`verified_cross_reference`、candidate-local `scope_coverage.status: invalid`、
+  `errors` が `scope_coverage_issue_identity_mismatch` ちょうど1件のみ）だけに従う。main
+  ancestry の検査は (a) の条件ではなく、`main_ancestry` が `verified: False` /
+  `reachable: False` のままの irrelevant sibling でも (a) の除外は成立する。(b) の条件を
+  (a) へ追加適用しない。
+- (b) #2893 の historical 除外は、main ancestry の `verified` と `reachable` がともに `True`
+  であることを必須とし、未確認・非到達の historical candidate は除外しない。除外後の残存
+  candidate がちょうど 1 件の fresh な current exact open/draft candidate であることも (b)
+  固有の条件である。
+
+freshness も同様に区別する。evidence 全体の stale（Issue body sha256 / main sha などの
+不一致）と、(a) で irrelevant sibling と再確認された candidate 自身の head drift（
+`_live_freshness_reference()` が既存の限定的な扱いで許容するもの）は別であり、後者の扱いを
+(b) の carve-out 参加 candidate へ拡張しない（参加 candidate の identity は常に要求される）。
+
+**decision-time semantic refresh（既存 producer が取得した live 値の消費。保証範囲は限定的）**:
+`resolve_landing_disposition_with_freshness_rebind()` が呼ぶ `_live_freshness_reference()` は、
+全 candidate について head / merge OID の identity を live 再取得する。一方、live PR body と
+`closingIssuesReferences` から scope coverage / closing authority の意味を decision-time に
+再導出するのは、次の 2 種の candidate に限る。
+
+- 収集時点で (a) の irrelevant sibling と認定済みの candidate。
+- (b) の除外が成立し得る状況（closing candidate なし、かつ historical merged
+  `later_scope_expansion` が存在する）での carve-out 参加 candidate。
+
+それ以外の candidate は identity の再取得に留まり、意味の再導出には入らない。全 candidate
+への一般的な PR body semantic refresh は保証しない。PR body 全体の byte equality は追加
+gate にしないため、prose や verification-result のみの PR body 更新で上記 2 種の判定が
+不要に停止することはない。Issue body sha256・candidate の head または merge OID・current
+main sha に対する既存の bounded freshness rebind は上記 AC9 のとおり維持する。この説明は
+新しい API call や新しい freshness classifier の導入を意味せず、producer が既に取得する live
+値の既存経路を説明するものである。
 
 呼び出し元は `pre_step1_data_plane` の canonical な `start_data_plane` / `action` を先に
 消費し、prose から判定を再導出しない。`ordinary_dispatch_or_explicit_recovery` は
