@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import re
 from bisect import bisect_left, bisect_right
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 KIND_SLASH_TASK = "SLASH_TASK"
@@ -90,6 +91,86 @@ _GITHUB_URL_RE = re.compile(
 _OWNER_REPO_HASH_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?=[A-Za-z0-9_])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)(?![\dA-Za-z_])"
 )
+# Issue #2881: ``_OWNER_REPO_HASH_RE`` above is kept as the declarative grammar of an
+# owner/repo reference, but no production consumer calls its ``.finditer`` any more:
+# with ``[A-Za-z0-9_.-]+`` after a ``.`` / ``-`` every position is a candidate start and
+# each candidate scanned to the end of the token looking for ``/``, so a prompt such as
+# ``"a." * n`` (zero matches) cost O(n^2) on the UserPromptSubmit hot path. All consumers
+# go through ``_scan_owner_repo_hash`` instead (same leftmost, non-overlapping matches).
+#
+# The scanner enumerates candidate starts with ``_OWNER_REPO_START_RE`` (ASCII word
+# character not preceded by one), measures the ``owner`` token with
+# ``_OWNER_REPO_RUN_RE`` and, only when it is directly followed by ``/``, the ``repo``
+# token and the ``#`` digits (``_OWNER_REPO_DIGITS_RE``: ``\d`` is Unicode Nd, unchanged
+# from #2850). Every candidate start inside the same ``[A-Za-z0-9_.-]`` run reaches the
+# same ``/`` (or the same failure), so after a failed attempt the scan resumes at the end
+# of that run instead of at the next position. Complexity (this owner/repo scan only, not
+# ``classify()`` / the scanner as a whole / the hook): each character is covered by a
+# constant number of regex calls (candidate search once, owner token at most once and as
+# the repo token of the previous ``/`` at most once, digits at most once), so the work is
+# O(n) for ``"a." * n`` and ``"a/" * n + "#x"``. These module-level regexes are the only
+# scan steps, so a test can wrap them and count the covered ranges.
+_OWNER_REPO_START_RE = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z0-9_]")
+_OWNER_REPO_RUN_RE = re.compile(r"[A-Za-z0-9_.-]+")
+_OWNER_REPO_DIGITS_RE = re.compile(r"\d+")
+
+
+class _OwnerRepoMatch:
+    """Minimal ``re.Match``-like result of ``_scan_owner_repo_hash``: ``start()`` /
+    ``end()`` / ``span()`` and ``group(1)`` (``owner/repo``) / ``group(2)`` (digits)."""
+
+    __slots__ = ("_start", "_end", "_repo", "_number")
+
+    def __init__(self, start: int, end: int, repo: str, number: str) -> None:
+        self._start, self._end, self._repo, self._number = start, end, repo, number
+
+    def start(self) -> int:
+        return self._start
+
+    def end(self) -> int:
+        return self._end
+
+    def span(self) -> tuple[int, int]:
+        return (self._start, self._end)
+
+    def group(self, index: int) -> str:
+        if index == 1:
+            return self._repo
+        if index == 2:
+            return self._number
+        raise IndexError(f"no such group: {index}")
+
+
+def _scan_owner_repo_hash(text: str) -> Iterator[_OwnerRepoMatch]:
+    r"""Leftmost, non-overlapping ``owner/repo#N`` matches of ``text`` with the same
+    semantics as ``_OWNER_REPO_HASH_RE.finditer``: ASCII ``[A-Za-z0-9_.-]`` tokens, an
+    ASCII word boundary before the owner, ``\d`` (Unicode Nd) digits and no following
+    ``[\dA-Za-z_]``. A multi-slash token such as ``a/b/c#1`` yields ``b/c#1``."""
+    length = len(text)
+    pos = 0
+    while True:
+        candidate = _OWNER_REPO_START_RE.search(text, pos)
+        if candidate is None:
+            return
+        start = candidate.start()
+        owner = _OWNER_REPO_RUN_RE.match(text, start)
+        owner_end = owner.end()
+        # Every start inside this run reaches the same ``/`` (or the same failure), so a
+        # failed attempt resumes at ``owner_end`` below.
+        if owner_end < length and text[owner_end] == "/":
+            repo = _OWNER_REPO_RUN_RE.match(text, owner_end + 1)
+            if repo is not None and repo.end() < length and text[repo.end()] == "#":
+                digits = _OWNER_REPO_DIGITS_RE.match(text, repo.end() + 1)
+                if digits is not None:
+                    end = digits.end()
+                    following = text[end] if end < length else ""
+                    # ``\d+`` is maximal, so the next character is never a digit; the
+                    # lookahead ``(?![\dA-Za-z_])`` only needs to reject ASCII letters / ``_``.
+                    if not (following.isascii() and (following.isalpha() or following == "_")):
+                        yield _OwnerRepoMatch(start, end, owner.group() + "/" + repo.group(), digits.group())
+                        pos = end
+                        continue
+        pos = owner_end
 _BARE_HASH_RE = re.compile(r"(?<![A-Za-z0-9_/])#(\d+)(?![\dA-Za-z_])")
 # Issue #2850 closed-prefix adjacency (OWNER-approved policy): ``Issue#12`` /
 # ``PR#34`` (no space between the prefix word and ``#``) is accepted as a
@@ -215,7 +296,7 @@ def _path_token_spans(text: str) -> list[tuple[int, int]]:
     if "#" not in text or "/" not in text:
         return spans
     recognised = sorted(
-        [m.span() for m in _GITHUB_URL_RE.finditer(text)] + [m.span() for m in _OWNER_REPO_HASH_RE.finditer(text)]
+        [m.span() for m in _GITHUB_URL_RE.finditer(text)] + [m.span() for m in _scan_owner_repo_hash(text)]
     )
     cursor = 0
     for token in _PATH_TOKEN_RE.finditer(text):
@@ -262,10 +343,11 @@ def _find_occurrences(authority_text: str, current_repo: str | None) -> list[_Oc
     # materialised <=20-char tail slice (NOT ``search(text, pos, endpos)``, whose
     # left context differs: ``"xpr" + " " * 18 + "o/r#1"``). The per-match work of
     # this prefix processing is therefore O(1) (at most 20 chars). This claim covers
-    # only this prefix processing, not ``_OWNER_REPO_HASH_RE.finditer`` itself
-    # (zero-match scan cost is owned by #2881) nor the scanner / classify() overall.
+    # only this prefix processing, not the owner/repo scan ``_scan_owner_repo_hash``
+    # itself (Issue #2881 owns that scan, see its comment) nor the scanner / classify()
+    # overall.
     first_slash = authority_text.find("/")
-    for match in _OWNER_REPO_HASH_RE.finditer(authority_text):
+    for match in _scan_owner_repo_hash(authority_text):
         repo, number = match.group(1), int(match.group(2))
         start = match.start()
         head_end = start if first_slash < 0 or first_slash >= start else first_slash
@@ -293,7 +375,7 @@ def _find_occurrences(authority_text: str, current_repo: str | None) -> list[_Oc
         target = Target(repo=current_repo, ref_kind=ref_kind, ref_number=number, explicit_repo=False)
         occurrences.append(_Occurrence(target, match.start(), match.end(), form))
 
-    owner_repo_spans = [m.span() for m in _OWNER_REPO_HASH_RE.finditer(authority_text)]
+    owner_repo_spans = [m.span() for m in _scan_owner_repo_hash(authority_text)]
     for match in _ADJACENT_PREFIX_HASH_RE.finditer(authority_text):
         # A prefix word inside an already recognised ``owner/repo#N`` span
         # (``owner/my-issue#12``) is part of the repo name, not a second ref.
@@ -723,7 +805,7 @@ def needs_current_repo_resolution(prompt: str) -> bool:
             continue
         return True
     # Issue #2850: ``Issue#12`` / ``PR#34`` also resolve against ``current_repo``.
-    owner_repo_spans = [m.span() for m in _OWNER_REPO_HASH_RE.finditer(authority_text)]
+    owner_repo_spans = [m.span() for m in _scan_owner_repo_hash(authority_text)]
     return any(
         not _inside_any_span(match.start(), owner_repo_spans) and not _inside_path_token(match.end(1), path_spans)
         for match in _ADJACENT_PREFIX_HASH_RE.finditer(authority_text)
