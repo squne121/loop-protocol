@@ -285,23 +285,91 @@ candidate は fresh head と current-scope ownership が両方検証できた場
 scope expansion は（下記の `already_satisfied` 合成が不発の場合）
 `ordinary_dispatch_or_explicit_recovery` とする。
 
-**Bounded carve-out（irrelevant sibling cross-reference の除外、Issue #2750）**: 上記の
-identity mismatch fail-closed 契約には、`qualified_candidate_conflict` の conflict counting
-に限定した bounded な例外が1つだけ存在する。`closing_relation`（構造化
-`closingIssuesReferences` が current target Issue を含む）candidate が1件も存在しない場合
-に限り、`verified_cross_reference` candidate のうち、candidate-local `scope_coverage`
-（`_coverage_for()` の evidence-level fallback ではなく `candidate["scope_coverage"]` 自体）
-が `status: invalid` かつ `errors` が **`scope_coverage_issue_identity_mismatch` の1件だけ**
-（他の schema/digest/manifest 等の error と複合していない）の場合に限り、その candidate は
-qualified landing candidate から除外され、`qualified_candidate_conflict` を生成しない。この
-carve-out は lifecycle（merged/open/draft/closed_unmerged のいずれも）を問わず conflict
-counting より前段で適用され、除外の結果 qualified candidate が0件になった場合は通常の
-`no_qualified_candidate`（→ 上記の `already_satisfied` 合成）にそのまま合流する。
-`closing_relation` candidate が1件でも存在する場合はこの carve-out を一切適用せず、その
-candidate の identity mismatch は従来どおり contradictory evidence として
-`reconciliation_required` を維持する。markerless candidate（marker 自体が存在しない）や、
-identity mismatch 以外の marker error を含む candidate（複合 error）はこの carve-out の対象
-外であり除外されない（#2119/#2137 の markerless legacy compatibility を壊さない）。
+**Bounded candidate exclusions（conflict counting / authority selection 用 local set からの限定的除外）**:
+上記の fail-closed 契約のもとで、`derive_landing_disposition()` は
+`qualified_candidate_conflict` の conflict counting と authority selection に使う local な
+qualified list に限って、次の 2 種類の除外を **別分類** として適用する。除外は local set
+のみを狭め、`evidence["candidates"]` 自体は変更せず保持する（debug / audit 用）。2 種の
+除外は成立条件も目的も異なるため、片方の条件をもう片方へ拡張・流用しない。
+
+- **closing precedence（前提）**: `closing_relation`（構造化 `closingIssuesReferences` が
+  current target Issue を含む）candidate が1件でも存在する場合は、下記のいずれの除外も
+  一切適用せず、既存の closing authority（structured closing linkage）を優先する。この
+  場合の identity mismatch は従来どおり contradictory evidence として
+  `reconciliation_required` を維持する。
+- **(a) irrelevant sibling cross-reference の除外（Issue #2750）**: closing candidate が
+  0 件のときのみ適用する。`verified_cross_reference` candidate のうち、candidate-local
+  `scope_coverage`（`_coverage_for()` の evidence-level fallback ではなく
+  `candidate["scope_coverage"]` 自体）が `status: invalid` かつ `errors` が
+  **`scope_coverage_issue_identity_mismatch` の1件だけ**（他の schema/digest/manifest 等の
+  error と複合していない）のものを、lifecycle（merged/open/draft/closed_unmerged のいずれ
+  も）を問わず除外する。複合 error の candidate と markerless candidate（marker 自体が存在
+  しない）は対象外であり除外されない（#2119/#2137 の markerless legacy compatibility を壊
+  さない）。除外の結果 qualified candidate が0件になった場合は通常の
+  `no_qualified_candidate`（→ 下記の `already_satisfied` 合成）にそのまま合流する。
+- **(b) historical merged `later_scope_expansion` の除外（Issue #2893）**: (a) の identity
+  mismatch の許容ではなく、**別分類** の限定的除外である。対象は、valid な同一 Issue
+  marker を持つ historical merged candidate（`verified_cross_reference`、lifecycle が
+  `merged`、candidate-local `scope_coverage` が valid で marker が current target Issue を
+  指す、`main_ancestry.verified` と `main_ancestry.reachable` がともに `True`、
+  `scope_coverage.later_scope_expansion is True`、`exact_coverage is not True`）に限る。
+  そのような historical candidate をすべて除外した後に残る candidate が **ちょうど 1 件**
+  であり、かつそれが fresh な current exact open/draft candidate（`verified_cross_reference`、
+  lifecycle が `open` または `draft`、`head_fresh is True`、valid な同一 Issue marker、
+  `exact_coverage is True`）である場合にのみ除外を確定する。「current exact が 1 件存在
+  する」へ条件を弱めない。残存 candidate は既存の単一 open/draft 経路（`existing_pr_resume`
+  など）で評価される。
+- **適用順**: closing candidate なし → (a) #2750 の除外 → (b) #2893 の historical 除外、の
+  順に評価する。
+
+**共通条件**（2 種の除外に共通する条件はこれだけである）: 除外は closing candidate が 0 件の
+ときのみ適用する。除外は conflict counting / authority selection 用の local set だけを狭め、
+fail-closed の既存 semantics は緩めない。current exact open/draft candidate が複数ある場合は
+`qualified_candidate_conflict` を維持し、malformed / stale / markerless legacy candidate は
+除外の対象にならない。除外条件を満たさない場合、qualified list は変更されず従来の判定が
+そのまま適用される。
+
+**各除外に固有の条件（混ぜない）**:
+
+- (a) #2750 の除外は、上記 (a) に書いた candidate-local な marker / provenance による既存の
+  限定条件（`verified_cross_reference`、candidate-local `scope_coverage.status: invalid`、
+  `errors` が `scope_coverage_issue_identity_mismatch` ちょうど1件のみ）だけに従う。main
+  ancestry の検査は (a) の条件ではなく、`main_ancestry` が `verified: False` /
+  `reachable: False` のままの irrelevant sibling でも (a) の除外は成立する。(b) の条件を
+  (a) へ追加適用しない。
+- (b) #2893 の historical 除外は、main ancestry の `verified` と `reachable` がともに `True`
+  であることを必須とし、未確認・非到達の historical candidate は除外しない。除外後の残存
+  candidate がちょうど 1 件の fresh な current exact open/draft candidate であることも (b)
+  固有の条件である。
+
+freshness も同様に区別する。evidence 全体の stale（Issue body sha256 / main sha などの
+不一致）と、(a) で irrelevant sibling と再確認された candidate 自身の head drift（
+`_live_freshness_reference()` が既存の限定的な扱いで許容するもの）は別であり、後者の扱いを
+(b) の carve-out 参加 candidate へ拡張しない（参加 candidate の identity は常に要求される）。
+
+**decision-time semantic refresh（既存 producer が取得した live 値の消費。保証範囲は限定的）**:
+`resolve_landing_disposition_with_freshness_rebind()` が呼ぶ `_live_freshness_reference()` は、
+全 candidate について head / merge OID の identity を live 再取得する。一方、live PR body と
+`closingIssuesReferences` から scope coverage / closing authority の意味を decision-time に
+再導出するのは、次の 2 種の candidate に限る。
+
+- 収集時点で (a) の irrelevant sibling と認定済みの candidate。
+- (b) の除外が成立し得る状況（closing candidate なし、かつ historical merged
+  `later_scope_expansion` が存在する）での carve-out 参加 candidate。
+
+それ以外の candidate は identity の再取得に留まり、意味の再導出には入らない。全 candidate
+への一般的な PR body semantic refresh は保証しない。PR body 全体の byte equality は追加
+gate にしないため、prose や verification-result のみの PR body 更新で上記 2 種の判定が
+不要に停止することはない。Issue body sha256・candidate の head または merge OID・current
+main sha に対する既存の bounded freshness rebind は上記 AC9 のとおり維持する。この説明は
+新しい API call や新しい freshness classifier の導入を意味せず、producer が既に取得する live
+値の既存経路を説明するものである。
+
+呼び出し元は `pre_step1_data_plane` の canonical な `start_data_plane` / `action` を先に
+消費し、prose から判定を再導出しない。`ordinary_dispatch_or_explicit_recovery` は
+`start_data_plane: true` / `dispatch_step1`、`existing_pr_resume` は
+`start_data_plane: false` / `resume_existing_pr` である。後者の `false` は duplicate
+worker / worktree / new PR を抑止する正常系であり failure ではない。
 
 **Disposition Precedence の `already_satisfied` 合成（新しい enum を追加しない #2607 との
 合成）**: `derive_landing_disposition()` が landing authority を確立できなかった場合
