@@ -205,6 +205,7 @@ class _Harness:
         self.default_outcome = default_outcome
         self.run_command_calls: list[tuple[str, int]] = []
         self.baseline_payloads: list[dict] = []
+        self.readiness_payloads: list[dict] = []
         self.readiness_files_seen: list[str] = []
         self.transport_launches = 0
         self._on_transport_launch = on_transport_launch
@@ -267,6 +268,8 @@ class _Harness:
             signal.signal(signal.SIGTERM, previous_sigterm)
         if script == "baseline_vc_preflight.py":
             self.baseline_payloads.append(json.loads(out.getvalue()))
+        if script == "contract_readiness_check.py" and "execute" in argv:
+            self.readiness_payloads.append(json.loads(out.getvalue()))
         if script == "check_issue_contract.py" and "merge_readiness" in argv:
             self.readiness_files_seen.append(argv[argv.index("--readiness-result-file") + 1])
         return code, out.getvalue(), err.getvalue()
@@ -616,3 +619,67 @@ def test_legacy_merged_result_without_diagnostics_is_still_a_valid_semantic_resu
     assert transport.validate_semantic_result_schema(legacy) is None
     with_diagnostics = dict(legacy, timeout_diagnostics={"schema_version": "TIMEOUT_DIAGNOSTICS_V1"})
     assert transport.validate_semantic_result_schema(with_diagnostics) is None
+
+
+def _big_review_body() -> str:
+    # 30 long pure VCs: the merged review result is large (~58 KB) even
+    # without the diagnostic, so adding all 16 occurrences (~10 KB) overflows
+    # the transport stdout cap although the diagnostic alone is < 16 KiB.
+    blocks = "".join(
+        f"```bash\n# AC{(index % 2) + 1}\n$ test -f d{index}/{'a' * 1450}.md\n```\n\n"
+        for index in range(30)
+    )
+    return _BODY_HEADER + blocks + _ALLOWED
+
+
+def test_large_review_result_with_timeouts_is_not_turned_into_capture_failure(
+    monkeypatch, tmp_path
+):
+    # The budget the merge side enforces is the transport's own cap.
+    assert cic.TIMEOUT_DIAGNOSTICS_STDOUT_CAP_BYTES == transport.STDOUT_CAP == 65_536
+
+    def writer_bytes(result: dict) -> int:
+        # `_cmd_run_checker_attempt()`: print(json.dumps(merged)) -> utf-8.
+        return len((json.dumps(result) + "\n").encode("utf-8"))
+
+    issue_number = 2897008
+    harness = _Harness(
+        monkeypatch,
+        tmp_path,
+        _big_review_body(),
+        outcomes_by_call={call: TIMEOUT_OUTCOME for call in range(20)},
+    )
+    code, out = harness.produce(issue_number)
+    assert code == 0 and out["status"] == "ok", out
+
+    # Real transport: not a capture_failure, no retry storm, verified artifact.
+    attempt = _attempt_result(out, issue_number)
+    assert attempt["transport_status"] == "ok", attempt
+    assert attempt["reason_code"] != "capture_failure"
+    assert harness.transport_launches == 1
+    full_artifact, semantic_result, _bytes = _persisted_artifacts(out)
+    merged = out["merged_review_result"]
+    assert full_artifact["verdict"] == semantic_result["verdict"] == "needs-fix"
+
+    # Precondition of the scenario (computed with the real writer's options):
+    # diagnostic-free result fits, the naive full diagnostic would not.
+    base = {key: value for key, value in merged.items() if key != "timeout_diagnostics"}
+    assert writer_bytes(base) <= transport.STDOUT_CAP
+    assert len(harness.baseline_payloads[0]["results"]) == 30
+    full_diagnostics = cic.build_timeout_diagnostics(
+        harness.readiness_payloads[0], body_sha256=harness.body_sha256
+    )
+    assert len(full_diagnostics["occurrences"]) == 16
+    assert writer_bytes(dict(base, timeout_diagnostics=full_diagnostics)) > transport.STDOUT_CAP
+
+    # Routing-critical facts are intact; only the optional diagnostic shrank.
+    assert merged["failure_class"] == "contract_readiness_human_judgment"
+    assert out["canonical_step2_route"] == pipeline.STEP_5_OPERATOR_INTERVENTION_REQUIRED
+    assert writer_bytes(merged) <= transport.STDOUT_CAP
+    diagnostics = semantic_result["timeout_diagnostics"]
+    assert diagnostics == merged["timeout_diagnostics"] == full_artifact["timeout_diagnostics"]
+    assert diagnostics["total_timeout_occurrences"] == 20
+    assert 0 < len(diagnostics["occurrences"]) < 16
+    assert diagnostics["truncated_count"] == 20 - len(diagnostics["occurrences"])
+    readback = harness.verified_readback(out, issue_number, "needs-fix")
+    assert readback["verdict_identity"] is True, readback

@@ -265,3 +265,64 @@ def test_static_mode_readiness_result_has_no_plan_binding_keys(tmp_path):
 )
 def test_malformed_provenance_is_dropped_not_partially_trusted(bad_provenance):
     assert crc._bounded_timeout_provenance(bad_provenance) is None
+
+
+_GOOD_PROVENANCE = {
+    "timeout_seconds": 150,
+    "cleanup_tail_seconds": 15,
+    "source": "static_policy",
+    "estimator_version": "v2",
+    "estimator_input_digest": "sha256:" + "0" * 64,
+}
+
+
+@pytest.mark.parametrize("bad", [[], {}, ["static_policy"], {"k": "v"}], ids=repr)
+@pytest.mark.parametrize("field", sorted(_GOOD_PROVENANCE))
+def test_unhashable_enum_like_provenance_value_is_dropped_without_exception(field, bad):
+    # PR #2901 review fix_delta (P2): a list / dict value must degrade to the
+    # same `None` as any other malformed value, never raise `TypeError` from
+    # the frozenset membership test.
+    assert crc._bounded_timeout_provenance(dict(_GOOD_PROVENANCE)) == _GOOD_PROVENANCE
+    assert crc._bounded_timeout_provenance(dict(_GOOD_PROVENANCE, **{field: bad})) is None
+
+
+@pytest.mark.parametrize("bad", [[], {}], ids=repr)
+def test_real_conversion_with_unhashable_provenance_source_does_not_raise(
+    monkeypatch, tmp_path, bad
+):
+    # Through the REAL preflight result builder and the REAL readiness
+    # conversion: only the (permitted seam 2) child payload is degraded.
+    launcher_calls = []
+    monkeypatch.setattr(bvp, "run_command", lambda command, timeout_seconds, cwd: TIMEOUT_OUTCOME)
+
+    def launcher(argv, *, timeout_seconds, cwd=None, env=None, **_ignored):
+        out, err = io.StringIO(), io.StringIO()
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        try:
+            with mock.patch.object(sys, "argv", [argv[1], *argv[2:]]):
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    returncode = bvp.main()
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
+        payload = json.loads(out.getvalue())
+        for item in payload["results"]:
+            if isinstance(item.get("timeout_provenance"), dict):
+                item["timeout_provenance"]["source"] = bad
+        launcher_calls.append(payload)
+        return bvp.SupervisedSubprocessResult(returncode, json.dumps(payload), err.getvalue(), False, 0.0)
+
+    monkeypatch.setattr(crc, "_run_subprocess_with_cooperative_supervisor", launcher)
+    body_file = tmp_path / "body.md"
+    body_file.write_text(_BODY, encoding="utf-8")
+    out = io.StringIO()
+    with mock.patch.object(
+        sys, "argv", ["contract_readiness_check.py", "--body-file", str(body_file), "--mode", "execute"]
+    ):
+        with contextlib.redirect_stdout(out):
+            crc.main()
+    result = json.loads(out.getvalue())
+    assert launcher_calls
+    timeout_errors = [e for e in result["errors"] if e.get("category") == "timeout"]
+    assert timeout_errors
+    for error in timeout_errors:
+        assert error["source_payload"]["timeout_provenance"] is None

@@ -1161,7 +1161,9 @@ def _bounded_timeout_provenance(raw: Any) -> Optional[dict]:
         return None
     if not (_is_plain_int(cleanup_tail_seconds) and 0 <= cleanup_tail_seconds <= _MAX_PROVENANCE_SECONDS):
         return None
-    if source not in _TIMEOUT_PROVENANCE_SOURCES:
+    # Type first: an unhashable (list / dict) value must degrade to `None`,
+    # not raise `TypeError` from the frozenset membership test.
+    if not isinstance(source, str) or source not in _TIMEOUT_PROVENANCE_SOURCES:
         return None
     if not (isinstance(estimator_version, str) and _ESTIMATOR_VERSION_RE.match(estimator_version)):
         return None

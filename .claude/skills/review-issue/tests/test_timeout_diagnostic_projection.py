@@ -486,3 +486,289 @@ def test_more_than_sixteen_timeouts_are_truncated_within_size_bound():
     assert diagnostics["truncated_count"] == 4
     assert diagnostics["total_timeout_occurrences"] == 20
     assert len(json.dumps(diagnostics).encode("utf-8")) <= 16 * 1024
+
+
+# ---------------------------------------------------------------------------
+# PR #2901 OWNER review fix_delta (Issue #2897)
+# ---------------------------------------------------------------------------
+
+_STDOUT_CAP = 65_536  # reviewer_transport.STDOUT_CAP (pinned in the root test)
+
+
+def _writer_bytes(result: dict) -> int:
+    """Size of `result` as the root review child really writes it:
+    `print(json.dumps(merged))` -> default options, trailing newline, utf-8."""
+    return len((json.dumps(result) + "\n").encode("utf-8"))
+
+
+def _large_review_body(last_command_padding: int = 1450) -> str:
+    # 30 long pure VCs (a large `parsed_vc_commands`, hence a large review
+    # result). The last one's length is the fine-tuning knob (1 byte / char).
+    blocks = []
+    for index in range(30):
+        padding = last_command_padding if index == 29 else 1450
+        blocks.append(
+            f"```bash\n# AC{(index % 2) + 1}\n$ test -f d{index}/{'a' * padding}.md\n```\n\n"
+        )
+    return _BODY_HEADER + "".join(blocks) + _ALLOWED
+
+
+_TWENTY_TIMEOUTS = {call: TIMEOUT_OUTCOME for call in range(20)}
+
+
+def _without_diagnostics(merged: dict) -> dict:
+    return {key: value for key, value in merged.items() if key != "timeout_diagnostics"}
+
+
+def _large_chain(monkeypatch, tmp_path, last_command_padding: int = 1450):
+    body = _large_review_body(last_command_padding)
+    review, readiness, merged, code, _launcher = _full_chain(
+        monkeypatch, tmp_path, body, _TWENTY_TIMEOUTS
+    )
+    assert merged is not None and code == 1
+    return body, review, readiness, merged
+
+
+def _assert_routing_unchanged(review: dict, merged: dict) -> None:
+    assert merged["verdict"] == "needs-fix"
+    assert merged["failure_class"] == "contract_readiness_human_judgment"
+    assert "Command exceeded timeout" in merged["blocking_issues"]
+    assert merged["structured_blockers"] == review["structured_blockers"]
+    assert merged["parsed_vc_commands"] == review["parsed_vc_commands"]
+
+
+def test_whole_result_stdout_budget_shrinks_only_the_diagnostic(monkeypatch, tmp_path):
+    body, review, readiness, merged = _large_chain(monkeypatch, tmp_path)
+    base = _without_diagnostics(merged)
+    full_diagnostics = cic.build_timeout_diagnostics(
+        readiness, body_sha256=review["body_sha256"]
+    )
+
+    # (1) Without the diagnostic the real stdout fits the transport cap.
+    assert _writer_bytes(base) <= _STDOUT_CAP
+    # The diagnostic alone is within its own 16 KiB bound...
+    assert len(json.dumps(full_diagnostics).encode("utf-8")) <= 16 * 1024
+    assert len(full_diagnostics["occurrences"]) == 16
+    # (2) ...but naively attaching all of it overflows the WHOLE result.
+    assert _writer_bytes(dict(base, timeout_diagnostics=full_diagnostics)) > _STDOUT_CAP
+
+    # (3) After the fix the production merge result fits.
+    assert _writer_bytes(merged) <= _STDOUT_CAP
+    # (4) Routing-critical content is exactly the diagnostic-free content.
+    _assert_routing_unchanged(review, merged)
+    assert cic.TIMEOUT_DIAGNOSTICS_STDOUT_CAP_BYTES == _STDOUT_CAP
+
+    # (5) Only the optional diagnostic was shrunk, consistently.
+    diagnostics = merged["timeout_diagnostics"]
+    kept = diagnostics["occurrences"]
+    assert 0 < len(kept) < 16
+    assert kept == full_diagnostics["occurrences"][: len(kept)]
+    assert diagnostics["total_timeout_occurrences"] == 20
+    assert diagnostics["truncated_count"] == 20 - len(kept)
+    assert diagnostics["body_sha256"] == review["body_sha256"]
+    # Not shrunk more than necessary: one more occurrence would overflow.
+    one_more = dict(diagnostics, occurrences=full_diagnostics["occurrences"][: len(kept) + 1])
+    assert _writer_bytes(dict(base, timeout_diagnostics=one_more)) > _STDOUT_CAP
+
+
+def test_header_only_diagnostic_boundary_then_optional_field_omitted(monkeypatch, tmp_path):
+    body, review, readiness, merged = _large_chain(monkeypatch, tmp_path)
+    base_size = _writer_bytes(_without_diagnostics(merged))
+    diagnostics = merged["timeout_diagnostics"]
+    header_only = dict(diagnostics, occurrences=[], truncated_count=20)
+    overhead = _writer_bytes(dict(_without_diagnostics(merged), timeout_diagnostics=header_only)) - base_size
+
+    # The base result grows 1 byte per padding char: leave exactly `overhead`
+    # bytes (header-only just fits) and `overhead - 1` bytes (it does not).
+    fits_padding = 1450 + (_STDOUT_CAP - overhead - base_size)
+    _body, review_fit, _readiness, merged_fit = _large_chain(monkeypatch, tmp_path, fits_padding)
+    assert _writer_bytes(_without_diagnostics(merged_fit)) == _STDOUT_CAP - overhead
+    assert merged_fit["timeout_diagnostics"]["occurrences"] == []
+    assert merged_fit["timeout_diagnostics"]["total_timeout_occurrences"] == 20
+    assert merged_fit["timeout_diagnostics"]["truncated_count"] == 20
+    assert _writer_bytes(merged_fit) == _STDOUT_CAP
+    _assert_routing_unchanged(review_fit, merged_fit)
+
+    _body, review_omit, _readiness, merged_omit = _large_chain(
+        monkeypatch, tmp_path, fits_padding + 1
+    )
+    assert _writer_bytes(_without_diagnostics(merged_omit)) == _STDOUT_CAP - overhead + 1
+    # Optional field omitted (pre-existing contract shape); the review result
+    # as a whole is NOT lost / not turned into a capture_failure.
+    assert "timeout_diagnostics" not in merged_omit
+    assert _writer_bytes(merged_omit) <= _STDOUT_CAP
+    _assert_routing_unchanged(review_omit, merged_omit)
+
+
+# --- Finding B: malformed (unhashable) enum-like values -> `unknown` --------
+
+_MALFORMED_ENUM_VALUES = [[], {}, ["static_policy"], {"k": "v"}]
+
+
+def _timeout_error(readiness: dict, occurrence_index: int) -> dict:
+    (error,) = [
+        e
+        for e in readiness["errors"]
+        if e.get("category") == "timeout"
+        and (e.get("source_payload") or {}).get("occurrence_index") == occurrence_index
+    ]
+    return error
+
+
+@pytest.mark.parametrize("bad", _MALFORMED_ENUM_VALUES, ids=repr)
+@pytest.mark.parametrize(
+    "field_path, expected_reason",
+    [
+        (("timeout_provenance", "source"), "provenance_missing"),
+        (("timeout_provenance", "estimator_version"), "provenance_missing"),
+        (("timeout_provenance", "estimator_input_digest"), "provenance_missing"),
+        (("timeout_provenance", "timeout_seconds"), "provenance_missing"),
+        (("timeout_provenance", "cleanup_tail_seconds"), "provenance_missing"),
+        (("timeout_provenance",), "provenance_missing"),
+        (("execution_source",), "dedup_binding_invalid"),
+        (("execution_key_hash",), "execution_key_missing"),
+        (("canonical_plan_digest",), "plan_digest_mismatch"),
+        (("occurrence_index",), "occurrence_index_out_of_range"),
+    ],
+    ids=lambda value: "/".join(value) if isinstance(value, tuple) else None,
+)
+def test_unhashable_enum_like_values_degrade_to_unknown_without_exception(
+    monkeypatch, tmp_path, field_path, expected_reason, bad
+):
+    def tamper(readiness):
+        payload = _timeout_error(readiness, 2)["source_payload"]
+        target = payload
+        for key in field_path[:-1]:
+            target = target[key]
+        target[field_path[-1]] = bad
+
+    review, readiness, merged, code, _launcher = _full_chain(
+        monkeypatch, tmp_path, _TWO_BLOCK_BODY, {2: TIMEOUT_OUTCOME}, tamper_readiness=tamper
+    )
+    # The merge completes with the very same routing facts.
+    assert merged is not None and code == 1
+    _assert_routing_unchanged(review, merged)
+    (occurrence,) = merged["timeout_diagnostics"]["occurrences"]
+    assert occurrence["attribution"] == "unknown"
+    assert occurrence["reason_code"] == expected_reason
+    assert expected_reason in cic.TIMEOUT_UNKNOWN_REASON_CODES
+    assert occurrence["occurrence_index"] is None
+    assert occurrence["timeout_provenance"] is None
+    assert occurrence["execution_key_hash"] is None
+
+
+@pytest.mark.parametrize("bad", _MALFORMED_ENUM_VALUES, ids=repr)
+def test_unhashable_provenance_source_in_real_preflight_payload_degrades(
+    monkeypatch, tmp_path, bad
+):
+    # Producer boundary, through the REAL conversion: a (legacy / corrupted)
+    # preflight item with a list / dict `source` must neither raise in the
+    # readiness producer nor in the review merge.
+    def degrade(payload):
+        for item in payload["results"]:
+            if isinstance(item.get("timeout_provenance"), dict):
+                item["timeout_provenance"]["source"] = bad
+
+    review, readiness, merged, code, _launcher = _full_chain(
+        monkeypatch, tmp_path, _TWO_BLOCK_BODY, {2: TIMEOUT_OUTCOME}, degrade=degrade
+    )
+    assert merged is not None and code == 1
+    _assert_routing_unchanged(review, merged)
+    (occurrence,) = merged["timeout_diagnostics"]["occurrences"]
+    assert occurrence["attribution"] == "unknown"
+    assert occurrence["reason_code"] == "provenance_missing"
+
+
+@pytest.mark.parametrize("bad", _MALFORMED_ENUM_VALUES, ids=repr)
+def test_consumer_bounded_provenance_helper_never_raises(bad):
+    good = {
+        "timeout_seconds": 150,
+        "cleanup_tail_seconds": 15,
+        "source": "static_fallback",
+        "estimator_version": "v2",
+        "estimator_input_digest": "sha256:" + "33" * 32,
+    }
+    assert cic._timeout_bounded_provenance(good) == good
+    for key in good:
+        assert cic._timeout_bounded_provenance(dict(good, **{key: bad})) is None
+
+
+# --- Finding C: dedup replay bound to a verified source --------------------
+
+
+def _two_occurrence_chain(monkeypatch, tmp_path, tamper=None, degrade=None):
+    # _DEDUP_BODY: occurrence 0 real execution (timeout), 1 its dedup replay.
+    review, readiness, merged, code, launcher = _full_chain(
+        monkeypatch, tmp_path, _DEDUP_BODY, {0: TIMEOUT_OUTCOME},
+        degrade=degrade, tamper_readiness=tamper,
+    )
+    assert merged is not None and code == 1
+    _assert_routing_unchanged(review, merged)
+    first, second, *_extra = merged["timeout_diagnostics"]["occurrences"]
+    return readiness, first, second, launcher
+
+
+def test_dedup_pair_positive_control_is_attributed(monkeypatch, tmp_path):
+    _readiness, first, second, _launcher = _two_occurrence_chain(monkeypatch, tmp_path)
+    assert (first["attribution"], first["reason_code"]) == ("attributed", "binding_verified")
+    assert (second["attribution"], second["reason_code"]) == ("attributed", "binding_verified")
+    assert second["dedup_source_result_index"] == 0
+    assert second["timeout_provenance"] == first["timeout_provenance"]
+
+
+def test_invalid_source_occurrence_does_not_lend_binding_to_its_replay(monkeypatch, tmp_path):
+    def tamper(readiness):
+        # Only the SOURCE occurrence's plan digest disagrees with the top level.
+        _timeout_error(readiness, 0)["source_payload"]["canonical_plan_digest"] = _OTHER_DIGEST
+
+    _readiness, first, second, _launcher = _two_occurrence_chain(monkeypatch, tmp_path, tamper)
+    assert (first["attribution"], first["reason_code"]) == ("unknown", "plan_digest_mismatch")
+    assert (second["attribution"], second["reason_code"]) == ("unknown", "dedup_binding_invalid")
+    assert second["timeout_provenance"] is None and second["execution_key_hash"] is None
+
+
+def test_source_without_provenance_in_real_payload_makes_replay_unknown(monkeypatch, tmp_path):
+    def degrade(payload):
+        # Real preflight payload, source item only loses its provenance.
+        payload["results"][0].pop("timeout_provenance", None)
+
+    _readiness, first, second, _launcher = _two_occurrence_chain(
+        monkeypatch, tmp_path, degrade=degrade
+    )
+    assert (first["attribution"], first["reason_code"]) == ("unknown", "provenance_missing")
+    assert (second["attribution"], second["reason_code"]) == ("unknown", "dedup_binding_invalid")
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("timeout_seconds", 300),
+        ("cleanup_tail_seconds", 77),
+        ("source", "explicit_override"),
+        ("estimator_version", "v999"),
+        ("estimator_input_digest", "sha256:" + "ee" * 32),
+    ],
+)
+def test_replay_with_contradicting_budget_provenance_is_unknown(monkeypatch, tmp_path, field, value):
+    def tamper(readiness):
+        provenance = _timeout_error(readiness, 1)["source_payload"]["timeout_provenance"]
+        assert provenance[field] != value
+        provenance[field] = value
+
+    _readiness, first, second, _launcher = _two_occurrence_chain(monkeypatch, tmp_path, tamper)
+    # The source stays attributed (its own binding is intact); only the
+    # contradicting replay degrades -- no budget is recomputed or guessed.
+    assert (first["attribution"], first["reason_code"]) == ("attributed", "binding_verified")
+    assert (second["attribution"], second["reason_code"]) == ("unknown", "dedup_binding_invalid")
+    assert second["timeout_provenance"] is None
+
+
+def test_conflicting_duplicate_source_index_is_not_a_verified_source(monkeypatch, tmp_path):
+    def tamper(readiness):
+        # A second error claims index 0 as `executed` with another key.
+        clone = json.loads(json.dumps(_timeout_error(readiness, 0)))
+        clone["source_payload"]["execution_key_hash"] = "sha256:" + "dd" * 32
+        readiness["errors"].append(clone)
+
+    _readiness, _first, second, _launcher = _two_occurrence_chain(monkeypatch, tmp_path, tamper)
+    assert (second["attribution"], second["reason_code"]) == ("unknown", "dedup_binding_invalid")

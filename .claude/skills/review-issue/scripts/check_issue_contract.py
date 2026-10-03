@@ -603,9 +603,16 @@ def readiness_status_to_failure_class(readiness_status: Optional[str]) -> Option
 
 TIMEOUT_DIAGNOSTICS_SCHEMA_VERSION = "TIMEOUT_DIAGNOSTICS_V1"
 TIMEOUT_DIAGNOSTICS_MAX_OCCURRENCES = 16
-# `reviewer_transport.STDOUT_CAP` is 65,536 bytes; staying well below it keeps
-# the diagnostic from turning a merged result into a transport capture_failure.
+# Per-diagnostic bound. This alone does NOT keep the merged result under the
+# transport cap (the diagnostic is added to an already large result); the
+# whole-result budget below is what is authoritative.
 TIMEOUT_DIAGNOSTICS_MAX_SERIALIZED_BYTES = 16 * 1024
+# Mirrors `reviewer_transport.STDOUT_CAP` (65,536 bytes): the transport turns a
+# child stdout larger than this into a `capture_failure`. The child writer is
+# `run_root_review_pipeline._cmd_run_checker_attempt()`'s
+# `print(json.dumps(merged))` (default `ensure_ascii=True`, trailing newline,
+# utf-8). A pinned test asserts this constant equals the transport's.
+TIMEOUT_DIAGNOSTICS_STDOUT_CAP_BYTES = 65_536
 
 TIMEOUT_ATTRIBUTION_ATTRIBUTED = "attributed"
 TIMEOUT_ATTRIBUTION_UNKNOWN = "unknown"
@@ -657,7 +664,9 @@ def _timeout_bounded_provenance(raw: object) -> Optional[dict]:
         return None
     if not (_timeout_plain_int(cleanup_tail_seconds) and 0 <= cleanup_tail_seconds <= _TIMEOUT_MAX_SECONDS):  # type: ignore[operator]
         return None
-    if source not in _TIMEOUT_PROVENANCE_SOURCES:
+    # Type first: an unhashable (list / dict) value must degrade to `None`
+    # (-> `unknown`), not raise `TypeError` from the frozenset membership test.
+    if not isinstance(source, str) or source not in _TIMEOUT_PROVENANCE_SOURCES:
         return None
     if not (isinstance(estimator_version, str) and _TIMEOUT_ESTIMATOR_VERSION_RE.match(estimator_version)):
         return None
@@ -677,6 +686,20 @@ def _timeout_error_payload(error: dict) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def _timeout_provenance_identity(provenance: Optional[dict]) -> Optional[tuple]:
+    """Hashable, ordered identity of a bounded provenance (dedup source /
+    replay comparison). `None` stays `None`."""
+    if provenance is None:
+        return None
+    return (
+        provenance["timeout_seconds"],
+        provenance["cleanup_tail_seconds"],
+        provenance["source"],
+        provenance["estimator_version"],
+        provenance["estimator_input_digest"],
+    )
+
+
 def _timeout_unknown_reason(
     *,
     top_level_digest: Optional[str],
@@ -687,7 +710,7 @@ def _timeout_unknown_reason(
     execution_key_hash: Optional[str],
     execution_source: Optional[str],
     dedup_source_index: Optional[int],
-    executed_key_by_index: dict,
+    executed_binding_by_index: dict,
 ) -> Optional[str]:
     """Return the bounded `unknown` reason code, or `None` if the occurrence
     binding is verified. Pure comparison of values already held by the
@@ -714,7 +737,13 @@ def _timeout_unknown_reason(
             dedup_source_index is None
             or dedup_source_index >= results_count
             or dedup_source_index >= occurrence_index
-            or executed_key_by_index.get(dedup_source_index) != execution_key_hash
+            # The source must itself be a binding-verified `executed`
+            # occurrence (see `build_timeout_diagnostics()`), with the same
+            # execution key AND the same applied-budget provenance: the
+            # execution key covers the timeout, and a replay reuses the
+            # source's execution under the very same budget.
+            or executed_binding_by_index.get(dedup_source_index)
+            != (execution_key_hash, _timeout_provenance_identity(provenance))
         ):
             return "dedup_binding_invalid"
     else:
@@ -748,16 +777,44 @@ def build_timeout_diagnostics(
 
     # `executed` result items by canonical index (any category), used to
     # check that a dedup replay points at an actual execution source with the
-    # same execution key.
-    executed_key_by_index: dict = {}
+    # same execution key and the same applied-budget provenance. A source is
+    # registered ONLY if its own binding integrity is verified from values
+    # already in this readiness result (plan digest, occurrence index range,
+    # provenance, execution key): an invalid source must never lend
+    # `binding_verified` to a replay. An index that appears twice with
+    # conflicting identity is not registered at all.
+    executed_binding_by_index: dict = {}
+    conflicting_source_indexes: set = set()
     for error in errors:
         if not isinstance(error, dict):
             continue
         payload = _timeout_error_payload(error)
         index = _timeout_index(payload.get("occurrence_index"))
         key = _timeout_sha256(payload.get("execution_key_hash"))
-        if index is not None and key is not None and payload.get("execution_source") == "executed":
-            executed_key_by_index[index] = key
+        if index is None or key is None or payload.get("execution_source") != "executed":
+            continue
+        source_provenance = _timeout_bounded_provenance(payload.get("timeout_provenance"))
+        source_reason = _timeout_unknown_reason(
+            top_level_digest=top_level_digest,
+            results_count=results_count,
+            error_digest=_timeout_sha256(payload.get("canonical_plan_digest")),
+            occurrence_index=index,
+            provenance=source_provenance,
+            execution_key_hash=key,
+            execution_source="executed",
+            dedup_source_index=_timeout_index(payload.get("dedup_source_result_index")),
+            executed_binding_by_index={},
+        )
+        if source_reason is not None:
+            continue
+        identity = (key, _timeout_provenance_identity(source_provenance))
+        if index in conflicting_source_indexes:
+            continue
+        if executed_binding_by_index.get(index, identity) != identity:
+            del executed_binding_by_index[index]
+            conflicting_source_indexes.add(index)
+            continue
+        executed_binding_by_index[index] = identity
 
     timeout_errors = [
         error
@@ -777,7 +834,8 @@ def build_timeout_diagnostics(
         command_hash = _timeout_sha256(payload.get("command_hash"))
         execution_key_hash = _timeout_sha256(payload.get("execution_key_hash"))
         execution_source = payload.get("execution_source")
-        if execution_source not in _TIMEOUT_EXECUTION_SOURCES:
+        # Type first (an unhashable list / dict must not raise `TypeError`).
+        if not isinstance(execution_source, str) or execution_source not in _TIMEOUT_EXECUTION_SOURCES:
             execution_source = None
         dedup_source_index = _timeout_index(payload.get("dedup_source_result_index"))
         provenance = _timeout_bounded_provenance(payload.get("timeout_provenance"))
@@ -791,7 +849,7 @@ def build_timeout_diagnostics(
             execution_key_hash=execution_key_hash,
             execution_source=execution_source,
             dedup_source_index=dedup_source_index,
-            executed_key_by_index=executed_key_by_index,
+            executed_binding_by_index=executed_binding_by_index,
         )
         if reason is None:
             occurrences.append(
@@ -845,6 +903,46 @@ def build_timeout_diagnostics(
     return diagnostics
 
 
+def _stdout_bytes_of_review_result(result: dict) -> int:
+    """Byte size of `result` as the root review child actually writes it:
+    `print(json.dumps(merged))` (default options, trailing newline, utf-8)."""
+    return len((json.dumps(result) + "\n").encode("utf-8"))
+
+
+def fit_timeout_diagnostics_to_stdout_budget(
+    base_result: dict, diagnostics: dict
+) -> Optional[dict]:
+    """Shrink the OPTIONAL `timeout_diagnostics` so the WHOLE merged result
+    (`base_result` + the diagnostic) stays within the transport stdout cap.
+
+    The per-diagnostic 16 KiB bound is not sufficient: the diagnostic is added
+    to an already large result, and a stdout above
+    `TIMEOUT_DIAGNOSTICS_STDOUT_CAP_BYTES` becomes a transport
+    `capture_failure` (a retry-eligible loss of the whole review result).
+    Only occurrences are dropped (and `truncated_count` kept consistent with
+    `total_timeout_occurrences`); `base_result` -- verdict, failure_class,
+    blockers -- is never touched, and JSON is never cut mid-stream. If even
+    the header-only diagnostic does not fit, `None` is returned and the
+    caller omits the optional field (the pre-existing contract shape).
+
+    `base_result` must already be in its final form (every other mutation
+    applied) so the measured size is the size actually written.
+    """
+    if "timeout_diagnostics" in base_result:
+        base_result = {k: v for k, v in base_result.items() if k != "timeout_diagnostics"}
+    total = diagnostics["total_timeout_occurrences"]
+    all_occurrences = list(diagnostics["occurrences"])
+    for keep in range(len(all_occurrences), -1, -1):
+        candidate = dict(diagnostics)
+        candidate["occurrences"] = all_occurrences[:keep]
+        candidate["truncated_count"] = total - keep
+        trial = dict(base_result)
+        trial["timeout_diagnostics"] = candidate
+        if _stdout_bytes_of_review_result(trial) <= TIMEOUT_DIAGNOSTICS_STDOUT_CAP_BYTES:
+            return candidate
+    return None
+
+
 def merge_readiness_into_review_result(
     review_result: dict,
     readiness_result: dict,
@@ -883,6 +981,7 @@ def merge_readiness_into_review_result(
     routed into `non_blocking_improvements`.
     """
     merged = json.loads(json.dumps(review_result))
+    timeout_diagnostics: Optional[dict] = None
     review_body_sha256 = merged.get("body_sha256")
     readiness_body_sha256 = readiness_result.get("body_sha256")
     readiness_errors = readiness_result.get("errors") or []
@@ -953,11 +1052,12 @@ def merge_readiness_into_review_result(
                 # failure_class / route change. Reached only after the
                 # body_sha256 fail-closed check above, so a mismatched
                 # readiness result never produces a diagnostic.
+                # Attached only after every other mutation below, and fitted
+                # to the whole-result stdout budget (see
+                # `fit_timeout_diagnostics_to_stdout_budget()`).
                 timeout_diagnostics = build_timeout_diagnostics(
                     readiness_result, body_sha256=review_body_sha256
                 )
-                if timeout_diagnostics is not None:
-                    merged["timeout_diagnostics"] = timeout_diagnostics
                 # `compact_review_result.py` checks `verdict == "approve"` first
                 # and short-circuits to `NEXT_ACTION: proceed` before it ever
                 # looks at `failure_class` (Issue #1791 review remediation
@@ -972,6 +1072,11 @@ def merge_readiness_into_review_result(
                     merged["verdict"] = "needs-fix"
             elif new_blockers:
                 merged["verdict"] = "needs-fix"
+
+    if timeout_diagnostics is not None:
+        fitted = fit_timeout_diagnostics_to_stdout_budget(merged, timeout_diagnostics)
+        if fitted is not None:
+            merged["timeout_diagnostics"] = fitted
 
     _validate_review_issue_result_payload(merged)
     return merged
