@@ -745,10 +745,24 @@ def _incident_markers(landed_evidence) -> tuple[str, str]:
     return merged_marker, draft_marker
 
 
-def _incident_run(landed_evidence, main_sha: str, *, fallback=None, ancestry_calls: list | None = None):
+def _incident_run(
+    landed_evidence,
+    main_sha: str,
+    *,
+    fallback=None,
+    ancestry_calls: list | None = None,
+    live_overrides: dict | None = None,
+):
     """Fake `gh` transport for the #2851 (merged) / #2888 (draft) incident:
     both are `verified_cross_reference` timeline candidates (no
-    `closingIssuesReferences`, the draft is `Refs #2843`)."""
+    `closingIssuesReferences`, the draft is `Refs #2843`).
+
+    `live_overrides` (#2893 P2 regressions) maps a PR number string to a dict
+    of field overrides applied ONLY to the decision-time
+    `gh pr view <N> --json <_LIVE_CANDIDATE_REFRESH_FIELDS>` response (the
+    freshness-rebind call shape). The collection-time (full-field) response
+    is never overridden, so a test can make the live PR state diverge from
+    what the first collection saw."""
     merged_marker, draft_marker = _incident_markers(landed_evidence)
     repo = _INCIDENT_REPO
     timeline = [
@@ -807,6 +821,7 @@ def _incident_run(landed_evidence, main_sha: str, *, fallback=None, ancestry_cal
                     key: payload[key]
                     for key in ("headRefOid", "mergedAt", "mergeCommit", "body", "closingIssuesReferences")
                 }
+                payload.update((live_overrides or {}).get(argv[3], {}))
             return 0, json.dumps(payload), ""
         if argv[:2] == ["gh", "api"] and len(argv) > 2 and "compare" in argv[2]:
             if ancestry_calls is not None:
@@ -904,3 +919,203 @@ def test_ac8_intake_capsule_pre_step1_data_plane_resumes_existing_pr(monkeypatch
     assert landed["pre_step1_data_plane"]["start_data_plane"] is False
     assert landed["pre_step1_data_plane"]["action"] != "suppress_worker_worktree_new_pr"
     assert set(landed["pre_step1_data_plane"]) == {"start_data_plane", "action"}
+
+
+# ---------------------------------------------------------------------------
+# #2893 PR #2894 review fix_delta (P2): decision-time live PR semantic
+# refresh. Every test below drives the production
+# `resolve_landing_disposition_with_freshness_rebind()` composition through
+# the fake `gh` transport, where the FIRST collection (full-field
+# `gh pr view`) and the decision-time refresh (`headRefOid,mergedAt,...,body,
+# closingIssuesReferences`) answer differently via `live_overrides`.
+# ---------------------------------------------------------------------------
+
+
+def _rebind(landed_evidence, run):
+    return landed_evidence.resolve_landing_disposition_with_freshness_rebind(
+        repo=_INCIDENT_REPO,
+        issue_number=_INCIDENT_ISSUE,
+        current_scope=_INCIDENT_LIVE_BODY,
+        run_command=run,
+    )
+
+
+def _marker_for(landed_evidence, body: str, head: str) -> str:
+    return landed_evidence.render_scope_coverage_marker(
+        landed_evidence.build_scope_coverage_marker(issue_number=_INCIDENT_ISSUE, issue_body=body, pr_head_sha=head)
+    )
+
+
+def test_p2_baseline_refresh_without_overrides_still_resumes_current_draft():
+    """Control: with no divergence between collection and decision time the
+    carve-out (and the refresh) keep `existing_pr_resume` for PR #2888."""
+    landed_evidence = _load(LANDED_EVIDENCE, "landed_evidence_p2_baseline")
+    result = _rebind(landed_evidence, _incident_run(landed_evidence, "9" * 40))
+    assert result["decision_time_rebind"] == {"status": "fresh"}
+    assert result["landing_disposition"]["disposition"] == "existing_pr_resume"
+    assert result["landing_disposition"]["candidate"]["pr"]["number"] == 2888
+
+
+def test_p2_current_draft_marker_missing_after_collection_does_not_resume_from_stale_exact():
+    """GIVEN the draft's marker is exact at collection WHEN its live body no
+    longer carries a marker at decision time THEN the stale exact state is
+    not used for historical exclusion/resume (fail-closed conflict)."""
+    landed_evidence = _load(LANDED_EVIDENCE, "landed_evidence_p2_draft_marker_missing")
+    run = _incident_run(
+        landed_evidence, "9" * 40, live_overrides={"2888": {"body": "Refs #2843\n\nmarker removed after collection"}}
+    )
+    result = _rebind(landed_evidence, run)
+    landing = result["landing_disposition"]
+    assert landing["disposition"] != "existing_pr_resume"
+    assert landing["disposition"] == "reconciliation_required"
+    assert landing["reason_codes"] == ["qualified_candidate_conflict"]
+    by_number = {c["pr"]["number"]: c for c in result["candidates"]}
+    assert by_number[2888]["scope_coverage"]["status"] == "missing_marker"
+
+
+def test_p2_current_draft_marker_becomes_non_exact_after_collection_does_not_resume():
+    """The draft's live marker now records an earlier (non-exact) scope."""
+    landed_evidence = _load(LANDED_EVIDENCE, "landed_evidence_p2_draft_marker_non_exact")
+    stale_scope_marker = _marker_for(landed_evidence, _INCIDENT_EARLIER_BODY, _INCIDENT_DRAFT_HEAD)
+    run = _incident_run(
+        landed_evidence, "9" * 40, live_overrides={"2888": {"body": "Refs #2843\n\n" + stale_scope_marker}}
+    )
+    landing = _rebind(landed_evidence, run)["landing_disposition"]
+    assert landing["disposition"] == "reconciliation_required"
+    assert landing["reason_codes"] == ["qualified_candidate_conflict"]
+
+
+def test_p2_historical_merged_marker_becomes_exact_current_after_collection_is_not_excluded():
+    """GIVEN PR #2851 looked historical at collection WHEN its live marker is
+    now exact-current THEN it is no longer a historical exclusion: both
+    candidates are qualified -> conflict (never `existing_pr_resume`)."""
+    landed_evidence = _load(LANDED_EVIDENCE, "landed_evidence_p2_merged_exact")
+    exact_marker = _marker_for(landed_evidence, _INCIDENT_LIVE_BODY, _INCIDENT_MERGE_OID)
+    run = _incident_run(landed_evidence, "9" * 40, live_overrides={"2851": {"body": exact_marker}})
+    result = _rebind(landed_evidence, run)
+    landing = result["landing_disposition"]
+    assert landing["disposition"] == "reconciliation_required"
+    assert landing["reason_codes"] == ["qualified_candidate_conflict"]
+    by_number = {c["pr"]["number"]: c for c in result["candidates"]}
+    assert by_number[2851]["scope_coverage"]["status"] == "covered_exactly"
+
+
+def test_p2_historical_merged_marker_becomes_invalid_after_collection_is_not_excluded():
+    """PR #2851's live marker is now malformed (invalid schema_version): it
+    must not be excluded as historical."""
+    landed_evidence = _load(LANDED_EVIDENCE, "landed_evidence_p2_merged_invalid")
+    merged_marker, _draft_marker = _incident_markers(landed_evidence)
+    corrupted = merged_marker.replace("IMPLEMENTATION_SCOPE_COVERAGE_V1\"", "BROKEN_SCHEMA\"", 1)
+    assert corrupted != merged_marker
+    run = _incident_run(landed_evidence, "9" * 40, live_overrides={"2851": {"body": corrupted}})
+    result = _rebind(landed_evidence, run)
+    landing = result["landing_disposition"]
+    assert landing["disposition"] == "reconciliation_required"
+    assert landing["reason_codes"] == ["qualified_candidate_conflict"]
+    by_number = {c["pr"]["number"]: c for c in result["candidates"]}
+    assert by_number[2851]["scope_coverage"]["status"] == "invalid"
+
+
+def test_p2_closing_relation_established_at_decision_time_applies_closing_precedence():
+    """GIVEN no closing relation at collection WHEN PR #2851's live
+    `closingIssuesReferences` now names the target THEN the existing closing
+    precedence applies (the same result as a collection-time closing
+    candidate): the merged `later_scope_expansion` candidate is the sole
+    authority -> `legacy_or_later_scope_expansion`, and the draft no longer
+    contributes."""
+    landed_evidence = _load(LANDED_EVIDENCE, "landed_evidence_p2_closing")
+    run = _incident_run(
+        landed_evidence, "9" * 40, live_overrides={"2851": {"closingIssuesReferences": [{"number": _INCIDENT_ISSUE}]}}
+    )
+    result = _rebind(landed_evidence, run)
+    by_number = {c["pr"]["number"]: c for c in result["candidates"]}
+    assert by_number[2851]["provenance"]["kind"] == "closing_relation"
+    assert by_number[2888]["provenance"]["kind"] == "verified_cross_reference"
+    landing = result["landing_disposition"]
+    # Reference: the same evidence with the closing relation present from the
+    # start, through the production derive path (not a copy of its logic).
+    reference = landed_evidence.derive_landing_disposition(
+        result, repo=_INCIDENT_REPO, issue_number=_INCIDENT_ISSUE
+    )
+    assert landing == reference
+    assert landing["disposition"] == "ordinary_dispatch_or_explicit_recovery"
+    assert landing["reason_codes"] == ["legacy_or_later_scope_expansion"]
+    assert landing["candidate"]["pr"]["number"] == 2851
+
+
+def test_p2_closing_relation_on_current_draft_at_decision_time_resumes_via_closing_precedence():
+    """The current draft gains a live closing relation: closing precedence
+    selects it alone; its exact marker then resumes through the existing path."""
+    landed_evidence = _load(LANDED_EVIDENCE, "landed_evidence_p2_closing_draft")
+    run = _incident_run(
+        landed_evidence, "9" * 40, live_overrides={"2888": {"closingIssuesReferences": [{"number": _INCIDENT_ISSUE}]}}
+    )
+    result = _rebind(landed_evidence, run)
+    by_number = {c["pr"]["number"]: c for c in result["candidates"]}
+    assert by_number[2888]["provenance"]["kind"] == "closing_relation"
+    landing = result["landing_disposition"]
+    assert landing == landed_evidence.derive_landing_disposition(
+        result, repo=_INCIDENT_REPO, issue_number=_INCIDENT_ISSUE
+    )
+    assert landing["disposition"] == "existing_pr_resume"
+    assert landing["candidate"]["pr"]["number"] == 2888
+
+
+def test_p2_prose_only_pr_body_change_keeps_existing_pr_resume():
+    """GIVEN only explanatory prose changes between collection and decision
+    time (marker and closing semantics identical) THEN freshness does not
+    fail on body bytes and `existing_pr_resume` is kept."""
+    landed_evidence = _load(LANDED_EVIDENCE, "landed_evidence_p2_prose")
+    merged_marker, draft_marker = _incident_markers(landed_evidence)
+    run = _incident_run(
+        landed_evidence,
+        "9" * 40,
+        live_overrides={
+            "2888": {"body": "Refs #2843\n\nPR description reworded after collection.\n\n" + draft_marker},
+            "2851": {"body": "Historical PR, wording edited later.\n\n" + merged_marker},
+        },
+    )
+    result = _rebind(landed_evidence, run)
+    assert result["decision_time_rebind"] == {"status": "fresh"}
+    landing = result["landing_disposition"]
+    assert "freshness_rebind_failed" not in landing["reason_codes"]
+    assert landing["disposition"] == "existing_pr_resume"
+    assert landing["candidate"]["pr"]["number"] == 2888
+
+
+def test_p2_unverifiable_live_semantic_state_of_participant_fails_closed():
+    """A carve-out participant whose live `body` / `closingIssuesReferences`
+    cannot be verified is never trusted from the stale collection-time marker:
+    `freshness_rebind_failed`."""
+    landed_evidence = _load(LANDED_EVIDENCE, "landed_evidence_p2_unverifiable")
+    for number, override in (
+        ("2888", {"body": None}),
+        ("2888", {"closingIssuesReferences": None}),
+        ("2851", {"body": 123}),
+        ("2851", {"closingIssuesReferences": "not-a-list"}),
+    ):
+        run = _incident_run(landed_evidence, "9" * 40, live_overrides={number: override})
+        result = _rebind(landed_evidence, run)
+        assert result["decision_time_rebind"] == {"status": "stale"}, (number, override)
+        assert result["landing_disposition"]["disposition"] == "reconciliation_required"
+        assert result["landing_disposition"]["reason_codes"] == ["freshness_rebind_failed"]
+
+
+def test_p2_participant_is_never_exempted_from_identity_requirement():
+    """A carve-out participant that live turns into an identity-mismatch
+    marker is NOT added to the #2750 identity exemption: its head drift still
+    fails freshness."""
+    landed_evidence = _load(LANDED_EVIDENCE, "landed_evidence_p2_identity_not_exempt")
+    sibling_marker = landed_evidence.render_scope_coverage_marker(
+        landed_evidence.build_scope_coverage_marker(
+            issue_number=9999, issue_body=_INCIDENT_LIVE_BODY, pr_head_sha="c" * 40
+        )
+    )
+    run = _incident_run(
+        landed_evidence,
+        "9" * 40,
+        live_overrides={"2888": {"body": sibling_marker, "headRefOid": "c" * 40}},
+    )
+    result = _rebind(landed_evidence, run)
+    assert result["landing_disposition"]["disposition"] == "reconciliation_required"
+    assert result["landing_disposition"]["reason_codes"] == ["freshness_rebind_failed"]

@@ -2164,3 +2164,79 @@ def test_ac6_existing_carveouts_and_legacy_behavior_are_unchanged():
         )
         == resumed
     )
+
+
+# ---------------------------------------------------------------------------
+# #2893 PR #2894 review fix_delta (P3): the #2893 carve-out requires a
+# positively verified same-Issue `marker` Mapping. A coverage whose `marker`
+# key is absent (status/errors otherwise valid) never satisfies the carve-out.
+# ---------------------------------------------------------------------------
+
+
+def _without_marker(coverage):
+    stripped = {key: value for key, value in coverage.items() if key != "marker"}
+    assert "marker" not in stripped
+    assert stripped["status"] in {"covered_exactly", "later_scope_expansion"}
+    assert stripped["errors"] == []
+    return stripped
+
+
+def test_p3_valid_same_issue_scope_coverage_requires_marker_mapping_for_target_issue():
+    valid = _historical_merged()
+    assert mod._has_valid_same_issue_scope_coverage(valid, ISSUE) is True
+    # marker key absent -> not valid
+    absent = _historical_merged(scope_coverage=_without_marker(_historical_coverage()))
+    assert mod._has_valid_same_issue_scope_coverage(absent, ISSUE) is False
+    # marker present but not a Mapping / names another Issue -> not valid
+    for bad_marker in (None, "marker", ["x"], {"issue_number": ISSUE + 1}, {}):
+        coverage = dict(_historical_coverage())
+        coverage["marker"] = bad_marker
+        candidate = _historical_merged(scope_coverage=coverage)
+        assert mod._has_valid_same_issue_scope_coverage(candidate, ISSUE) is False, bad_marker
+
+
+def test_p3_historical_side_marker_key_missing_does_not_form_carve_out():
+    """status=later_scope_expansion / errors=[] but no `marker` key on the
+    historical merged candidate: the #2893 carve-out does not apply, so the
+    two-candidate conflict is preserved."""
+    historical = _historical_merged(scope_coverage=_without_marker(_historical_coverage()))
+    assert mod._is_historical_merged_later_scope_candidate(historical, ISSUE) is False
+    result = _disposition([historical, _current_exact()])
+    assert result["disposition"] == "reconciliation_required"
+    assert result["reason_codes"] == ["qualified_candidate_conflict"]
+    # Sanity: the same pair with the marker attached resumes.
+    assert _disposition([_historical_merged(), _current_exact()])["disposition"] == "existing_pr_resume"
+
+
+def test_p3_current_side_marker_key_missing_does_not_form_carve_out():
+    """status=covered_exactly / errors=[] but no `marker` key on the current
+    exact candidate: it is not a current exact resume candidate."""
+    current = _current_exact(scope_coverage=_without_marker(_current_exact_coverage()))
+    assert mod._is_current_exact_resume_candidate(current, ISSUE) is False
+    for order in ((_historical_merged(), current), (current, _historical_merged())):
+        result = _disposition(list(order))
+        assert result["disposition"] == "reconciliation_required"
+        assert result["reason_codes"] == ["qualified_candidate_conflict"]
+
+
+def test_p3_marker_key_missing_does_not_change_non_2893_paths():
+    """#2750 sibling carve-out, markerless legacy resume and a lone
+    covered_exactly open candidate without a `marker` key keep their
+    pre-#2893 semantics."""
+    # #2750: identity-mismatch sibling (no marker key by construction) is still excluded.
+    sibling = _candidate(
+        lifecycle="merged",
+        provenance="verified_cross_reference",
+        pr_number=2735,
+        scope_coverage=_sibling_identity_mismatch_coverage(),
+    )
+    assert "marker" not in sibling["scope_coverage"]
+    lone_exact = _current_exact(scope_coverage=_without_marker(_current_exact_coverage()))
+    result = _disposition([sibling, lone_exact])
+    assert result["disposition"] == "existing_pr_resume"
+    assert result["candidate"]["pr"]["number"] == 2888
+    # Markerless legacy open candidate (no coverage at all) still resumes by ownership.
+    legacy = _candidate(lifecycle="open", provenance="verified_cross_reference", pr_number=2890, ownership=True)
+    legacy_result = _disposition([legacy])
+    assert legacy_result["disposition"] == "existing_pr_resume"
+    assert legacy_result["reason_codes"] == ["markerless_allowed_paths_coverage"]

@@ -369,18 +369,21 @@ def _has_valid_same_issue_scope_coverage(candidate: Mapping[str, Any], issue_num
     fallback of `_coverage_for()`), so the decision can never be satisfied by
     an unrelated global coverage. A valid coverage has a coverage status
     (`covered_exactly` / `later_scope_expansion`, i.e. neither `invalid` nor
-    `missing_marker`), no errors, and -- when the parsed marker is attached --
-    a marker that names the current target Issue.
+    `missing_marker`), no errors, and the parsed `marker` attached as a
+    Mapping that names the current target Issue. A coverage whose `marker`
+    key is absent (or not a Mapping) is NOT valid here (P3): the #2893
+    carve-out must be backed by a positively verified same-Issue marker, never
+    by a status string alone. This helper is #2893-carve-out-specific; the
+    #2750 `_is_irrelevant_cross_reference()` and the markerless legacy
+    open/draft path do not use it and are unchanged.
     """
     coverage = candidate.get("scope_coverage")
     if not isinstance(coverage, Mapping):
         return False
     if coverage.get("status") not in {"covered_exactly", "later_scope_expansion"} or coverage.get("errors"):
         return False
-    if "marker" in coverage:
-        marker = coverage["marker"]
-        return isinstance(marker, Mapping) and marker.get("issue_number") == issue_number
-    return True
+    marker = coverage.get("marker")
+    return isinstance(marker, Mapping) and marker.get("issue_number") == issue_number
 
 
 def _is_historical_merged_later_scope_candidate(candidate: Mapping[str, Any], issue_number: int) -> bool:
@@ -828,6 +831,30 @@ def _collection_time_reference(evidence: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _is_historical_carveout_participant(candidate: Mapping[str, Any], issue_number: int) -> bool:
+    """A candidate whose collection-time semantic state can feed the #2893
+    carve-out (and therefore must be re-derived from live data at decision
+    time): `verified_cross_reference`, lifecycle merged/open/draft, and a
+    candidate-local valid same-Issue scope coverage."""
+    provenance = candidate.get("provenance")
+    return (
+        isinstance(provenance, Mapping)
+        and provenance.get("kind") == "verified_cross_reference"
+        and candidate.get("lifecycle") in {"merged", "open", "draft"}
+        and _has_valid_same_issue_scope_coverage(candidate, issue_number)
+    )
+
+
+def _historical_carveout_possible(candidates: list[Any], issue_number: int) -> bool:
+    """True when the #2893 carve-out could apply to the collected evidence: no
+    `closing_relation` candidate and at least one historical merged
+    later_scope_expansion candidate."""
+    mappings = [c for c in candidates if isinstance(c, Mapping) and isinstance(c.get("provenance"), Mapping)]
+    if any(c["provenance"].get("kind") == "closing_relation" for c in mappings):
+        return False
+    return any(_is_historical_merged_later_scope_candidate(c, issue_number) for c in mappings)
+
+
 def _live_freshness_reference(
     *,
     repo: str,
@@ -851,7 +878,21 @@ def _live_freshness_reference(
     silently treated as "still irrelevant" -- so it is NOT excluded from the
     freshness identity requirement and drives `ok=False` /
     `freshness_rebind_failed` like any other unconfirmed candidate (research
-    Issue #2761 P1-1/P1-2)."""
+    Issue #2761 P1-1/P1-2).
+
+    historical merged later_scope_expansion carve-out (#2893 P2): when that
+    carve-out could apply (no `closing_relation` candidate, and a historical
+    merged later_scope_expansion candidate exists at collection time), every
+    carve-out participant (see `_is_historical_carveout_participant()`) also
+    has its semantic state (scope coverage / closing relation) re-derived
+    from this same already-fetched live `body`/`closingIssuesReferences`, so
+    the carve-out decision is never made from a stale collection-time marker
+    state. A participant whose live authority cannot be fully verified is
+    recorded in `unconfirmed_qualified_irrelevant_numbers` (-> `ok=False` /
+    `freshness_rebind_failed`, never fail-open). Participants are NEVER added
+    to `excluded_candidate_numbers` (their identity is always required) and
+    the PR body is never byte-compared: a prose-only change that leaves the
+    marker/closing semantics unchanged keeps the disposition."""
     rc, out, _ = run_command(["gh", "issue", "view", str(issue_number), "--repo", repo, "--json", "body"])
     issue_body_sha256: str | None = None
     live_issue_body: str | None = None
@@ -883,6 +924,7 @@ def _live_freshness_reference(
     # alone (as a `None` proxy for "unconfirmed") would silently miss this
     # case and fail back open.
     unconfirmed_qualified_irrelevant_numbers: set[int] = set()
+    carveout_refresh = _historical_carveout_possible(candidates, issue_number)
     for candidate in candidates:
         if not isinstance(candidate, Mapping):
             continue
@@ -910,7 +952,12 @@ def _live_freshness_reference(
                     identity = parsed.get("headRefOid")
         candidate_identity[number] = identity
 
-        if not previously_qualified_irrelevant:
+        carveout_participant = (
+            carveout_refresh
+            and not previously_qualified_irrelevant
+            and _is_historical_carveout_participant(candidate, issue_number)
+        )
+        if not previously_qualified_irrelevant and not carveout_participant:
             continue
         # research Issue #2761 P1-1/P1-2: a collection-time-qualified
         # irrelevant sibling's decision-time re-confirmation is only trusted
@@ -951,7 +998,12 @@ def _live_freshness_reference(
             pr_body=live_body, issue_number=issue_number, live_issue_body=live_issue_body
         )
         probe_candidate = {"provenance": candidate.get("provenance") or {}, "scope_coverage": live_coverage}
-        still_irrelevant = (not live_closing) and _is_irrelevant_cross_reference(probe_candidate)
+        # #2893 P2: a carve-out participant is re-derived but NEVER granted the
+        # #2750 identity exemption (it was not a qualified irrelevant sibling
+        # at collection time); identity comparison stays as before.
+        still_irrelevant = (
+            previously_qualified_irrelevant and (not live_closing) and _is_irrelevant_cross_reference(probe_candidate)
+        )
         candidate_live_updates[number] = {
             "scope_coverage": live_coverage,
             "promote_closing_relation": live_closing,
