@@ -1336,8 +1336,20 @@ ISSUE_VALUES = {{
     "url": REPO_URL + "/issues/" + FIXTURE_ISSUE,
     "labels": [{{"name": "phase/implementation"}}],
     "comments": [],
+    "author": {{"login": "canary-author"}},
+    "assignees": [],
+    "milestone": None,
+    "createdAt": UPDATED_AT,
     "updatedAt": UPDATED_AT,
+    "closedAt": None,
 }}
+# PR_VALUES は canonical route (impl-review-loop / implement-issue / open-pr / pr-review-judge の実コードと
+# SKILL) が `gh pr view --json` で要求する field (headRefOid, mergeable, mergeStateStatus, number, url, state,
+# isDraft, files, comments, body, closingIssuesReferences, mergedAt, mergeCommit 等) と、worker が PR の事実
+# 確認に使いうる一般的な field (reviews, latestReviews, commits, author, assignees, additions, deletions,
+# changedFiles, headRepository*, maintainerCanModify, autoMergeRequest, reviewRequests 等) を fixture の事実
+# として持つ。ここに無い field (projectItems, potentialMergeCommit, baseRefOid 等) は canonical route が読まない
+# ため意図的に fail-closed (null で成功扱いにしない)。実在しない subcommand (`gh pr reviews` 等) も fail-closed。
 PR_VALUES = {{
     "number": int(FIXTURE_PR),
     "state": "OPEN",
@@ -1369,13 +1381,49 @@ PR_VALUES = {{
             "repository": {{"name": ALLOWED_REPO.split("/")[1], "owner": {{"login": ALLOWED_REPO.split("/")[0]}}}},
         }}
     ],
+    "latestReviews": [
+        {{
+            "id": "canary-review-1",
+            "author": {{"login": "canary-reviewer"}},
+            "authorAssociation": "OWNER",
+            "body": FIXTURE_REVIEWS[0]["body"],
+            "state": "CHANGES_REQUESTED",
+            "submittedAt": UPDATED_AT,
+            "commit": {{"oid": HEAD_REF_OID}},
+        }}
+    ],
+    "reviewRequests": [],
     "labels": [],
     "comments": [],
+    "commits": [
+        {{
+            "oid": HEAD_REF_OID,
+            "messageHeadline": "canary fixture commit",
+            "authoredDate": UPDATED_AT,
+            "committedDate": UPDATED_AT,
+            "authors": [{{"login": "canary-author"}}],
+        }}
+    ],
+    "id": "PR_canary_fixture",
+    "author": {{"login": "canary-author"}},
+    "assignees": [],
+    "milestone": None,
     "mergedAt": None,
     "mergeCommit": None,
+    "mergedBy": None,
+    "autoMergeRequest": None,
+    "maintainerCanModify": False,
+    "isCrossRepository": False,
+    "headRepository": {{"name": ALLOWED_REPO.split("/")[1]}},
+    "headRepositoryOwner": {{"login": ALLOWED_REPO.split("/")[0]}},
     "files": [{{"path": FIXTURE_CHANGED_PATH, "additions": 1, "deletions": 0}}],
+    "additions": 1,
+    "deletions": 0,
+    "changedFiles": 1,
     "statusCheckRollup": [],
+    "createdAt": UPDATED_AT,
     "updatedAt": UPDATED_AT,
+    "closedAt": None,
 }}
 
 
@@ -1735,6 +1783,47 @@ def _allowlisted(value: object, allowed: frozenset[str]) -> str | None:
     return value if isinstance(value, str) and value in allowed else "other"
 
 
+_ARGV_WORD_RE = re.compile(r"[a-z][a-z-]{0,20}")
+_ARGV_OPTION_RE = re.compile(r"--?[A-Za-z][A-Za-z0-9-]{0,31}")
+_ARGV_JSON_FIELD_RE = re.compile(r"[A-Za-z][A-Za-z0-9]{0,39}")
+
+
+def _undefined_argv_shape(argv: list) -> dict:
+    """fake gh が未定義 argv として fail-closed にした呼び出しの sanitized な shape。サブコマンド 2 token、
+    先頭の positional (数値は `<n>`、それ以外は `<arg>`)、option 名の一覧、`--json` の field 名の一覧だけ。
+    option の値 (--body / --body-file / --repo / --jq 等)・path・自由文は載せない。"""
+    tokens = [str(item) for item in argv]
+    subcommand = [t if _ARGV_WORD_RE.fullmatch(t) else "<other>" for t in tokens[:2]]
+    rest = tokens[2:]
+    positionals: list[str] = []
+    for token in rest:
+        if token.startswith("-"):
+            break
+        positionals.append("<n>" if token.isdigit() else "<arg>")
+    options: list[str] = []
+    json_fields: list[str] | None = None
+    for index, token in enumerate(rest):
+        if not token.startswith("-"):
+            continue
+        name, has_value, inline_value = token.partition("=")
+        options.append(name if _ARGV_OPTION_RE.fullmatch(name) else "<option>")
+        if name == "--json":
+            raw = inline_value if has_value else (rest[index + 1] if index + 1 < len(rest) else "")
+            json_fields = [
+                field if _ARGV_JSON_FIELD_RE.fullmatch(field) else "<field>"
+                for field in raw.split(",")
+                if field
+            ][:24]
+    shape: dict = {
+        "subcommand": subcommand,
+        "positionals": positionals[:4],
+        "options": options[:12],
+    }
+    if json_fields is not None:
+        shape["json_fields"] = json_fields
+    return shape
+
+
 def _denial_surface(tool_name: str, lineage: str | None) -> str:
     """denial が起きた tool surface（AC9: 親 Agent outbound か、子の Bash/wrapper か）。"""
     if lineage is None:
@@ -1996,13 +2085,20 @@ def analyze_canonical_workflow_stream(
         }
         for _, node in child_bash[:24]
     ]
-    update_pr_result: dict = {"invoked": update_pr_invoked, "outcome": None, "updated": False, "error_codes": []}
-    if update_pr_nodes:
-        update_pr_result["outcome"] = _result_outcome(update_pr_nodes[-1]["id"])
-        found_update = _tool_result_for(events, update_pr_nodes[-1]["id"])
+    def _update_pr_call(node: dict) -> dict:
+        found_update = _tool_result_for(events, node["id"])
         update_text = _flatten_tool_result_text(found_update[1].get("content")) if found_update is not None else ""
-        update_pr_result["updated"] = bool(re.search(r"^UPDATED=true$", update_text, re.MULTILINE))
-        update_pr_result["error_codes"] = sorted(set(_UPDATE_PR_ERROR_CODE_RE.findall(update_text)))[:4]
+        return {
+            "outcome": _result_outcome(node["id"]),
+            "updated": bool(re.search(r"^UPDATED=true$", update_text, re.MULTILINE)),
+            "error_codes": sorted(set(_UPDATE_PR_ERROR_CODE_RE.findall(update_text)))[:4],
+        }
+
+    update_pr_result: dict = {"invoked": update_pr_invoked, "outcome": None, "updated": False, "error_codes": []}
+    # child lineage の update_pr.py 呼び出しごとの結果 (最後の 1 件だけでは再試行の失敗原因が残らない)。
+    update_pr_calls = [_update_pr_call(node) for node in update_pr_nodes[:8]]
+    if update_pr_nodes:
+        update_pr_result.update(_update_pr_call(update_pr_nodes[-1]))
     fake_undefined_count = sum(1 for record in fake_records if record.get("handled") is not True)
 
     if not delegation_observed:
@@ -2070,6 +2166,12 @@ def analyze_canonical_workflow_stream(
         "direct_gh_invocation_observed": direct_gh_invocation_observed,
         "fake_gh_invocation_count": fake_gh_invocation_count,
         "fake_gh_undefined_argv_count": sum(1 for record in fake_records if record.get("handled") is not True),
+        "fake_gh_undefined_argv_shapes": [
+            _undefined_argv_shape(record.get("argv") if isinstance(record.get("argv"), list) else [])
+            for record in fake_records
+            if record.get("handled") is not True
+        ][:8],
+        "update_pr_calls": update_pr_calls,
         "fake_gh_calls": [
             {
                 "argv_head": [str(item) for item in record.get("argv", [])[:3]],
@@ -2479,6 +2581,10 @@ def _side_run_summary(side: dict | None, unavailable_reason: str | None) -> dict
         "parent_agent_delegation_observed": side.get("parent_agent_delegation_observed"),
         "target_worker_lineage_observed": side.get("target_worker_lineage_observed"),
         "wrapper_reached": side.get("wrapper_reached"),
+        "worker_result_status": side.get("worker_result_status"),
+        "worker_result_reason_code": side.get("worker_result_reason_code"),
+        "fake_gh_undefined_argv_shapes": side.get("fake_gh_undefined_argv_shapes"),
+        "update_pr_calls": side.get("update_pr_calls"),
         # target worker lineage に束縛済みの classifier denial surface。
         "classifier_denial_surfaces": sorted(side.get("classifier_denial_surfaces") or []),
         "nontarget_classifier_denial_count": side.get("nontarget_classifier_denial_count"),
@@ -2559,6 +2665,7 @@ def run_canonical_workflow_delegation_canary(
             "comparison_scope": "single_side_wiring_only",
             "classifier_denial_surfaces": _side_denial_surfaces(current),
             "current": current or None,
+            "current_side": _side_run_summary(current, current_unavailable_reason),
             "baseline": None,
             "current_unavailable_reason": current_unavailable_reason
             or (current or {}).get("unavailable_reason"),

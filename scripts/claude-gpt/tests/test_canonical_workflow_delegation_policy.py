@@ -2050,11 +2050,210 @@ def test_f3_observation_runs_keep_per_run_facts_and_aggregate_outcome_is_not_per
     assert detail["baseline_outcome_counts"] == {"deny_observed": 0, "allow": 0, "unavailable": 1}
 
 
+def test_g1_undefined_argv_shapes_and_update_pr_calls_are_sanitized_and_per_call(tmp_path):
+    """GIVEN fake gh が未定義 argv で fail-closed にした記録と、update_pr.py が複数回呼ばれた stream
+    WHEN sanitized evidence を作る
+    THEN 未定義 argv は subcommand / 正規化済み positional / option 名 / --json の field 名だけの shape で、
+         値・path・番号・free text は漏れず、上限 8 件。update_pr_calls は呼び出しごとの結果を保持する
+    """
+    shim_dir = tmp_path.resolve()
+    gh = str(shim_dir / "gh")
+    secret_path = "/home/someone/private/body.md"
+    records = [
+        {"resolved_path": gh, "argv": ["pr", "view", "2147483647", "--repo", canary.TRUSTED_REPO, "--json",
+                                       "number,noSuchField,bad;field", "--jq", ".title | secret-expression"],
+         "handled": False},
+        {"resolved_path": gh, "argv": ["pr", "reviews", "2147483647"], "handled": False},
+        {"resolved_path": gh, "argv": ["pr", "edit", "123", "--body", "free text secret", "--body-file", secret_path],
+         "handled": False},
+        {"resolved_path": gh, "argv": ["pr", "view", "2147483647", "--json=headRefOid"], "handled": False},
+        {"resolved_path": gh, "argv": ["Weird_Cmd/x", "9"], "handled": False},
+        {"resolved_path": gh, "argv": ["pr", "view", "2147483647"], "handled": True},
+    ]
+    records += [{"resolved_path": gh, "argv": ["issue", "view", str(n)], "handled": False} for n in range(10)]
+    events = _base_events()
+    # update_pr.py を 2 回実行: 1 回目は error code つきの失敗、2 回目は成功。
+    events.insert(
+        2, _tool_result_event("toolu_bash", "ERROR=E_VALIDATION_FAILED\nERROR_DETAIL=/home/u/secret", is_error=True)
+    )
+    events.insert(3, _tool_use_event("toolu_bash2", "Bash", {"command": "uv run python3 update_pr.py --pr-number 1"},
+                                     parent="toolu_agent"))
+    events.insert(4, _tool_result_event("toolu_bash2", "UPDATED=true"))
+    evidence = canary.analyze_canonical_workflow_stream(_stream_of(events), records, shim_dir)
+
+    shapes = evidence["fake_gh_undefined_argv_shapes"]
+    assert evidence["fake_gh_undefined_argv_count"] == 15 and len(shapes) == 8  # 件数は全体、shape は上限 8
+    assert shapes[0] == {
+        "subcommand": ["pr", "view"], "positionals": ["<n>"], "options": ["--repo", "--json", "--jq"],
+        "json_fields": ["number", "noSuchField", "<field>"],
+    }
+    assert shapes[1] == {"subcommand": ["pr", "reviews"], "positionals": ["<n>"], "options": []}
+    assert shapes[2]["options"] == ["--body", "--body-file"] and shapes[2]["positionals"] == ["<n>"]
+    assert shapes[3]["json_fields"] == ["headRefOid"] and shapes[3]["options"] == ["--json"]
+    assert shapes[4]["subcommand"] == ["<other>", "<other>"]
+    serialized = json.dumps(shapes)
+    for leaked in ("2147483647", "123", canary.TRUSTED_REPO, secret_path, "free text secret", "secret-expression",
+                   "bad;field", "Weird_Cmd"):
+        assert leaked not in serialized, leaked
+
+    calls = evidence["update_pr_calls"]
+    assert [c["outcome"] for c in calls] == ["error", "ok"]
+    assert calls[0]["error_codes"] == ["E_VALIDATION_FAILED"] and calls[0]["updated"] is False
+    assert calls[1]["updated"] is True and calls[1]["error_codes"] == []
+    assert evidence["update_pr_result"]["updated"] is True and evidence["update_pr_result"]["outcome"] == "ok"
+    assert "/home/u/secret" not in json.dumps(evidence)
+    # 未定義 argv が無い / update_pr.py が呼ばれない stream は空リスト。
+    clean = canary.analyze_canonical_workflow_stream("", [], None)
+    assert clean["fake_gh_undefined_argv_shapes"] == [] and clean["update_pr_calls"] == []
+
+
+def test_g2_g3_per_run_side_summary_and_runtime_wrapper_diagnostics_are_sanitized():
+    """GIVEN worker が failed/validation_failed を返し fake gh 未定義 argv がある run を含む bounded observation の結果
+    WHEN runtime wrapper が run ごとの診断を取り出す
+    THEN _side_run_summary と wrapper 出力が worker_result_status / reason_code / shape / update_pr_calls を含み、
+         AC4 (current のみ) と AC5 (各 run の baseline / current) の双方で raw 値を含まない
+    """
+    side = {
+        "side_outcome": "chain_failed_without_classifier_denial", "launcher_exit_code": 0, "timed_out": False,
+        "parent_agent_delegation_observed": True, "target_worker_lineage_observed": True, "wrapper_reached": True,
+        "worker_result_status": "failed", "worker_result_reason_code": "validation_failed",
+        "classifier_denial_surfaces": [], "fake_gh_undefined_argv_count": 3,
+        "fake_gh_undefined_argv_shapes": [{"subcommand": ["pr", "view"], "positionals": ["<n>"], "options": ["--json"],
+                                           "json_fields": ["latestReviews"]}],
+        "update_pr_calls": [{"outcome": "error", "updated": False, "error_codes": ["E_X"]},
+                            {"outcome": "ok", "updated": True, "error_codes": []}],
+        "chain_stop_reason": "worker_result_not_bound",
+        # 診断に不要な値は side summary に入らない。
+        "child_bash_summary": [{"category": "other", "outcome": "ok"}], "prompt_text": "RAW PROMPT",
+    }
+    summary = canary._side_run_summary(side, None)
+    for key in (
+        "worker_result_status", "worker_result_reason_code", "fake_gh_undefined_argv_shapes", "update_pr_calls",
+    ):
+        assert summary[key] == side[key], key
+    assert "RAW PROMPT" not in json.dumps(summary) and "child_bash_summary" not in summary
+
+    ac5_section = {
+        "observation_run_outcomes": [
+            {"run_index": 1, "baseline_outcome": "unavailable", "current_outcome": side["side_outcome"],
+             "baseline_side": canary._side_run_summary({}, "disposable_worktree_add_failed"),
+             "current_side": summary, "current_unavailable_reason": "x", "raw_command": "SECRET CMD"},
+        ]
+    }
+    ac5 = _run_diagnostics(ac5_section)
+    assert len(ac5) == 1 and ac5[0]["run_index"] == 1
+    assert ac5[0]["baseline_outcome"] == "unavailable" and ac5[0]["current_outcome"] == side["side_outcome"]
+    assert ac5[0]["baseline"]["unavailable_reason"] == "disposable_worktree_add_failed"
+    for key in _RUN_DIAGNOSTIC_SIDE_KEYS:
+        assert key in ac5[0]["baseline"] and key in ac5[0]["current"], key
+    assert ac5[0]["current"]["worker_result_reason_code"] == "validation_failed"
+    assert ac5[0]["current"]["update_pr_calls"][0]["error_codes"] == ["E_X"]
+    assert set(ac5[0]) == {"run_index", "baseline_outcome", "current_outcome", "baseline", "current"}
+    assert "SECRET CMD" not in json.dumps(ac5) and "RAW PROMPT" not in json.dumps(ac5)
+
+    ac4 = _run_diagnostics({"baseline_outcome": None, "current_outcome": "chain_failed_without_classifier_denial",
+                            "current_side": summary, "current": {"prompt_text": "RAW PROMPT"}})
+    assert len(ac4) == 1 and ac4[0]["current"]["fake_gh_undefined_argv_count"] == 3
+    assert ac4[0]["current"]["chain_stop_reason"] == "worker_result_not_bound"
+    assert "RAW PROMPT" not in json.dumps(ac4)
+    assert _run_diagnostics(None) == [] and _run_diagnostics({}) == []
+
+    # 実 AC4 経路 (runtime 不足の SKIP) でも current_side が残り、wrapper が読める。
+    code, detail = canary.run_canonical_workflow_delegation_canary(None, None, 1)
+    assert code == 77 and "skip_reason" in detail  # 前提不成立の SKIP では side は無く、診断は空になる
+    assert _run_diagnostics(detail) == []
+
+
+def test_g5_fake_gh_serves_pr_and_issue_facts_beyond_the_minimum_and_keeps_unknown_fail_closed(tmp_path):
+    """GIVEN canonical route / worker が PR の事実確認に使いうる gh pr view --json field
+    WHEN fake gh へ問い合わせる
+    THEN 事実として返る (reviews / latestReviews / commits / author / 件数 / headRepository* 等)。fixture の
+         事実にない field と実在しない subcommand (pr reviews) は fail-closed のまま
+    """
+    log_path = tmp_path / "calls.jsonl"
+    shim = tmp_path / "gh"
+    shim.write_text(canary._fake_gh_source(log_path), encoding="utf-8")
+    shim.chmod(0o755)
+    pr = str(canary.CANONICAL_WORKFLOW_FIXTURE_PR_NUMBER)
+    issue = str(canary.CANONICAL_WORKFLOW_FIXTURE_ISSUE_NUMBER)
+
+    def run(*argv):
+        return subprocess.run([str(shim), *argv], capture_output=True, text=True, timeout=20, check=False)
+
+    pr_fields = (
+        "reviews,latestReviews,comments,commits,statusCheckRollup,files,author,assignees,milestone,createdAt,"
+        "updatedAt,closedAt,additions,deletions,changedFiles,headRepository,headRepositoryOwner,maintainerCanModify,"
+        "autoMergeRequest,reviewRequests,isCrossRepository,mergedBy,labels,id"
+    )
+    view = run("pr", "view", pr, "--repo", canary.TRUSTED_REPO, "--json", pr_fields)
+    assert view.returncode == 0, view.stderr
+    data = json.loads(view.stdout)
+    assert set(data) == set(pr_fields.split(","))
+    assert data["commits"][0]["oid"] == data["latestReviews"][0]["commit"]["oid"]
+    assert (data["additions"], data["deletions"], data["changedFiles"]) == (1, 0, 1)
+    assert data["autoMergeRequest"] is None and data["milestone"] is None and data["closedAt"] is None
+    issue_fields = "author,assignees,milestone,createdAt,closedAt,comments,labels"
+    assert set(json.loads(run("issue", "view", issue, "--json", issue_fields).stdout)) == set(issue_fields.split(","))
+    for argv in (
+        ("pr", "reviews", pr),
+        ("pr", "view", pr, "--json", "projectItems"),
+        ("pr", "view", pr, "--json", "potentialMergeCommit"),
+        ("pr", "view", pr, "--comments"),
+    ):
+        assert run(*argv).returncode == canary.FAKE_GH_UNDEFINED_ARGV_EXIT, argv
+    for token in (*_INSTRUCTION_TOKENS, "Agent"):
+        assert token not in view.stdout, token
+
+
 # ---------------------------------------------------------------------------
 # runtime wrapper (claude_live: 明示 opt-in でのみ実行。default collection から deselect)
 # ---------------------------------------------------------------------------
 
 _EXIT_SKIP_UNAVAILABLE = 77
+
+
+# runtime wrapper が run ごとに出力する sanitized な診断 field (#2843 OWNER P2: run 別の最小診断値の保持)。
+# raw transcript / prompt / command / HOME path は含めない。値は分類コード・件数・boolean・正規化済み shape のみ。
+_RUN_DIAGNOSTIC_SIDE_KEYS = (
+    "launcher_exit_code", "timed_out", "parent_agent_delegation_observed", "target_worker_lineage_observed",
+    "wrapper_reached", "worker_result_status", "worker_result_reason_code", "classifier_denial_surfaces",
+    "fake_gh_undefined_argv_count", "fake_gh_undefined_argv_shapes", "update_pr_calls", "chain_stop_reason",
+    "unavailable_reason",
+)
+
+
+def _run_diagnostics(section: dict | None) -> list[dict]:
+    """canonical_workflow_delegation section から run ごとの sanitized 診断を取り出す。AC4 (current のみ 1 run) と
+    AC5 (observation_run_outcomes の各 run) の双方を扱う。"""
+    if not section:
+        return []
+
+    def side_fields(side: dict | None) -> dict:
+        return {key: (side or {}).get(key) for key in _RUN_DIAGNOSTIC_SIDE_KEYS}
+
+    runs = section.get("observation_run_outcomes")
+    if runs:
+        return [
+            {
+                "run_index": run.get("run_index"),
+                "baseline_outcome": run.get("baseline_outcome"),
+                "current_outcome": run.get("current_outcome"),
+                "baseline": side_fields(run.get("baseline_side")),
+                "current": side_fields(run.get("current_side")),
+            }
+            for run in runs
+        ]
+    if section.get("current_side") is not None:
+        return [
+            {
+                "run_index": 1,
+                "baseline_outcome": section.get("baseline_outcome"),
+                "current_outcome": section.get("current_outcome"),
+                "baseline": side_fields(None),
+                "current": side_fields(section.get("current_side")),
+            }
+        ]
+    return []
 
 
 def _run_runtime_canary(*canary_args: str) -> tuple[int, dict]:
@@ -2086,6 +2285,8 @@ def _run_runtime_canary(*canary_args: str) -> tuple[int, dict]:
         section = payload.get(section_name)
         if section:
             print("CANARY_SUMMARY", json.dumps({k: section.get(k) for k in summary_keys if k in section}))
+    for run_diagnostic in _run_diagnostics(payload.get("canonical_workflow_delegation")):
+        print("CANARY_RUN_DIAGNOSTICS", json.dumps(run_diagnostic, ensure_ascii=False))
     return proc.returncode, payload
 
 
