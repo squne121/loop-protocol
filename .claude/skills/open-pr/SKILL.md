@@ -95,6 +95,8 @@ facts JSON の key は `repo` / `issue_state`（`OPEN` | `CLOSED`）/ `pr_number
 - 状態取得失敗 → `E_LINKED_ISSUE_STATE_UNKNOWN` を返して停止
 - `update_pr.py` 経由の本文更新は facts を渡さない従来の LP057（番号一致の検証）のままで、本 evaluator の対象外
 
+`Refs` を選ぶことは「PR 本文が Issue を close しない」ことだけを意味し、Issue が OPEN のまま維持される保証ではない（Development 欄の手動 relation や採用される merge message の closing keyword でも close され得る）。本文以外の自動 close 経路の確認は merge 前に `validate_pr_body.py --evaluate-native-auto-close-risk`（`docs/dev/workflow.md` の「native auto-close risk check」）が行い、`open_pr.py` は起票時にこれを実行しない。
+
 non-closing（`Refs`）の PR は `implementation_pr_observed` も closing relation に依存せず発行できる: `emit_implementation_pr_observed(..., non_closing_authority=None)` は PR の **live 本文**（GitHub から fresh 取得。local の `final_body` ではない）に同じ evaluator を実行し、`nonclosing_required`（A1 / A2）かつ live 本文が `valid`、closing node が空、`pr_body_sha256` が live 本文と一致する場合に限り、既存 wire のまま発行する。evaluator が `fail_closed`、hash が束縛できない、authority 未取得の場合は従来の `NO_LINK` / `RELATION_ISSUE_MISMATCH` のまま発行しない。`classify_closing_issue_relation(snapshot, candidate_issue, candidate_repo=None, non_closing_authority=None)` の `non_closing_authority` は 7 key（`decision` / `level` / `reason_code` / `repo` / `issue_number` / `pr_number` / `pr_body_sha256`）の dict で、post-merge 側 adapter の snapshot top-level `non_closing_authority` と同一の写像である（`docs/dev/task-context.md`）。
 
 ### 3.5. Parent Child Materialization（delivery-rollup parent の child PR の場合の親子 materialization）

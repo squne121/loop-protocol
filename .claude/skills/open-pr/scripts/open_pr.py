@@ -395,7 +395,8 @@ def select_linked_issue_reference(
     """
     result = run_reference_policy_entrypoint(original_body, linked_issue, linked_issue_body, facts)
     final_body = original_body
-    if result.get("decision") in {"closing_required", "nonclosing_required"}:
+    decision = result.get("decision")
+    if isinstance(decision, str) and decision in {"closing_required", "nonclosing_required"}:
         needs_append = result.get("body_reason") != "closing_for_other" and (
             result.get("body_verdict") == "repair"
             or result.get("body_reason") == "reference_missing"
@@ -829,7 +830,12 @@ def non_closing_authority_binds(
     """
     if not isinstance(non_closing_authority, dict) or set(non_closing_authority) != set(NON_CLOSING_AUTHORITY_KEYS):
         return False
-    if non_closing_authority["decision"] != "nonclosing_required" or non_closing_authority["level"] not in {"A1", "A2"}:
+    # `isinstance(str)` before set membership: a list / object `level` is a structured rejection,
+    # never a `TypeError` from hashing it.
+    level = non_closing_authority["level"]
+    if non_closing_authority["decision"] != "nonclosing_required":
+        return False
+    if not isinstance(level, str) or level not in {"A1", "A2"}:
         return False
     authority_repo = _relation_repo_identity(non_closing_authority["repo"])
     if authority_repo is None or authority_repo != snapshot_repo:
@@ -944,15 +950,17 @@ def resolve_live_non_closing_authority(
         return None, snapshot
     state = get_linked_issue_state(repo, linked_issue)
     linked_issue_body = get_linked_issue_body(repo, linked_issue)
-    if state not in {"OPEN", "CLOSED"} or linked_issue_body is None:
+    if not isinstance(state, str) or state not in {"OPEN", "CLOSED"} or linked_issue_body is None:
         return None, snapshot
     facts = build_reference_facts(repo, state, live_body, pr_number)
     result = run_reference_policy_entrypoint(live_body, linked_issue, linked_issue_body, facts)
     # The live body must itself carry the Refs for this Issue: `decision` alone says what the
     # authority requires, `body_verdict == valid` says the body actually satisfies it.
+    level = result.get("level")
     if (
         result.get("decision") != "nonclosing_required"
-        or result.get("level") not in {"A1", "A2"}
+        or not isinstance(level, str)
+        or level not in {"A1", "A2"}
         or result.get("body_verdict") != "valid"
     ):
         return None, snapshot
@@ -980,7 +988,7 @@ def emit_implementation_pr_observed(
         "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name)"
         "{nameWithOwner pullRequest(number:$number){number "
         "closingIssuesReferences(first:2,excludeUserLinked:false,userLinkedOnly:false)"
-        "{nodes{number repository{nameWithOwner}}}}}"
+        "{nodes{number repository{nameWithOwner}}}}}}"
     )
     try:
         response = run_gh(

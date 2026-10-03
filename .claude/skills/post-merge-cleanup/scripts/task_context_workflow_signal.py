@@ -123,7 +123,10 @@ def _non_closing_authority_binds(
     authority = snapshot.get("non_closing_authority")
     if not isinstance(authority, dict) or set(authority) != NON_CLOSING_AUTHORITY_KEYS:
         return False
-    if authority["decision"] != "nonclosing_required" or authority["level"] not in {"A1", "A2"}:
+    # `isinstance(str)` before set membership: a list / object `level` is a structured rejection
+    # (the caller maps it to `RELATION_ISSUE_MISMATCH`, zero writes), never a `TypeError`.
+    level = authority["level"]
+    if authority["decision"] != "nonclosing_required" or not isinstance(level, str) or level not in {"A1", "A2"}:
         return False
     authority_repo = authority["repo"]
     if not isinstance(authority_repo, str) or authority_repo.lower() != repo.lower():

@@ -1181,3 +1181,17 @@ def test_given_reference_policy_matrix_when_repairing_then_closing_keyword_only_
             assert result["decision"] == "closing_required", case_id
         if result["decision"] != "closing_required":
             assert documented != "repair", case_id
+
+
+def test_given_nonclosing_required_when_step5_then_native_auto_close_risk_is_a_merge_precondition_not_a_repair():
+    text = _read(STEP5_FT)
+    assert "--evaluate-native-auto-close-risk" in text
+    for token in ("final message", "final native relation", "adopted_message_sha256", "blocked", "auto repair しない"):
+        assert token in text, token
+    # the real flag exists, so the documented step cannot drift from the CLI
+    help_text = subprocess.run(
+        [sys.executable, str(VALIDATE_PR_BODY_PY), "--help"], capture_output=True, text=True, check=True
+    ).stdout
+    assert "--evaluate-native-auto-close-risk" in help_text and "--native-close-facts-file" in help_text
+    # a body hash alone is explicitly not the guarantee
+    assert "hash だけでは自動 close の不在を保証しない" in text

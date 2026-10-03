@@ -82,14 +82,14 @@ decision table と grammar の正本は `docs/dev/workflow.md` の「PR referenc
 | 順 | 条件 | decision | level | PR 本文の reference | merge 時の Issue |
 |---|---|---|---|---|---|
 | 0 | linked Issue が CLOSED | `nonclosing_required` | CLOSED | `Refs #N`（closing keyword は block） | 既に CLOSED（authority 評価なし） |
-| 1 | A1 present かつ valid | `nonclosing_required` | A1 | `Refs #N`（Runtime Verification Applicability の状態に依存しない） | merge で close されない（OPEN のまま） |
+| 1 | A1 present かつ valid | `nonclosing_required` | A1 | `Refs #N`（Runtime Verification Applicability の状態に依存しない） | 本文は close しない（本文以外の自動 close 経路が無いと native auto-close risk check で確認できた場合に OPEN を維持） |
 | 2 | A1 present かつ invalid（2 行以上を含む） | `fail_closed` | なし | 停止（A2 / A3 へ降格しない） | 停止 |
-| 3 | A1 なし、A2 成立 | `nonclosing_required` | A2 | `Refs #N` | merge で close されない（OPEN のまま） |
+| 3 | A1 なし、A2 成立 | `nonclosing_required` | A2 | `Refs #N` | 本文は close しない（本文以外の自動 close 経路が無いと native auto-close risk check で確認できた場合に OPEN を維持） |
 | 4 | A1 なし、A2 不成立、A3 成立 | `closing_required` | A3 | `Closes #N` | merge で auto-close |
 | 5 | 上記以外（Issue state 取得不能、Runtime Verification Applicability の欠落・重複・解釈不能、facts 不正） | `fail_closed` | なし | 停止 | 停止 |
 
-- merge は Issue の close を意味しない。live evidence が未取得の間は Refs-bound Issue を OPEN に保ち、live evidence の取得・証跡へのリンク・残 AC の充足を確認した後にだけ operator / orchestrator が明示的に close する。
-- merge 時の guard は final head の PR 本文に対する reviewer の fresh な evaluator 実行であり、orchestrator は merge 直前に entrypoint を再実行して `pr_body_sha256` を attested 値と照合する（不一致なら merge せず re-review）。
+- merge は Issue の close を意味しない。`Refs` 本文だけでは OPEN 維持を保証せず、本文以外の自動 close 経路（native closing relation / 採用される merge message）が無いと native auto-close risk check で確認できた場合に OPEN が維持される。live evidence が未取得の間は Refs-bound Issue を OPEN に保ち、live evidence の取得・証跡へのリンク・残 AC の充足を確認した後にだけ operator / orchestrator が明示的に close する。
+- merge 時の guard は final head の PR 本文に対する reviewer の fresh な evaluator 実行であり、orchestrator は merge 直前に entrypoint を再実行して `pr_body_sha256` を attested 値と照合する（不一致なら merge せず re-review）。`nonclosing_required` では加えて native auto-close risk check を final message / final native relation に対して再実行する（または検証済み message をそのまま使う）。PR 本文 / Issue 本文の hash だけでは本文以外の自動 close 経路を保証できない（`docs/dev/workflow.md` の「native auto-close risk check」）。
 
 ### `unbound` の原因別フォールバック/エスカレーション（Issue #2790 AC8、PR #2795 review fix_delta P2-C 改訂）
 

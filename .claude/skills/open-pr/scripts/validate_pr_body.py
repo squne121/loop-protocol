@@ -1035,7 +1035,10 @@ def _validated_reference_facts(facts: object) -> dict | None:
     repo = facts["repo"]
     if not isinstance(repo, str) or _REPO_PATTERN.fullmatch(repo) is None:
         return None
-    if facts["issue_state"] not in {"OPEN", "CLOSED"}:
+    issue_state = facts["issue_state"]
+    # `isinstance(str)` before set membership: an unhashable JSON value (list / object) must be a
+    # structured `facts_invalid`, never a `TypeError` from the set lookup.
+    if not isinstance(issue_state, str) or issue_state not in {"OPEN", "CLOSED"}:
         return None
     pr_number = facts["pr_number"]
     if pr_number is not None and (type(pr_number) is not int or pr_number <= 0):
@@ -1146,6 +1149,264 @@ def evaluate_reference_policy_from_files(
     return evaluate_reference_policy(body_bytes, linked_issue, linked_issue_body, facts)
 
 
+# ---------------------------------------------------------------------------
+# Native auto-close risk check (Issue #2878, PR #2896 review). `nonclosing_required` (A1 / A2) is a
+# claim about the PR *body*; GitHub can still close the Issue through a manually linked closing
+# relation (Development sidebar) or a closing keyword in the commit message that is actually adopted
+# by the chosen merge method. This is a second, pure function over structured facts: it reuses the
+# single evaluator result and `_closing_candidates` (no second grammar) and performs no GitHub I/O.
+# ---------------------------------------------------------------------------
+NATIVE_CLOSE_FACTS_KEYS = frozenset(
+    {
+        "repo",
+        "closing_relations",
+        "closing_relations_complete",
+        "merge_settings",
+        "merge_method",
+        "pr_title",
+        "pr_body",
+        "commit_messages",
+        "final_squash_message",
+    }
+)
+NATIVE_CLOSE_SETTINGS_KEYS = frozenset(
+    {
+        "allow_squash_merge",
+        "allow_merge_commit",
+        "allow_rebase_merge",
+        "squash_merge_commit_title",
+        "squash_merge_commit_message",
+    }
+)
+NATIVE_CLOSE_RELATION_KEYS = frozenset({"number", "repository"})
+NATIVE_CLOSE_FINAL_MESSAGE_KEYS = frozenset({"title", "body"})
+NATIVE_CLOSE_MERGE_METHODS = ("squash", "merge", "rebase")
+_SQUASH_TITLE_SETTINGS = frozenset({"PR_TITLE", "COMMIT_OR_PR_TITLE"})
+_SQUASH_MESSAGE_SETTINGS = frozenset({"PR_BODY", "COMMIT_MESSAGES", "BLANK"})
+NATIVE_AUTO_CLOSE_OUTPUT_KEYS = (
+    "status",
+    "reason_code",
+    "decision",
+    "level",
+    "repo",
+    "issue_number",
+    "pr_number",
+    "adopted_message_sha256",
+    "findings",
+)
+
+
+def _native_close_result(
+    policy_result: dict[str, object],
+    status: str,
+    reason_code: str,
+    *,
+    adopted_message_sha256: str | None = None,
+    findings: list[dict[str, str]] | None = None,
+) -> dict[str, object]:
+    return {
+        "status": status,
+        "reason_code": reason_code,
+        "decision": policy_result.get("decision"),
+        "level": policy_result.get("level"),
+        "repo": policy_result.get("repo"),
+        "issue_number": policy_result.get("issue_number"),
+        "pr_number": policy_result.get("pr_number"),
+        "adopted_message_sha256": adopted_message_sha256,
+        "findings": findings or [],
+    }
+
+
+def _validated_native_close_facts(facts: object) -> dict | None:
+    """Return the native facts when they match the exact wire contract, else `None`."""
+    if not isinstance(facts, dict) or set(facts) != NATIVE_CLOSE_FACTS_KEYS:
+        return None
+    repo = facts["repo"]
+    if not isinstance(repo, str) or _REPO_PATTERN.fullmatch(repo) is None:
+        return None
+    relations = facts["closing_relations"]
+    if not isinstance(relations, list) or type(facts["closing_relations_complete"]) is not bool:
+        return None
+    for relation in relations:
+        if not isinstance(relation, dict) or set(relation) != NATIVE_CLOSE_RELATION_KEYS:
+            return None
+        if type(relation["number"]) is not int or relation["number"] <= 0:
+            return None
+        relation_repo = relation["repository"]
+        if not isinstance(relation_repo, str) or _REPO_PATTERN.fullmatch(relation_repo) is None:
+            return None
+    settings = facts["merge_settings"]
+    if not isinstance(settings, dict) or set(settings) != NATIVE_CLOSE_SETTINGS_KEYS:
+        return None
+    allow_keys = ("allow_squash_merge", "allow_merge_commit", "allow_rebase_merge")
+    if not all(type(settings[key]) is bool for key in allow_keys):
+        return None
+    # the squash text settings are `null` / absent-equivalent while squash is disabled, so they are
+    # only judged (as enum members) when squash is a candidate method.
+    for key in ("squash_merge_commit_title", "squash_merge_commit_message"):
+        if settings[key] is not None and not isinstance(settings[key], str):
+            return None
+    method = facts["merge_method"]
+    if method is not None and (not isinstance(method, str) or method not in NATIVE_CLOSE_MERGE_METHODS):
+        return None
+    if not isinstance(facts["pr_title"], str) or not isinstance(facts["pr_body"], str):
+        return None
+    commits = facts["commit_messages"]
+    if not isinstance(commits, list) or not all(isinstance(message, str) for message in commits):
+        return None
+    final_message = facts["final_squash_message"]
+    if final_message is not None:
+        if not isinstance(final_message, dict) or set(final_message) != NATIVE_CLOSE_FINAL_MESSAGE_KEYS:
+            return None
+        if not all(isinstance(final_message[key], str) for key in NATIVE_CLOSE_FINAL_MESSAGE_KEYS):
+            return None
+    return facts
+
+
+def _targets_issue(text: str, repo: str, issue_number: int) -> bool:
+    """Whether `text` contains a closing keyword aimed at `(repo, issue_number)` (raw text, unmasked)."""
+    return any(
+        candidate_repo == repo.lower() and int(number) == issue_number
+        for candidate_repo, number in _closing_candidates(text, repo)
+    )
+
+
+def _squash_adopted_message(facts: dict) -> tuple[str, str] | None:
+    """The `(title, body)` GitHub will adopt for a squash merge, or `None` if the settings are unknown.
+
+    An explicit `final_squash_message` (the exact message that will be submitted) wins; otherwise the
+    live `squash_merge_commit_title` / `squash_merge_commit_message` settings decide. The derivation is
+    a conservative over-approximation: for `COMMIT_MESSAGES` every commit's full message is included.
+    """
+    final_message = facts["final_squash_message"]
+    if final_message is not None:
+        return final_message["title"], final_message["body"]
+    settings = facts["merge_settings"]
+    title_setting = settings["squash_merge_commit_title"]
+    message_setting = settings["squash_merge_commit_message"]
+    commits = facts["commit_messages"]
+    if title_setting == "PR_TITLE":
+        title = facts["pr_title"]
+    elif title_setting == "COMMIT_OR_PR_TITLE":
+        title = commits[0].split("\n", 1)[0] if len(commits) == 1 else facts["pr_title"]
+    else:
+        return None
+    if message_setting == "PR_BODY":
+        body = facts["pr_body"]
+    elif message_setting == "COMMIT_MESSAGES":
+        body = "\n\n".join(commits)
+    elif message_setting == "BLANK":
+        body = ""
+    else:
+        return None
+    return title, body
+
+
+def evaluate_native_auto_close_risk(policy_result: object, native_facts: object) -> dict[str, object]:
+    """Pure native auto-close risk check for a `nonclosing_required` (A1 / A2) merge (Issue #2878).
+
+    `policy_result` is the single reference evaluator's output; `native_facts` is a structured
+    snapshot the caller fetched fresh (GitHub's closing relation, the live repository merge settings,
+    the PR title / body / commit messages, optionally the exact final squash message). The result
+    `status` is `clear` (no auto-close path other than the body was found), `blocked` (the target
+    Issue would still be auto-closed), `fail_closed` (facts / settings / policy unusable) or
+    `not_applicable` (the lane does not promise OPEN). Nothing here closes or merges anything.
+
+    The guarantee is time-bound: a human can change the final squash message or the relation after
+    this ran, so the merge-time caller must re-run it on the final message / relation, or merge the
+    verified message unchanged (`adopted_message_sha256`). A PR / Issue body hash alone proves neither.
+    """
+    policy = policy_result if isinstance(policy_result, dict) else {}
+    decision = policy.get("decision")
+    level = policy.get("level")
+    if decision == "fail_closed" or not isinstance(decision, str):
+        return _native_close_result(policy, "fail_closed", "reference_policy_fail_closed")
+    if decision != "nonclosing_required":
+        return _native_close_result(policy, "not_applicable", "closing_required_lane")
+    if not isinstance(level, str) or level not in {"A1", "A2"}:
+        return _native_close_result(policy, "not_applicable", "issue_closed")
+    facts = _validated_native_close_facts(native_facts)
+    policy_repo = policy.get("repo")
+    issue_number = policy.get("issue_number")
+    if (
+        facts is None
+        or not isinstance(policy_repo, str)
+        or facts["repo"].lower() != policy_repo.lower()
+        or type(issue_number) is not int
+    ):
+        return _native_close_result(policy, "fail_closed", "facts_invalid")
+    if not facts["closing_relations_complete"]:
+        return _native_close_result(policy, "fail_closed", "relations_incomplete")
+    settings = facts["merge_settings"]
+    allowed = {
+        "squash": settings["allow_squash_merge"],
+        "merge": settings["allow_merge_commit"],
+        "rebase": settings["allow_rebase_merge"],
+    }
+    requested = facts["merge_method"]
+    if requested is not None:
+        if not allowed[requested]:
+            return _native_close_result(policy, "fail_closed", "merge_method_not_allowed")
+        methods = [requested]
+    else:
+        methods = [method for method in NATIVE_CLOSE_MERGE_METHODS if allowed[method]]
+        if not methods:
+            return _native_close_result(policy, "fail_closed", "merge_method_not_allowed")
+    findings: list[dict[str, str]] = []
+    repo = facts["repo"]
+    for relation in facts["closing_relations"]:
+        if relation["repository"].lower() == repo.lower() and relation["number"] == issue_number:
+            findings.append({"kind": "native_relation", "method": "any", "source": "closingIssuesReferences"})
+    adopted_sha: str | None = None
+    for method in methods:
+        if method == "squash":
+            if facts["final_squash_message"] is None and (
+                settings["squash_merge_commit_title"] not in _SQUASH_TITLE_SETTINGS
+                or settings["squash_merge_commit_message"] not in _SQUASH_MESSAGE_SETTINGS
+            ):
+                return _native_close_result(policy, "fail_closed", "squash_settings_invalid")
+            adopted = _squash_adopted_message(facts)
+            if adopted is None:
+                return _native_close_result(policy, "fail_closed", "squash_settings_invalid")
+            title, body = adopted
+            adopted_sha = hashlib.sha256(f"{title}\n\n{body}".encode("utf-8")).hexdigest()
+            sources = [("squash_title", title), ("squash_body", body)]
+        elif method == "merge":
+            sources = [("pr_title", facts["pr_title"]), ("pr_body", facts["pr_body"])]
+            sources += [("commit_message", message) for message in facts["commit_messages"]]
+        else:
+            sources = [("commit_message", message) for message in facts["commit_messages"]]
+        for source, text in sources:
+            if _targets_issue(text, repo, issue_number):
+                findings.append({"kind": "effective_message", "method": method, "source": source})
+    if findings:
+        reason = (
+            "native_relation_present"
+            if any(finding["kind"] == "native_relation" for finding in findings)
+            else "effective_message_closing_keyword"
+        )
+        return _native_close_result(policy, "blocked", reason, adopted_message_sha256=adopted_sha, findings=findings)
+    return _native_close_result(policy, "clear", "no_native_auto_close_path", adopted_message_sha256=adopted_sha)
+
+
+def evaluate_native_auto_close_risk_from_files(
+    body_bytes: bytes,
+    linked_issue: int,
+    facts_file: str,
+    linked_issue_body_file: str,
+    native_facts_file: str,
+) -> dict[str, object]:
+    """File-based wrapper: re-runs the single evaluator, then the native check. Bad input is `facts_invalid`."""
+    policy = evaluate_reference_policy_from_files(body_bytes, linked_issue, facts_file, linked_issue_body_file)
+    native_facts: object = None
+    if native_facts_file:
+        try:
+            native_facts = json.loads(Path(native_facts_file).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            native_facts = None
+    return evaluate_native_auto_close_risk(policy, native_facts)
+
+
 def validate_pr_body(
     body: str,
     changed_paths: list[str] | None,
@@ -1197,6 +1458,20 @@ def main(argv: list[str] | None = None) -> int:
         help="reference policy facts JSON（供給時は LP057 が単一 evaluator の結果に従う。Issue #2878）",
     )
     parser.add_argument(
+        "--native-close-facts-file",
+        type=str,
+        default="",
+        help="native auto-close risk facts JSON（--evaluate-native-auto-close-risk の入力。Issue #2878）",
+    )
+    parser.add_argument(
+        "--evaluate-native-auto-close-risk",
+        action="store_true",
+        help=(
+            "nonclosing_required の merge 前に本文以外の自動 close 経路"
+            "（native relation / 採用される merge message）を検査し JSON を出す（Issue #2878）"
+        ),
+    )
+    parser.add_argument(
         "--evaluate-reference-policy",
         action="store_true",
         help="lint を実行せず reference policy evaluator の JSON object だけを stdout へ出す（Issue #2878）",
@@ -1207,6 +1482,16 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as exc:
         print(f"ERROR: Cannot read body file: {exc}", file=sys.stderr)
         return 2
+    if args.evaluate_native_auto_close_risk:
+        risk = evaluate_native_auto_close_risk_from_files(
+            body_bytes,
+            args.linked_issue,
+            args.reference_facts_file,
+            args.linked_issue_body_file,
+            args.native_close_facts_file,
+        )
+        print(json.dumps(risk, ensure_ascii=False))
+        return 0
     if args.evaluate_reference_policy:
         evaluation = evaluate_reference_policy_from_files(
             body_bytes, args.linked_issue, args.reference_facts_file, args.linked_issue_body_file

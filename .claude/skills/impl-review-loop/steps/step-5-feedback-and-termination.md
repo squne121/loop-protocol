@@ -143,6 +143,10 @@ step-5 の扱いは次の表が正本で、表に無い組合せは `blocker` �
 | closing_required | block | closing_for_other | blocker（番号違いの closing keyword は auto repair しない） |
 | fail_closed | block | not_evaluated | stop（auto repair しない。`reason_code` を blocker に記載して人間判断へ） |
 
+`nonclosing_required` / `valid` / `ok` の `none` は **PR 本文の判定**であり、本文以外の自動 close 経路（GitHub の手動 closing relation、採用される squash message の closing keyword）が無いことまでは保証しない。
+`nonclosing_required`（A1 / A2）の PR は merge 前に、`validate_pr_body.py --evaluate-native-auto-close-risk`（native auto-close risk check、手順と facts の exact key は `docs/dev/workflow.md` が正本）を
+**merge 直前の final message / final native relation に対して**再実行する（または `adopted_message_sha256` が一致する検証済み message を変更せず使う）。`status: blocked` / `fail_closed` の間は merge せず、`blockers[]` に `reason_code` と具体的な矛盾（relation の解除、message の修正）を記載して `REQUEST_CHANGES` とする。これは body-only repair の対象ではなく auto repair しない。PR / Issue 本文の hash だけでは自動 close の不在を保証しない。
+
 `fail_closed`（A1 invalid / ambiguous、authority 不明、facts 不正）は常に停止し、`ensure_closing_keyword` を発行しない。
 CLOSED の linked Issue（`level: CLOSED`）は常に `nonclosing_required` で、`Refs` が valid、closing keyword は `blocker`。
 

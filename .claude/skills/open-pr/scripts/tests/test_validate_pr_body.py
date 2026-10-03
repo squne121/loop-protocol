@@ -1188,6 +1188,11 @@ def test_given_reference_facts_wire_when_evaluated_then_exact_keys_and_body_byte
         lambda facts: {key: value for key, value in facts.items() if key != "repo"},  # missing key
         lambda facts: {**facts, "issue_state": "MERGED"},
         lambda facts: {**facts, "issue_state": None},
+        # unhashable / non-string JSON values must be structured facts_invalid, never TypeError
+        lambda facts: {**facts, "issue_state": []},
+        lambda facts: {**facts, "issue_state": {}},
+        lambda facts: {**facts, "issue_state": True},
+        lambda facts: {**facts, "issue_state": 5},
         lambda facts: {**facts, "pr_number": 0},
         lambda facts: {**facts, "pr_number": True},
         lambda facts: {**facts, "pr_number": "7"},
@@ -1251,3 +1256,275 @@ def test_given_facts_without_evaluate_flag_when_linted_then_lp057_follows_the_ev
     # a missing linked-issue-body-file is facts_invalid, even when the body alone could decide
     rc, lp057 = lint("Refs #330", omit=("issue",))
     assert rc == 1 and "facts_invalid" in lp057[0]["message"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #2878 (PR #2896 review): native auto-close risk check for `nonclosing_required`
+# ---------------------------------------------------------------------------
+
+from validate_pr_body import (  # noqa: E402
+    NATIVE_AUTO_CLOSE_OUTPUT_KEYS,
+    evaluate_native_auto_close_risk,
+)
+
+NATIVE_PR = 2896
+
+
+def _native_facts(**overrides):
+    """Squash-only repository (the live setting, not a hardcoded assumption) with a clean PR."""
+    facts = {
+        "repo": REF_REPO,
+        "closing_relations": [],
+        "closing_relations_complete": True,
+        "merge_settings": {
+            "allow_squash_merge": True,
+            "allow_merge_commit": False,
+            "allow_rebase_merge": False,
+            "squash_merge_commit_title": "PR_TITLE",
+            "squash_merge_commit_message": "PR_BODY",
+        },
+        "merge_method": None,
+        "pr_title": "feat: 参照と close の分離",
+        "pr_body": "## Summary\n\nRefs #330\n",
+        "commit_messages": ["feat: 実装\n\nbody"],
+        "final_squash_message": None,
+    }
+    for key, value in overrides.items():
+        if key == "merge_settings":
+            value = {**facts["merge_settings"], **value}
+        facts[key] = value
+    return facts
+
+
+def _policy(pr_body="Refs #330\n", *, issue_body=A2_BODY, state="OPEN", comment=None):
+    return _evaluate(pr_body, state=state, issue_body=issue_body, comment=comment, pr_number=NATIVE_PR)
+
+
+def _native(facts, **policy_kwargs):
+    return evaluate_native_auto_close_risk(_policy(**policy_kwargs), facts)
+
+
+def test_given_valid_refs_without_native_close_path_when_checked_then_clear_with_adopted_message_hash():
+    for kwargs in ({}, {"issue_body": A3_BODY, "comment": _comment(), "pr_body": f"Refs #330\n{A1_LINE}\n"}):
+        result = _native(_native_facts(), **kwargs)
+        assert set(result) == set(NATIVE_AUTO_CLOSE_OUTPUT_KEYS)
+        assert (result["status"], result["reason_code"]) == ("clear", "no_native_auto_close_path")
+        assert result["findings"] == []
+        assert result["decision"] == "nonclosing_required" and result["level"] in {"A1", "A2"}
+        expected = hashlib.sha256(
+            "feat: 参照と close の分離\n\n## Summary\n\nRefs #330\n".encode("utf-8")
+        ).hexdigest()
+        assert result["adopted_message_sha256"] == expected  # the verified message can be bound at merge time
+
+
+@pytest.mark.parametrize("issue_body,comment_extra", [(A2_BODY, None), (A3_BODY, "a1")])
+def test_given_native_relation_to_target_when_a1_or_a2_then_blocked_even_though_body_is_valid_refs(
+    issue_body, comment_extra
+):
+    pr_body = "Refs #330\n" + (f"{A1_LINE}\n" if comment_extra else "")
+    policy = _policy(pr_body, issue_body=issue_body, comment=_comment() if comment_extra else None)
+    assert (policy["decision"], policy["body_verdict"]) == ("nonclosing_required", "valid")  # body alone says OPEN
+
+    facts = _native_facts(closing_relations=[{"number": REF_ISSUE, "repository": REF_REPO.upper()}])
+    result = evaluate_native_auto_close_risk(policy, facts)
+    assert (result["status"], result["reason_code"]) == ("blocked", "native_relation_present")
+    assert result["findings"][0]["kind"] == "native_relation"
+
+
+def test_given_unrelated_native_relation_or_keyword_when_checked_then_target_is_not_blocked():
+    unrelated = _native_facts(
+        closing_relations=[
+            {"number": REF_ISSUE + 1, "repository": REF_REPO},  # other Issue, same repository
+            {"number": REF_ISSUE, "repository": "someone/else"},  # same number, other repository
+        ],
+        pr_body="Closes #331\nFixes someone/else#330\nRefs #330\n",
+        commit_messages=["fix: x\n\nResolves #999"],
+    )
+    result = _native(unrelated)
+    assert (result["status"], result["findings"]) == ("clear", [])
+
+
+@pytest.mark.parametrize(
+    "keyword", ["close", "Closes", "closed", "fix", "FIXES", "fixed", "resolve", "resolves", "Resolved"]
+)
+@pytest.mark.parametrize("target", ["#330", "squne121/loop-protocol#330", "https://github.com/squne121/loop-protocol/issues/330"])
+def test_given_effective_squash_message_with_target_keyword_when_checked_then_blocked(keyword, target):
+    # PR_BODY setting: the PR body is the adopted squash body
+    facts = _native_facts(pr_body=f"## Summary\n\nRefs #330\n\n{keyword}: {target}\n")
+    result = _native(facts)
+    assert (result["status"], result["reason_code"]) == ("blocked", "effective_message_closing_keyword")
+    assert result["findings"] == [{"kind": "effective_message", "method": "squash", "source": "squash_body"}]
+
+
+def test_given_squash_settings_when_checked_then_only_the_adopted_text_is_inspected():
+    kw_commit = ["fix: a\n\nFixes #330"]
+    # PR_BODY / BLANK: the commit history is not adopted, so a keyword there is not a blocker
+    for message_setting in ("PR_BODY", "BLANK"):
+        settings = {"squash_merge_commit_message": message_setting}
+        facts = _native_facts(merge_settings=settings, commit_messages=kw_commit)
+        assert _native(facts)["status"] == "clear", message_setting
+    # COMMIT_MESSAGES: the commits are adopted
+    facts = _native_facts(merge_settings={"squash_merge_commit_message": "COMMIT_MESSAGES"}, commit_messages=kw_commit)
+    assert _native(facts)["reason_code"] == "effective_message_closing_keyword"
+    # BLANK ignores the PR body, so a PR body keyword is no longer adopted
+    facts = _native_facts(merge_settings={"squash_merge_commit_message": "BLANK"}, pr_body="Closes #330\n")
+    assert _native(facts)["status"] == "clear"
+    # title settings: PR_TITLE vs COMMIT_OR_PR_TITLE (single commit headline wins; several commits -> PR title)
+    titled = {"pr_title": "docs: x", "commit_messages": ["Closes #330"]}
+    assert _native(_native_facts(**titled))["status"] == "clear"
+    single = _native_facts(merge_settings={"squash_merge_commit_title": "COMMIT_OR_PR_TITLE"}, **titled)
+    assert (_native(single)["reason_code"], _native(single)["findings"][0]["source"]) == (
+        "effective_message_closing_keyword",
+        "squash_title",
+    )
+    several = _native_facts(
+        merge_settings={"squash_merge_commit_title": "COMMIT_OR_PR_TITLE"},
+        pr_title="docs: x",
+        commit_messages=["Closes #330", "second"],
+    )
+    assert _native(several)["status"] == "clear"
+    # PR title with a keyword is adopted under PR_TITLE
+    assert _native(_native_facts(pr_title="Fixes #330"))["findings"][0]["source"] == "squash_title"
+
+
+def test_given_final_squash_message_when_checked_then_it_overrides_the_settings_derivation():
+    # the human changed the final message in the merge UI: that exact text is what is checked
+    changed = _native_facts(final_squash_message={"title": "feat: x", "body": "Resolves #330"})
+    result = _native(changed)
+    assert (result["status"], result["findings"][0]["source"]) == ("blocked", "squash_body")
+    # a verified clean message is reported with a hash the merge step can compare
+    clean = _native_facts(final_squash_message={"title": "feat: x", "body": "Refs #330"})
+    result = _native(clean)
+    assert result["status"] == "clear"
+    assert result["adopted_message_sha256"] == hashlib.sha256(b"feat: x\n\nRefs #330").hexdigest()
+    # a clean derivation from settings does not vouch for a different final message
+    assert result["adopted_message_sha256"] != _native(_native_facts())["adopted_message_sha256"]
+
+
+def test_given_live_merge_settings_when_checked_then_methods_are_not_hardcoded():
+    commit_kw = ["fix: a\n\nFixes #330"]
+    merge_enabled = {"allow_merge_commit": True}
+    # merge commit enabled and no method chosen: every enabled method is checked (commits are adopted by merge)
+    result = _native(_native_facts(merge_settings=merge_enabled, commit_messages=commit_kw))
+    assert (result["status"], result["findings"]) == (
+        "blocked",
+        [{"kind": "effective_message", "method": "merge", "source": "commit_message"}],
+    )
+    # an explicit squash method does not inspect commit history that squash does not adopt
+    assert _native(_native_facts(merge_settings=merge_enabled, merge_method="squash", commit_messages=commit_kw))[
+        "status"
+    ] == "clear"
+    # rebase keeps the commit messages
+    rebase = _native_facts(
+        merge_settings={"allow_squash_merge": False, "allow_rebase_merge": True}, commit_messages=commit_kw
+    )
+    assert _native(rebase)["findings"] == [
+        {"kind": "effective_message", "method": "rebase", "source": "commit_message"}
+    ]
+    # a method the repository does not allow is fail-closed, as is a repository with no merge method
+    assert _native(_native_facts(merge_method="rebase"))["reason_code"] == "merge_method_not_allowed"
+    none_allowed = _native_facts(merge_settings={"allow_squash_merge": False})
+    assert _native(none_allowed)["reason_code"] == "merge_method_not_allowed"
+
+
+@pytest.mark.parametrize(
+    "mutate,reason",
+    [
+        (lambda f: None, "facts_invalid"),
+        (lambda f: [], "facts_invalid"),
+        (lambda f: {**f, "extra": 1}, "facts_invalid"),
+        (lambda f: {k: v for k, v in f.items() if k != "merge_settings"}, "facts_invalid"),
+        (lambda f: {**f, "repo": []}, "facts_invalid"),
+        (lambda f: {**f, "repo": "other/repo"}, "facts_invalid"),
+        (lambda f: {**f, "closing_relations": {}}, "facts_invalid"),
+        (lambda f: {**f, "closing_relations": [{"number": "330", "repository": REF_REPO}]}, "facts_invalid"),
+        (lambda f: {**f, "closing_relations": [{"number": True, "repository": REF_REPO}]}, "facts_invalid"),
+        (lambda f: {**f, "closing_relations": [{"number": 330, "repository": []}]}, "facts_invalid"),
+        (lambda f: {**f, "closing_relations": [{"number": 330}]}, "facts_invalid"),
+        (lambda f: {**f, "closing_relations_complete": "yes"}, "facts_invalid"),
+        (lambda f: {**f, "closing_relations_complete": False}, "relations_incomplete"),
+        (lambda f: {**f, "merge_method": []}, "facts_invalid"),
+        (lambda f: {**f, "merge_method": "ff"}, "facts_invalid"),
+        (lambda f: {**f, "pr_title": None}, "facts_invalid"),
+        (lambda f: {**f, "pr_body": 5}, "facts_invalid"),
+        (lambda f: {**f, "commit_messages": "x"}, "facts_invalid"),
+        (lambda f: {**f, "commit_messages": [1]}, "facts_invalid"),
+        (lambda f: {**f, "final_squash_message": {"title": "x"}}, "facts_invalid"),
+        (lambda f: {**f, "final_squash_message": "x"}, "facts_invalid"),
+        (lambda f: {**f, "merge_settings": {**f["merge_settings"], "allow_squash_merge": "true"}}, "facts_invalid"),
+        (lambda f: {**f, "merge_settings": {**f["merge_settings"], "squash_merge_commit_title": []}}, "facts_invalid"),
+        (lambda f: {**f, "merge_settings": {**f["merge_settings"], "extra": 1}}, "facts_invalid"),
+        (
+            lambda f: {**f, "merge_settings": {**f["merge_settings"], "squash_merge_commit_title": "SOMETHING_NEW"}},
+            "squash_settings_invalid",
+        ),
+        (
+            lambda f: {**f, "merge_settings": {**f["merge_settings"], "squash_merge_commit_message": None}},
+            "squash_settings_invalid",
+        ),
+    ],
+)
+def test_given_malformed_native_facts_when_checked_then_structured_fail_closed_not_exception(mutate, reason):
+    result = evaluate_native_auto_close_risk(_policy(), mutate(_native_facts()))
+    assert (result["status"], result["reason_code"]) == ("fail_closed", reason)
+    assert set(result) == set(NATIVE_AUTO_CLOSE_OUTPUT_KEYS) and result["findings"] == []
+
+
+def test_given_lane_without_open_promise_when_checked_then_not_applicable_or_fail_closed_policy_passes_through():
+    facts = _native_facts(closing_relations=[{"number": REF_ISSUE, "repository": REF_REPO}])
+    # A3: the PR is supposed to close the Issue, so a native relation is not a risk
+    a3 = evaluate_native_auto_close_risk(_policy("Closes #330\n", issue_body=A3_BODY), facts)
+    assert (a3["status"], a3["reason_code"]) == ("not_applicable", "closing_required_lane")
+    # CLOSED: there is no OPEN state left to preserve
+    closed = evaluate_native_auto_close_risk(_policy("Refs #330\n", state="CLOSED"), facts)
+    assert (closed["status"], closed["reason_code"]) == ("not_applicable", "issue_closed")
+    # fail_closed reference policy (A1 line without a usable comment) never becomes clear
+    stopped = evaluate_native_auto_close_risk(_policy(f"Refs #330\n{A1_LINE}\n"), _native_facts())
+    assert (stopped["status"], stopped["reason_code"]) == ("fail_closed", "reference_policy_fail_closed")
+    # a malformed policy result is also structured
+    for bad_policy in (None, [], {"decision": []}, {"decision": "nonclosing_required", "level": []}):
+        result = evaluate_native_auto_close_risk(bad_policy, _native_facts())
+        assert result["status"] in {"fail_closed", "not_applicable"}
+
+
+def _run_native_cli(tmp_path, *, native_facts, pr_body=b"Refs #330\n", issue_body=A2_BODY, omit_native=False):
+    native_file = tmp_path / "native.json"
+    payload = native_facts if isinstance(native_facts, str) else json.dumps(native_facts)
+    native_file.write_text(payload, encoding="utf-8")
+    extra = ["--evaluate-native-auto-close-risk"]
+    if not omit_native:
+        extra += ["--native-close-facts-file", str(native_file)]
+    return _run_cli(
+        tmp_path,
+        pr_body_bytes=pr_body,
+        facts=_facts(pr_number=NATIVE_PR),
+        issue_body=issue_body,
+        extra=extra,
+    )
+
+
+def test_given_native_facts_file_when_cli_runs_then_json_with_exit_zero_for_every_status(tmp_path):
+    clear = _run_native_cli(tmp_path, native_facts=_native_facts())
+    assert clear.returncode == 0, clear.stderr
+    assert json.loads(clear.stdout)["status"] == "clear"
+
+    blocked = _run_native_cli(
+        tmp_path, native_facts=_native_facts(closing_relations=[{"number": REF_ISSUE, "repository": REF_REPO}])
+    )
+    assert blocked.returncode == 0
+    payload = json.loads(blocked.stdout)
+    assert (payload["status"], payload["reason_code"], payload["pr_number"]) == (
+        "blocked",
+        "native_relation_present",
+        NATIVE_PR,
+    )
+
+    # a unreadable / non-JSON / missing native facts file is facts_invalid, still exit 0
+    for kwargs in ({"native_facts": "{not json"}, {"native_facts": _native_facts(), "omit_native": True}):
+        proc = _run_native_cli(tmp_path, **kwargs)
+        assert proc.returncode == 0
+        assert json.loads(proc.stdout)["reason_code"] == "facts_invalid"
+
+    # the single evaluator is reused: its fail_closed (here an unresolved Issue contract) is passed through
+    stopped = _run_native_cli(tmp_path, native_facts=_native_facts(), issue_body="no section")
+    assert json.loads(stopped.stdout)["reason_code"] == "reference_policy_fail_closed"

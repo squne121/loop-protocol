@@ -191,9 +191,9 @@ GitHub の closing 判定を over-approximate する保守的な定義とする�
 | 順 | 条件 | decision | level | PR 本文の reference | merge 時の Issue |
 |---|---|---|---|---|---|
 | 0 | linked Issue が CLOSED | `nonclosing_required` | CLOSED | `Refs #N`（closing keyword は block） | 既に CLOSED（authority 評価なし） |
-| 1 | A1 present かつ valid | `nonclosing_required` | A1 | `Refs #N`（Runtime Verification Applicability の状態に依存しない） | merge で close されない（OPEN のまま） |
+| 1 | A1 present かつ valid | `nonclosing_required` | A1 | `Refs #N`（Runtime Verification Applicability の状態に依存しない） | 本文は close しない（本文以外の自動 close 経路が無いと native auto-close risk check で確認できた場合に OPEN を維持） |
 | 2 | A1 present かつ invalid（2 行以上を含む） | `fail_closed` | なし | 停止（A2 / A3 へ降格しない） | 停止 |
-| 3 | A1 なし、A2 成立 | `nonclosing_required` | A2 | `Refs #N` | merge で close されない（OPEN のまま） |
+| 3 | A1 なし、A2 成立 | `nonclosing_required` | A2 | `Refs #N` | 本文は close しない（本文以外の自動 close 経路が無いと native auto-close risk check で確認できた場合に OPEN を維持） |
 | 4 | A1 なし、A2 不成立、A3 成立 | `closing_required` | A3 | `Closes #N` | merge で auto-close |
 | 5 | 上記以外（Issue state 取得不能、Runtime Verification Applicability の欠落・重複・解釈不能、facts 不正） | `fail_closed` | なし | 停止 | 停止 |
 
@@ -206,10 +206,40 @@ GitHub の closing 判定を over-approximate する保守的な定義とする�
 ### merge と Issue close の分離（close gate）
 
 - merge は PR を取り込むだけで、Issue の close を意味しない。`closing_required`（A3）の PR だけが `Closes #N` により merge で auto-close される
-- `nonclosing_required`（A1 / A2）の PR は `Refs #N` であり、merge しても Issue は OPEN のまま扱う。live evidence の取得・証跡へのリンク・残 AC の充足を確認した後にだけ、operator / orchestrator が明示的に close する。live evidence が未取得の間は OPEN を保つ。adapter・reviewer・本 evaluator は close を実行せず、close 権限も返さない（新たな自動 close 実行器・close eligibility evaluator・ledger は作らない）
-- **merge 時の guard**: reviewer（`pr-review-judge`）が final head の PR 本文に対して fresh な evaluator を実行する。`update_pr.py` は facts 未供給の従来 LP057 のため、review 後の本文編集は次の review で検出する。orchestrator は merge 直前に entrypoint を再実行し（本文は `uv run python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin)["body"] or "")' < <(gh api repos/<owner>/<repo>/pulls/<PR番号>)` のように GitHub の本文文字列そのものを書き出して `--body-file` に渡す）、`pr_body_sha256` を review / attestation 時の値と照合する。不一致または `decision` が変わった場合は merge せず re-review する
+- `nonclosing_required`（A1 / A2）の PR は `Refs #N` であり、**本文は** merge で Issue を close しない。ただし本文が `Refs` であることだけでは Issue が OPEN のまま維持される保証にはならない。保証は「本文以外の自動 close 経路も残っていないことを確認した場合」に限り成立する（次節「native auto-close risk check」）。live evidence の取得・証跡へのリンク・残 AC の充足を確認した後にだけ、operator / orchestrator が明示的に close する。live evidence が未取得の間は OPEN を保つ。adapter・reviewer・本 evaluator は close を実行せず、close 権限も返さない（新たな自動 close 実行器・close eligibility evaluator・ledger は作らない）
+- **merge 時の guard**: reviewer（`pr-review-judge`）が final head の PR 本文に対して fresh な evaluator と native auto-close risk check を実行する。`update_pr.py` は facts 未供給の従来 LP057 のため、review 後の本文編集は次の review で検出する。orchestrator は merge 直前に entrypoint を再実行し（本文は `uv run python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin)["body"] or "")' < <(gh api repos/<owner>/<repo>/pulls/<PR番号>)` のように GitHub の本文文字列そのものを書き出して `--body-file` に渡す）、`pr_body_sha256` を review / attestation 時の値と照合する。不一致または `decision` が変わった場合は merge せず re-review する。`nonclosing_required` では加えて native auto-close risk check を **merge 直前の final message / final native relation に対して**再実行する（または検証済みの message をそのまま使う。下記「merge 直前の最終 precondition」）
 - **post-merge の Task Context binding**: closing relation を持たない `Refs` PR は、orchestrator が fresh snapshot の `pullRequest.body` と entrypoint 結果の 7 key を `non_closing_authority`（snapshot の top-level key）として添えた場合に限り、`--phase merged` / `--phase completed` で対象 Issue に bind できる（`docs/dev/task-context.md` と `.claude/skills/post-merge-cleanup/SKILL.md`）。worktree / branch 削除を実行する `cleanup_exec.py::_verify_linked_issue` の closing relation 非依存認可は別 Outcome（#2891）が所有し、それまで `Refs`-bound PR の削除系 cleanup は `LINKED_ISSUE_MISMATCH` で安全側（削除なし）に停止する
 - `impl-review-loop` の intake における context URL の provenance 判定（`build_intake_capsule.py`）は `Refs`-only PR に対し引き続き fail-closed であり、本節の対象外
+
+### native auto-close risk check（`nonclosing_required` の merge 前に本文以外の自動 close 経路を確認する）
+
+`evaluate_reference_policy` は pure のまま維持し、GitHub I/O を入れない。`decision: nonclosing_required`（A1 / A2）の merge-time / merge-readiness lane に限り、
+**別の pure 関数** `validate_pr_body.py::evaluate_native_auto_close_risk` を追加で実行する（既存 evaluator の結果と `_closing_candidates` を再利用し、policy や grammar を複製しない）。
+GitHub は PR 本文以外にも、Development 欄で手動リンクされた closing relation や、default branch に取り込まれる commit message の closing keyword で Issue を close する。
+いずれも PR 本文の bytes を変えずに成立するため、本文 hash の比較だけでは検出できない。
+
+```bash
+uv run --locked python3 .claude/skills/open-pr/scripts/validate_pr_body.py --evaluate-native-auto-close-risk --body-file <PR本文ファイル> --linked-issue <N> --linked-issue-body-file <Issue本文ファイル> --reference-facts-file <facts JSON> --native-close-facts-file <native facts JSON>
+```
+
+- native facts JSON の exact key: `repo` / `closing_relations`（`closingIssuesReferences` 相当。`number` と `repository`（`owner/name`）の object の list）/ `closing_relations_complete`（relation を取り切ったか。`false` は `fail_closed`）/ `merge_settings`（`allow_squash_merge` / `allow_merge_commit` / `allow_rebase_merge` / `squash_merge_commit_title` / `squash_merge_commit_message`。repository の **live** 設定）/ `merge_method`（採用予定の方式 `squash` | `merge` | `rebase`、未定なら `null` で許可された全方式を検査）/ `pr_title` / `pr_body` / `commit_messages`（PR の commit の full message の list）/ `final_squash_message`（merge 画面で確定した `title` / `body`。無ければ `null`）。未知 key・型違い・欠落は `fail_closed` / `facts_invalid`（例外にしない）
+- 出力 key: `status`（`clear` / `blocked` / `fail_closed` / `not_applicable`）/ `reason_code` / `decision` / `level` / `repo` / `issue_number` / `pr_number` / `adopted_message_sha256`（squash で採用される title と body の SHA-256。`final_squash_message` を検査した場合は検証済み message の識別に使う）/ `findings`。evaluator と同じく decision によらず exit 0
+- `reason_code`: `no_native_auto_close_path`（clear）/ `native_relation_present` / `effective_message_closing_keyword`（blocked）/ `reference_policy_fail_closed` / `facts_invalid` / `relations_incomplete` / `merge_method_not_allowed` / `squash_settings_invalid`（fail_closed）/ `closing_required_lane` / `issue_closed`（not_applicable）
+- **native relation**: 対象 Issue が `closingIssuesReferences` に居るのに A1 / A2（`nonclosing_required`）の場合は `blocked`（`native_relation_present`）。PR 本文だけを authority にしない。relation が無い妥当な `Refs` は `clear`。対象と別 Issue・別 repository の relation や closing keyword は対象の blocker にしない
+- **採用される merge message**: 設定を hardcode しない。repository の live な `squash_merge_commit_title`（`PR_TITLE` / `COMMIT_OR_PR_TITLE`）と `squash_merge_commit_message`（`PR_BODY` / `COMMIT_MESSAGES` / `BLANK`）から、実際に採用される squash の title と body を導出し、対象 Issue への closing keyword（`close` / `closes` / `closed` / `fix` / `fixes` / `fixed` / `resolve` / `resolves` / `resolved` と `#N` / `owner/repo#N` / URL 形）を検査する。squash で採用されない履歴上の commit text は禁止しない（`PR_BODY` / `BLANK` では commit message は検査対象外）。`merge` / `rebase` が許可・選択されている場合はそれらが取り込む commit message も検査する。未知の設定値は `fail_closed`
+- **解消**: 本文判定（`Refs`）と native relation / 採用される message が矛盾した場合に限り、その具体的な矛盾（relation の解除、message の修正）を解消してから再確認する
+- 実 Issue を merge / close する CI test は置かない。構造化 fixture（fake GitHub result）による deterministic regression で固定する
+
+#### merge 直前の最終 precondition（人間の merge 操作との境界）
+
+人間は merge 画面で final squash message を変更でき、Development 欄の relation も review 後に変更できる。したがって「review 時に一度 `clear` だったから将来も OPEN のまま」とは保証しない。
+`nonclosing_required` の PR を merge する最終 precondition は次のいずれかである:
+
+1. merge 直前に、native auto-close risk check を **final message（merge 画面で確定する `final_squash_message`）と final native relation** に対して再実行し、`status: clear` を確認する
+2. 以前に `clear` と判定した message（`adopted_message_sha256` が一致するもの）を、変更せずそのまま merge に使う（relation は 1 と同様に最終時点を確認する）
+
+PR 本文の hash（`pr_body_sha256`）や Issue 本文の hash だけでは、relation と final message のどちらの変更も検出できないため、この precondition の代わりにならない。
+`status: blocked` / `fail_closed` の間は merge しない。
 
 ## Issue / PR 種別とテンプレート
 

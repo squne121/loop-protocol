@@ -1332,3 +1332,70 @@ def test_given_authority_matrix_when_selecting_reference_then_closes_or_refs_or_
         assert "Closes #330" not in validated_body
     if case["kind"] == "Refs":
         assert "Closes #330" not in validated_body
+
+
+# --- Issue #2878 (PR #2896 review P2): malformed JSON types are structured rejections -----------------
+
+_AUTHORITY_BODY = "## Summary\n\nRefs #330\n"
+
+
+def _authority_for_body(**overrides) -> dict:
+    import hashlib
+
+    authority = {
+        "decision": "nonclosing_required",
+        "level": "A2",
+        "reason_code": "a2_contract_deferred",
+        "repo": "squne121/loop-protocol",
+        "issue_number": 330,
+        "pr_number": 7,
+        "pr_body_sha256": hashlib.sha256(_AUTHORITY_BODY.encode("utf-8")).hexdigest(),
+    }
+    authority.update(overrides)
+    return authority
+
+
+@pytest.mark.parametrize("level", [[], {}, True, None, 5, "A3", "a1"])
+def test_given_non_string_authority_level_when_binding_then_false_without_type_error(level):
+    pull_request = {"body": _AUTHORITY_BODY}
+    assert open_pr.non_closing_authority_binds(
+        _authority_for_body(level=level), pull_request, "squne121/loop-protocol", 330, 7
+    ) is False
+    # the well-formed authority still binds, so the rejection above is about `level` only
+    assert open_pr.non_closing_authority_binds(
+        _authority_for_body(), pull_request, "squne121/loop-protocol", 330, 7
+    ) is True
+
+
+@pytest.mark.parametrize("field,value", [("decision", []), ("decision", {}), ("repo", []), ("issue_number", {})])
+def test_given_non_string_authority_field_when_binding_then_false_without_type_error(field, value):
+    assert open_pr.non_closing_authority_binds(
+        _authority_for_body(**{field: value}), {"body": _AUTHORITY_BODY}, "squne121/loop-protocol", 330, 7
+    ) is False
+
+
+@pytest.mark.parametrize("bad", [[], {}, True, None, 5])
+def test_given_malformed_evaluator_result_or_state_when_resolving_live_authority_then_none_without_type_error(
+    monkeypatch: pytest.MonkeyPatch, bad
+):
+    snapshot = {"data": {"repository": {"nameWithOwner": "squne121/loop-protocol", "pullRequest": {"number": 7}}}}
+    monkeypatch.setattr(open_pr, "fetch_live_pr_body", lambda repo, pr: _AUTHORITY_BODY)
+    monkeypatch.setattr(open_pr, "get_linked_issue_body", lambda repo, issue: A2_ISSUE_BODY)
+    # a malformed linked Issue state
+    monkeypatch.setattr(open_pr, "get_linked_issue_state", lambda repo, issue: bad)
+    assert open_pr.resolve_live_non_closing_authority(
+        repo="squne121/loop-protocol", pr_number=7, linked_issue=330, snapshot=snapshot
+    ) == (None, snapshot)
+    # a malformed evaluator result (`level` / `decision` of the wrong JSON type)
+    monkeypatch.setattr(open_pr, "get_linked_issue_state", lambda repo, issue: "OPEN")
+    for key in ("level", "decision"):
+        result = {**_authority_for_body(), "effective_kind": "non-closing", "body_verdict": "valid",
+                  "body_reason": "ok", key: bad}
+        monkeypatch.setattr(open_pr, "run_reference_policy_entrypoint", lambda *_a, _r=result, **_k: _r)
+        assert open_pr.resolve_live_non_closing_authority(
+            repo="squne121/loop-protocol", pr_number=7, linked_issue=330, snapshot=snapshot
+        ) == (None, snapshot)
+    select = open_pr.select_linked_issue_reference
+    monkeypatch.setattr(open_pr, "run_reference_policy_entrypoint", lambda *_a, **_k: {"decision": bad})
+    body, kind, _result = select("body\n", 330, A2_ISSUE_BODY, {"repo": "squne121/loop-protocol"})
+    assert (body, kind) == ("body\n", "none")  # a malformed decision never appends or guesses a reference

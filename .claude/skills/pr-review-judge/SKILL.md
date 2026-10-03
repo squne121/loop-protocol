@@ -35,6 +35,23 @@ uv run --locked python3 .claude/skills/open-pr/scripts/validate_pr_body.py --eva
 - `decision: fail_closed`（A1 invalid / ambiguous、authority 不明、facts 不正）→ fail-closed。`blockers[]` に `reason_code` を記載して `REQUEST_CHANGES`（auto repair 前提にしない）
 - entrypoint を実行できない、候補 Issue 番号が特定できない場合も fail-closed（`REQUEST_CHANGES`）
 
+**native auto-close risk check（`decision: nonclosing_required`、level A1 / A2 のときだけ追加で実行する）**: `Refs` の本文は「本文は close しない」ことしか示さず、
+GitHub の手動 closing relation（Development 欄）や、採用される merge message の closing keyword では Issue が close され得る。そこで本文の判定とは別に、同じ `validate_pr_body.py` の次の entrypoint を実行する
+（evaluator の結果を再利用する pure 関数で、grammar は複製しない。facts は gh で fresh 取得して `<native facts JSON>` に渡す: `closing_relations` は PR の `closingIssuesReferences` の `number` と `repository`（`owner/name`）の list、
+`closing_relations_complete` は取り切れたか、`merge_settings` は `gh api repos/<owner>/<repo>` の live な `allow_squash_merge` / `allow_merge_commit` / `allow_rebase_merge` / `squash_merge_commit_title` / `squash_merge_commit_message`、
+`merge_method` は採用予定の方式（未定なら `null`）、`pr_title` / `pr_body` / `commit_messages`（`gh api repos/<owner>/<repo>/pulls/<PR番号>/commits --paginate` の full message の list）、`final_squash_message` は確定済みの title / body（無ければ `null`）。
+exact key は `docs/dev/workflow.md` の「native auto-close risk check」が正本）:
+
+```bash
+uv run --locked python3 .claude/skills/open-pr/scripts/validate_pr_body.py --evaluate-native-auto-close-risk --body-file <PR本文ファイル> --linked-issue <N> --linked-issue-body-file <Issue本文ファイル> --reference-facts-file <facts JSON> --native-close-facts-file <native facts JSON>
+```
+
+- `status: clear` → 本文以外の自動 close 経路が無いと確認できた状態。このときに限り「`Refs` なので Issue は OPEN のまま維持される」とみなす
+- `status: blocked`（`native_relation_present` / `effective_message_closing_keyword`）→ blocker として `REQUEST_CHANGES`。`blockers[]` に `reason_code` と `findings` の具体的な矛盾を記載する
+- `status: fail_closed`（facts / 設定 / relation 取得が不完全）→ fail-closed。`blockers[]` に `reason_code` を記載して `REQUEST_CHANGES`
+- `status: not_applicable`（A3 / CLOSED）→ 追加の判定なし
+- この結果は review 時点のものである。人間は merge 画面で final squash message や relation を変更できるため、merge 直前に final message / final native relation に対して再実行する（または検証済み message を変更せず使う）ことを merge の最終 precondition とする。PR / Issue 本文の hash だけでは保証にならない（`docs/dev/workflow.md`）
+
 `pr-reviewer-lite` の allow-list は `Closes #N` の存在を要求するため、`Refs`-bound PR（`nonclosing_required`）は lite の適用対象外であり、この `pr-review-judge`（Sonnet `pr-reviewer`）で扱う（`pr-reviewer-lite.md` 自体は変更しない）。decision table と grammar の正本は `docs/dev/workflow.md` の「PR reference と Issue close の分離」。
 
 ### 2) Mergeability 取得

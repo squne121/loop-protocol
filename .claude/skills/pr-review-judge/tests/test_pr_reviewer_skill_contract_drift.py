@@ -630,6 +630,18 @@ def _documented_entrypoint_command() -> str:
         line.strip()
         for line in _step1_section().splitlines()
         if line.strip().startswith("uv run --locked python3 .claude/skills/open-pr/scripts/validate_pr_body.py")
+        and "--evaluate-reference-policy" in line
+    ]
+    assert len(commands) == 1, commands
+    return commands[0]
+
+
+def _documented_native_risk_command() -> str:
+    commands = [
+        line.strip()
+        for line in _step1_section().splitlines()
+        if line.strip().startswith("uv run --locked python3 .claude/skills/open-pr/scripts/validate_pr_body.py")
+        and "--evaluate-native-auto-close-risk" in line
     ]
     assert len(commands) == 1, commands
     return commands[0]
@@ -785,3 +797,73 @@ def test_given_reference_policy_smoke_fixture_when_checked_statically_then_marke
         assert list(validator.iter_errors(broken)), f"schema must require {required}"
     assert list(validator.iter_errors({**valid, "smoke_marker": "OTHER"}))
     assert list(validator.iter_errors({**valid, "verdict": "MAYBE"}))
+
+
+def test_given_nonclosing_required_when_step1_then_native_auto_close_risk_entrypoint_is_documented_and_real(tmp_path):
+    """PR #2896 review P1-A: a `Refs` body alone does not keep the Issue OPEN. Step 1 documents a second
+    entrypoint whose flags are real and whose documented statuses are the ones the CLI emits."""
+    import json
+    import subprocess
+    import sys
+
+    step1 = _step1_section()
+    command = _documented_native_risk_command()
+    help_text = subprocess.run(
+        [sys.executable, str(VALIDATE_PR_BODY_PATH), "--help"], capture_output=True, text=True, check=True
+    ).stdout
+    for flag in (
+        "--evaluate-native-auto-close-risk", "--body-file", "--linked-issue", "--linked-issue-body-file",
+        "--reference-facts-file", "--native-close-facts-file",
+    ):
+        assert re.search(rf"(?<![\w-]){re.escape(flag)}(?![\w-])", command), f"documented command lacks {flag}"
+        assert flag in help_text, f"documented flag {flag} is not accepted by validate_pr_body.py"
+
+    # the documented statuses / reason codes are what the CLI really returns (clear and blocked rows)
+    (tmp_path / "body.md").write_bytes("本文\n\nRefs #42\n".encode("utf-8"))
+    (tmp_path / "issue.md").write_text(_RVA_A2, encoding="utf-8")
+    (tmp_path / "facts.json").write_text(
+        json.dumps({"repo": "squne121/loop-protocol", "issue_state": "OPEN", "pr_number": 9, "decision_comment": None}),
+        encoding="utf-8",
+    )
+    native = {
+        "repo": "squne121/loop-protocol",
+        "closing_relations": [],
+        "closing_relations_complete": True,
+        "merge_settings": {
+            "allow_squash_merge": True, "allow_merge_commit": False, "allow_rebase_merge": False,
+            "squash_merge_commit_title": "PR_TITLE", "squash_merge_commit_message": "PR_BODY",
+        },
+        "merge_method": None,
+        "pr_title": "feat: x",
+        "pr_body": "Refs #42",
+        "commit_messages": ["feat: x"],
+        "final_squash_message": None,
+    }
+
+    def run(native_facts):
+        (tmp_path / "native.json").write_text(json.dumps(native_facts), encoding="utf-8")
+        proc = subprocess.run(
+            [
+                sys.executable, str(VALIDATE_PR_BODY_PATH), "--evaluate-native-auto-close-risk",
+                "--body-file", str(tmp_path / "body.md"), "--linked-issue", "42",
+                "--linked-issue-body-file", str(tmp_path / "issue.md"),
+                "--reference-facts-file", str(tmp_path / "facts.json"),
+                "--native-close-facts-file", str(tmp_path / "native.json"),
+            ],
+            capture_output=True, text=True, check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        return json.loads(proc.stdout)
+
+    assert run(native)["status"] == "clear"
+    blocked = run({**native, "closing_relations": [{"number": 42, "repository": "squne121/loop-protocol"}]})
+    assert (blocked["status"], blocked["reason_code"]) == ("blocked", "native_relation_present")
+
+    for token in (
+        "nonclosing_required", "clear", "blocked", "fail_closed", "not_applicable", "native_relation_present",
+        "effective_message_closing_keyword", "final_squash_message", "merge 直前",
+    ):
+        assert token in step1, token
+    # the guarantee is conditional, and a body / Issue hash alone is stated to be insufficient
+    assert "hash だけでは保証にならない" in step1
+    assert "OPEN のまま維持される」とみなす" in step1

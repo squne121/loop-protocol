@@ -357,6 +357,10 @@ INVALID_AUTHORITIES = {
     "level_a3": _authority(level="A3", reason_code="a3_close_ready"),
     "level_closed": _authority(level="CLOSED", reason_code="issue_closed"),
     "level_missing": _authority(level=None),
+    "level_list": _authority(level=[]),
+    "level_object": _authority(level={}),
+    "level_bool": _authority(level=True),
+    "level_number": _authority(level=5),
     "other_issue_number": _authority(issue_number=ISSUE + 1),
     "string_issue_number": _authority(issue_number=str(ISSUE)),
     "other_pr_number": _authority(pr_number=PR + 1),
@@ -628,6 +632,11 @@ PARITY_CASES = {
     ),
     "level_a3": ({}, _authority(level="A3", reason_code="a3_close_ready"), False),
     "level_closed": ({}, _authority(level="CLOSED", reason_code="issue_closed"), False),
+    "level_list": ({}, _authority(level=[]), False),
+    "level_object": ({}, _authority(level={}), False),
+    "level_bool": ({}, _authority(level=True), False),
+    "level_null": ({}, _authority(level=None), False),
+    "level_number": ({}, _authority(level=5), False),
     "authority_missing": ({}, None, False),
     "hash_mismatch": ({}, _authority(pr_body_sha256="f" * 64), False),
     "other_repo": ({}, _authority(repo="owner/other"), False),
@@ -695,3 +704,48 @@ def test_given_fixture_matrix_when_classified_then_producer_and_consumer_agree()
             # without the explicit opt-in (recover / local-only) a non-closing PR is never accepted
             default_evidence, default_reason = post_merge_signal._merged_evidence(snapshot, ISSUE, PR)
             assert (default_evidence, default_reason) == (None, "RELATION_ISSUE_MISMATCH"), name
+
+
+def _graphql_balance(query: str) -> tuple[int, int, int, int]:
+    return query.count("{"), query.count("}"), query.count("("), query.count(")")
+
+
+def test_given_production_graphql_query_when_emitted_then_the_captured_query_is_well_formed(monkeypatch):
+    """The query is captured from what `emit_implementation_pr_observed` really sent to `gh`
+    (a fake `gh` that succeeds for any query would hide a malformed one, #2825)."""
+    open_pr = _load_open_pr()
+    _outcome, _signals, gh_calls = _emit(monkeypatch, open_pr, live_body=LIVE_REFS_BODY)
+    graphql_calls = [call for call in gh_calls if call[:2] == ("api", "graphql")]
+    assert len(graphql_calls) == 1
+    call = graphql_calls[0]
+    query_args = [arg for arg in call if isinstance(arg, str) and arg.startswith("query=")]
+    assert len(query_args) == 1
+    query = query_args[0][len("query="):]
+
+    opens, closes, lparens, rparens = _graphql_balance(query)
+    assert opens == closes and lparens == rparens, (opens, closes, lparens, rparens)
+    depth = 0
+    for char in query:
+        depth += {"{": 1, "}": -1}.get(char, 0)
+        assert depth >= 0, "closing brace before its opening brace"
+    assert depth == 0 and query.rstrip().endswith("}")
+
+    # the existing bounded relation shape and the owner / name / number bindings are kept
+    assert "closingIssuesReferences(first:2," in query
+    assert "repository(owner:$owner,name:$name)" in query
+    assert "pullRequest(number:$number)" in query
+    for field in ("nameWithOwner", "number", "closingIssuesReferences", "nodes", "repository"):
+        assert field in query, field
+    assert "query($owner:String!,$name:String!,$number:Int!)" in query
+    assert "owner=" + REPO.split("/")[0] in call and "name=" + REPO.split("/")[1] in call
+    assert f"number={PR}" in call
+
+
+def test_given_unbalanced_query_when_checked_then_the_balance_helper_detects_it():
+    # guards the regression helper itself: the pre-fix query (6 `{` / 5 `}`) must not look balanced
+    broken = (
+        "query($a:Int!){repository(a:$a){pullRequest(a:$a){n "
+        "closingIssuesReferences(first:2){nodes{number repository{nameWithOwner}}}}}"
+    )
+    opens, closes, _l, _r = _graphql_balance(broken)
+    assert opens != closes
