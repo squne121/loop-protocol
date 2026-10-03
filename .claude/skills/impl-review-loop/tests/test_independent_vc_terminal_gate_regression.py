@@ -274,15 +274,20 @@ class Workspace:
         hashes: list[str] | None = None,
         reviewer_head: str | None = None,
         verdict: dict[str, Any] | None = None,
+        expected_head: str | None = None,
+        live_head: str | None = None,
     ) -> tuple[int, dict[str, Any]]:
+        """``head`` is the default for ``--expected-head-sha`` and the live
+        mergeability head; ``expected_head`` / ``live_head`` override each
+        independently so a split between them can be expressed."""
         hashes = hashes if hashes is not None else _hashes(runtime_only)
         argv = [
             "step5-terminal-gate",
-            *self._binding_args(head, body, hashes, "term"),
+            *self._binding_args(expected_head or head, body, hashes, "term"),
             "--reviewer-verdict-file",
             self.write("reviewer_verdict.json", verdict or _reviewer_verdict(reviewer_head or head)),
             "--live-mergeability-file",
-            self.write("live_mergeability.json", _live_mergeability(head)),
+            self.write("live_mergeability.json", _live_mergeability(live_head or head)),
             "--dispatch-seq",
             str(dispatch_seq),
         ]
@@ -1257,6 +1262,225 @@ def test_ac_label_must_be_echoed_verbatim_for_canonical_pass(tmp_path):
     assert rc == 1
     assert "baseline_current_mapping_mismatch" in payload["adjudication"]["errors"]
     assert ws.invoke_count == 1
+
+
+# --- fix_delta P1-A: split-head approval ------------------------------------
+
+
+def test_terminal_gate_rejects_split_live_and_vc_heads(tmp_path):
+    ws = _dispatched(tmp_path)  # canonical PASS + dispatch seq=1 bound to HEAD_A
+
+    # (1) control: VC=A / expected=A / reviewer=A / live=A still approves.
+    rc, term = ws.terminal_gate(dispatch_seq=1)
+    assert rc == 0 and term["route"] == "approved"
+
+    # (2) the split: reviewer + live agree on B while expected / VC / dispatch
+    # are bound to A. The router alone would approve; the gate must not.
+    rc, term = ws.terminal_gate(
+        dispatch_seq=1, expected_head=HEAD_A, live_head=HEAD_B, reviewer_head=HEAD_B
+    )
+    assert rc == 1
+    assert term["route"] == "continue_loop"
+    assert term["route"] != "approved"
+    assert term["reason_code"] == "binding_changed_since_dispatch"
+    assert term["rerun_required"] == {"verification": True, "pr_review": True}
+    assert any("live_mergeability_head_sha_differs_from_expected_head_sha" in e for e in term["errors"])
+
+    # (3) reviewer=A / live=B stays a stale-head re-review at the router.
+    rc, term = ws.terminal_gate(
+        dispatch_seq=1, expected_head=HEAD_A, live_head=HEAD_B, reviewer_head=HEAD_A
+    )
+    assert rc == 1 and term["route"] == "route_stale_head_rereview"
+
+    # (4) expected=B while the stored dispatch binding is A: binding mismatch
+    # (reviewer + live also on B, so only the stored binding can reject it).
+    rc, term = ws.terminal_gate(
+        dispatch_seq=1, expected_head=HEAD_B, live_head=HEAD_B, reviewer_head=HEAD_B
+    )
+    assert rc == 1 and term["reason_code"] == "binding_changed_since_dispatch"
+    assert any("dispatch_binding_key_differs_from_live_binding" in e for e in term["errors"])
+
+
+def test_split_head_does_not_override_seq_and_vc_gate_priority(tmp_path):
+    ws = _dispatched(tmp_path)
+
+    # seq mismatch is evaluated before the split-head check.
+    rc, term = ws.terminal_gate(
+        dispatch_seq=7, expected_head=HEAD_A, live_head=HEAD_B, reviewer_head=HEAD_B
+    )
+    assert rc == 1 and term["reason_code"] == "dispatch_seq_mismatch"
+
+    # the split-head check is evaluated before the VC gate (stored PASS gone).
+    state = ws.state()
+    state["vc_adjudication"] = {}
+    ws.write_state(state)
+    rc, term = ws.terminal_gate(
+        dispatch_seq=1, expected_head=HEAD_A, live_head=HEAD_B, reviewer_head=HEAD_B
+    )
+    assert rc == 1 and term["reason_code"] == "binding_changed_since_dispatch"
+
+
+def test_step5_terminal_gate_function_rejects_split_and_malformed_live_mergeability(tmp_path):
+    ws = _dispatched(tmp_path)
+    kwargs = dict(
+        expected_head_sha=HEAD_A,
+        expected_contract_body_sha256=BODY_A,
+        expected_command_hashes=_hashes(False),
+        dispatch_seq=1,
+    )
+
+    rc, term = mod.step5_terminal_gate(ws.state(), _reviewer_verdict(HEAD_B), _live_mergeability(HEAD_B), **kwargs)
+    assert rc != 0 and term["route"] != "approved"
+    assert term["reason_code"] == mod.REASON_BINDING_CHANGED_SINCE_DISPATCH
+
+    # A live_mergeability that is not a dict, or lacks head_sha, can never be
+    # approved: the router fails closed first, and if it ever returned
+    # approved the gate treats the missing head as a mismatch.
+    for bad_live in ({}, {"mergeable": "MERGEABLE", "merge_state_status": "CLEAN"}, None, "x"):
+        try:
+            rc, term = mod.step5_terminal_gate(ws.state(), _reviewer_verdict(HEAD_A), bad_live, **kwargs)
+        except Exception:  # the router rejects the malformed shape itself
+            continue
+        assert rc != 0 and term["route"] != "approved"
+
+
+def test_step5_terminal_gate_missing_live_head_after_router_approval_is_binding_changed(tmp_path, monkeypatch):
+    ws = _dispatched(tmp_path)
+    route_module = mod._load_route_module()
+
+    class _Approved:
+        route = route_module.ROUTE_APPROVED
+        fail_closed = False
+        reason_code = None
+        selected_action = None
+        rerun_required = {"verification": False, "pr_review": False}
+        errors: list[str] = []
+
+    monkeypatch.setattr(
+        route_module,
+        "route_loop_verdict_v2_resolve_semantic_ambiguity",
+        lambda *a, **k: _Approved(),
+    )
+    for bad_live in ({}, {"head_sha": None}, {"head_sha": 123}, None, []):
+        rc, term = mod.step5_terminal_gate(
+            ws.state(),
+            _reviewer_verdict(HEAD_A),
+            bad_live,
+            expected_head_sha=HEAD_A,
+            expected_contract_body_sha256=BODY_A,
+            expected_command_hashes=_hashes(False),
+            dispatch_seq=1,
+        )
+        assert rc == 1 and term["route"] == "continue_loop"
+        assert term["reason_code"] == "binding_changed_since_dispatch"
+
+
+# --- fix_delta P2: state persist failure is distinguishable -----------------
+
+
+def test_state_persist_failure_is_distinct_from_ordinary_rerun(tmp_path, monkeypatch, capsys):
+    ws = _dispatched(tmp_path)
+    old_state = ws.loop_state.read_bytes()
+
+    # A blocking re-verification of the same binding (FAIL report) invalidates
+    # the PASS in memory; the persist then fails (os.replace fault injection).
+    bad_verdict = _test_verdict(
+        HEAD_A, BODY_A, False, result="FAIL", ac_overrides={"AC1": {"status": "fail", "exit_code": 1}}
+    )
+    argv = [
+        "step4-adjudicate",
+        *ws._binding_args(HEAD_A, BODY_A, _hashes(False), "persist"),
+        "--test-verdict-file",
+        ws.write("verdict_persist.json", bad_verdict),
+        "--contract-snapshot-file",
+        ws.write("snapshot_persist.json", _contract_snapshot(BODY_A, False)),
+        "--diff-summary-file",
+        ws.write("diff_persist.json", _diff_summary(HEAD_A)),
+        "--allowed-paths-file",
+        ws.write("allowed_persist.json", ALLOWED_PATHS),
+        "--expected-issue-number",
+        str(ISSUE_NUMBER),
+        "--expected-pr-number",
+        str(PR_NUMBER),
+    ]
+
+    def _boom(src, dst):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(mod.os, "replace", _boom)
+    rc = mod.main(argv)
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    monkeypatch.undo()
+
+    assert rc == 2 and rc != 1  # not an ordinary "invalidated" rerun (exit 1)
+    assert out["invoke_pr_reviewer"] is False
+    assert out["reason_code"] == "state_persist_failed_invalidation_unconfirmed"
+    assert out["reason_code"] == mod.REASON_STATE_PERSIST_FAILED
+    assert out["seq"] is None
+    assert out["stale_pass_invalidated_best_effort"] is False
+    assert out["errors"] == ["state_persist_failed:OSError"]
+    # The old state (with the stale PASS) is untouched, and no temp file leaked.
+    assert ws.loop_state.read_bytes() == old_state
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
+
+    # Control: an ordinary invalidating rerun (persist succeeds) is exit 1 with
+    # a different reason_code.
+    rc, payload = ws._run(argv)
+    assert rc == 1
+    assert payload["reason_code"] != "state_persist_failed_invalidation_unconfirmed"
+
+
+def test_state_persist_failure_best_effort_invalidation_when_only_first_write_fails(tmp_path, monkeypatch, capsys):
+    ws = _dispatched(tmp_path)
+    argv = [
+        "step4-adjudicate",
+        *ws._binding_args(HEAD_A, BODY_A, _hashes(False), "persist2"),
+        "--test-verdict-file",
+        str(tmp_path / "missing_report.json"),
+        "--contract-snapshot-file",
+        ws.write("snapshot_persist2.json", _contract_snapshot(BODY_A, False)),
+        "--diff-summary-file",
+        ws.write("diff_persist2.json", _diff_summary(HEAD_A)),
+        "--allowed-paths-file",
+        ws.write("allowed_persist2.json", ALLOWED_PATHS),
+    ]
+    real_replace = mod.os.replace
+    calls = {"n": 0}
+
+    def _fail_first(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("first replace fails")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(mod.os, "replace", _fail_first)
+    rc = mod.main(argv)
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    monkeypatch.undo()
+
+    assert rc == 2
+    assert out["reason_code"] == "state_persist_failed_invalidation_unconfirmed"
+    assert out["stale_pass_invalidated_best_effort"] is True
+    assert _key() not in ws.state().get("vc_adjudication", {})
+
+
+def test_persist_failure_during_reuse_stored_does_not_record_dispatch(tmp_path, monkeypatch, capsys):
+    ws = _dispatched(tmp_path)
+    old_state = ws.loop_state.read_bytes()
+    argv = ["step4-adjudicate", "--reuse-stored", *ws._binding_args(HEAD_A, BODY_A, _hashes(False), "reuse_fail")]
+
+    def _boom(src, dst):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(mod.os, "replace", _boom)
+    rc = mod.main(argv)
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    monkeypatch.undo()
+
+    assert rc == 2
+    assert out["invoke_pr_reviewer"] is False
+    assert out["reason_code"] == "state_persist_failed_invalidation_unconfirmed"
+    assert ws.loop_state.read_bytes() == old_state
 
 
 # --- AC10 static / documentation binding ------------------------------------

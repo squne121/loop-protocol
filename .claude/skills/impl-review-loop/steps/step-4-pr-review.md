@@ -42,9 +42,9 @@ TEST_VERDICT comment/artifact（存在する場合）は diagnostics-only であ
 | `--contract-snapshot-file` | `status: go`、`body_sha256`（`sha256:` 付き）、baseline の VC classification（`results[]` または `checks.vc_preflight.classifications[]`） | `ensure_contract_snapshot.py` が trusted source に保存した `CONTRACT_REVIEW_RESULT_V1`（または baseline producer の `baseline_vc_preflight/v1`）。`body_sha256` は live Issue 本文の digest と一致させる |
 | `--diff-summary-file` | `head_sha`（PR current head）、`pr_number`、changed paths（`changed_paths[]`） | `gh pr view <pr_number> --json headRefOid,number,files` による独立取得（`gh pr diff --name-only` でも可） |
 | `--allowed-paths-file` | live Issue の `## Allowed Paths` を並べた JSON 配列 | `gh issue view <issue_number> --json body` で取得した本文の Allowed Paths |
-| `--expected-head-sha` | PR current head SHA | `gh pr view <pr_number> --json headRefOid --jq .headRefOid` |
+| `--expected-head-sha` | PR current head SHA | `gh pr view <pr_number> --json headRefOid,mergeable,mergeStateStatus` の 1 回の応答の `headRefOid`。Step 5 の `--expected-head-sha` と live mergeability file も同じ応答から作る（`step-5-feedback-and-termination.md` 参照）。HEAD を別々に取得して混ぜない |
 | `--expected-contract-body-sha256` | live Issue 本文の SHA-256（`sha256:` 付き） | `gh issue view <issue_number> --json body \| jq -j .body \| sha256sum`（`ensure_contract_snapshot.py` の `sha256_of(body)` と同じ digest） |
-| `--expected-command-hashes-file` | literal Verification Command の SHA-256 を宣言順に並べた JSON 配列 | live Issue 本文から `baseline_vc_preflight.py --body-file <live body> --format json` で再導出した `results[].command_hash`（contract snapshot の値を使い回さない） |
+| `--expected-command-hashes-file` | literal Verification Command の SHA-256 を宣言順に並べた JSON 配列 | live Issue 本文を独立取得して保存したファイルから `adjudicate_vc_result.py extract-vc-metadata --body-file <live body>` で再導出した `command_hashes[]`（parse-only で VC を実行しない。`baseline_vc_preflight.py` は executor のため hash 取得に使わない。contract snapshot の値を使い回さない） |
 | `--expected-issue-number` / `--expected-pr-number` | runtime_only VC を含む場合は必須（未指定は拒否される） | 呼び出し元が `gh issue view` / `gh pr view` で独立取得した live 値 |
 
 手組みの入力（上記の取得元を経ない JSON）は正規経路ではなく、保存済み PASS の根拠として扱わない。
@@ -54,6 +54,15 @@ TEST_VERDICT comment/artifact（存在する場合）は diagnostics-only であ
 #### 呼び出し
 
 ```bash
+# 0) live PR state を 1 回だけ取得する（Step 5 の mergeability と同じ応答から HEAD を取る）
+LIVE_PR_JSON="$(gh pr view "$PR_NUMBER" --json headRefOid,mergeable,mergeStateStatus)"
+LIVE_HEAD_SHA="$(jq -r .headRefOid <<<"$LIVE_PR_JSON")"
+
+# 0b) literal command hash（宣言順）を、VC を実行しない parse-only subcommand で live Issue 本文から導出する
+gh issue view "$ISSUE_NUMBER" --json body --jq .body > "$LIVE_ISSUE_BODY"
+uv run python3 .claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py extract-vc-metadata \
+  --body-file "$LIVE_ISSUE_BODY" > "$VC_METADATA" && jq '.command_hashes' "$VC_METADATA" > "$EXPECTED_COMMAND_HASHES"
+
 # 1) 通常起動 / 再検証: adapt -> adjudicate -> persist -> gate を単一 process で実行する
 uv run python3 .claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py step4-adjudicate \
   --loop-state-file "$LOOP_STATE_FILE" \
@@ -61,7 +70,7 @@ uv run python3 .claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py s
   --contract-snapshot-file "$CONTRACT_SNAPSHOT" \
   --diff-summary-file "$DIFF_SUMMARY" \
   --allowed-paths-file "$ALLOWED_PATHS" \
-  --expected-head-sha "$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid)" \
+  --expected-head-sha "$LIVE_HEAD_SHA" \
   --expected-contract-body-sha256 "$(gh issue view "$ISSUE_NUMBER" --json body | jq -j .body | sha256sum | awk '{print "sha256:" $1}')" \
   --expected-command-hashes-file "$EXPECTED_COMMAND_HASHES" \
   --expected-issue-number "$ISSUE_NUMBER" \
@@ -84,7 +93,16 @@ uv run python3 .claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py s
   --expected-command-hashes-file "$EXPECTED_COMMAND_HASHES"
 ```
 
-`step4-adjudicate` は単一 JSON を stdout に出力する（`invoke_pr_reviewer` / `reason_code` / `binding_key` / `seq`）。exit code は `0=invoke`（pr-reviewer 起動可。`loop_state["dispatch"]` を更新し、`seq` が 1 進む）/ `1=rerun`（Step 2 の test-runner 再実行が必要。同一 binding の既存 PASS は失効済み）/ `2=malformed`（`--loop-state-file` / `--expected-command-hashes-file` が破損、または `LOOP_STATE` が object でない。何も書き込まない）。`--loop-state-file` は read-modify-write（同一 directory の temp file から rename で原子的に書込み、不在なら空 mapping から作成）。`exit 1` の場合は `pr-reviewer` を起動せず Step 2 に戻る。`step4-gate` は従来どおり read-only で、`0=invoke` / `1=rerun` / `2=malformed` を返す診断用 subcommand である。
+`step4-adjudicate` は単一 JSON を stdout に出力する（`invoke_pr_reviewer` / `reason_code` / `binding_key` / `seq`）。exit code は `0=invoke`（pr-reviewer 起動可。`loop_state["dispatch"]` を更新し、`seq` が 1 進む）/ `1=rerun`（Step 2 の test-runner 再実行が必要。同一 binding の既存 PASS は失効済み）/ `2=malformed` または state 保存失敗（`reason_code` で区別する。`loop_state_malformed` 等: `--loop-state-file` / `--expected-command-hashes-file` が破損、または `LOOP_STATE` が object でなく、何も書き込まない。`state_persist_failed_invalidation_unconfirmed`: 下記「state 保存失敗の回復契約」）。`--loop-state-file` は read-modify-write（同一 directory の temp file から rename で原子的に書込み、不在なら空 mapping から作成）。`exit 1` の場合は `pr-reviewer` を起動せず Step 2 に戻る。`step4-gate` は従来どおり read-only で、`0=invoke` / `1=rerun` / `2=malformed` を返す診断用 subcommand である。
+
+#### state 保存失敗の回復契約（`state_persist_failed_invalidation_unconfirmed`）
+
+`--loop-state-file` への原子的書込み（temp file + `os.replace`）が失敗した場合、`step4-adjudicate` は traceback ではなく構造化出力（`invoke_pr_reviewer: false` / `reason_code: state_persist_failed_invalidation_unconfirmed` / `seq: null` / `stale_pass_invalidated_best_effort` / `errors`）を出し、**exit 2** で終了する。通常の再検証失敗（exit 1。同一 binding の既存 PASS は失効して永続化済み）とは区別すること。保存に失敗した invocation では、メモリ上の失効も新しい dispatch も永続化されていないため、**以前に保存された PASS が `--loop-state-file` に残っている可能性がある**。`stale_pass_invalidated_best_effort: true` は同一 binding の entry を 1 回だけ best-effort で削除できたことを示すが、確定的な保証ではない。
+
+- この出力を受けたら pr-reviewer を起動せず、`seq` ファイルも更新しない。
+- 失効の永続化が確認できるまで、`--reuse-stored` を呼ばず、`step4-gate` の stored PASS も根拠にしない。
+- 保持している test-runner の final result（read-only report）があれば、ディスク / 権限などの保存失敗の原因を解消した後、同じ report で通常の `step4-adjudicate`（`--reuse-stored` なし）をやり直して adjudicate + persist を完了させてから再開する。report が無い場合は Step 2 の test-runner 再実行に戻る。
+- WAL・ledger・lock・追加の state file は導入しない。回復は canonical な adjudicate + persist のやり直しだけである。
 
 「reviewer dispatch 許可」とは `step4-adjudicate` が `invoke`（exit 0）を返したことである。reviewer の実起動は LLM 手順であり、dispatch 関数は存在しない。
 
