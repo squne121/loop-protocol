@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 import tempfile
 
+import pytest
+
 
 def test_current_head_evidence_certifies_clean_temporary_repository():
     """GIVEN clean temporary Git repo WHEN current-head evidence is observed THEN it is certified."""
@@ -3666,3 +3668,107 @@ def test_rg_exit2_missing_file_via_file_flag_command_is_expected_fail():
     assert classification == "expected_fail"
     assert category == "new_file_missing_expected"
     assert decision == "go"
+
+
+# --- Issue #2900: rg 引数なし長形式 boolean flag を PATH/PATTERN と誤認しない ---
+
+_RG_LONG_BOOL_FLAGS = (
+    "--files-without-match",
+    "--fixed-strings",
+    "--count",
+    "--no-line-number",
+)
+
+
+def test_rg_long_boolean_flags_single_allowed_file_not_broad():
+    """AC1 (Issue #2900): GIVEN 4 つの長形式 boolean flag を含む rg コマンドで Allowed Paths の
+    単一 file を対象にする WHEN broad 判定と static 分類を行う THEN broad ではなく
+    broad_search_path_unbounded でも block されない。"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import _rg_has_broad_search_path, classify_static_command
+
+    allowed = ["a/b.md"]
+    argvs = [
+        ["rg", "--files-without-match", "--fixed-strings", "phrase", "a/b.md"],
+        ["rg", "--count", "phrase", "a/b.md"],
+        ["rg", "--no-line-number", "phrase", "a/b.md"],
+        ["rg", "--files-without-match", "--fixed-strings", "--count", "--no-line-number", "phrase", "a/b.md"],
+    ]
+    for argv in argvs:
+        assert _rg_has_broad_search_path(argv, allowed_paths=allowed) is False, argv
+
+    commands = [
+        "rg --files-without-match --fixed-strings 'phrase' a/b.md",
+        "rg --count phrase a/b.md",
+        "rg --no-line-number phrase a/b.md",
+    ]
+    with tempfile.TemporaryDirectory() as temp_dir:
+        for command in commands:
+            result = classify_static_command(command, Path(temp_dir), allowed_paths=allowed)
+            category = result[1] if result else None
+            assert category != "broad_search_path_unbounded", (command, result)
+
+
+@pytest.mark.parametrize(
+    "argv, expected",
+    [
+        # flag が末尾
+        (["rg", "x", "a/b.md", "--count"], ["a/b.md"]),
+        # value-taking option と混在
+        (["rg", "--count", "--glob", "*.md", "x", "a/b.md"], ["a/b.md"]),
+        # 明示 pattern: a/b.md を PATTERN として捨てない
+        (["rg", "--count", "--regexp=x", "a/b.md"], ["a/b.md"]),
+        # pattern file: patterns.txt を PATH にしない
+        (["rg", "--count", "--file=patterns.txt", "a/b.md"], ["a/b.md"]),
+        # `--` 以降は data: --count が PATH
+        (["rg", "--fixed-strings", "x", "--", "--count"], ["--count"]),
+        # 4 flag 全部 + PATTERN + PATH
+        (
+            ["rg", "--files-without-match", "--fixed-strings", "--count", "--no-line-number", "x", "a/b.md"],
+            ["a/b.md"],
+        ),
+    ],
+)
+def test_rg_extract_path_operands_long_boolean_flags_exclude_pattern(argv, expected):
+    """AC2 (Issue #2900): 4 つの長形式 boolean flag と PATTERN が PATH に混入しない。"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import _rg_extract_path_operands
+
+    assert _rg_extract_path_operands(argv) == expected
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        # path なし
+        ["rg", "--count", "x"],
+        ["rg", "--files-without-match", "--fixed-strings", "x"],
+        # repo root
+        ["rg", "--count", "x", "."],
+        # 親 directory
+        ["rg", "--count", "x", "a"],
+        # Allowed Paths 外
+        ["rg", "--count", "x", "outside.md"],
+        # 複数 PATH の一部が範囲外
+        ["rg", "--count", "x", "outside.md", "a/b.md"],
+        # --files は読み飛ばし集合に含まれない (別モード flag)
+        ["rg", "--files", "outside.md", "a/b.md"],
+    ],
+)
+def test_rg_long_boolean_flags_still_broad_when_path_missing_or_out_of_scope(argv):
+    """AC3 (Issue #2900): 長形式 boolean flag 付きでも従来の broad 判定が維持される。"""
+    script_path = Path(__file__).parent.parent / "baseline_vc_preflight.py"
+    sys.path.insert(0, str(script_path.parent))
+    from baseline_vc_preflight import _rg_extract_path_operands, _rg_has_broad_search_path
+
+    assert _rg_has_broad_search_path(argv, allowed_paths=["a/b.md"]) is True, argv
+
+    # PATTERN / flag が PATH に混入せず、実 PATH のみが抽出される (broad の理由が正しいことを固定)
+    operands = _rg_extract_path_operands(argv)
+    assert "x" not in operands, (argv, operands)
+    assert not any(a in _RG_LONG_BOOL_FLAGS for a in operands), (argv, operands)
+    if argv[1] == "--files":
+        # --files は PATTERN を取らない別モードだが、集合に含めず従来挙動のまま
+        assert operands == ["outside.md", "a/b.md"]
