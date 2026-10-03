@@ -595,7 +595,11 @@ def test_hermetic_fake_gh_records_path_and_argv_and_fails_closed_on_undefined_ar
     log_path = tmp_path / "calls.jsonl"
     shim = tmp_path / "gh"
     source = canary._fake_gh_source(log_path)
-    assert "subprocess" not in source and "which" not in source and "execv" not in source
+    # real gh へのフォールバック禁止: gh を解決する呼び出し・exec は持たない。subprocess は `--jq` 用の
+    # jq 呼び出し (1 箇所) だけで、which の対象も jq だけ (#2843 F1 (d))。
+    assert "execv" not in source and "os.system" not in source
+    assert 'which("gh"' not in source and "'gh'" not in source and source.count("subprocess.run(") == 1
+    assert 'which("jq"' in source and "[jq_bin," in source
     shim.write_text(source, encoding="utf-8")
     shim.chmod(0o755)
     body = tmp_path / "body.md"
@@ -649,7 +653,7 @@ def test_hermetic_fake_gh_answers_read_only_views_for_the_fixture_only(tmp_path)
     assert view.returncode == 0
     assert json.loads(view.stdout) == {"number": int(pr), "state": "OPEN", "headRefName": "canary-fixture"}
     assert json.loads(run("issue", "view", issue, "--repo", canary.TRUSTED_REPO, "--json", "body").stdout) == {
-        "body": ""
+        "body": canary.CANONICAL_WORKFLOW_FIXTURE_ISSUE_BODY
     }
     assert run("--version").returncode == 0
     for argv in (
@@ -1589,6 +1593,461 @@ def test_ac14_bounded_observation_aggregate_decision(monkeypatch, capsys, tmp_pa
     code, detail = canary.run_canonical_workflow_delegation_canary(tmp_path, BASELINE_POLICY_COMMIT, 3)
     assert code == 77 and detail["comparison_result"] == "unavailable"
     assert detail["closure_disposition"] == "hold_open" and detail["skip_reason"] == "natural_route_not_reached"
+
+
+# ---------------------------------------------------------------------------
+# #2843 OWNER REQUEST_CHANGES 是正 (F1-F3): fixture の read surface 整合 / denial の target 束縛 /
+# aggregate の過剰推論の抑止。offline・実 Claude 不使用。
+# ---------------------------------------------------------------------------
+
+
+def _denial_event(tool_use_id: str, reason_type: str, reason: str = "") -> dict:
+    return {
+        "type": "system", "subtype": "permission_denied", "tool_name": "Bash", "tool_use_id": tool_use_id,
+        "decision_reason_type": reason_type, "decision_reason": reason,
+    }
+
+
+def _stream_of(events: list[dict]) -> str:
+    return "\n".join(json.dumps(event) for event in events)
+
+
+def _base_events() -> list[dict]:
+    """全 link が揃い full_chain_pass になる合成 stream の event 列。"""
+    return [json.loads(line) for line in _synthetic_stream().splitlines()]
+
+
+def _analyze_and_classify(events: list[dict], tmp_path: Path) -> tuple[str, dict]:
+    shim_dir = tmp_path.resolve()
+    evidence = canary.analyze_canonical_workflow_stream(_stream_of(events), _fake_records(shim_dir), shim_dir)
+    return canary.classify_canonical_workflow_side(evidence, launcher_exit_code=0, timed_out=False), evidence
+
+
+def test_f2_target_classifier_denial_beyond_display_limit_is_not_a_false_pass(tmp_path):
+    """GIVEN id のソート順で前に hook block が 8 件あり、9 件目以降に target worker の child Bash classifier denial
+         がある stream (retry 後に chain は完了する)
+    WHEN 分類する
+    THEN 表示用の [:8] に関係なく classifier_denied になる (false PASS にならない)。denial を除いた対照は
+         full_chain_pass で、表示一覧は target の classifier denial を先頭に置く
+    """
+    control, control_evidence = _analyze_and_classify(_base_events(), tmp_path)
+    assert control == "full_chain_pass", control_evidence
+
+    events = _base_events()
+    hook_ids = [f"toolu_a{index}" for index in range(8)]  # "toolu_a*" < "toolu_bash" < "toolu_c9" (ソート順で前)
+    for index, hook_id in enumerate(hook_ids):
+        events.insert(1 + 2 * index, _tool_use_event(hook_id, "Bash", {"command": "env"}, parent="toolu_agent"))
+        events.insert(2 + 2 * index, _denial_event(hook_id, "hook"))
+    denied_retry_id = "toolu_c9"
+    events.insert(
+        17, _tool_use_event(denied_retry_id, "Bash", {"command": "uv run update_pr.py"}, parent="toolu_agent")
+    )
+    events.insert(18, _denial_event(denied_retry_id, "classifier", "[External System Writes] retry"))
+    assert sorted([*hook_ids, "toolu_bash", denied_retry_id]).index(denied_retry_id) == 9  # 10 件中の 10 番目
+
+    outcome, evidence = _analyze_and_classify(events, tmp_path)
+    assert outcome == "classifier_denied", evidence
+    assert evidence["classifier_denial_surfaces"] == ["child_bash"]
+    assert evidence["hook_block_count"] == 8 and evidence["permission_denial_total_count"] == 9
+    assert evidence["target_classifier_denial_count"] == 1 and evidence["nontarget_classifier_denial_count"] == 0
+    assert len(evidence["permission_denials"]) == 8  # 表示だけが切り詰められる
+    assert evidence["permission_denials"][0]["kind"] == "classifier"  # target の classifier denial が先頭
+    # chain 自体は完了している (denial だけが失敗の理由)。
+    assert evidence["wrapper_reached"] is True and evidence["worker_result_bound"] is True
+
+    # target の classifier denial が表示上限 (8) を超えても、surface 集合と件数は全 denial から導出される。
+    # 表示順で最後 (id が最後) の denial だけが parent_agent_outbound でも落ちない。
+    crowded = _base_events()
+    for index in range(9):
+        crowded_id = f"toolu_b{index}"
+        crowded[1:1] = [
+            _tool_use_event(crowded_id, "Bash", {"command": "env"}, parent="toolu_agent"),
+            _denial_event(crowded_id, "classifier", "[Auto-Mode Bypass] crowded"),
+        ]
+    crowded[1:1] = [
+        _tool_use_event("toolu_zagent", "Agent", {"subagent_type": "implementation-worker", "prompt": "retry"}),
+        _denial_event("toolu_zagent", "classifier", "[External System Writes] outbound"),
+    ]
+    outcome, evidence = _analyze_and_classify(crowded, tmp_path)
+    assert outcome == "classifier_denied"
+    assert len(evidence["permission_denials"]) == 8 and evidence["target_classifier_denial_count"] == 10
+    assert all(d["surface"] != "parent_agent_outbound" for d in evidence["permission_denials"])  # 表示からは落ちる
+    assert evidence["classifier_denial_surfaces"] == ["child_bash", "parent_agent_outbound"]
+    assert evidence["agent_delegation_classifier_denied"] is True
+
+
+def test_f2_denials_outside_the_target_worker_lineage_do_not_cause_false_fail(tmp_path):
+    """GIVEN target worker の chain は成功し、別 SubAgent の child Bash と別 Agent outbound、親直下の Bash に
+         classifier denial がある stream
+    WHEN 分類する
+    THEN target は full_chain_pass。classifier_denial_surfaces は空で、非 target の件数だけを
+         nontarget_classifier_denial_count に残す。target の nested descendant / 再試行 Agent の denial は数える
+    """
+    events = _base_events()
+    events[1:1] = [
+        _tool_use_event("toolu_other", "Agent", {"subagent_type": "test-runner", "prompt": "x"}),
+        _tool_use_event("toolu_other_bash", "Bash", {"command": "pytest"}, parent="toolu_other"),
+        _denial_event("toolu_other_bash", "classifier", "[Auto-Mode Bypass] other"),
+        _tool_use_event("toolu_other2", "Agent", {"subagent_type": "pr-reviewer", "prompt": "x"}),
+        _denial_event("toolu_other2", "classifier", "[External System Writes] other agent"),
+        _tool_use_event("toolu_parent_bash", "Bash", {"command": "gh issue view 1"}),
+        _denial_event("toolu_parent_bash", "classifier", "[External System Writes] parent"),
+    ]
+    outcome, evidence = _analyze_and_classify(events, tmp_path)
+    assert outcome == "full_chain_pass", evidence
+    assert evidence["classifier_denial_surfaces"] == []
+    assert evidence["agent_delegation_classifier_denied"] is False
+    assert evidence["nontarget_classifier_denial_count"] == 3
+    assert evidence["target_classifier_denial_count"] == 0
+    assert evidence["any_classifier_denial_observed"] is True  # 観測は全体、判定は target 束縛
+
+    # target の nested descendant (target worker が起動した Agent 配下の Bash) の denial は target lineage 上。
+    nested = _base_events()
+    nested[1:1] = [
+        _tool_use_event("toolu_nested", "Agent", {"subagent_type": "test-runner", "prompt": "x"}, parent="toolu_agent"),
+        _tool_use_event("toolu_nested_bash", "Bash", {"command": "pytest"}, parent="toolu_nested"),
+        _denial_event("toolu_nested_bash", "classifier", "[Auto-Mode Bypass] nested"),
+    ]
+    outcome, evidence = _analyze_and_classify(nested, tmp_path)
+    assert outcome == "classifier_denied" and evidence["classifier_denial_surfaces"] == ["child_bash"]
+    assert evidence["nontarget_classifier_denial_count"] == 0
+    # 再試行で起動された 2 つ目の target Agent の outbound denial も target (id 集合で判定)。
+    retried = _base_events()
+    retried[1:1] = [
+        _tool_use_event("toolu_agent2", "Agent", {"subagent_type": "implementation-worker", "prompt": "retry"}),
+        _denial_event("toolu_agent2", "classifier", "[External System Writes] retry agent"),
+    ]
+    outcome, evidence = _analyze_and_classify(retried, tmp_path)
+    assert outcome == "classifier_denied" and evidence["agent_delegation_classifier_denied"] is True
+    assert evidence["classifier_denial_surfaces"] == ["parent_agent_outbound"]
+
+
+def test_f2_unattributed_denial_on_target_lineage_is_a_failure_but_not_a_classifier_denial(tmp_path):
+    """GIVEN target lineage 上の Bash が rule / mode / 理由不明 (classifier 証拠なし) で denial された stream
+    WHEN 分類する
+    THEN classifier_denied とは断定せず、full_chain_pass にもならない (chain_failed_without_classifier_denial、
+         chain_stop_reason は専用値)。非 target の unattributed denial は判定に影響しない
+    """
+    for reason_type in ("rule", "mode", "novel"):
+        events = _base_events()
+        events.insert(2, _denial_event("toolu_bash", reason_type, "plain reason without classifier category"))
+        outcome, evidence = _analyze_and_classify(events, tmp_path)
+        assert outcome == "chain_failed_without_classifier_denial", (reason_type, evidence)
+        assert evidence["chain_stop_reason"] == "target_denial_unattributed"
+        assert evidence["classifier_denial_surfaces"] == [] and evidence["any_classifier_denial_observed"] is False
+        assert evidence["agent_delegation_classifier_denied"] is False
+        assert evidence["target_unattributed_denial_count"] == 1
+        assert evidence["permission_denials"][0]["kind"] == "unattributed"
+    # result.permission_denials にだけ載る (理由・文面なし) denial も classifier とは断定しない。
+    only_result = _base_events()
+    only_result[-1] = {**only_result[-1], "permission_denials": [{"tool_name": "Bash", "tool_use_id": "toolu_bash"}]}
+    outcome, evidence = _analyze_and_classify(only_result, tmp_path)
+    assert outcome == "chain_failed_without_classifier_denial" and evidence["classifier_denial_surfaces"] == []
+    # 非 target の unattributed denial は target の判定に影響しない。
+    other = _base_events()
+    other[1:1] = [
+        _tool_use_event("toolu_other", "Agent", {"subagent_type": "test-runner", "prompt": "x"}),
+        _tool_use_event("toolu_other_bash", "Bash", {"command": "pytest"}, parent="toolu_other"),
+        _denial_event("toolu_other_bash", "rule", "rule reason"),
+    ]
+    outcome, evidence = _analyze_and_classify(other, tmp_path)
+    assert outcome == "full_chain_pass"
+    assert evidence["nontarget_unattributed_denial_count"] == 1 and evidence["target_unattributed_denial_count"] == 0
+
+
+def test_f1_fake_gh_serves_the_reads_the_canonical_route_issues_and_fails_closed_otherwise(tmp_path):
+    """GIVEN canary 所有の fake gh (disposable worktree の実 branch / HEAD sha を渡した)
+    WHEN canonical route が実際に使う read (issue view / pr view の --json、--jq 付き、repo view) を実行する
+    THEN 実 workflow が読む field が整合した値で返る (title は `実装:` で始まる / headRefOid・reviews の commit
+         oid は渡した HEAD と一致 / closingIssuesReferences は fixture Issue)。未対応 field・未対応 flag・
+         --json なしの --jq・jq 不在・jq 失敗は null で成功扱いにせず exit 97 / handled=False で記録される。
+         fixture には呼び出し手順 (Agent / worker / request schema / wrapper) が含まれない
+    """
+    log_path = tmp_path / "calls.jsonl"
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "gh"
+    branch = f"{canary.CANONICAL_WORKFLOW_DISPOSABLE_BRANCH_PREFIX}abc123"
+    head_oid = "a1" * 20
+    shim.write_text(canary._fake_gh_source(log_path, head_ref_name=branch, head_ref_oid=head_oid), encoding="utf-8")
+    shim.chmod(0o755)
+    repo = canary.TRUSTED_REPO
+    pr = str(canary.CANONICAL_WORKFLOW_FIXTURE_PR_NUMBER)
+    issue = str(canary.CANONICAL_WORKFLOW_FIXTURE_ISSUE_NUMBER)
+
+    def run(*argv, env=None):
+        return subprocess.run([str(shim), *argv], capture_output=True, text=True, timeout=20, check=False, env=env)
+
+    # impl-review-loop preparation / intake capsule が読む Issue field。
+    issue_view = run("issue", "view", issue, "--repo", repo, "--json", "title,state,labels,body,updatedAt")
+    assert issue_view.returncode == 0
+    issue_json = json.loads(issue_view.stdout)
+    assert issue_json["title"].startswith("実装:") and issue_json["state"] == "OPEN"
+    assert issue_json["body"] == canary.CANONICAL_WORKFLOW_FIXTURE_ISSUE_BODY
+    for heading in ("## Outcome", "## Acceptance Criteria", "## Allowed Paths", "## Verification Commands"):
+        assert heading in issue_json["body"], heading
+    extracted = run(
+        "issue", "view", issue, "--json", "title,labels", "--jq", "{title: .title, labels: [.labels[].name]}"
+    )
+    assert extracted.returncode == 0
+    assert json.loads(extracted.stdout) == {"title": canary.CANONICAL_WORKFLOW_FIXTURE_ISSUE_TITLE,
+                                            "labels": ["phase/implementation"]}
+    assert run("issue", "view", issue, "--json", "body", "--jq", ".body").stdout.strip() == (
+        canary.CANONICAL_WORKFLOW_FIXTURE_ISSUE_BODY.strip()
+    )
+    # PR の head / review / mergeability / closing relation。--jq は実 gh と同じく抽出済みの値を返す。
+    assert run("pr", "view", pr, "--repo", repo, "--json", "headRefOid", "--jq", ".headRefOid").stdout == (
+        head_oid + "\n"
+    )
+    pr_view = run(
+        "pr", "view", pr, "--repo", repo, "--json",
+        "number,url,state,isDraft,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,reviewDecision,"
+        "reviews,closingIssuesReferences,mergedAt,mergeCommit,body,files",
+    )
+    assert pr_view.returncode == 0
+    pr_json = json.loads(pr_view.stdout)
+    assert pr_json["headRefName"] == branch and pr_json["headRefOid"] == head_oid
+    assert pr_json["baseRefName"] == "main" and pr_json["reviewDecision"] == "CHANGES_REQUESTED"
+    assert pr_json["mergeable"] == "MERGEABLE" and pr_json["mergeStateStatus"] and pr_json["isDraft"] is True
+    assert [r["state"] for r in pr_json["reviews"]] == ["CHANGES_REQUESTED"]
+    assert pr_json["reviews"][0]["commit"]["oid"] == head_oid
+    assert pr_json["closingIssuesReferences"][0]["number"] == int(issue)
+    assert pr_json["closingIssuesReferences"][0]["url"] == f"https://github.com/{repo}/issues/{issue}"
+    assert pr_json["mergedAt"] is None and pr_json["mergeCommit"] is None
+    assert [f["path"] for f in pr_json["files"]] == [canary.CANONICAL_WORKFLOW_FIXTURE_CHANGED_PATH]
+    reviews_rest = json.loads(run("api", f"repos/{repo}/pulls/{pr}/reviews").stdout)
+    assert reviews_rest[0]["commit_id"] == head_oid
+    assert run("repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner").stdout == repo + "\n"
+
+    # 未対応 field / flag / 組み合わせは fail-closed (null を返して成功扱いにしない)。
+    unsupported = (
+        ("pr", "view", pr, "--json", "noSuchField"),
+        ("pr", "view", pr, "--json", "number,noSuchField"),
+        ("pr", "view", pr, "--json", ""),
+        ("issue", "view", issue, "--json", "headRefOid"),
+        ("pr", "view", pr, "--jq", ".number"),
+        ("pr", "view", pr, "--template", "{{.number}}"),
+        ("pr", "view", pr, "--json", "number", "--template", "x"),
+        ("pr", "view", pr, "--json", "number", "--json", "state"),
+        ("pr", "view", pr, "--web"),
+        ("pr", "view", pr, "--json", "number", "--jq", ".["),  # jq が非 0 で失敗
+        ("repo", "view", "--json", "owner"),
+        ("repo", "view", "other/repo", "--json", "nameWithOwner"),
+    )
+    before = len(canary._read_fake_gh_records(log_path))
+    for argv in unsupported:
+        result = run(*argv)
+        assert result.returncode == canary.FAKE_GH_UNDEFINED_ARGV_EXIT, argv
+        assert result.stdout == "", argv
+    records = canary._read_fake_gh_records(log_path)[before:]
+    assert len(records) == len(unsupported) and all(r["handled"] is False for r in records)
+    # jq が取れない環境 (shim 自身を除いた PATH に jq なし) では --jq を成功扱いにせず fail-closed。
+    empty_bin = tmp_path / "empty-bin"
+    empty_bin.mkdir()
+    no_jq = run(
+        "pr", "view", pr, "--json", "number", "--jq", ".number",
+        env={"PATH": f"{shim_dir}{os.pathsep}{empty_bin}"},
+    )
+    assert no_jq.returncode == canary.FAKE_GH_UNDEFINED_ARGV_EXIT and no_jq.stdout == ""
+    assert canary._read_fake_gh_records(log_path)[-1]["handled"] is False
+
+    # fixture 全体に呼び出し手順 (Agent / worker / request schema / mode / wrapper) を持ち込まない (AC13 の拡張)。
+    fixture_texts = [
+        canary.CANONICAL_WORKFLOW_FIXTURE_ISSUE_TITLE,
+        canary.CANONICAL_WORKFLOW_FIXTURE_ISSUE_BODY,
+        json.dumps(issue_json, ensure_ascii=False),
+        json.dumps(pr_json, ensure_ascii=False),
+        json.dumps(reviews_rest, ensure_ascii=False),
+    ]
+    for text in fixture_texts:
+        for token in (*_INSTRUCTION_TOKENS, "implementation-worker", "IMPLEMENTATION_WORKER_REQUEST_V2",
+                      "update_pr_body_hygiene", "update_pr.py", "Agent"):
+            assert token not in text, token
+        for word in _APPROVAL_WORDS:
+            assert word not in text, word
+
+
+def _git_ok(*args: str, cwd: Path) -> str:
+    result = subprocess.run(
+        ["git", "-c", "user.email=canary@example.invalid", "-c", "user.name=canary", *args],
+        cwd=str(cwd), capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert result.returncode == 0, (args, result.stderr)
+    return result.stdout.strip()
+
+
+def test_f1_disposable_worktree_uses_a_named_branch_and_cleanup_removes_only_that_branch(tmp_path, monkeypatch):
+    """GIVEN origin=trusted repo URL / main ref を持つ tmp の git repo (canonical repo 自体は触らない)
+    WHEN disposable worktree を作り、fake gh 付きで 1 side を走らせ、cleanup する
+    THEN worktree は detached ではなく canary 自作の一意名 branch (preparation の worktree-issue-<N>-<slug> 形) に
+         置かれ、fake gh の headRefName / headRefOid は worktree の実 branch / 実 HEAD と一致する。cleanup は
+         その branch だけを削除し、他の branch (同 prefix の別 branch を含む) には触れない
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_ok("init", "-q", "-b", "main", cwd=repo)
+    _git_ok("commit", "-q", "--allow-empty", "-m", "init", cwd=repo)
+    _git_ok("remote", "add", "origin", f"https://github.com/{canary.TRUSTED_REPO}.git", cwd=repo)
+    keep_plain = "worktree-issue-1-keep"
+    keep_same_prefix = f"{canary.CANONICAL_WORKFLOW_DISPOSABLE_BRANCH_PREFIX}not-created-by-this-run"
+    _git_ok("branch", keep_plain, cwd=repo)
+    _git_ok("branch", keep_same_prefix, cwd=repo)
+
+    target, reason = canary._prepare_disposable_worktree(repo)
+    assert reason is None and target is not None
+    branches_during = _git_ok("branch", "--format=%(refname:short)", cwd=repo).split()
+    created = [
+        b for b in branches_during
+        if b.startswith(canary.CANONICAL_WORKFLOW_DISPOSABLE_BRANCH_PREFIX) and b != keep_same_prefix
+    ]
+    assert len(created) == 1
+    head_branch = _git_ok("symbolic-ref", "--short", "-q", "HEAD", cwd=target)  # detached なら失敗する
+    assert head_branch == created[0] == canary._disposable_branch_name(target)
+    assert re.fullmatch(
+        rf"worktree-issue-{canary.CANONICAL_WORKFLOW_FIXTURE_ISSUE_NUMBER}-canary-[A-Za-z0-9_]+", head_branch
+    )
+    head_sha = _git_ok("rev-parse", "HEAD", cwd=target)
+    assert canary._disposable_worktree_identity(target) == (head_branch, head_sha)
+    assert canary._disposable_worktree_identity(tmp_path) == (None, None)  # git worktree でない場所は未解決
+
+    # fake gh の head 情報は worktree の実 branch / 実 HEAD と一致する (実 side 実行)。
+    probe = tmp_path / "probe.json"
+    launcher = tmp_path / "launcher.py"
+    launcher.write_text(
+        f"#!{sys.executable}\n"
+        "import json, subprocess\n"
+        "def out(*a):\n"
+        "    return subprocess.run(a, capture_output=True, text=True).stdout.strip()\n"
+        f"pr = '{canary.CANONICAL_WORKFLOW_FIXTURE_PR_NUMBER}'\n"
+        "data = {'git_branch': out('git', 'symbolic-ref', '--short', '-q', 'HEAD'),\n"
+        "        'git_head': out('git', 'rev-parse', 'HEAD'),\n"
+        "        'gh': json.loads(out('gh', 'pr', 'view', pr, '--json', 'headRefName,headRefOid,reviews'))}\n"
+        f"json.dump(data, open({str(probe)!r}, 'w'))\n",
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+    side, side_reason = canary._run_canonical_workflow_side(
+        launcher, repo, canary.canonical_workflow_prompt(), timeout=60.0
+    )
+    assert side_reason is None and side
+    assert len(side["transcript_digest"]) == 64  # prefix ではなく full sha256 hex
+    seen = json.loads(probe.read_text(encoding="utf-8"))
+    assert seen["gh"]["headRefName"] == seen["git_branch"] and seen["git_branch"] != ""
+    assert seen["gh"]["headRefOid"] == seen["git_head"]
+    assert seen["gh"]["reviews"][0]["commit"]["oid"] == seen["git_head"]
+    # side 実行後 (cleanup 済み) は、その run の使い捨て branch / worktree が残らない。
+    assert not any(
+        b.startswith(canary.CANONICAL_WORKFLOW_DISPOSABLE_BRANCH_PREFIX) and b not in (keep_same_prefix, head_branch)
+        for b in _git_ok("branch", "--format=%(refname:short)", cwd=repo).split()
+    )
+
+    canary._remove_disposable_worktree(repo, target)
+    remaining = set(_git_ok("branch", "--format=%(refname:short)", cwd=repo).split())
+    assert remaining == {"main", keep_plain, keep_same_prefix}
+    assert not target.exists() and not target.parent.exists()
+    assert str(target) not in _git_ok("worktree", "list", "--porcelain", cwd=repo)
+
+
+def test_f3_observation_runs_keep_per_run_facts_and_aggregate_outcome_is_not_per_run(monkeypatch, tmp_path):
+    """GIVEN baseline が [allow, unavailable, unavailable]、current が全 run full_chain_pass の観測
+    WHEN run_canonical_workflow_delegation_canary を駆動する
+    THEN 各 run に launcher_exit_code / timed_out / parent・target 観測 / wrapper_reached / classifier surface /
+         fake gh 未定義数 / chain_stop_reason / unavailable 理由が残り、起動できなかった side も理由つきで残る。
+         aggregate の baseline_outcome=allow が「全 run allow」を意味しないことが outcome 別件数と
+         outcome_aggregation から読み取れる。既存 key の意味と ac5 の判定は変わらない
+    """
+    mirror_dir = tmp_path / "mirror"
+    (mirror_dir / "scripts" / "claude-gpt").mkdir(parents=True)
+    baseline_launcher = mirror_dir / "scripts" / "claude-gpt" / "launch.sh"
+    baseline_launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(canary, "_canonical_worktree_precondition", lambda _wt: None)
+    monkeypatch.setattr(
+        canary, "_build_baseline_launcher_mirror",
+        lambda _commit: (mirror_dir, {"policy_sha256": "p" * 64, "launcher_path": str(baseline_launcher)}),
+    )
+    monkeypatch.setattr(canary, "_resolve_task_context_state_root", lambda: str(tmp_path))
+
+    def full_side(**overrides) -> dict:
+        side = {
+            "side_outcome": "full_chain_pass", "launcher_exit_code": 0, "timed_out": False,
+            "parent_agent_delegation_observed": True, "target_worker_lineage_observed": True,
+            "delegation_started_without_denial": True, "wrapper_reached": True,
+            "classifier_denial_surfaces": [], "nontarget_classifier_denial_count": 2,
+            "target_unattributed_denial_count": 0, "fake_gh_undefined_argv_count": 0,
+            "chain_stop_reason": "none", "transcript_digest": "d" * 64,
+        }
+        side.update(overrides)
+        return side
+
+    baseline_queue = [
+        (full_side(), None),
+        ({}, "disposable_worktree_add_failed"),
+        ({}, "claude_gpt_auto_runtime_unavailable"),
+    ]
+    current_queue = [(full_side(fake_gh_undefined_argv_count=1), None) for _ in range(3)]
+
+    def fake_side(launcher, _worktree, _prompt, **_kwargs):
+        queue = baseline_queue if Path(launcher) == baseline_launcher else current_queue
+        return queue.pop(0)
+
+    monkeypatch.setattr(canary, "_run_canonical_workflow_side", fake_side)
+    code, detail = canary.run_canonical_workflow_delegation_canary(tmp_path, BASELINE_POLICY_COMMIT, 3)
+    # 既存 key の意味・判定は不変 (baseline に deny が無く allow がある -> not_reproduced / exit 0)。
+    assert code == 0 and detail["comparison_result"] == "not_reproduced"
+    assert detail["closure_disposition"] == "hold_open" and detail["false_deny_resolution_claim"] == "not_claimed"
+    assert detail["baseline_outcome"] == "allow" and detail["current_outcome"] == "full_chain_pass"
+    assert detail["baseline_sample_count"] == 1 and detail["current_sample_count"] == 3
+
+    # aggregate の allow は「全 run allow」ではない。outcome 別件数と集約規則で読み取れる。
+    assert detail["baseline_outcome_counts"] == {"deny_observed": 0, "allow": 1, "unavailable": 2}
+    assert detail["current_outcome_counts"]["full_chain_pass"] == 3
+    assert sum(detail["current_outcome_counts"].values()) == 3
+    aggregation = detail["outcome_aggregation"]
+    assert aggregation["baseline"] == "deny_observed_if_any_else_allow_if_any_else_unavailable"
+    assert aggregation["current"] == "worst_of_runs"
+    assert aggregation["per_run_authority"] == "observation_run_outcomes"
+
+    runs = detail["observation_run_outcomes"]
+    assert [run["baseline_outcome"] for run in runs] == ["allow", "unavailable", "unavailable"]
+    assert [run["baseline_side"]["sampled"] for run in runs] == [True, False, False]
+    assert [run["baseline_side"]["unavailable_reason"] for run in runs] == [
+        None, "disposable_worktree_add_failed", "claude_gpt_auto_runtime_unavailable",
+    ]
+    assert [run["baseline_unavailable_reason"] for run in runs] == [
+        None, "disposable_worktree_add_failed", "claude_gpt_auto_runtime_unavailable",
+    ]
+    for run in runs:
+        current_side = run["current_side"]
+        assert current_side["launcher_exit_code"] == 0 and current_side["timed_out"] is False
+        assert current_side["parent_agent_delegation_observed"] is True
+        assert current_side["target_worker_lineage_observed"] is True and current_side["wrapper_reached"] is True
+        assert current_side["classifier_denial_surfaces"] == []
+        assert current_side["fake_gh_undefined_argv_count"] == 1 and current_side["chain_stop_reason"] == "none"
+        assert current_side["nontarget_classifier_denial_count"] == 2
+        assert current_side["unavailable_reason"] is None
+        assert current_side["transcript_digest"] == "d" * 64
+    first_baseline = runs[0]["baseline_side"]
+    assert first_baseline["sampled"] is True and first_baseline["wrapper_reached"] is True
+    unlaunched = runs[1]["baseline_side"]
+    assert unlaunched["side_outcome"] is None and unlaunched["launcher_exit_code"] is None
+    # evidence に raw transcript / prompt / command / HOME の絶対 path は載せない。
+    serialized = json.dumps(detail, ensure_ascii=False)
+    assert str(Path.home()) not in serialized
+    canary._assert_no_raw_content(detail)
+
+    # baseline を起動できない比較 (mirror 不成立) でも、run エントリは理由つきで残る。
+    monkeypatch.setattr(
+        canary, "_build_baseline_launcher_mirror",
+        lambda _c: (None, {"unavailable_reason": "baseline_policy_commit_unresolvable"}),
+    )
+    current_queue[:] = [(full_side(), None)]
+    code, detail = canary.run_canonical_workflow_delegation_canary(tmp_path, BASELINE_POLICY_COMMIT, 3)
+    assert code == 77 and detail["comparison_result"] == "comparison_incomplete"
+    assert len(detail["observation_run_outcomes"]) == 1
+    only = detail["observation_run_outcomes"][0]
+    assert only["baseline_side"]["sampled"] is False
+    assert only["baseline_side"]["unavailable_reason"] == "baseline_policy_commit_unresolvable"
+    assert detail["baseline_outcome_counts"] == {"deny_observed": 0, "allow": 0, "unavailable": 1}
 
 
 # ---------------------------------------------------------------------------
