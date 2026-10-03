@@ -959,7 +959,7 @@ def test_hermetic_fake_gh_answers_worker_read_only_queries_for_the_fixture_only(
         ("pr", "ready", pr, "--repo", repo),
         ("pr", "comment", pr, "--repo", repo, "--body", "x"),
         ("pr", "list", "--repo", repo),
-        ("api", f"repos/{repo}/pulls/{pr}"),
+        ("api", f"repos/{repo}/pulls/{pr}/merge"),  # fixture の事実にない endpoint (pulls/<n> 自体は #2843 で追加)
         ("api", f"repos/{repo}/issues/123/comments"),
         ("api", f"repos/other/repo/issues/{issue}/comments"),
         ("api", "-X", "POST", f"repos/{repo}/issues/{issue}/comments"),
@@ -2256,6 +2256,146 @@ def test_h1_h3_body_file_path_kind_fake_edit_calls_and_worker_result_facts_are_s
     diag = _run_diagnostics({"observation_run_outcomes": [{"run_index": 1, "current_side": summary}]})
     assert diag[0]["current"]["update_pr_calls"][1]["body_file_path_kind"] == "fixture_abspath_in_worktree"
     assert diag[0]["current"]["worker_result_binding_facts"]["status_ok"] is False
+
+
+def _stateful_gh(tmp_path: Path):
+    log_path = tmp_path / "calls.jsonl"
+    shim = tmp_path / "gh"
+    shim.write_text(canary._fake_gh_source(log_path), encoding="utf-8")
+    shim.chmod(0o755)
+
+    def run(*argv):
+        return subprocess.run([str(shim), *argv], capture_output=True, text=True, timeout=20, check=False)
+
+    return run, log_path
+
+
+def test_i1_fake_gh_returns_the_updated_pr_body_after_a_successful_pr_edit(tmp_path):
+    """GIVEN canary 所有の fake gh (最小 stateful)
+    WHEN fixture PR に pr edit --body-file を成功させ、その後 pr view / REST で本文を読み戻す
+    THEN 更新前は stale 本文、更新後は更新後の本文 (複数回の edit は最後が有効) を返し、本文以外の field は不変。
+         状態は canary 所有 dir (log と同じ dir) にだけ保存し、fixture_update_confirmed の意味 (fixture 本文との一致)
+         は変わらない。範囲外の PR / 未定義 argv では本文を変えない
+    """
+    run, log_path = _stateful_gh(tmp_path)
+    repo = canary.TRUSTED_REPO
+    pr = str(canary.CANONICAL_WORKFLOW_FIXTURE_PR_NUMBER)
+    stale = canary.CANONICAL_WORKFLOW_FIXTURE_STALE_PR_BODY
+    fields = "number,state,title,body,headRefName,headRefOid,reviewDecision,mergeStateStatus,reviews,files"
+
+    def view_all():
+        return json.loads(run("pr", "view", pr, "--repo", repo, "--json", fields).stdout)
+
+    def view_body():
+        return run("pr", "view", pr, "--repo", repo, "--json", "body", "--jq", ".body").stdout
+
+    before = view_all()
+    assert before["body"] == stale and view_body() == stale + "\n"
+    assert json.loads(run("api", f"repos/{repo}/pulls/{pr}").stdout)["body"] == stale
+    assert "canary fixture pr" in run("pr", "view", pr).stdout
+
+    first = tmp_path / "first.md"
+    first.write_text(canary.CANONICAL_WORKFLOW_FIXTURE_BODY, encoding="utf-8")
+    assert run("pr", "edit", pr, "--repo", repo, "--body-file", str(first)).returncode == 0
+    after = view_all()
+    assert after["body"] == canary.CANONICAL_WORKFLOW_FIXTURE_BODY
+    assert {k: v for k, v in after.items() if k != "body"} == {k: v for k, v in before.items() if k != "body"}
+    assert view_body() == canary.CANONICAL_WORKFLOW_FIXTURE_BODY + "\n"
+    assert json.loads(run("api", f"repos/{repo}/pulls/{pr}").stdout)["body"] == canary.CANONICAL_WORKFLOW_FIXTURE_BODY
+    assert json.loads(run("api", f"repos/{repo}/issues/{pr}").stdout)["body"] == canary.CANONICAL_WORKFLOW_FIXTURE_BODY
+    jq_body = run("api", f"repos/{repo}/pulls/{pr}", "--jq", ".body").stdout
+    assert jq_body == canary.CANONICAL_WORKFLOW_FIXTURE_BODY + "\n"
+
+    # 2 回目の edit は最後が有効。範囲外 PR / --repo 違い / body file なしの edit は本文を変えない。
+    second = tmp_path / "second.md"
+    second.write_text("## Summary\n二回目の本文\n", encoding="utf-8")
+    assert run("pr", "edit", pr, "--repo", repo, "--body-file", str(second)).returncode == 0
+    assert view_all()["body"] == "## Summary\n二回目の本文\n"
+    for argv in (
+        ("pr", "edit", "1", "--repo", repo, "--body-file", str(first)),
+        ("pr", "edit", pr, "--repo", "other/repo", "--body-file", str(first)),
+        ("pr", "edit", pr, "--repo", repo, "--body-file", str(tmp_path / "missing.md")),
+        ("pr", "edit", pr, "--repo", repo, "--body", "inline"),
+    ):
+        assert run(*argv).returncode == canary.FAKE_GH_UNDEFINED_ARGV_EXIT, argv
+    assert view_all()["body"] == "## Summary\n二回目の本文\n"
+    # 状態は log と同じ canary 所有 dir にだけ置かれ、body_sha256 の記録は従来どおり (fixture 一致の判定に使う)。
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith("fake-gh")) == ["fake-gh-pr-body.state"]
+    records = [r for r in canary._read_fake_gh_records(log_path) if r["argv"][:2] == ["pr", "edit"]]
+    handled = [r for r in records if r["handled"]]
+    assert [r["body_sha256"] for r in handled] == [
+        canary._sha256_text(canary.CANONICAL_WORKFLOW_FIXTURE_BODY), canary._sha256_text("## Summary\n二回目の本文\n"),
+    ]
+    assert all(r["handled"] is False and "body_sha256" not in r for r in records if r not in handled)
+    # 別の fake gh (別 dir) には状態が伝わらない (stale のまま)。
+    (tmp_path / "other").mkdir()
+    other_run, _ = _stateful_gh(tmp_path / "other")
+    assert json.loads(other_run("pr", "view", pr, "--json", "body").stdout)["body"] == stale
+
+
+def test_i2_api_endpoint_template_is_sanitized_and_rest_reads_keep_the_fail_closed_boundary(tmp_path):
+    """GIVEN 未定義 argv の `gh api` と、canonical route が GET しうる REST endpoint
+    WHEN 診断 shape を作り / fake gh に問い合わせる
+    THEN endpoint template は数字を <n>、trusted repo を <repo>、構造語以外を <seg> に正規化し、query は option 名
+         だけ (値・owner/repo・番号・本文を漏らさない)。REST GET は fixture の事実を返し、mutation flag は fail-closed
+    """
+    shape = canary._undefined_argv_shape(
+        ["api", "--paginate", f"repos/{canary.TRUSTED_REPO}/pulls/2147483647/requested_reviewers?per_page=100&secret=v",
+         "--jq", ".[].secret_expression"]
+    )
+    assert shape["api_endpoint_template"] == "repos/<repo>/pulls/<n>/requested_reviewers"
+    assert shape["api_query_options"] == ["per_page", "secret"]
+    assert shape["options"] == ["--paginate", "--jq"]
+    other = canary._undefined_argv_shape(
+        ["api", "-X", "POST", "/repos/someone/else-repo/issues/42/comments", "-f", "body=x"]
+    )
+    assert other["api_endpoint_template"] == "repos/<seg>/<seg>/issues/<n>/comments"
+    assert other["api_query_options"] == [] and other["options"] == ["-X", "-f"]
+    serialized = json.dumps([shape, other])
+    for leaked in (canary.TRUSTED_REPO, "squne121", "loop-protocol", "2147483647", "someone", "else-repo",
+                   "secret_expression", "body=x", "secret=v"):
+        assert leaked not in serialized, leaked
+    assert "api_endpoint_template" not in canary._undefined_argv_shape(["pr", "view", "1"])
+    assert canary._undefined_argv_shape(["api"]) == {"subcommand": ["api"], "positionals": [], "options": []}
+    weird = canary._undefined_argv_shape(["api", "repos/a/b/compare/main...feature/x%20y"])
+    assert weird["api_endpoint_template"] == "repos/<seg>/<seg>/compare/<seg>/<seg>"
+
+    run, _log = _stateful_gh(tmp_path)
+    repo = canary.TRUSTED_REPO
+    pr = str(canary.CANONICAL_WORKFLOW_FIXTURE_PR_NUMBER)
+    issue = str(canary.CANONICAL_WORKFLOW_FIXTURE_ISSUE_NUMBER)
+    pulls = json.loads(run("api", f"repos/{repo}/pulls/{pr}").stdout)
+    assert pulls["number"] == int(pr) and pulls["draft"] is True and pulls["merged"] is False
+    assert pulls["head"]["ref"] == "canary-fixture" and pulls["base"]["ref"] == "main"
+    assert pulls["head"]["sha"] == canary.CANONICAL_WORKFLOW_FIXTURE_DEFAULT_HEAD_OID
+    files = json.loads(run("api", "--paginate", f"repos/{repo}/pulls/{pr}/files?per_page=100").stdout)
+    assert [f["filename"] for f in files] == [canary.CANONICAL_WORKFLOW_FIXTURE_CHANGED_PATH]
+    commits = json.loads(run("api", f"/repos/{repo}/pulls/{pr}/commits").stdout)
+    assert commits[0]["sha"] == pulls["head"]["sha"]
+    issue_rest = json.loads(run("api", f"repos/{repo}/issues/{issue}").stdout)
+    assert issue_rest["title"].startswith("実装:")
+    assert issue_rest["body"] == canary.CANONICAL_WORKFLOW_FIXTURE_ISSUE_BODY
+    assert run("api", f"repos/{repo}/pulls/{pr}", "--jq", ".head.sha").stdout.strip() == pulls["head"]["sha"]
+    # fail-closed 境界: mutation flag / 重複 endpoint / 未知 endpoint / 範囲外 / --jq の値欠落 / jq 失敗。
+    for argv in (
+        ("api", "-X", "PATCH", f"repos/{repo}/pulls/{pr}"),
+        ("api", "--method", "PATCH", f"repos/{repo}/pulls/{pr}"),
+        ("api", f"repos/{repo}/pulls/{pr}", "-f", "body=x"),
+        ("api", f"repos/{repo}/pulls/{pr}", "-F", "body=@x"),
+        ("api", f"repos/{repo}/pulls/{pr}", "--input", "-"),
+        ("api", f"repos/{repo}/pulls/{pr}", f"repos/{repo}/pulls/{pr}/files"),
+        ("api", f"repos/{repo}/pulls/{pr}", "--jq"),
+        ("api", f"repos/{repo}/pulls/{pr}", "--jq", ".["),
+        ("api", f"repos/{repo}/pulls/1"),
+        ("api", f"repos/other/repo/pulls/{pr}"),
+        ("api", f"repos/{repo}/pulls/{pr}/merge"),
+        ("api", f"repos/{repo}/pulls/{pr}/requested_reviewers"),
+        ("api", "graphql"),
+    ):
+        result = run(*argv)
+        assert result.returncode == canary.FAKE_GH_UNDEFINED_ARGV_EXIT and result.stdout == "", argv
+    for token in (*_INSTRUCTION_TOKENS, "Agent"):
+        assert token not in json.dumps(pulls) + json.dumps(issue_rest) + json.dumps(commits), token
 
 
 def test_g5_fake_gh_serves_pr_and_issue_facts_beyond_the_minimum_and_keeps_unknown_fail_closed(tmp_path):

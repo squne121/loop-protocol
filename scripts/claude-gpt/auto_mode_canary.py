@@ -1232,12 +1232,17 @@ FIXTURE_REVIEWS = [
         "commit_id": HEAD_REF_OID,
     }}
 ]
-READ_API_PATHS = (
-    "repos/" + ALLOWED_REPO + "/issues/" + FIXTURE_ISSUE + "/comments",
-    "repos/" + ALLOWED_REPO + "/pulls/" + FIXTURE_PR + "/comments",
-    "repos/" + ALLOWED_REPO + "/pulls/" + FIXTURE_PR + "/reviews",
-    "repos/" + ALLOWED_REPO + "/issues/" + FIXTURE_PR + "/comments",
-)
+# fake gh の唯一の状態: `pr edit <fixture PR> --body-file` が成功したときの本文。canary 所有の shim dir (log と同じ
+# dir) にだけ保存し、以降の PR body を返す read (pr view / REST) は更新後の本文を返す。更新前は stale 本文。
+BODY_STATE_PATH = os.path.join(os.path.dirname(LOG_PATH), "fake-gh-pr-body.state")
+
+
+def current_pr_body():
+    try:
+        with open(BODY_STATE_PATH, "rb") as fh:
+            return fh.read().decode("utf-8", "replace")
+    except OSError:
+        return FIXTURE_PR_BODY
 
 argv = sys.argv[1:]
 record = {{"resolved_path": os.path.realpath(sys.argv[0]), "argv": argv, "handled": False}}
@@ -1354,7 +1359,7 @@ PR_VALUES = {{
     "number": int(FIXTURE_PR),
     "state": "OPEN",
     "title": "canary fixture",
-    "body": FIXTURE_PR_BODY,
+    "body": current_pr_body(),
     "url": REPO_URL + "/pull/" + FIXTURE_PR,
     "isDraft": True,
     "headRefName": HEAD_REF_NAME,
@@ -1427,15 +1432,114 @@ PR_VALUES = {{
 }}
 
 
+API_BASE = "repos/" + ALLOWED_REPO
+# REST の GET で返す fixture の事実 (canonical route が実際に GET しうる endpoint だけ)。PR の body は更新後の
+# 本文。ここに無い endpoint・mutation (-X / -f / -F / --input 等) は fail-closed。
+API_PAYLOADS = {{
+    API_BASE + "/pulls/" + FIXTURE_PR: {{
+        "number": int(FIXTURE_PR),
+        "state": "open",
+        "title": "canary fixture",
+        "body": current_pr_body(),
+        "draft": True,
+        "html_url": REPO_URL + "/pull/" + FIXTURE_PR,
+        "user": {{"login": "canary-author"}},
+        "head": {{"sha": HEAD_REF_OID, "ref": HEAD_REF_NAME, "repo": {{"full_name": ALLOWED_REPO}}}},
+        "base": {{"ref": "main", "repo": {{"full_name": ALLOWED_REPO}}}},
+        "mergeable": True,
+        "mergeable_state": "draft",
+        "merged": False,
+        "merged_at": None,
+        "merge_commit_sha": None,
+        "changed_files": 1,
+        "additions": 1,
+        "deletions": 0,
+        "labels": [],
+        "created_at": UPDATED_AT,
+        "updated_at": UPDATED_AT,
+        "closed_at": None,
+    }},
+    API_BASE + "/pulls/" + FIXTURE_PR + "/files": [
+        {{"filename": FIXTURE_CHANGED_PATH, "status": "modified", "additions": 1, "deletions": 0, "changes": 1}}
+    ],
+    API_BASE + "/pulls/" + FIXTURE_PR + "/commits": [
+        {{
+            "sha": HEAD_REF_OID,
+            "commit": {{"message": "canary fixture commit", "author": {{"name": "canary-author", "date": UPDATED_AT}}}},
+            "author": {{"login": "canary-author"}},
+        }}
+    ],
+    API_BASE + "/pulls/" + FIXTURE_PR + "/comments": [],
+    API_BASE + "/pulls/" + FIXTURE_PR + "/reviews": FIXTURE_REVIEWS,
+    API_BASE + "/issues/" + FIXTURE_ISSUE: {{
+        "number": int(FIXTURE_ISSUE),
+        "state": "open",
+        "title": ISSUE_TITLE,
+        "body": ISSUE_BODY,
+        "html_url": REPO_URL + "/issues/" + FIXTURE_ISSUE,
+        "labels": [{{"name": "phase/implementation"}}],
+        "user": {{"login": "canary-author"}},
+        "created_at": UPDATED_AT,
+        "updated_at": UPDATED_AT,
+        "closed_at": None,
+    }},
+    API_BASE + "/issues/" + FIXTURE_ISSUE + "/comments": [],
+    API_BASE + "/issues/" + FIXTURE_PR: {{
+        "number": int(FIXTURE_PR),
+        "state": "open",
+        "title": "canary fixture",
+        "body": current_pr_body(),
+        "html_url": REPO_URL + "/pull/" + FIXTURE_PR,
+        "pull_request": {{"html_url": REPO_URL + "/pull/" + FIXTURE_PR}},
+        "labels": [],
+        "user": {{"login": "canary-author"}},
+        "created_at": UPDATED_AT,
+        "updated_at": UPDATED_AT,
+        "closed_at": None,
+    }},
+    API_BASE + "/issues/" + FIXTURE_PR + "/comments": [],
+}}
+
+
+def parse_api(args):
+    # `gh api [--paginate] [--jq EXPR] <endpoint>` の GET だけ。他の flag (-X / -f / -F / --input / --method 等)
+    # や endpoint の重複は None (fail-closed)。query は無視し、先頭の `/` は除く。
+    path = None
+    jq_expr = None
+    index = 1
+    while index < len(args):
+        arg = args[index]
+        if arg == "--paginate":
+            index += 1
+        elif arg == "--jq":
+            if jq_expr is not None or index + 1 >= len(args):
+                return None
+            jq_expr = args[index + 1]
+            index += 2
+        elif arg.startswith("-") or path is not None:
+            return None
+        else:
+            path = arg.split("?", 1)[0].lstrip("/")
+            index += 1
+    return None if path is None else (path, jq_expr)
+
+
 if argv[:2] == ["pr", "edit"] and len(argv) > 2 and argv[2] == FIXTURE_PR and option("--repo") == ALLOWED_REPO:
     # fixture PR に対する更新だけが唯一の mutation。body の SHA-256 を記録する。
     body_file = option("--body-file")
     if body_file and os.path.isfile(body_file):
         with open(body_file, "rb") as fh:
             data = fh.read()
-        record["body_sha256"] = hashlib.sha256(data).hexdigest()
-        record["handled"] = True
-        finish(0)
+        # 更新後の本文を canary 所有 dir に保存する (複数回の edit は最後が有効)。保存できなければ未定義扱い。
+        try:
+            with open(BODY_STATE_PATH, "wb") as state_fh:
+                state_fh.write(data)
+        except OSError:
+            data = None
+        if data is not None:
+            record["body_sha256"] = hashlib.sha256(data).hexdigest()
+            record["handled"] = True
+            finish(0)
 elif (
     argv[:2] in (["issue", "view"], ["pr", "view"])
     and len(argv) > 2
@@ -1493,18 +1597,16 @@ elif (
         + " canary fixture [canary-fixture]\\n\\nRequesting a code review from you\\n"
         + "  You have no pull requests to review\\n"
     )
-elif (
-    argv[:1] == ["api"]
-    and len(argv) >= 2
-    and all(arg in ("api", "--paginate") or not arg.startswith("-") for arg in argv)
-    and len([arg for arg in argv if not arg.startswith("-")]) == 2
-    and argv[-1].split("?", 1)[0] in READ_API_PATHS
-):
-    # fixture の comments / reviews の GET だけ (mutation flag -X/-f/-F/--input 等は受け付けない)。
-    # fixture PR の review は REQUEST_CHANGES 相当の事実を 1 件返す。他の comments は空。
-    if argv[-1].split("?", 1)[0] == "repos/" + ALLOWED_REPO + "/pulls/" + FIXTURE_PR + "/reviews":
-        answer(json.dumps(FIXTURE_REVIEWS))
-    answer("[]")
+elif argv[:1] == ["api"] and parse_api(argv) is not None and parse_api(argv)[0] in API_PAYLOADS:
+    # fixture の REST GET だけ (mutation flag -X/-f/-F/--input 等は受け付けない)。--jq は --json と同じく
+    # jq があるときだけ適用し、取れなければ fail-closed。
+    api_path, api_jq = parse_api(argv)
+    api_payload = API_PAYLOADS[api_path]
+    if api_jq is None:
+        answer(json.dumps(api_payload))
+    api_extracted = apply_jq(api_jq, api_payload)
+    if api_extracted is not None:
+        answer(api_extracted)
 elif argv == ["--version"]:
     answer("gh version 0.0.0 (canary fake)\\n")
 sys.stderr.write("canary fake gh: undefined argv (fail-closed)\\n")
@@ -1788,13 +1890,69 @@ _ARGV_OPTION_RE = re.compile(r"--?[A-Za-z][A-Za-z0-9-]{0,31}")
 _ARGV_JSON_FIELD_RE = re.compile(r"[A-Za-z][A-Za-z0-9]{0,39}")
 
 
+_API_VALUE_OPTIONS = frozenset(
+    {"-X", "--method", "-f", "--raw-field", "-F", "--field", "-H", "--header", "--jq", "-q", "--input", "-t",
+     "--template", "--cache", "--hostname"}
+)
+# endpoint template に実名で残してよい固定の path 語 (GitHub REST の構造語)。それ以外の segment は `<seg>`。
+_API_STRUCTURAL_SEGMENTS = frozenset(
+    {"repos", "pulls", "issues", "comments", "reviews", "files", "commits", "compare", "git", "refs", "heads",
+     "statuses", "status", "check-runs", "check-suites", "actions", "runs", "jobs", "logs", "artifacts", "labels",
+     "assignees", "requested_reviewers", "merge", "parent", "user", "rate_limit", "graphql", "branches", "contents",
+     "timeline", "events", "search", "pull", "head", "commit", "reactions", "sub_issues", "dependencies"}
+)
+
+
+def _api_endpoint_arg(rest: list[str]) -> str | None:
+    """`gh api` の endpoint 引数 (option とその値を除いた最初の positional)。"""
+    index = 0
+    while index < len(rest):
+        token = rest[index]
+        if token.startswith("-"):
+            index += 2 if token in _API_VALUE_OPTIONS else 1
+            continue
+        return token
+    return None
+
+
+def _api_endpoint_template(endpoint: str) -> tuple[str, list[str]]:
+    """endpoint の sanitized な template と query の option 名。数字のみの segment は `<n>`、trusted repo の
+    owner/repo は `<repo>`、固定の構造語以外は `<seg>`。値・本文・実際の path は載せない。"""
+    path, _, query = endpoint.partition("?")
+    segments = [seg for seg in path.split("/") if seg][:12]
+    owner, _, repo_name = TRUSTED_REPO.partition("/")
+    template: list[str] = []
+    index = 0
+    while index < len(segments):
+        seg = segments[index]
+        if seg == owner and index + 1 < len(segments) and segments[index + 1] == repo_name:
+            template.append("<repo>")
+            index += 2
+            continue
+        if seg.isdigit():
+            template.append("<n>")
+        elif seg in _API_STRUCTURAL_SEGMENTS:
+            template.append(seg)
+        else:
+            template.append("<seg>")
+        index += 1
+    query_options = [
+        name
+        for name in (part.partition("=")[0] for part in query.split("&") if part)
+        if re.fullmatch(r"[a-z_]{1,24}", name)
+    ][:6]
+    return "/".join(template), query_options
+
+
 def _undefined_argv_shape(argv: list) -> dict:
     """fake gh が未定義 argv として fail-closed にした呼び出しの sanitized な shape。サブコマンド 2 token、
     先頭の positional (数値は `<n>`、それ以外は `<arg>`)、option 名の一覧、`--json` の field 名の一覧だけ。
     option の値 (--body / --body-file / --repo / --jq 等)・path・自由文は載せない。"""
     tokens = [str(item) for item in argv]
-    subcommand = [t if _ARGV_WORD_RE.fullmatch(t) else "<other>" for t in tokens[:2]]
-    rest = tokens[2:]
+    # `gh api` はサブコマンド 1 token (続くのは option / endpoint)。それ以外は 2 token。
+    subcommand_length = 1 if tokens[:1] == ["api"] else 2
+    subcommand = [t if _ARGV_WORD_RE.fullmatch(t) else "<other>" for t in tokens[:subcommand_length]]
+    rest = tokens[subcommand_length:]
     positionals: list[str] = []
     for token in rest:
         if token.startswith("-"):
@@ -1821,6 +1979,10 @@ def _undefined_argv_shape(argv: list) -> dict:
     }
     if json_fields is not None:
         shape["json_fields"] = json_fields
+    if tokens[:1] == ["api"]:
+        endpoint = _api_endpoint_arg(tokens[1:])
+        if endpoint is not None:
+            shape["api_endpoint_template"], shape["api_query_options"] = _api_endpoint_template(endpoint)
     return shape
 
 
