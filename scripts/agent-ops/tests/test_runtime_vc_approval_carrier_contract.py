@@ -201,6 +201,99 @@ def test_negative_control_not_weakened(contract, runner):
 
 
 # ---------------------------------------------------------------------------
+# AC8 (Issue #2810 operator decision): pre-repair-check の read-only 実行を同じ rule に限定して追加
+# ---------------------------------------------------------------------------
+
+
+def _overlay_allow_rule(contract, runner) -> tuple[list, str]:
+    overlay = json.loads(contract.build_approval_overlay_json(PROFILE_ID, _base_overlay(runner)))
+    allow = overlay["autoMode"]["allow"]
+    return allow, allow[1]
+
+
+def test_pre_repair_check_overlay_allow_is_defaults_plus_single_rule(contract, runner):
+    allow, rule = _overlay_allow_rule(contract, runner)
+    assert allow == ["$defaults", rule]
+    assert isinstance(rule, str) and rule
+
+
+def test_pre_repair_check_rule_pins_both_actions(contract, runner):
+    _, rule = _overlay_allow_rule(contract, runner)
+    # action 1: 既存の exact repair command (弱化されていない)
+    assert "`bash scripts/claude-gpt/repair_proxy.sh`" in rule
+    assert contract.get_approval_profile(PROFILE_ID).repair_command in rule
+    # action 2: read-only な pre-repair-check の exact form
+    assert "uv run --locked python3 .claude/skills/impl-review-loop/scripts/classify_runtime_migration.py "\
+        "pre-repair-check" in rule
+    assert "`pre-repair-check`" in rule
+    assert "--expected-claude-gpt-home" in rule
+    assert "--pre-repair-evidence-json" in rule
+    assert "claude_gpt_home_absolute_path" in rule and "repo_head" in rule
+    assert "read-only" in rule
+    assert "creates or changes no files" in rule
+    assert "uses no network" in rule
+    assert "performs no install" in rule
+    assert "git rev-parse HEAD" in rule
+    assert "Exactly two actions" in rule
+    # 既存の制約が残っている
+    assert "file://" in rule and "no network installer" in rule
+    assert "persistent install destination" in rule
+    assert "is never modified" in rule
+
+
+def test_pre_repair_check_rule_does_not_widen_permission(contract, runner):
+    _, rule = _overlay_allow_rule(contract, runner)
+    for permissive in ("any command", "arbitrary", "&&", "||", "printenv", "env -", "Bash(", "*", "sudo",
+                       "curl", "wget", "pip install", "uv sync", "uv pip"):
+        assert permissive not in rule, permissive
+    # classifier script は 1 度だけ名指しされ、uv run も 1 つの exact form にしか現れない。
+    assert rule.count("classify_runtime_migration.py") == 2  # 名指し 1 回 + exact command 内の 1 回
+    assert rule.count("uv run") == 1
+    assert rule.count("python3") == 1
+    # 名指しされる subcommand は pre-repair-check だけ。
+    for other in ("materialize", "classify ", "--current-head"):
+        assert other not in rule, other
+    assert rule.count("pre-repair-check") == 2  # 名指し 1 回 + exact command 内の 1 回
+    # 許可する flag は 2 つだけ。
+    flags = {tok.strip("`(),.") for tok in rule.split() if tok.strip("`(),.").startswith("--")}
+    assert flags == {"--locked", "--expected-claude-gpt-home", "--pre-repair-evidence-json"}
+    # 明示的な除外文言
+    assert "Nothing else is allowed" in rule
+    assert "no shell chaining" in rule
+    assert "no listing of environment variables" in rule
+
+
+def test_pre_repair_check_constants_match_rule(contract, runner):
+    _, rule = _overlay_allow_rule(contract, runner)
+    assert contract.PRE_REPAIR_CHECK_SUBCOMMAND == "pre-repair-check"
+    assert contract.PRE_REPAIR_CHECK_FLAGS == ("--expected-claude-gpt-home", "--pre-repair-evidence-json")
+    script = REPO_ROOT / contract.PRE_REPAIR_CHECK_SCRIPT_RELPATH
+    assert script.is_file()
+    assert contract.PRE_REPAIR_CHECK_COMMAND_PREFIX in rule
+
+
+def test_pre_repair_check_invariants_still_hold(contract, runner):
+    # registry は closed で profile は 1 つだけ。
+    assert contract.approval_profile_ids() == (PROFILE_ID,)
+    assert set(contract._APPROVAL_PROFILE_REGISTRY) == {PROFILE_ID}
+    profile = contract.get_approval_profile(PROFILE_ID)
+    assert profile.allow_rule == contract._REPAIR_PROXY_ALLOW_RULE
+    # overlay: autoMode は allow だけ。soft_deny / hard_deny / environment を持たない。
+    base = json.loads(_base_overlay(runner))
+    overlay = json.loads(contract.build_approval_overlay_json(PROFILE_ID, _base_overlay(runner)))
+    assert set(overlay["autoMode"]) == {"allow"}
+    for key in ("soft_deny", "hard_deny", "environment"):
+        assert key not in overlay["autoMode"]
+        assert key not in overlay
+    # permissions.deny と hooks は base のまま保持される。
+    assert overlay["permissions"] == base["permissions"]
+    assert overlay["hooks"] == base["hooks"]
+    # builder は profile_id と base JSON だけを受け取る (caller の allow 文字列の入口は無い)。
+    assert list(inspect.signature(contract.build_approval_overlay_json).parameters) == [
+        "profile_id", "base_settings_json"]
+
+
+# ---------------------------------------------------------------------------
 # AC3: generic passthrough 不在
 # ---------------------------------------------------------------------------
 

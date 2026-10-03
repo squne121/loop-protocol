@@ -131,6 +131,142 @@ semantic planning・overlap・contract snapshot・body SHA・artifact 異常に�
   HUMAN_REVIEW_REQUIRED` は reviewer の正式な判定結果であり、`route_loop_verdict_v2()` の
   routing に従って正当に human escalation する。
 
+## Runtime Migration 3分類ルーティング（Issue #2810）
+
+runtime VC の failure evidence が `#2801` 相当の structured incompatibility
+（`cause=proxy_model_catalog_incompatible`、`repair_command=scripts/claude-gpt/repair_proxy.sh`）
+を示す場合、root（Step 5）はそれを **SubAgent の自己申告ではなく root-owned の capability
+classification** として次の3分類に決定論的に分類する。分類は
+`.claude/skills/impl-review-loop/scripts/classify_runtime_migration.py` の `materialize` ->
+classify の 2 段 CLI（下記「分類器入力の生成手順」）を実際に経由して行い、markdown の
+文字列一致や目視判断、LLM による JSON の手組みで代替しない。
+
+1. **agent-executable bounded runtime migration**（`class: agent_executable_migration`、エージェントが実行可能）
+2. **implementation defect**（`class: implementation_defect`、実装側の不具合）
+3. **genuine human capability blocker**（`class: human_capability_blocker`、人間対応が必要）
+
+3分類の詳細な充足条件は `classify_runtime_migration.py` のモジュール docstring を正本とする。
+本セクションは Step 5 が classifier の入出力をどう扱うかの **routing 手順**のみを定める
+（classifier 自体の判定ロジックはここに複製しない）。
+
+この分類は、既存 `human_review_required` の扱い（本文書の上記セクション）や
+`route_loop_verdict_v2()` の review / mergeability routing（`route_to_update_branch` /
+`conflict_hard_stop` 等）とは独立した、runtime failure 専用の capability classification
+である。両者を混同しない: `human_review_required: true` の自己申告や PR mergeability の
+routing は本セクションの分類対象にならず、逆に本セクションの `human_capability_blocker`
+判定は `route_human_escalation` とは別の human veto 追加項目（下記）として扱う。
+
+### 分類器入力の生成手順（materialize、root が所有する canonical path）
+
+classifier の入力 JSON は LLM が手組みしない。root は現在の evidence から
+`classify_runtime_migration.py materialize` で決定論的に生成し、その stdout をそのまま
+classifier（引数なし・stdin JSON -> stdout JSON）へ渡す。canonical path は次の 2 段（パイプ 1 本）:
+
+```bash
+uv run --locked python3 .claude/skills/impl-review-loop/scripts/classify_runtime_migration.py materialize \
+  --failure-evidence-file <CLAUDE_GPT_LAUNCH_RESULT_V1 の failure receipt(JSON)> \
+  --issue-number <N> [--repo <owner/repo>] \
+  [--preflight-file <preflight JSON>] [--install-log-file <install log>] \
+  [--worker-result-file <worker_result JSON>] [--operator-host-differs] \
+| uv run --locked python3 .claude/skills/impl-review-loop/scripts/classify_runtime_migration.py
+```
+
+- `--issue-number` は `gh issue view` で live Issue 本文を取得する。取得失敗・未指定は
+  `live_issue_authorizes_migration: false`（fail-closed）。hermetic な検証では
+  `--issue-body-file` で本文を注入する。
+- **許可述語**（`issue_authorizes_repair_migration`）: live Issue 本文の code fence 外の 1 行に、
+  literal `bash scripts/claude-gpt/repair_proxy.sh`（引数追加・suffix 連結なし）と agent 実行の
+  明示許可 marker（`agent-executable` / `agent が実行してよい` 等）が **同じ行**にあり、かつ当該
+  literal を含むどの行にも禁止・曖昧 marker（`禁止` / `手動` / `human operator` /
+  `Out of Scope` 等）が無い場合のみ true。VC の code block 内の literal や許可 marker の無い
+  言及は true にならない（`create-issue` `references/body-authoring.md` の #2810 追加ガイダンスと一致）。
+- `effective_env`: 現在の環境から `CLAUDE_GPT_HOME`（未設定なら `~/.claude-gpt`）を絶対パスへ
+  正規化し、`CLAUDE_CODE_PROXY_INSTALL_DIR` / `CLAUDE_CODE_PROXY_VERSION` /
+  `CLAUDE_GPT_REPAIR_INSTALLER_URL` のいずれかが存在すれば `override_vars_present: true`
+  （`CLAUDE_GPT_HOME` 自体は override に含めない）。
+- `probes.install_dir_writable` は `probe_install_dir_writable()` を production から呼んで得る。
+  `probes.host_reachable` は「effective home の最も近い既存祖先が execution host 上の directory
+  として存在し、かつ `--operator-host-differs` が無い」場合に true、フラグ指定なら false、判定不能は
+  null（classifier が `probe_result_indeterminate` に fail-closed する）。
+- `capability_flags`: `needs_credential` は preflight の `chatgpt_auth.available == false`、
+  `needs_privilege` は install log の `sudo required` からのみ導出する。`needs_secret` /
+  `destructive_or_global` は決定論的な導出根拠が無いため常に false（捏造しない）。
+- evidence file の欠落・malformed は `materialize` が exit 2 で fail-closed する（stdout は空となり
+  後段の classifier も空入力で exit 2 になるため分類結果は得られない。migration は実行せず通常の
+  fix loop に残す）。分類後（repair 実行後）の再分類は、worker result から
+  作った `worker_result` JSON（`status` / `reason_code` / `exit_code` / root が独立検証した
+  `deny_evidence_verified` / `runtime_migration.sudo_required` を写した `sudo_required_in_log`）を
+  `--worker-result-file` に渡して同じ 2 段を再実行する。
+- classifier は固定 key の primitive 型（bool / str / int）を検証し、型違反は
+  `implementation_defect`（route: `malformed_input_type_fail_closed`）に fail-closed する。
+
+### pre/post evidence の採取（root が実施。test-runner は read-only のまま採取しない）
+
+classifier へ渡す前に、root が repair 前後で次を実行・記録する:
+
+```bash
+git rev-parse HEAD
+git status --porcelain
+sha256sum scripts/claude-gpt/launch.sh
+bash -c 'unset CLAUDE_GPT_PROXY_BIN; bash scripts/claude-gpt/launch.sh --check-only'
+```
+
+`CLAUDE_GPT_LAUNCH_RESULT_V1` の `proxy.absolute_path` / `proxy.version` /
+`preflight.home_source` を pre/post それぞれで記録し、
+`classify_runtime_migration.py::bind_pre_post_identity()` に渡して同一の effective launcher
+environment を対象にしたかを判定する（AC7）。test-runner の read-only contract
+（`.claude/agents/test-runner.md`）はこの採取責務を持たない（変更しない）。
+
+### agent-executable migration のルーティング
+
+`class: agent_executable_migration` の場合、Step 5 は人間へコマンド実行を丸投げせず、既存
+`fix_delta -> Step 1 implementation-worker` route に narrow な `runtime_migration_action`
+として渡す（`step-1-implementation.md` の `fix_delta.runtime_migration_action` 参照）。
+`expected_claude_gpt_home` には materialize 出力の `effective_env.claude_gpt_home` を、
+`pre_repair_evidence_ref` には inline JSON
+`{"claude_gpt_home_absolute_path": "<同 home>", "repo_head": "<git rev-parse HEAD>"}` を渡す。
+worker は repair 前にこれらを `pre-repair-check` で検証し、不一致なら repair を起動しない。
+repair 完了後は古い evidence を再利用せず、fresh Step 2 で current-head の canonical runtime
+VC を再実行する。古い evidence の再利用は routing 上 reject する。
+
+### implementation defect のルーティング
+
+`class: implementation_defect` の場合、`human_action_required` にせず、通常の `fix_delta`
+route（該当箇所の実装修正 -> 再検証）に残す。
+
+### human capability blocker のルーティング（human veto への狭い追加項目）
+
+`class: human_capability_blocker` の場合のみ停止する。この capability blocker は #1860 Owner
+Decision の human veto 節（owner の live 停止指示 / secret Decision Gate / mergeability）への
+**狭い追加項目**であり、`human_action_required` は既存 `termination_reason: human_escalation`
+の subtype（`escalation_subtype: capability_blocker`）として表現する。新しい
+`termination_reason` enum 値は追加しない。`route_loop_verdict_v2()` の意味論と既存
+TEST_VERDICT / LOOP_VERDICT / IMPLEMENT_RESULT schema は変更しない。
+
+停止 report は classifier が返す `human_action_report`（`reason` / `required_human_action` /
+`target_environment` / `verification_command` / `resume_condition`）をそのまま終了報告コメントへ
+反映する。いずれかのフィールドが欠落した状態で `human_action_required` を立ててはならない。
+
+normal test failure・review finding・implementation defect を「人間が repair command を
+手動実行してください」とだけ返して終了させてはならない（AC6 regression 禁止事項）。
+
+### apply_runtime_migration_fix_delta mode の worker result 写像（既存 Step 5 規則からの分離）
+
+`apply_runtime_migration_fix_delta` mode の `IMPLEMENTATION_WORKER_RESULT_V2` は、本文書
+冒頭の `worker_status_result_routing`（`update_branch` 等、既存 mode 向け）とは **別の**
+写像を使う。他の mode の写像は変更しない。
+
+| worker result | routing |
+|---|---|
+| `status: failed` + `reason_code: repair_failed` | `implementation_defect`（通常の fix loop へ。`classify_runtime_migration.py` に `worker_result` として渡して再分類する） |
+| `status: permission_blocked` + `reason_code: permission_denied` | root が deny evidence（hook payload / tool_result 上の拒否証跡）を独立に検証できた場合に限り `human_capability_blocker`。検証できない bare self-report は停止権限を持たず（AC6）、`implementation_defect` として fix loop に残す |
+| `status: blocked` + `reason_code: identity_mismatch` | repair 未実行（`runtime_migration.repair_executed: false`）。root が渡した `expected_claude_gpt_home` / `pre_repair_evidence_ref` が worker の effective 環境・current head と不一致という root 契約違反として **fail-closed 即停止**（`classify_runtime_migration.py` へは渡さない。evidence を再採取して Step 5 を最初からやり直す） |
+| `status: blocked` + `reason_code: command_mismatch` | root 契約違反として **fail-closed 即停止**（`classify_runtime_migration.py` へは渡さない。capability blocker ではなく、root が worker へ渡した `repair_command` 自体が worker 自身の literal-match 検証と不一致という routing 実装側の defect であるため、通常の `human_capability_blocker` 経路とは区別して報告する） |
+
+`apply_runtime_migration_fix_delta` 成功時（`status: ok`）は常に
+`rerun_required.verification: true` / `rerun_required.pr_review: true` を伴う。fresh Step 2
+を実行してから Step 4（pr-review-judge）を再実行する。
+
 ## update_branch の処理手順（Issue #1873: reviewer 自己申告を廃止、control-plane が合成）
 
 `route_loop_verdict_v2()` が `route: route_to_update_branch` を返した場合、`decision.selected_action`

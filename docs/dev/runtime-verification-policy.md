@@ -712,6 +712,81 @@ failure（ChatGPT アカウントの再認証が必要という結論）と誤�
 
 ---
 
+## 13. runtime 依存関係 migration の一回限りの ownership（Issue #2810）
+
+### 「コード統合」と「対象 runtime の migration/acceptance」の分離
+
+repository code が merge されたことと、target runtime が実際にその変更を反映して
+動作できることは別の完了条件である。runtime dependency（例: Claude-GPT の
+model/proxy lifecycle）を変更する Issue は、両方が完了して初めて "完了" とする。
+repository policy（required model set 等）が local runtime capability（実際に
+インストール済みの proxy バージョン等）より先行して変わるケースでは、
+「code は正しいが target runtime がまだ追従していない」状態が生まれうる。この
+状態を「Issue は完了した」と扱ってはならない。
+
+**具体例（#2772 -> #2801）**: #2772 は Claude-GPT の既定 model を GPT-6 Sol/Luna
+へ更新し merge された。この時点では自動 updater / normal launch 時の upgrade を
+明示的に Out of Scope としていたため、既存インストール済みの proxy がまだ旧
+model catalog のままの operator runtime では、canonical launcher
+（`scripts/claude-gpt/launch.sh --check-only`）が `proxy_model_catalog_incompatible`
+で失敗する状態が残った。#2801 はこの repair path（
+`scripts/claude-gpt/repair_proxy.sh`）を実装したが、「structured failure が
+出た後、誰が repair を実行して再検証するか」という **migration ownership** は
+定義しないまま Out of Scope とされていた。このギャップ自体が本 Issue（#2810）の
+scope である。
+
+### migration ownership の明示
+
+runtime dependency change を伴う Issue（`decision: immediate` の runtime
+acceptance AC を含む Issue）が local runtime state migration を要求する場合、
+Issue は次を明示しなければならない:
+
+- 誰が migration を実行するか（agent-executable な bounded repair か、human
+  operator による手動対応か）
+- どの条件を満たせば agent が実行してよいか（repository-owned の exact command、
+  secret/privilege/destructive mutation を要求しない、target が writable かつ
+  到達可能、live Issue が明示的に許可している 等）
+- repair 後にどの evidence を fresh に再検証するか（pre-repair の evidence を
+  再利用しない）
+
+### human intervention の必要条件
+
+human intervention（migration の手動実行）は、以下のいずれかに該当する場合
+**のみ**必要とする。これに該当しない failure（通常の test failure・review
+finding・implementation defect）を「人間が repair command を手動実行して
+ください」とだけ報告して終了させてはならない:
+
+- login / re-auth 等の本人 credential 操作、secret/token の入力・変更
+- sudo / privilege escalation、非 writable target に対する privileged mutation
+- destructive/global mutation
+- target operator host が execution host から到達不能
+- repository policy または実行環境の classifier/hook が当該 agent execution を
+  拒否している事実が evidence（tool_result / hook payload 上の deny evidence）で
+  検証できる場合
+
+### 必須報告項目
+
+human intervention が必要と判定された場合の報告は、次を全て含む:
+
+- `reason`: なぜ human intervention が必要か
+- `required_human_action`: 具体的に何を行う必要があるか（exact command / 操作）
+- `target_environment`: どの環境が対象か
+- `verification_command`: 完了後にどのコマンドで検証するか
+- `resume_condition`: 何を満たせば再開できるか
+
+### agent-executable な bounded repair の扱い
+
+上記 human intervention の必要条件に該当しない runtime dependency migration は、
+新しい permanent updater/harness や generic remediation framework を作らず、
+既存の implementation fix loop（`fix_delta -> Step 1 implementation-worker`）へ
+narrow な action として委譲してよい。repair 完了後は pre-repair の failure
+evidence を再利用せず、fresh な canonical runtime verification を再実行する。
+詳細な routing 手順は `.claude/skills/impl-review-loop/steps/
+step-5-feedback-and-termination.md` の「Runtime Migration 3分類ルーティング」
+セクションを参照する。
+
+---
+
 ## 14. 承認が必要な runtime VC の approval carrier（Issue #2839）
 
 runtime VC が Auto mode の classifier に拒否される操作（例: repository 管理下の fixture installer を実行する repair command）を含む場合、対話 session で operator が承認しても、runner（`scripts/agent-ops/run_worktree_agent_runtime_smoke.py`）が起動する独立した `claude -p` にはその承認が届かない。本節は、この承認を子 session へ invocation 単位で bounded かつ auditable に渡す仕組み（approval carrier）と、それを渡せない契約を事前に検出する手順を定める。
