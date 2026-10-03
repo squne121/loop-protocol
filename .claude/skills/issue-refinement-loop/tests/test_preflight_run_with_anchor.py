@@ -1206,6 +1206,39 @@ def _hrd_run_preflight(
     return result, exit_code, calls
 
 
+def test_mixed_section_directive_bound_before_real_preflight_consumer(tmp_path, monkeypatch, capsys):
+    """Planner evidence-only partial plan cannot authorize a mixed H2 write."""
+    comment = ("## Stop Conditions\n- Stop if tests fail.\n"
+               "- Allowed Paths に `src/new.ts` を追加してください。\n")
+    original_invoke = _e2e_preflight._invoke_planner
+    original_consume = _e2e_preflight.consume_trusted_anchor_contract_patch_plan
+    observed = {}
+
+    def invoke(*args, **kwargs):
+        plan, code, stderr, stdout = original_invoke(*args, **kwargs)
+        if isinstance(plan, dict):
+            observed["pre_bind"] = copy.deepcopy(plan.get("scope_signal_guard_decision_v2"))
+        return plan, code, stderr, stdout
+
+    def consume(**kwargs):
+        observed["consumer_operations"] = kwargs["contract_patch_plan"]["operations"]
+        return original_consume(**kwargs)
+
+    monkeypatch.setattr(_e2e_preflight, "_invoke_planner", invoke)
+    monkeypatch.setattr(_e2e_preflight, "consume_trusted_anchor_contract_patch_plan", consume)
+    result, _exit_code, calls = _hrd_run_preflight(
+        tmp_path, anchor_body=comment, run_id="mixed_h2_bound",
+    )
+    captured = capsys.readouterr()
+    assert observed["pre_bind"]["scope_delta_authority"]["contract_patch_plan"]["operations"]
+    assert observed["consumer_operations"] == []
+    assert result["contract_update"]["reason_code"] == "unsafe_unstructured_patch_operation"
+    assert result["contract_update"]["writes"] == 0 and calls["apply_transaction"] == 0
+    assert "PLANNER_FAIL_CLOSED" not in result["blockers"]
+    assert "CONTRACT_UPDATE_FAILED" in result["blockers"]
+    assert comment not in captured.out
+
+
 def test_ac1_ac6_explicit_human_review_directive_reaches_next_action_production_reachable(tmp_path, capsys):
     """AC1/AC6: an explicit trusted human_review_directive (freeform
     with_human_context comment, NOT a structured ANCHOR_SCOPE_REFRAME_V1
@@ -1369,10 +1402,13 @@ def test_issue2715_origin_comment_reproduction_stays_fail_closed_at_expands_allo
 
     assert result["next_action"] != "issue_editor_required"
     assert result["next_action"] == "human_judgment_required"
-    assert "PLANNER_FAIL_CLOSED" in result["blockers"]
+    assert "CONTRACT_UPDATE_FAILED" in result["blockers"]
+    assert "PLANNER_FAIL_CLOSED" not in result["blockers"]
+    assert result["planner_fail_closed"] is False
+    assert result["planner_fail_closed_reason_codes"] == []
     assert result["contract_update"]["status"] == "failed"
     assert result["contract_update"]["writes"] == 0
-    assert result["contract_update"].get("reason_code") is None
+    assert result["contract_update"]["reason_code"] == "contract_patch_plan_missing"
     assert calls["apply_transaction"] == 0
     # The boundary check short-circuits before the #2620 route's own fresh,
     # TOCTOU-safe fetch_current() readback is ever reached.
@@ -1478,7 +1514,7 @@ def test_missing_planner_plan_ineligible_input_remains_fail_closed_production_re
     (`scope_signal_delta.classify_scope_delta_authority()`) was reached at
     all for this ineligibility cause, and (2) when reached, the exact
     `route.reason_code` it independently resolved -- distinguishing the
-    shared `PLANNER_FAIL_CLOSED` marker's DIFFERENT underlying causes
+    shared `CONTRACT_UPDATE_FAILED` marker's DIFFERENT underlying causes
     (wrong lane / untrusted author / ambiguous directive / never reached at
     all for a binding-mismatched structured payload) instead of treating
     them as one interchangeable outcome.
@@ -1500,7 +1536,11 @@ def test_missing_planner_plan_ineligible_input_remains_fail_closed_production_re
     assert result["contract_update"]["status"] == "failed"
     assert result["contract_update"]["disposition"] not in {"proven_no_change", "no_change"}
     assert calls["apply_transaction"] == 0
-    assert "PLANNER_FAIL_CLOSED" in result["blockers"]
+    assert "CONTRACT_UPDATE_FAILED" in result["blockers"]
+    assert "PLANNER_FAIL_CLOSED" not in result["blockers"]
+    assert result["planner_fail_closed"] is False
+    assert result["planner_fail_closed_reason_codes"] == []
+    assert result["contract_update"]["reason_code"] == "contract_patch_plan_missing"
 
     if expect_classifier_reached:
         assert len(classify_calls) == 1

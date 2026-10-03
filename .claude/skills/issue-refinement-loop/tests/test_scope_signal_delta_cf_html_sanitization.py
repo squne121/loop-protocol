@@ -179,20 +179,30 @@ def test_production_chain_stops_or_canonicalizes_before_write():
     # WHEN operations are derived from that evidence
     operations = delta.derive_contract_patch_operations([evidence])
 
-    # THEN the generated operation set is EXACT, not merely "sanitized" --
-    # #2333 fix_delta P1: a wrongly-mutated operation that writes clean text
-    # into a completely different section would previously still PASS this
-    # test, since it only checked for the ABSENCE of contamination markers,
-    # never the semantic correctness of the operation itself.
-    assert operations == [
-        {
-            "section": "Acceptance Criteria",
-            "op": "append",
-            "text": "Add retry handling to the sync worker for transient network failures.",
-            "rationale": "Directive extracted from trusted review comment (revised ac)",
-            "source_evidence_index": 0,
-        }
-    ]
+    # The CF_HTML envelope is sanitized, but a Revised AC heading and an
+    # unnumbered bullet do not authorize an unbulleted raw-prose append.
+    assert operations == []
+    assert delta.derive_contract_patch_operations([evidence], source_body=comment_body) == []
+    state = {"body": "## Acceptance Criteria\n\n- [ ] AC1: existing\n"}
+    original = state["body"]
+    writes = []
+
+    def apply_transaction(_issue, body, _readiness):
+        writes.append(body)
+        state["body"] = body
+        return {"status": "applied"}
+
+    unsafe = [{"section": "Acceptance Criteria", "op": "append",
+               "text": "Add retry handling to the sync worker for transient network failures."}]
+    result = preflight.consume_trusted_anchor_contract_patch_plan(
+        repo="squne121/loop-protocol", issue_number=2333,
+        issue={"body": original}, anchor_url=anchor_url, anchor_payload=comment_payload,
+        anchor_body=comment_body, contract_patch_plan={"operations": unsafe},
+        callbacks={"apply_transaction": apply_transaction},
+    )
+    assert (result["status"], result["failure"], result["writes"]) == (
+        "blocked", "unsafe_unstructured_patch_operation", 0)
+    assert state["body"] == original and writes == []
 
 
 def test_html_only_allowed_paths_directive_produces_zero_allowed_paths_operations():
