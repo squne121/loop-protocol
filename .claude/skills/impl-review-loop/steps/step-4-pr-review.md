@@ -49,6 +49,8 @@ TEST_VERDICT comment/artifact（存在する場合）は diagnostics-only であ
 
 手組みの入力（上記の取得元を経ない JSON）は正規経路ではなく、保存済み PASS の根拠として扱わない。
 
+`--test-verdict-file` の `runtime_ac_results[].ac` は、contract snapshot の baseline classification（`results[].ac`。fallback リテラル `AC_UNKNOWN` とカンマ連結ラベルを含む）と逐語で一致しなければならない。root は Step 2 の委譲時にその `(ac label, literal command)` の組を test-runner へ渡し（`step-2-verification.md` の「`ac` label の出所と verbatim echo 規則」参照）、受領後に label を付け替えない。`(ac, command_hash)` 集合が baseline と異なる report は `baseline_current_mapping_mismatch`（exit 1）で gate を閉じる。是正は正確な label での test-runner 再起動であり、report の手編集ではない。
+
 #### 呼び出し
 
 ```bash

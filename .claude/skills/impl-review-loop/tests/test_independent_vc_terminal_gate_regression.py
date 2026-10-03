@@ -1177,6 +1177,88 @@ def test_absent_or_malformed_dispatch_returns_dispatch_seq_mismatch(tmp_path):
     assert completed.returncode == 2
 
 
+# --- AC1 producer/consumer `ac` label alignment (fix_delta iteration 1) -----
+
+
+def test_ac_label_must_be_echoed_verbatim_for_canonical_pass(tmp_path):
+    """The baseline `ac` label (comma-joined multi-AC label and the literal
+    `AC_UNKNOWN` fallback) must be echoed verbatim by the producer. A label
+    rewritten to range notation closes the gate with
+    `baseline_current_mapping_mismatch` and invalidates a stored PASS."""
+    multi_label = "AC1,AC2"
+    unknown_label = "AC_UNKNOWN"
+    snapshot = {
+        "schema": "baseline_vc_preflight/v1",
+        "status": "go",
+        "body_sha256": BODY_A,
+        "results": [
+            {"ac": multi_label, "command_hash": H_AC1, "classification": "expected_fail", "exit_code": 1},
+            {"ac": unknown_label, "command_hash": H_AC2, "classification": "expected_fail", "exit_code": 1},
+        ],
+    }
+    hashes = [H_AC1, H_AC2]
+
+    def _report(labels: tuple[str, str]) -> dict[str, Any]:
+        report = _test_verdict(HEAD_A, BODY_A, False)
+        report["runtime_ac_results"] = [
+            _ac_result(labels[0], H_AC1),
+            _ac_result(labels[1], H_AC2),
+        ]
+        return report
+
+    def _adjudicate(ws: Workspace, report: dict[str, Any], tag: str) -> tuple[int, dict[str, Any]]:
+        argv = [
+            "step4-adjudicate",
+            *ws._binding_args(HEAD_A, BODY_A, hashes, tag),
+            "--test-verdict-file",
+            ws.write(f"verdict_{tag}.json", report),
+            "--contract-snapshot-file",
+            ws.write(f"snapshot_{tag}.json", snapshot),
+            "--diff-summary-file",
+            ws.write(f"diff_{tag}.json", _diff_summary(HEAD_A)),
+            "--allowed-paths-file",
+            ws.write(f"allowed_{tag}.json", ALLOWED_PATHS),
+            "--expected-issue-number",
+            str(ISSUE_NUMBER),
+            "--expected-pr-number",
+            str(PR_NUMBER),
+        ]
+        rc, payload = ws._run(argv)
+        if rc == 0:
+            ws.invoke_count += 1
+        return rc, payload
+
+    key = _key(hashes=hashes)
+    ws = Workspace(tmp_path)
+
+    # (a) verbatim baseline labels (incl. the AC_UNKNOWN row) -> canonical PASS.
+    rc, payload = _adjudicate(ws, _report((multi_label, unknown_label)), "verbatim")
+    assert rc == 0, payload
+    assert payload["adjudication"]["blocking"] is False
+    assert payload["binding_key"] == key and payload["seq"] == 1
+    assert ws.invoke_count == 1
+    assert key in ws.state()["vc_adjudication"]
+    assert ws.state()["dispatch"] == {"binding_key": key, "seq": 1}
+
+    # (b) one label rewritten to range notation -> mapping mismatch, no new
+    # dispatch, and the stored PASS for the same binding is invalidated.
+    rc, payload = _adjudicate(ws, _report(("AC1-AC2", unknown_label)), "range")
+    assert rc == 1, payload
+    assert payload["adjudication"]["blocking"] is True
+    assert "baseline_current_mapping_mismatch" in payload["adjudication"]["errors"]
+    assert payload["invoke_pr_reviewer"] is False
+    assert ws.invoke_count == 1
+    assert ws.state()["dispatch"] == {"binding_key": key, "seq": 1}
+    assert key not in ws.state().get("vc_adjudication", {})
+    assert ws.step4_gate(hashes=hashes)[0] == 1
+
+    # (b') re-labelling AC_UNKNOWN is rejected the same way.
+    rc, payload = _adjudicate(ws, _report((multi_label, "AC3")), "unknown_renamed")
+    assert rc == 1
+    assert "baseline_current_mapping_mismatch" in payload["adjudication"]["errors"]
+    assert ws.invoke_count == 1
+
+
 # --- AC10 static / documentation binding ------------------------------------
 
 

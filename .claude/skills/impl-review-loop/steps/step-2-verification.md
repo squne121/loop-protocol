@@ -17,12 +17,13 @@ spawn_agent:
     Objective: execute the actual linked Issue Verification Commands as an independent read-only report.
     Live reference: bind the actual Issue number, PR number, contract body SHA, and diff head SHA.
     Bounded scope: bind the literal AC list and literal Verification Commands for that exact head only.
+    Per-command ac labels: pass each baseline `ac` label (including the literal AC_UNKNOWN fallback and comma-joined multi-AC labels, in declaration order) paired with its literal command; echo it verbatim in runtime_ac_results[].ac.
     Expected result: a head-bound TEST_VERDICT_MACHINE/v2 read-only report that includes generated_at (UTC RFC 3339 time at which test-runner generated the report), per-command command_hash, and per-AC PASS, FAIL, or SKIP facts, without fabricating any GitHub workflow, check run, or artifact field.
 ```
 
 ### Materialization rule（実値を具体化する規則）
 
-`task_name` は実行直前に実際の非負 iteration で `verification_i{iteration}` から materialize し、同一 root session 内で既に保存済みの canonical task name を再利用してはならない。`fork_turns: none` のため、root は message に実際の Issue number、PR number、AC 全文、literal Verification Commands 全文、contract body SHA、diff head SHA を値として埋め込む。`LOOP_STATE`、`Step 1 PR number`、`current contract body SHA`、変数名、波括弧・山括弧の placeholder を child message に渡してはならない。この static template 自体を tool call として送信してはならない。
+`task_name` は実行直前に実際の非負 iteration で `verification_i{iteration}` から materialize し、同一 root session 内で既に保存済みの canonical task name を再利用してはならない。`fork_turns: none` のため、root は message に実際の Issue number、PR number、AC 全文、literal Verification Commands 全文（各 command の baseline `ac` label との組。後述「`ac` label の出所と verbatim echo 規則」節に従う）、contract body SHA、diff head SHA を値として埋め込む。`LOOP_STATE`、`Step 1 PR number`、`current contract body SHA`、変数名、波括弧・山括弧の placeholder を child message に渡してはならない。この static template 自体を tool call として送信してはならない。
 
 完了の扱いは4 site 共通の [Common Completion Protocol](step-4-pr-review.md#common-completion-protocol) に従う。Step 4 起動前に、root は `list_agents` で test-runner task の terminal `completed` と、その task の final result（read-only report）の両方を確認する（Issue #88 Required Design #1）。terminal `completed` のみ、または final result のみでは Step 2 完了とみなさない。
 
@@ -47,6 +48,24 @@ root が test-runner へ渡す委譲契約として、`TEST_VERDICT_MACHINE/v2` 
 | `runtime_ac_results[]` | 全 Verification Command について `ac` / `command`（逐語） / **per-command `command_hash`**（`sha256:` 付き。必須） / `exit_code` / `status` / `fallback_detected` / `human_review_required` / `stop_condition_triggered` / `notes` |
 
 `command_hash` は現行どおり command ごとに必須であり、欠落した行は consumer が受理しない。`generated_at` は上記の意味でのみ使う（既存 field であり、新 field・新 schema は追加しない）。
+
+### `ac` label の出所と verbatim echo 規則（baseline 由来、Issue #2837 fix_delta）
+
+consumer（`adjudicate_vc_result.py`）は baseline と current を `(ac, command_hash)` の組で対応付ける。`command_hash` だけが一致しても、`ac` 文字列が baseline classification と 1 文字でも違えば対応付けは成立しない。したがって per-command の `ac` 値の出所を次のとおり一意に固定する。
+
+- **出所**: baseline classification（contract snapshot の `results[]`。`baseline_vc_preflight.py` が出力する `results[].ac`）の `ac` 値そのもの。コマンドに AC 注記が無い場合の fallback リテラル `AC_UNKNOWN`（例: `pnpm lint` / `pnpm test` / `pnpm build` や gemini の pytest）、および複数 AC に紐づく場合のカンマ連結ラベル（例: `AC1,AC2,AC3,AC4,AC5,AC6,AC7,AC8`、`AC10,AC11`。Issue 宣言順のまま）を含む。
+- **root の責務**: root は test-runner へ渡す message に、全 Verification Command について `(ac label, literal command)` の組を baseline classification から **そのまま** 埋め込む。この label は `--expected-command-hashes-file` と同じ独立ソース（live Issue 本文から `baseline_vc_preflight.py --body-file <live body> --format json` で再導出した `results[]`）から取り、test-runner の出力から取ってはならない。root は report 受領後に label を付け替えて辻褄を合わせてはならない（remap 禁止）。
+- **test-runner の責務**: `runtime_ac_results[]` の各行に、渡された `ac` を **逐語のまま**（改名・統合・分割・範囲表記 `AC1-AC8` / `AC10-AC11` への圧縮・別 AC への再帰属をしない）、逐語の `command`、およびその `command_hash` とともに返す。1 command = 1 行で、root が渡した組と 1 対 1 に対応させる。
+
+message template（上記 `Expected result` に加えて、materialize 時に次の 1 行を含める）:
+
+```text
+Per-command ac labels (echo verbatim in runtime_ac_results[].ac, never rename/merge/split/range-compress): <ac label 1> => <literal command 1>; <ac label 2> => <literal command 2>; ...
+```
+
+#### 失敗様式と是正
+
+report の `(ac, command_hash)` 集合が baseline の集合と異なる場合（label の改名・統合・範囲表記・`AC_UNKNOWN` の欠落を含む）、`step4-adjudicate` は gate を閉じ、`errors: ["baseline_current_mapping_mismatch"]` / `overall_status: indeterminate` / `reason_code: adjudication_missing_or_malformed` を返して exit 1 となる（同一 binding の既存 PASS も失効する）。是正は **正確な label を渡して test-runner を再起動する** ことであり、report の手編集・label の事後 remap・consumer の check の緩和（曖昧一致・別名対応の追加）ではない。
 
 ### GitHub 由来情報（適用条件つき、`pr_review_only` / legacy publish 経路のみ必須）
 
