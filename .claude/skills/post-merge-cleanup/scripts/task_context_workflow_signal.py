@@ -21,6 +21,7 @@ Issue #2817 adds two additive, explicit phases next to ``merged`` / ``completed`
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -101,10 +102,54 @@ def _final_success_receipt_reason(receipt_file: Path | None) -> str | None:
     return None
 
 
-def _merged_evidence(snapshot: object, issue_number: int, pr_number: int) -> tuple[dict | None, str]:
+# Issue #2878: the 7 keys of the orchestrator-attested `non_closing_authority` (a projection of
+# `validate_pr_body.py --evaluate-reference-policy`). `effective_kind` / `body_verdict` /
+# `body_reason` are deliberately not part of it. The producer-side twin is
+# `open_pr.non_closing_authority_binds`; a parity regression keeps the two aligned.
+NON_CLOSING_AUTHORITY_KEYS = frozenset(
+    {"decision", "level", "reason_code", "repo", "issue_number", "pr_number", "pr_body_sha256"}
+)
+
+
+def _non_closing_authority_binds(
+    snapshot: dict, pull_request: dict, repo: str, issue_number: int, pr_number: int
+) -> bool:
+    """Whether the snapshot's top-level `non_closing_authority` binds this PR to `issue_number`.
+
+    No PR body grammar is re-implemented here and no Issue state is re-judged: A1 / A2 imply the
+    Issue was OPEN when the evaluator ran. The attestation shares the snapshot's trust boundary
+    (the adapter does not independently verify the snapshot itself).
+    """
+    authority = snapshot.get("non_closing_authority")
+    if not isinstance(authority, dict) or set(authority) != NON_CLOSING_AUTHORITY_KEYS:
+        return False
+    if authority["decision"] != "nonclosing_required" or authority["level"] not in {"A1", "A2"}:
+        return False
+    authority_repo = authority["repo"]
+    if not isinstance(authority_repo, str) or authority_repo.lower() != repo.lower():
+        return False
+    if type(authority["issue_number"]) is not int or authority["issue_number"] != issue_number:
+        return False
+    if type(authority["pr_number"]) is not int or authority["pr_number"] != pr_number:
+        return False
+    body = pull_request.get("body")
+    if not isinstance(body, str):
+        return False
+    digest = authority["pr_body_sha256"]
+    return isinstance(digest, str) and digest == hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _merged_evidence(
+    snapshot: object, issue_number: int, pr_number: int, *, allow_non_closing: bool = False
+) -> tuple[dict | None, str]:
     # A GraphQL response may carry plausible partial data alongside top-level
     # errors. It is not authoritative merged-PR evidence and must never reach
     # either signal application or cleanup selection.
+    #
+    # `allow_non_closing` (Issue #2878, `--phase merged` / `--phase completed` only) lets a PR
+    # with *no* closing node bind via the attested `non_closing_authority`. A closing node
+    # keeps the legacy rule (exactly one, matching the target), and recover / local-only
+    # (`_fresh_merged_evidence`) never pass it.
     if not isinstance(snapshot, dict) or "errors" in snapshot:
         return None, "RELATION_UNAVAILABLE"
     try:
@@ -116,16 +161,20 @@ def _merged_evidence(snapshot: object, issue_number: int, pr_number: int) -> tup
         return None, "RELATION_UNAVAILABLE"
     if pr.get("merged") is not True or pr.get("number") != pr_number or not isinstance(repo, str):
         return None, "MERGED_SNAPSHOT_INVALID"
-    if not isinstance(nodes, list) or len(nodes) != 1 or not isinstance(nodes[0], dict):
-        return None, "RELATION_ISSUE_MISMATCH"
-    relation_repository = nodes[0].get("repository")
-    relation_repo = relation_repository.get("nameWithOwner") if isinstance(relation_repository, dict) else None
-    if (
-        nodes[0].get("number") != issue_number
-        or not isinstance(relation_repo, str)
-        or relation_repo.lower() != repo.lower()
-    ):
-        return None, "RELATION_ISSUE_MISMATCH"
+    if allow_non_closing and isinstance(nodes, list) and len(nodes) == 0:
+        if not isinstance(pr, dict) or not _non_closing_authority_binds(snapshot, pr, repo, issue_number, pr_number):
+            return None, "RELATION_ISSUE_MISMATCH"
+    else:
+        if not isinstance(nodes, list) or len(nodes) != 1 or not isinstance(nodes[0], dict):
+            return None, "RELATION_ISSUE_MISMATCH"
+        relation_repository = nodes[0].get("repository")
+        relation_repo = relation_repository.get("nameWithOwner") if isinstance(relation_repository, dict) else None
+        if (
+            nodes[0].get("number") != issue_number
+            or not isinstance(relation_repo, str)
+            or relation_repo.lower() != repo.lower()
+        ):
+            return None, "RELATION_ISSUE_MISMATCH"
     if not isinstance(oid, str):
         return None, "MERGE_OID_INVALID"
     return {"repo": repo.lower(), "issue_number": issue_number, "pr_number": pr_number, "merge_commit_oid": oid}, "OK"
@@ -387,7 +436,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, json.JSONDecodeError):
         print(json.dumps({"disposition": "deferred", "reason_code": "RELATION_UNAVAILABLE"}))
         return 0
-    evidence, reason = _merged_evidence(snapshot, args.issue_number, args.pr_number)
+    evidence, reason = _merged_evidence(snapshot, args.issue_number, args.pr_number, allow_non_closing=True)
     if evidence is None:
         print(json.dumps({"disposition": "deferred", "reason_code": reason}))
         return 0

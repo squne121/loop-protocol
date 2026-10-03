@@ -56,6 +56,22 @@
 | `reason` | string | なぜ本 Issue では動作検証が成立しないかの理由 |
 | `deferred_destination.destination_type` | `issue \| phase \| milestone` | 後続検証先の種別 |
 | `deferred_destination.destination_ref` | string | Issue 番号（例: `#123`）/ フェーズ名 / マイルストーン名 |
+
+#### 予約 literal `post-merge-live-evidence`（merge 後の live evidence を待つ宣言、Issue #2878）
+
+`destination_type: phase` かつ `destination_ref: post-merge-live-evidence` は、merge 後に canonical main root / default branch で取得する live evidence を待つ
+`deferred` の予約 literal である。既存 enum（`issue | phase | milestone`）と必須 field は変更しない。この組を宣言した Issue は、PR reference の判定で
+「merge で close してはならない」（A2。`Refs #N` が正しい reference）として扱われ、live evidence の取得・証跡リンク・残 AC の充足を確認した後に
+operator / orchestrator が明示的に close する。判定規則の正本は `docs/dev/workflow.md` の「PR reference と Issue close の分離」で、evaluator は
+`.claude/skills/open-pr/scripts/validate_pr_body.py` に 1 つだけ実装される。
+
+```markdown
+- decision: deferred
+- deferred_destination:
+    - destination_type: phase
+    - destination_ref: post-merge-live-evidence
+- deferred_verification_condition: <merge 後に実 production subprocess で取得する live evidence の条件>
+```
 | `deferred_verification_condition` | string | 後続の何が完了すれば動作検証が成立するかの条件説明 |
 
 ### decision と runtime-verification タグの整合ルール

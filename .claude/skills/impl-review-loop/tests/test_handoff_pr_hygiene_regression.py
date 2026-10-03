@@ -41,6 +41,9 @@ TEST_VERDICT_MACHINE:
 
 from __future__ import annotations
 
+import json
+import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -290,32 +293,30 @@ pass
     # not be resolved deterministically") fire and mask the LP057 result we probe here.
     _LP057_CHANGED_PATHS = ["docs/dev/test-lane-policy.md"]
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="LP057 currently accepts 'Refs #N' without a Closes keyword; it should "
-        "require Closes for a child PR. Documented LP057 gap (before-fail fixture).",
-    )
-    def test_lp057_refs_only_before_fail_requires_closing_keyword(self):
-        """AC4 before-fail: ``Refs #N`` のみは LP057 failure になるべきだが現在は pass する。
+    def test_lp057_refs_only_is_decided_by_reference_policy_not_a_blanket_closes_requirement(self):
+        """Issue #2878: Refs-only は「常に Closes 欠落 failure」ではない。
 
-        xfail: LP057 は ``Refs #N`` を許容するため status は pass となり、この
-        ``status == "fail"`` アサーションは失敗する（= xfail 成立）。LP057 が Closes を
-        必須化したら xfail を外すこと。
-
-        Note (#1064): ``changed_paths`` を非空にして LP058 を切り分け、LP057 単独の
-        leniency を検証する。モジュールは ``_load_validate_pr_body`` で一意名ロードし、
-        単一プロセス統合実行でも順序非依存にした。
+        旧 strict-xfail（Refs-only は LP057 failure になるべき）は、post-merge live evidence を待つ
+        Issue（A2）や CLOSED Issue では `Refs` が正しい reference であるため誤りだった。facts 未供給の
+        LP057 は従来どおり Refs を受理し（退行なし）、facts 供給時は単一 evaluator の decision に従う:
+        `closing_required` の根拠なし Refs-only だけが failure、`nonclosing_required` の Refs は valid。
         """
         mod = self._load_validate_pr_body()
-        result = mod.validate_pr_body(
+        legacy = mod.validate_pr_body(
             self._pr_body("Refs #634"),
             changed_paths=self._LP057_CHANGED_PATHS,
             linked_issue=634,
         )
-        assert result.status == "fail", (
-            "LP057 should fail for 'Refs #634' (no closing keyword). "
-            f"Got: {result.status}"
-        )
+        assert not [error for error in legacy.errors if error.rule_id == "LP057"]
+
+        body = self._pr_body("Refs #634")
+        facts = {"repo": "squne121/loop-protocol", "issue_state": "OPEN", "pr_number": None, "decision_comment": None}
+        for issue_body, expect_lp057 in ((_A3_ISSUE_BODY, True), (_A2_ISSUE_BODY, False)):
+            policy = mod.evaluate_reference_policy(body.encode("utf-8"), 634, issue_body, facts)
+            result = mod.validate_pr_body(
+                body, changed_paths=self._LP057_CHANGED_PATHS, linked_issue=634, reference_policy=policy
+            )
+            assert bool([error for error in result.errors if error.rule_id == "LP057"]) is expect_lp057
 
     @pytest.mark.parametrize("malformed_reference", ["Issue #634", "関連: #634"])
     def test_lp057_rejects_malformed_closing_reference(self, malformed_reference: str):
@@ -1047,3 +1048,136 @@ class TestAC16PrReviewerLiteNoTestVerdictAuthority:
             "pr-reviewer-lite.md must state TEST_VERDICT is diagnostics-only "
             "(Issue #1856 AC16)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #2878 AC6: ensure_closing_keyword は reference authority entrypoint の decision に従う
+# ---------------------------------------------------------------------------
+
+_A3_ISSUE_BODY = "## Runtime Verification Applicability\n\n- decision: immediate\n- reason: x\n"
+_A2_ISSUE_BODY = (
+    "## Runtime Verification Applicability\n\n"
+    "- decision: deferred\n"
+    "- reason: merge 後の live evidence\n"
+    "- deferred_destination:\n"
+    "    - destination_type: phase\n"
+    "    - destination_ref: post-merge-live-evidence\n"
+    "- deferred_verification_condition: merge 後に取得する\n"
+)
+_ENTRYPOINT_COMMAND_PREFIX = (
+    "uv run --locked python3 .claude/skills/open-pr/scripts/validate_pr_body.py --evaluate-reference-policy"
+)
+_REASON_CODES = (
+    "issue_closed",
+    "a1_explicit_decision",
+    "a1_decision_invalid",
+    "a1_decision_ambiguous",
+    "a2_contract_deferred",
+    "a3_close_ready",
+    "runtime_applicability_unresolved",
+    "facts_invalid",
+)
+_A1_URL = "https://github.com/squne121/loop-protocol/issues/634#issuecomment-5"
+
+
+def _run_entrypoint(tmp_path: Path, *, pr_body: str, issue_body: str, state: str = "OPEN", comment=None) -> dict:
+    (tmp_path / "body.md").write_bytes(pr_body.encode("utf-8"))
+    (tmp_path / "issue.md").write_text(issue_body, encoding="utf-8")
+    (tmp_path / "facts.json").write_text(
+        json.dumps(
+            {"repo": "squne121/loop-protocol", "issue_state": state, "pr_number": 7, "decision_comment": comment}
+        ),
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [
+            sys.executable, str(VALIDATE_PR_BODY_PY), "--evaluate-reference-policy",
+            "--body-file", str(tmp_path / "body.md"), "--linked-issue", "634",
+            "--linked-issue-body-file", str(tmp_path / "issue.md"),
+            "--reference-facts-file", str(tmp_path / "facts.json"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def _step5_action_table() -> dict[tuple[str, str, str], str]:
+    table: dict[tuple[str, str, str], str] = {}
+    for line in _read(STEP5_FT).splitlines():
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        decisions = {"closing_required", "nonclosing_required", "fail_closed"}
+        if line.startswith("|") and len(cells) == 4 and cells[0] in decisions:
+            table[(cells[0], cells[1], cells[2])] = cells[3].split("（")[0].strip()
+    return table
+
+
+def test_given_reference_policy_matrix_when_repairing_then_closing_keyword_only_for_closing_required(tmp_path):
+    text = _read(STEP5_FT)
+    # step-5 names the exact entrypoint command, the script and every reason code (no re-implemented grammar)
+    assert _ENTRYPOINT_COMMAND_PREFIX in text
+    assert (REPO_ROOT / ".claude" / "skills" / "open-pr" / "scripts" / "validate_pr_body.py").exists()
+    for reason_code in _REASON_CODES:
+        assert f"`{reason_code}`" in text or reason_code in text, reason_code
+
+    # every mention of ensure_closing_keyword is policy-qualified (no unconditional instruction remains)
+    mentions = [match.start() for match in re.finditer("ensure_closing_keyword", text)]
+    assert mentions
+    for position in mentions:
+        window = text[max(0, position - 400): position + 400]
+        assert "closing_required" in window or "entrypoint" in window, (
+            f"unqualified ensure_closing_keyword mention near: {text[position - 60: position + 60]!r}"
+        )
+
+    action_table = _step5_action_table()
+    ref = "Refs #634"
+    closes = "Closes #634"
+    # (pr_body reference, issue body, state, comment, expected evaluator triple, expected step-5 action)
+    a1_comment = {
+        "url": _A1_URL,
+        "id": 5,
+        "issue_url": "https://api.github.com/repos/squne121/loop-protocol/issues/634",
+        "author_association": "OWNER",
+        "body": "REFERENCE_DECISION_V1: nonclosing issue=#634",
+    }
+    a1_line = f"Reference-Decision: {_A1_URL}"
+    closing_ok = ("closing_required", "valid", "ok")
+    closing_repair = ("closing_required", "repair", "closing_missing")
+    closing_missing = ("closing_required", "block", "reference_missing")
+    closing_other = ("closing_required", "block", "closing_for_other")
+    refs_ok = ("nonclosing_required", "valid", "ok")
+    forbidden = ("nonclosing_required", "block", "closing_forbidden")
+    refs_missing = ("nonclosing_required", "block", "reference_missing")
+    not_evaluated = ("fail_closed", "block", "not_evaluated")
+    # (id, pr_body reference, issue body, state, A1 comment fact, expected evaluator triple, step-5 action)
+    cases = [
+        ("a3_refs_only", ref, _A3_ISSUE_BODY, "OPEN", None, closing_repair, "repair"),
+        ("a3_no_reference", "none", _A3_ISSUE_BODY, "OPEN", None, closing_missing, "repair"),
+        ("a3_closes", closes, _A3_ISSUE_BODY, "OPEN", None, closing_ok, "none"),
+        ("a2_refs_valid", ref, _A2_ISSUE_BODY, "OPEN", None, refs_ok, "none"),
+        ("a2_closes_is_blocker", closes, _A2_ISSUE_BODY, "OPEN", None, forbidden, "blocker"),
+        ("a2_none_is_blocker", "none", _A2_ISSUE_BODY, "OPEN", None, refs_missing, "blocker"),
+        ("closing_for_other_is_blocker", "Closes #635", _A3_ISSUE_BODY, "OPEN", None, closing_other, "blocker"),
+        ("closed_refs_valid", ref, _A3_ISSUE_BODY, "CLOSED", None, refs_ok, "none"),
+        ("closed_closes_is_blocker", closes, _A3_ISSUE_BODY, "CLOSED", None, forbidden, "blocker"),
+        ("a1_valid_refs_over_a3", f"{ref}\n{a1_line}", _A3_ISSUE_BODY, "OPEN", a1_comment, refs_ok, "none"),
+        ("a1_valid_closes_is_blocker", f"{closes}\n{a1_line}", _A3_ISSUE_BODY, "OPEN", a1_comment, forbidden,
+         "blocker"),
+        ("a1_invalid_stops_not_repaired_to_closes", f"{ref}\n{a1_line}", _A3_ISSUE_BODY, "OPEN", None,
+         not_evaluated, "stop"),
+        ("unresolved_applicability_stops", ref, "## Outcome\nnone\n", "OPEN", None, not_evaluated, "stop"),
+    ]
+    for case_id, reference, issue_body, state, comment, expected_triple, expected_action in cases:
+        pr_body = "## Summary\n\n本文\n" + ("" if reference == "none" else f"\n{reference}\n")
+        result = _run_entrypoint(tmp_path, pr_body=pr_body, issue_body=issue_body, state=state, comment=comment)
+        triple = (result["decision"], result["body_verdict"], result["body_reason"])
+        assert triple == expected_triple, (case_id, result)
+        # the documented step-5 table gives the action; ensure_closing_keyword only for closing_required
+        documented = action_table.get(triple, "blocker")
+        assert documented == expected_action, (case_id, triple, documented)
+        if documented == "repair":
+            assert result["decision"] == "closing_required", case_id
+        if result["decision"] != "closing_required":
+            assert documented != "repair", case_id

@@ -701,3 +701,97 @@ def test_runtime_smoke_evidence_fails_on_agent_type_mismatch(tmp_path):
     summary_path = _write_summary(tmp_path, _synthetic_summary_fields(effective_agent_type="codex"))
     rc = boundary.check_runtime_smoke_evidence(REPO_ROOT, artifact_path=str(summary_path))
     assert rc == boundary.EXIT_FAIL
+
+
+# ---------------------------------------------------------------------------
+# Issue #2878 AC5: merge と Issue close の分離（close gate matrix の 2 文書一致）
+# ---------------------------------------------------------------------------
+
+WORKFLOW_DOC = REPO_ROOT / "docs" / "dev" / "workflow.md"
+VALIDATE_PR_BODY = REPO_ROOT / ".claude" / "skills" / "open-pr" / "scripts" / "validate_pr_body.py"
+DECISION_TABLE_HEADING = "#### PR reference decision table（判定表の正本）"
+
+
+def _decision_table(path: Path) -> list[tuple[str, ...]]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines.count(DECISION_TABLE_HEADING) == 1, f"{path}: exactly one decision table heading expected"
+    start = lines.index(DECISION_TABLE_HEADING) + 1
+    rows: list[tuple[str, ...]] = []
+    for line in lines[start:]:
+        if line.startswith("|"):
+            rows.append(tuple(" ".join(cell.split()) for cell in line.strip().strip("|").split("|")))
+        elif rows:
+            break
+    return rows
+
+
+def _load_validate_pr_body_for_table():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("validate_pr_body_for_close_gate_matrix", VALIDATE_PR_BODY)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_given_close_gate_matrix_when_compared_then_workflow_and_post_merge_skill_match():
+    workflow_table = _decision_table(WORKFLOW_DOC)
+    skill_table = _decision_table(ORCHESTRATOR_SKILL)
+    assert workflow_table == skill_table, "docs/dev/workflow.md and post-merge-cleanup/SKILL.md decision tables diverged"
+    assert workflow_table[0] == ("順", "条件", "decision", "level", "PR 本文の reference", "merge 時の Issue")
+    body_rows = workflow_table[2:]
+    assert [row[0] for row in body_rows] == ["0", "1", "2", "3", "4", "5"]  # total, ordered rows 0..5
+
+    # the table is not just prose: each row's decision / level is what the single evaluator returns
+    module = _load_validate_pr_body_for_table()
+    repo = "squne121/loop-protocol"
+    a3 = "## Runtime Verification Applicability\n\n- decision: immediate\n- reason: x\n"
+    a2 = (
+        "## Runtime Verification Applicability\n\n- decision: deferred\n- reason: x\n- deferred_destination:\n"
+        "    - destination_type: phase\n    - destination_ref: post-merge-live-evidence\n"
+        "- deferred_verification_condition: merge 後\n"
+    )
+    url = f"https://github.com/{repo}/issues/7#issuecomment-3"
+    comment = {
+        "url": url, "id": 3, "issue_url": f"https://api.github.com/repos/{repo}/issues/7",
+        "author_association": "OWNER", "body": "REFERENCE_DECISION_V1: nonclosing issue=#7",
+    }
+
+    def evaluate(state, issue_body, pr_body, decision_comment=None):
+        facts = {"repo": repo, "issue_state": state, "pr_number": None, "decision_comment": decision_comment}
+        return module.evaluate_reference_policy(pr_body.encode("utf-8"), 7, issue_body, facts)
+
+    observed = {
+        "0": evaluate("CLOSED", a3, "Refs #7"),
+        "1": evaluate("OPEN", "## Outcome\n", f"Refs #7\nReference-Decision: {url}", comment),
+        "2": evaluate("OPEN", a3, f"Refs #7\nReference-Decision: {url}\nReference-Decision: {url}", comment),
+        "3": evaluate("OPEN", a2, "Refs #7"),
+        "4": evaluate("OPEN", a3, "Closes #7"),
+        "5": evaluate("OPEN", "## Outcome\n", "Refs #7"),
+    }
+    for row in body_rows:
+        result = observed[row[0]]
+        assert f"`{result['decision']}`" == row[2], (row, result)
+        expected_level = "なし" if result["level"] is None else result["level"]
+        assert expected_level == row[3], (row, result)
+
+    # close gate prose is present in both documents (merge != close; evidence before an explicit close)
+    for path in (WORKFLOW_DOC, ORCHESTRATOR_SKILL):
+        text = path.read_text(encoding="utf-8")
+        assert "merge は" in text and "close" in text
+        assert "OPEN" in text and "operator / orchestrator" in text
+        assert "pr_body_sha256" in text and "re-review" in text
+        assert "Closes #N" in text and "Refs #N" in text
+
+    # the old unconditional rule ("PR body Closes string is never an authority") is now a limited rule
+    skill_text = ORCHESTRATOR_SKILL.read_text(encoding="utf-8")
+    assert "PR 本文の `Closes #N` 文字列は authority にしない（`closingIssuesReferences` だけを使う）。" not in skill_text
+    assert "PR 本文の `Closes #N` 文字列そのものは authority にしない" in skill_text
+    assert "non_closing_authority" in skill_text and "`--phase recover` / `--phase local-only` は non-closing binding を受理せず" in skill_text
+
+    # deletion-class cleanup for Refs-bound PRs stays safe-side stopped until #2891 (no linked_issue_number bypass)
+    assert "#2891" in skill_text
+    assert "LINKED_ISSUE_MISMATCH" in skill_text
+    assert "`linked_issue_number` を省略して認可を迂回する運用は採らない" in skill_text
+    assert "cleanup_exec.py::_verify_linked_issue" in skill_text

@@ -829,3 +829,425 @@ def test_follow_up_missing_contract_when_empty_list():
     errors = [error for error in result.errors if error.rule_id == "E_FOLLOW_UP_MISSING_CONTRACT"]
     assert result.status == "fail"
     assert len(errors) == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #2878: reference authority evaluator (single pure decision table)
+# ---------------------------------------------------------------------------
+
+import hashlib  # noqa: E402
+
+from validate_pr_body import evaluate_reference_policy  # noqa: E402
+
+REF_REPO = "squne121/loop-protocol"
+REF_ISSUE = 330
+FENCE3 = chr(96) * 3
+A1_REF_URL = f"https://github.com/{REF_REPO}/issues/{REF_ISSUE}#issuecomment-777"
+A3_BODY = "## Runtime Verification Applicability\n\n- decision: immediate\n- reason: x\n"
+A2_BODY = (
+    "## Runtime Verification Applicability\n\n"
+    "- decision: deferred\n"
+    "- reason: merge 後の live evidence\n"
+    "- deferred_destination:\n"
+    "    - destination_type: phase\n"
+    "    - destination_ref: post-merge-live-evidence\n"
+    "- deferred_verification_condition: merge 後に取得する\n"
+)
+A2_NESTED_HEADING_BODY = (
+    "## Runtime Verification Applicability\n\n"
+    "- decision: deferred\n"
+    "### 詳細\n"
+    "- deferred_destination:\n"
+    "    - destination_type: phase\n"
+    "    - destination_ref: post-merge-live-evidence\n"
+    "- deferred_verification_condition: merge 後に取得する\n"
+)
+DEFERRED_OTHER_BODY = A2_BODY.replace("post-merge-live-evidence", "phase-5")
+
+
+def _comment(**overrides):
+    comment = {
+        "url": A1_REF_URL,
+        "id": 777,
+        "issue_url": f"https://api.github.com/repos/{REF_REPO}/issues/{REF_ISSUE}",
+        "author_association": "OWNER",
+        "body": f"REFERENCE_DECISION_V1: nonclosing issue=#{REF_ISSUE}\n",
+    }
+    comment.update(overrides)
+    return comment
+
+
+def _facts(state="OPEN", comment=None, pr_number=None, repo=REF_REPO):
+    return {"repo": repo, "issue_state": state, "pr_number": pr_number, "decision_comment": comment}
+
+
+def _evaluate(pr_body, *, state="OPEN", issue_body=A3_BODY, comment=None, pr_number=None, facts=None):
+    return evaluate_reference_policy(
+        pr_body.encode("utf-8"),
+        REF_ISSUE,
+        issue_body,
+        facts if facts is not None else _facts(state, comment, pr_number),
+    )
+
+
+OPEN_A3 = dict(state="OPEN", issue_body=A3_BODY)
+OPEN_A2 = dict(state="OPEN", issue_body=A2_BODY)
+CLOSED = dict(state="CLOSED", issue_body=A3_BODY)
+NOTES_330 = "\n## Notes\n\n- Related issue: #330\n"
+NOTES_OTHER = "\n## Notes\n\n- Related issue: #331\n"
+
+# (id, kwargs, pr_body, (decision, level, reason_code), (effective_kind, body_verdict, body_reason))
+D_A3 = ("closing_required", "A3", "a3_close_ready")
+D_A2 = ("nonclosing_required", "A2", "a2_contract_deferred")
+D_A1 = ("nonclosing_required", "A1", "a1_explicit_decision")
+D_CLOSED = ("nonclosing_required", "CLOSED", "issue_closed")
+CLOSING_OK = ("closing", "valid", "ok")
+REFS_OK = ("non-closing", "valid", "ok")
+REPAIR = ("non-closing", "repair", "closing_missing")
+FORBIDDEN = ("closing", "block", "closing_forbidden")
+NONE_MISSING = ("none", "block", "reference_missing")
+NOTES_MISSING = ("notes-only", "block", "reference_missing")
+NOTES_VALID = ("notes-only", "valid", "ok")
+OTHER_NONE = ("none", "block", "closing_for_other")
+OTHER_REFS = ("non-closing", "block", "closing_for_other")
+NOT_EVALUATED = ("none", "block", "not_evaluated")
+UNRESOLVED = ("fail_closed", None, "runtime_applicability_unresolved")
+A1_INVALID = ("fail_closed", None, "a1_decision_invalid")
+A1_AMBIGUOUS = ("fail_closed", None, "a1_decision_ambiguous")
+CLOSED_A3_BODY = dict(state="OPEN", issue_body="## Outcome\n\nnone\n")
+NO_SECTION = "## Outcome\n\nnone\n"
+RVA = "## Runtime Verification Applicability\n\n"
+A1_LINE = f"Reference-Decision: {A1_REF_URL}"
+ISSUE_BASE = f"https://github.com/{REF_REPO}/issues"
+
+
+def _a1(**comment_overrides):
+    return dict(OPEN_A3, comment=_comment(**comment_overrides))
+
+
+def _open(issue_body, **extra):
+    return dict(state="OPEN", issue_body=issue_body, **extra)
+
+
+REFERENCE_POLICY_MATRIX = [
+    # --- authority rows 0 / 3 / 4 with the body mapping ---------------------------------------------
+    ("a3_closes", OPEN_A3, "Closes #330", D_A3, CLOSING_OK),
+    ("a3_refs_only_repair", OPEN_A3, "Refs #330", D_A3, REPAIR),
+    ("a3_none", OPEN_A3, "no reference", D_A3, NONE_MISSING),
+    ("a3_notes_only", OPEN_A3, NOTES_330, D_A3, NOTES_MISSING),
+    ("a3_notes_other_number", OPEN_A3, NOTES_OTHER, D_A3, NONE_MISSING),
+    ("a3_closes_and_refs_coexist", OPEN_A3, "Refs #330\nCloses #330", D_A3, CLOSING_OK),
+    ("a3_duplicate_closes", OPEN_A3, "Closes #330\nCloses #330", D_A3, CLOSING_OK),
+    ("a3_not_applicable", _open(RVA + "decision: not_applicable\n"), "Closes #330", D_A3, CLOSING_OK),
+    ("a3_deferred_other_destination", _open(DEFERRED_OTHER_BODY), "Closes #330", D_A3, CLOSING_OK),
+    ("a2_refs", OPEN_A2, "Refs #330", D_A2, REFS_OK),
+    ("a2_refs_duplicate", OPEN_A2, "Refs #330\nrefs #330", D_A2, REFS_OK),
+    ("a2_closes_forbidden", OPEN_A2, "Closes #330", D_A2, FORBIDDEN),
+    ("a2_closes_and_refs_forbidden", OPEN_A2, "Refs #330\nCloses #330", D_A2, FORBIDDEN),
+    ("a2_none", OPEN_A2, "nothing", D_A2, NONE_MISSING),
+    ("a2_notes_only", OPEN_A2, NOTES_330, D_A2, NOTES_MISSING),
+    ("a2_nested_heading_ok", _open(A2_NESTED_HEADING_BODY), "Refs #330", D_A2, REFS_OK),
+    # --- every GitHub closing keyword and every target grammar --------------------------------------
+    *[
+        (f"a3_keyword_{keyword.replace(chr(58), '_colon')}", OPEN_A3, f"{keyword} #330", D_A3, CLOSING_OK)
+        for keyword in ("Close", "Closes", "Closed", "Fix", "Fixes", "Fixed", "Resolve", "Resolves", "Resolved",
+                        "CLOSES", "fixes:")
+    ],
+    ("a3_cross_repo_form", OPEN_A3, f"Fixes {REF_REPO}#330", D_A3, CLOSING_OK),
+    ("a3_issue_url_form", OPEN_A3, f"Resolves {ISSUE_BASE}/330", D_A3, CLOSING_OK),
+    ("a2_fixes_forbidden", OPEN_A2, "Fixes #330\nRefs #330", D_A2, FORBIDDEN),
+    # --- closing for another issue / repository / prefix collision ----------------------------------
+    ("other_number", OPEN_A3, "Closes #331", D_A3, OTHER_NONE),
+    ("other_number_with_target", OPEN_A3, "Closes #330\nFixes #331", D_A3, ("closing", "block", "closing_for_other")),
+    ("other_repository", OPEN_A3, "Closes other/repo#330", D_A3, OTHER_NONE),
+    ("prefix_collision_longer", OPEN_A3, "Closes #3301", D_A3, OTHER_NONE),
+    ("prefix_collision_shorter", OPEN_A3, "Closes #33", D_A3, OTHER_NONE),
+    ("refs_prefix_collision_is_not_a_reference", OPEN_A2, "Refs #3301", D_A2, NONE_MISSING),
+    ("other_blocks_valid_refs", OPEN_A2, "Refs #330\nCloses #331", D_A2, OTHER_REFS),
+    # --- ordinary prose that merely looks like a keyword is ignored, never fail_closed --------------
+    ("prose_then_closes", OPEN_A3, "fixes the typo\nresolved by the earlier change\ncloses the loop\nCloses #330",
+     D_A3, CLOSING_OK),
+    ("prose_only_is_none", OPEN_A3, "fixes the typo\nresolved by the earlier change\ncloses the loop", D_A3,
+     NONE_MISSING),
+    ("prose_with_refs_under_a2", OPEN_A2, "closes the loop\nRefs #330", D_A2, REFS_OK),
+    # --- code fence / quote / inline code handling (two separate decisions) -------------------------
+    ("a2_closing_in_fence_blocked", OPEN_A2, f"Refs #330\n{FENCE3}\nCloses #330\n{FENCE3}\n", D_A2, FORBIDDEN),
+    ("a2_closing_in_quote_blocked", OPEN_A2, "Refs #330\n> Fixes #330\n", D_A2, FORBIDDEN),
+    ("other_in_fence_detected", OPEN_A2, f"Refs #330\n{FENCE3}\nFixes #331\n{FENCE3}\n", D_A2, OTHER_REFS),
+    ("a3_closing_only_in_fence_repair", OPEN_A3, f"{FENCE3}\nCloses #330\n{FENCE3}\n", D_A3,
+     ("closing", "repair", "closing_missing")),
+    ("a3_closing_only_in_fence_with_outside_refs", OPEN_A3, f"Refs #330\n{FENCE3}\nCloses #330\n{FENCE3}\n", D_A3,
+     ("closing", "repair", "closing_missing")),
+    ("a3_closing_only_in_quote_repair", OPEN_A3, "> Closes #330\n", D_A3, ("closing", "repair", "closing_missing")),
+    ("a3_fence_closing_plus_real_closing", OPEN_A3, f"{FENCE3}\nCloses #330\n{FENCE3}\nCloses #330", D_A3,
+     CLOSING_OK),
+    ("refs_in_fence_not_counted", OPEN_A2, f"{FENCE3}\nRefs #330\n{FENCE3}\n", D_A2, NONE_MISSING),
+    ("refs_in_quote_not_counted", OPEN_A2, "> Refs #330\n", D_A2, NONE_MISSING),
+    ("refs_in_inline_code_not_counted", OPEN_A2, "see `Refs #330`", D_A2, NONE_MISSING),
+    # --- CLOSED Issue: dedicated mapping, no authority evaluation -----------------------------------
+    ("closed_refs", CLOSED, "Refs #330", D_CLOSED, REFS_OK),
+    ("closed_closes_forbidden", CLOSED, "Closes #330", D_CLOSED, FORBIDDEN),
+    ("closed_closing_in_fence_forbidden", CLOSED, f"{FENCE3}\nFixes #330\n{FENCE3}\n", D_CLOSED, FORBIDDEN),
+    ("closed_notes_only_valid", CLOSED, NOTES_330, D_CLOSED, NOTES_VALID),
+    ("closed_none", CLOSED, "nothing", D_CLOSED, NONE_MISSING),
+    ("closed_notes_other_number", CLOSED, NOTES_OTHER, D_CLOSED, NONE_MISSING),
+    ("closed_closing_for_other", CLOSED, "Refs #330\nCloses #331", D_CLOSED, OTHER_REFS),
+    ("closed_ignores_invalid_a1_line", CLOSED, "Refs #330\nReference-Decision: not-a-url", D_CLOSED, REFS_OK),
+    # --- A1 explicit decision -----------------------------------------------------------------------
+    ("a1_valid_over_a3", _a1(), f"Refs #330\n{A1_LINE}", D_A1, REFS_OK),
+    ("a1_valid_without_applicability_section", _open(NO_SECTION, comment=_comment()), f"Refs #330\n{A1_LINE}",
+     D_A1, REFS_OK),
+    ("a1_valid_with_closing_forbidden", _a1(), f"Closes #330\n{A1_LINE}", D_A1, FORBIDDEN),
+    ("a1_valid_member", _a1(author_association="MEMBER"), f"Refs #330\n{A1_LINE}", D_A1, REFS_OK),
+    ("a1_valid_collaborator", _a1(author_association="COLLABORATOR"), f"Refs #330\n{A1_LINE}", D_A1, REFS_OK),
+    ("a1_ignored_when_indented", _a1(), f"Closes #330\n  {A1_LINE}", D_A3, CLOSING_OK),
+    # --- A2 / A3 unresolved -> fail_closed ----------------------------------------------------------
+    ("applicability_missing", _open(NO_SECTION), "Refs #330", UNRESOLVED, NOT_EVALUATED),
+    ("applicability_duplicated", _open(A3_BODY + "\n" + A3_BODY), "Refs #330", UNRESOLVED, NOT_EVALUATED),
+    ("applicability_only_in_fence", _open(f"{FENCE3}\n{A2_BODY}{FENCE3}\n"), "Refs #330", UNRESOLVED,
+     NOT_EVALUATED),
+    ("applicability_decision_not_in_enum", _open(RVA + "- decision: maybe\n"), "Refs #330", UNRESOLVED,
+     NOT_EVALUATED),
+    ("applicability_decision_missing", _open(RVA + "- reason: x\n"), "Refs #330", UNRESOLVED, NOT_EVALUATED),
+    ("applicability_decision_repeated", _open(RVA + "- decision: immediate\n- decision: deferred\n"), "Refs #330",
+     UNRESOLVED, NOT_EVALUATED),
+    ("applicability_deferred_without_destination",
+     _open(RVA + "- decision: deferred\n- deferred_verification_condition: x\n"), "Refs #330", UNRESOLVED,
+     NOT_EVALUATED),
+    ("applicability_deferred_without_condition",
+     _open(A2_BODY.replace("- deferred_verification_condition: merge 後に取得する\n", "")), "Refs #330",
+     UNRESOLVED, NOT_EVALUATED),
+    # --- A1 present-but-invalid never degrades to A2 / A3 -------------------------------------------
+    ("a1_invalid_comment_missing", dict(OPEN_A2, comment=None), f"Refs #330\n{A1_LINE}", A1_INVALID, NOT_EVALUATED),
+    ("a1_invalid_url_shape", dict(OPEN_A2, comment=_comment()), "Refs #330\nReference-Decision: https://example.com/x",
+     A1_INVALID, NOT_EVALUATED),
+    ("a1_invalid_other_issue_number", _a1(),
+     f"Refs #330\nReference-Decision: {ISSUE_BASE}/331#issuecomment-777", A1_INVALID, NOT_EVALUATED),
+    ("a1_invalid_other_repository", _a1(),
+     "Refs #330\nReference-Decision: https://github.com/other/repo/issues/330#issuecomment-777", A1_INVALID,
+     NOT_EVALUATED),
+    ("a1_invalid_comment_url_mismatch", _a1(url=A1_REF_URL + "0"), f"Refs #330\n{A1_LINE}", A1_INVALID,
+     NOT_EVALUATED),
+    ("a1_invalid_comment_id_mismatch", _a1(id=778), f"Refs #330\n{A1_LINE}", A1_INVALID, NOT_EVALUATED),
+    ("a1_invalid_comment_issue_url_mismatch", _a1(issue_url=f"https://api.github.com/repos/{REF_REPO}/issues/331"),
+     f"Refs #330\n{A1_LINE}", A1_INVALID, NOT_EVALUATED),
+    ("a1_invalid_insufficient_authority", _a1(author_association="CONTRIBUTOR"), f"Refs #330\n{A1_LINE}",
+     A1_INVALID, NOT_EVALUATED),
+    ("a1_invalid_marker_missing", _a1(body="no marker"), f"Refs #330\n{A1_LINE}", A1_INVALID, NOT_EVALUATED),
+    ("a1_invalid_marker_for_other_issue", _a1(body="REFERENCE_DECISION_V1: nonclosing issue=#331"),
+     f"Refs #330\n{A1_LINE}", A1_INVALID, NOT_EVALUATED),
+    ("a1_invalid_marker_twice",
+     _a1(body="REFERENCE_DECISION_V1: nonclosing issue=#330\nREFERENCE_DECISION_V1: nonclosing issue=#330"),
+     f"Refs #330\n{A1_LINE}", A1_INVALID, NOT_EVALUATED),
+    ("a1_invalid_marker_not_a_whole_line", _a1(body="note REFERENCE_DECISION_V1: nonclosing issue=#330"),
+     f"Refs #330\n{A1_LINE}", A1_INVALID, NOT_EVALUATED),
+    ("a1_ambiguous_two_different_lines", _a1(), f"Refs #330\n{A1_LINE}\n{A1_LINE}9", A1_AMBIGUOUS, NOT_EVALUATED),
+    ("a1_ambiguous_same_url_twice", _a1(), f"Refs #330\n{A1_LINE}\n{A1_LINE}", A1_AMBIGUOUS, NOT_EVALUATED),
+    ("a1_ambiguous_inside_a_fence_still_counts", dict(OPEN_A2, comment=_comment()),
+     f"Refs #330\n{A1_LINE}\n{FENCE3}\n{A1_LINE}\n{FENCE3}\n", A1_AMBIGUOUS, NOT_EVALUATED),
+]
+
+
+def test_given_reference_policy_matrix_when_validated_then_accept_or_reject():
+    seen_ids = set()
+    for case_id, kwargs, pr_body, expected_decision, expected_body in REFERENCE_POLICY_MATRIX:
+        assert case_id not in seen_ids, case_id
+        seen_ids.add(case_id)
+        kwargs = dict(kwargs)
+        result = _evaluate(pr_body, **kwargs)
+        assert (result["decision"], result["level"], result["reason_code"]) == expected_decision, (case_id, result)
+        if expected_decision[0] == "fail_closed":
+            # fail_closed is always a stop: block / not_evaluated, level null
+            assert (result["body_verdict"], result["body_reason"]) == ("block", "not_evaluated"), case_id
+            continue
+        assert (result["effective_kind"], result["body_verdict"], result["body_reason"]) == expected_body, (
+            case_id,
+            result,
+        )
+
+    # the accept / reject decision a lint caller sees (LP057 with facts) follows the same evaluator
+    for pr_body, kwargs, expect_error in (
+        ("Closes #330", OPEN_A3, False),
+        ("Refs #330", OPEN_A3, True),
+        ("Refs #330", OPEN_A2, False),
+        ("Closes #330", OPEN_A2, True),
+        ("Refs #330", dict(state="OPEN", issue_body="## Outcome\n\nnone\n"), True),
+    ):
+        base = load_fixture("valid_not_schema_change.md").replace("- Related issue: #330", "- Related issue: N/A")
+        body = base + "\n" + pr_body + "\n"
+        policy = _evaluate(body, **kwargs)
+        result = validate_pr_body(body, load_paths("non_safety_paths.txt"), REF_ISSUE, reference_policy=policy)
+        lp057 = [error for error in result.errors if error.rule_id == "LP057"]
+        assert bool(lp057) is expect_error, (pr_body, kwargs, lp057)
+
+
+def test_given_reference_policy_facts_not_supplied_when_validated_then_legacy_lp057_is_unchanged():
+    body = load_fixture("valid_not_schema_change.md")  # Notes `Related issue: #330` only
+    legacy = validate_pr_body(body, load_paths("non_safety_paths.txt"), REF_ISSUE)
+    assert [error.rule_id for error in legacy.errors if error.rule_id == "LP057"] == []
+    for text, expect_error in (("Closes #330", False), ("Refs #330", False), ("Closes #331", True)):
+        result = validate_pr_body(body + "\n" + text + "\n", load_paths("non_safety_paths.txt"), REF_ISSUE)
+        assert bool([error for error in result.errors if error.rule_id == "LP057"]) is expect_error, text
+
+
+REFERENCE_RESULT_KEYS = {
+    "decision",
+    "level",
+    "reason_code",
+    "repo",
+    "issue_number",
+    "pr_number",
+    "pr_body_sha256",
+    "effective_kind",
+    "body_verdict",
+    "body_reason",
+}
+REFERENCE_REASON_CODES = {
+    "issue_closed",
+    "a1_explicit_decision",
+    "a1_decision_invalid",
+    "a1_decision_ambiguous",
+    "a2_contract_deferred",
+    "a3_close_ready",
+    "runtime_applicability_unresolved",
+    "facts_invalid",
+}
+
+
+_DEFAULT_FACTS = object()
+
+
+def _run_cli(tmp_path, *, pr_body_bytes, facts=_DEFAULT_FACTS, issue_body=A3_BODY, extra=(), omit=()):
+    body_file = tmp_path / "body.md"
+    body_file.write_bytes(pr_body_bytes)
+    facts_file = tmp_path / "facts.json"
+    facts_file.write_text(json.dumps(_facts() if facts is _DEFAULT_FACTS else facts), encoding="utf-8")
+    issue_file = tmp_path / "issue.md"
+    issue_file.write_text(issue_body, encoding="utf-8")
+    argv = [sys.executable, str(SCRIPT_PATH), "--body-file", str(body_file), "--linked-issue", str(REF_ISSUE)]
+    if "issue" not in omit:
+        argv += ["--linked-issue-body-file", str(issue_file)]
+    if "facts" not in omit:
+        argv += ["--reference-facts-file", str(facts_file)]
+    argv += list(extra)
+    return subprocess.run(argv, capture_output=True, text=True, check=False)
+
+
+def test_given_reference_facts_wire_when_evaluated_then_exact_keys_and_body_bytes_hash(tmp_path):
+    crlf_body = b"Closes #330\r\nsecond line\r\n"
+    proc = _run_cli(tmp_path, pr_body_bytes=crlf_body, extra=["--evaluate-reference-policy"])
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout)
+    assert set(result) == REFERENCE_RESULT_KEYS
+    assert result["decision"] == "closing_required" and result["level"] == "A3"
+    assert result["reason_code"] in REFERENCE_REASON_CODES
+    assert result["repo"] == REF_REPO and result["issue_number"] == REF_ISSUE and result["pr_number"] is None
+    # sha256 of the exact bytes (CRLF kept), lowercase hex, not of a newline-normalized string
+    assert result["pr_body_sha256"] == hashlib.sha256(crlf_body).hexdigest()
+    assert result["pr_body_sha256"] != hashlib.sha256(crlf_body.replace(b"\r\n", b"\n")).hexdigest()
+    assert result["pr_body_sha256"] == result["pr_body_sha256"].lower()
+    assert (result["effective_kind"], result["body_verdict"], result["body_reason"]) == ("closing", "valid", "ok")
+
+    # decision never changes the exit code: a stop is still exit 0 with a JSON `decision`
+    stop = _run_cli(
+        tmp_path, pr_body_bytes=b"Refs #330", issue_body="no section", extra=["--evaluate-reference-policy"]
+    )
+    assert stop.returncode == 0
+    stopped = json.loads(stop.stdout)
+    assert set(stopped) == REFERENCE_RESULT_KEYS
+    assert (stopped["decision"], stopped["level"], stopped["reason_code"]) == (
+        "fail_closed",
+        None,
+        "runtime_applicability_unresolved",
+    )
+    assert (stopped["body_verdict"], stopped["body_reason"]) == ("block", "not_evaluated")
+
+    # evaluator mode needs both --reference-facts-file and --linked-issue-body-file
+    for omitted in ("facts", "issue"):
+        missing = _run_cli(tmp_path, pr_body_bytes=b"Refs #330", extra=["--evaluate-reference-policy"], omit=(omitted,))
+        assert missing.returncode == 0
+        missing_result = json.loads(missing.stdout)
+        assert (missing_result["decision"], missing_result["reason_code"]) == ("fail_closed", "facts_invalid")
+        assert set(missing_result) == REFERENCE_RESULT_KEYS
+
+    # only an unreadable --body-file keeps the legacy stderr + exit 2
+    unreadable = subprocess.run(
+        [sys.executable, str(SCRIPT_PATH), "--body-file", str(tmp_path / "nope.md"), "--linked-issue", "330",
+         "--evaluate-reference-policy"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert unreadable.returncode == 2 and unreadable.stdout == ""
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda facts: {**facts, "extra": 1},  # unknown key
+        lambda facts: {key: value for key, value in facts.items() if key != "repo"},  # missing key
+        lambda facts: {**facts, "issue_state": "MERGED"},
+        lambda facts: {**facts, "issue_state": None},
+        lambda facts: {**facts, "pr_number": 0},
+        lambda facts: {**facts, "pr_number": True},
+        lambda facts: {**facts, "pr_number": "7"},
+        lambda facts: {**facts, "repo": "not-a-repo"},
+        lambda facts: {**facts, "repo": 5},
+        lambda facts: {**facts, "updated_at": "2026-10-03T00:00:00Z"},  # never a fact
+        lambda facts: {**facts, "decision_comment": {**_comment(), "extra": 1}},
+        lambda facts: {**facts, "decision_comment": {key: value for key, value in _comment().items() if key != "body"}},
+        lambda facts: {**facts, "decision_comment": {**_comment(), "id": "777"}},
+        lambda facts: {**facts, "decision_comment": {**_comment(), "id": True}},
+        lambda facts: {**facts, "decision_comment": "comment"},
+        lambda facts: ["not", "an", "object"],
+        lambda facts: None,
+    ],
+)
+def test_given_malformed_reference_facts_when_evaluated_then_facts_invalid(tmp_path, mutate):
+    facts = mutate(_facts(comment=_comment()))
+    proc = _run_cli(tmp_path, pr_body_bytes=b"Refs #330", facts=facts, extra=["--evaluate-reference-policy"])
+    assert proc.returncode == 0
+    result = json.loads(proc.stdout)
+    assert (result["decision"], result["level"], result["reason_code"]) == ("fail_closed", None, "facts_invalid")
+    assert set(result) == REFERENCE_RESULT_KEYS
+
+
+def test_given_non_json_facts_file_when_evaluated_then_facts_invalid(tmp_path):
+    body_file = tmp_path / "body.md"
+    body_file.write_text("Refs #330", encoding="utf-8")
+    facts_file = tmp_path / "facts.json"
+    facts_file.write_text("{not json", encoding="utf-8")
+    issue_file = tmp_path / "issue.md"
+    issue_file.write_text(A2_BODY, encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT_PATH), "--body-file", str(body_file), "--linked-issue", "330",
+         "--linked-issue-body-file", str(issue_file), "--reference-facts-file", str(facts_file),
+         "--evaluate-reference-policy"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0
+    assert json.loads(proc.stdout)["reason_code"] == "facts_invalid"
+
+
+def test_given_facts_without_evaluate_flag_when_linted_then_lp057_follows_the_evaluator(tmp_path):
+    body = load_fixture("valid_not_schema_change.md").replace("- Related issue: #330", "- Related issue: N/A")
+    changed = tmp_path / "paths.txt"
+    changed.write_text("src/example.ts\n", encoding="utf-8")
+
+    def lint(pr_body, issue_body=A2_BODY, omit=()):
+        proc = _run_cli(tmp_path, pr_body_bytes=(body + "\n" + pr_body + "\n").encode("utf-8"),
+                        issue_body=issue_body, extra=["--changed-paths-file", str(changed)], omit=omit)
+        payload = json.loads(proc.stdout)
+        assert payload["schema"] == "loop_body_lint/v1"  # output stays the legacy lint shape
+        return proc.returncode, [error for error in payload["errors"] if error["rule_id"] == "LP057"]
+
+    assert lint("Refs #330") == (0, [])
+    rc, lp057 = lint("Closes #330")
+    assert rc == 1 and len(lp057) == 1 and "closing_forbidden" in lp057[0]["message"]
+    rc, lp057 = lint("Refs #330", issue_body=A3_BODY)
+    assert rc == 1 and "closing_missing" in lp057[0]["message"]
+    # a missing linked-issue-body-file is facts_invalid, even when the body alone could decide
+    rc, lp057 = lint("Refs #330", omit=("issue",))
+    assert rc == 1 and "facts_invalid" in lp057[0]["message"]

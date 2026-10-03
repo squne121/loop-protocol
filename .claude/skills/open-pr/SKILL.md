@@ -1,6 +1,6 @@
 ---
 name: open-pr
-description: 承認済みの implementation issue の PR を起票するときに使う。publish ゲート（人間承認）/ Closes/Refs 自動判定 / idempotency チェック（同一ブランチの既存 PR detect）/ `gh pr create` 実行を担当する独立スキル。implement-issue / impl-review-loop から委譲され、PR 起票責務を一箇所に集約する。
+description: 承認済みの implementation issue の PR を起票するときに使う。publish ゲート（人間承認）/ reference authority に基づく Closes/Refs 判定 / idempotency チェック（同一ブランチの既存 PR detect）/ `gh pr create` 実行を担当する独立スキル。implement-issue / impl-review-loop から委譲され、PR 起票責務を一箇所に集約する。
 ---
 
 # Open PR
@@ -53,7 +53,7 @@ uv run --locked python3 .claude/skills/open-pr/scripts/open_pr.py \
 
 ### 2. final PR body の validator 実行
 
-`open_pr.py` は linked issue state を解決して `Closes` / `Refs` を final body に反映した後、`validate_pr_body.py` を実行する。
+`open_pr.py` は linked issue state / 本文を解決し、reference authority evaluator（下記 3.）の結果で `Closes` / `Refs` を final body に反映した後、`validate_pr_body.py`（facts 供給時は LP057 も同じ evaluator に従う）を実行する。
 
 validator CLI（検証 CLI）:
 ```bash
@@ -72,22 +72,30 @@ JSON schema は `loop_body_lint/v1` (`target: "pr"`)、exit code は pass=0 / fa
 - LP053: Schema Change Applicability decision 不正
 - LP055: Safety Claim Matrix 列欠落
 - LP056: `Not controlled` 非空時の Follow-up 欠落
-- LP057: final PR body の related issue 欠落
+- LP057: final PR body の related issue 欠落（facts 未供給は従来どおり番号一致の検証。`--reference-facts-file` 供給時は reference authority evaluator の結果に従う）
 - LP058: changed paths 未解決
 
 validator が `fail` または `internal` を返した場合、`open_pr.py` は **`gh pr create` を呼ばず fail-closed** で停止する。
 
-### 3. Linked Issue 状態確認 + Closes / Refs 自動判定
+### 3. Linked Issue 状態確認 + Closes / Refs の判定（reference を決める単一 evaluator の結果に従う、Issue #2878）
+
+「linked Issue の特定」と「merge 時に close してよいか」は別の判断であり、`Closes` だけで兼用しない。判断は
+`validate_pr_body.py` 内の **単一の pure evaluator** に集約され（grammar・decision table の正本は `docs/dev/workflow.md` の「PR reference と Issue close の分離」）、
+`open_pr.py` は facts（linked Issue の state / 本文、PR 本文、A1 の `Reference-Decision:` が指す comment）を gh で fresh 取得して、次の entrypoint の JSON だけを消費する。
 
 ```bash
-ISSUE_STATE=$(gh issue view <linked_issue> --json state --jq '.state')
+uv run --locked python3 .claude/skills/open-pr/scripts/validate_pr_body.py --evaluate-reference-policy --body-file <PR本文ファイル> --linked-issue <N> --linked-issue-body-file <Issue本文ファイル> --reference-facts-file <facts JSON>
 ```
 
-- `OPEN` → `Closes #<linked_issue>` を PR 本文に追記
-- `CLOSED` → `Refs #<linked_issue>` に downgrade（自動マージで誤って再 close しないため）し、WARN を出力
-- 状態取得失敗 → `E_LINKED_ISSUE_STATE_UNKNOWN` を返して停止
+facts JSON の key は `repo` / `issue_state`（`OPEN` | `CLOSED`）/ `pr_number`（PR 作成前は `null`）/ `decision_comment`（取得していなければ `null`、あれば `url` / `id` / `issue_url` / `author_association` / `body`）のみ。
+出力は JSON object 1 つ（decision によらず exit 0）: `decision`（`closing_required` / `nonclosing_required` / `fail_closed`）、`level`（A1 / A2 / A3 / CLOSED / null）、`reason_code`、`repo`、`issue_number`、`pr_number`、`pr_body_sha256`（`--body-file` の bytes の SHA-256）、`effective_kind`、`body_verdict`（`valid` / `repair` / `block`）、`body_reason`。
 
-PR 本文に既に `Closes #N` / `Refs #N` がある場合は、上記判定と一致するかを確認し、不一致なら本文側を優先（caller の意図を尊重）。
+- `open_pr.py` の選択: `closing_required` → `Closes #N`（A3: close-ready な Issue）、`nonclosing_required` → `Refs #N`（A1: 人間の明示 decision / A2: `post-merge-live-evidence` 待ち / CLOSED）。valid な caller 指定の reference は本文のまま保持する。reference が無い、または `closing_required` で根拠のない Refs-only の場合のみ evaluator が要求する kind を追記する
+- `fail_closed`（A1 invalid / ambiguous、Issue state 取得不能、Runtime Verification Applicability の欠落・重複・解釈不能、facts 不正）は誤 close を避けるため停止する（本文を推測で補わない）。番号違いの closing keyword、`nonclosing_required` での closing keyword も停止
+- 状態取得失敗 → `E_LINKED_ISSUE_STATE_UNKNOWN` を返して停止
+- `update_pr.py` 経由の本文更新は facts を渡さない従来の LP057（番号一致の検証）のままで、本 evaluator の対象外
+
+non-closing（`Refs`）の PR は `implementation_pr_observed` も closing relation に依存せず発行できる: `emit_implementation_pr_observed(..., non_closing_authority=None)` は PR の **live 本文**（GitHub から fresh 取得。local の `final_body` ではない）に同じ evaluator を実行し、`nonclosing_required`（A1 / A2）かつ live 本文が `valid`、closing node が空、`pr_body_sha256` が live 本文と一致する場合に限り、既存 wire のまま発行する。evaluator が `fail_closed`、hash が束縛できない、authority 未取得の場合は従来の `NO_LINK` / `RELATION_ISSUE_MISMATCH` のまま発行しない。`classify_closing_issue_relation(snapshot, candidate_issue, candidate_repo=None, non_closing_authority=None)` の `non_closing_authority` は 7 key（`decision` / `level` / `reason_code` / `repo` / `issue_number` / `pr_number` / `pr_body_sha256`）の dict で、post-merge 側 adapter の snapshot top-level `non_closing_authority` と同一の写像である（`docs/dev/task-context.md`）。
 
 ### 3.5. Parent Child Materialization（delivery-rollup parent の child PR の場合の親子 materialization）
 
@@ -176,7 +184,7 @@ PR_URL=$(gh pr create \
 PR_URL=https://github.com/<owner>/<repo>/pull/<number>
 PR_NUMBER=<number>
 LINKED_ISSUE=<linked_issue>
-LINK_KIND=Closes | Refs
+LINK_KIND=Closes | Refs | none
 EXISTING=true | false
 DRY_RUN=true | false
 ```
@@ -243,7 +251,7 @@ impl-review-loop の publish failure lane に戻す。force update / reset へ�
 - `publish: yes` 未指定で PR を作成しない（人間承認 fail-closed）
 - `validate_pr_body.py` が fail / internal を返した場合は PR を作成しない
 - changed paths を解決できない場合は `LP058` により fail-closed する
-- linked issue が CLOSED の場合は `Closes` を `Refs` に必ず downgrade（リンク済み close 連鎖防止）
+- reference の選択は reference authority evaluator の結果に従う。linked issue が CLOSED の場合は `Refs` のみ valid（closing keyword は停止。リンク済み close 連鎖防止）、post-merge live evidence 待ち（A1 / A2）の OPEN Issue も `Refs` のみ valid、`fail_closed` は停止
 - 同一ブランチに OPEN PR がある場合は重複作成せず既存 URL を返す
 - `dry_run: true` でも publish ゲートと validator は実行する
 - 既存 PR が見つかった場合、本文 update は必ず update_pr.py wrapper 経由で行う（validator bypass 防止）

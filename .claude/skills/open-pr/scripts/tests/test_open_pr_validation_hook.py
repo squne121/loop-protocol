@@ -22,6 +22,25 @@ def load_fixture(name: str) -> str:
     return (FIXTURE_DIR / name).read_text(encoding="utf-8")
 
 
+A3_ISSUE_BODY = "## Runtime Verification Applicability\n\ndecision: not_applicable\nreason: 静的検証のみ\n"
+A2_ISSUE_BODY = (
+    "## Runtime Verification Applicability\n\n"
+    "- decision: deferred\n"
+    "- reason: merge 後の live evidence が必要\n"
+    "- deferred_destination:\n"
+    "    - destination_type: phase\n"
+    "    - destination_ref: post-merge-live-evidence\n"
+    "- deferred_verification_condition: merge 後に canonical main root で取得する\n"
+)
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_linked_issue_body(monkeypatch: pytest.MonkeyPatch):
+    """Issue #2878: the reference policy reads the linked Issue body, so keep it offline and
+    deterministic (a close-ready A3 Issue) unless a test installs its own body."""
+    monkeypatch.setattr(open_pr, "get_linked_issue_body", lambda repo, issue: A3_ISSUE_BODY)
+
+
 def write_temp_body(body: str) -> str:
     handle = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".md", delete=False)
     handle.write(body)
@@ -304,7 +323,7 @@ def test_default_closed_issue_link_kind_remains_refs(monkeypatch: pytest.MonkeyP
         Path(body_path).unlink(missing_ok=True)
 
 
-def test_existing_refs_for_open_issue_are_preserved_and_run_preflights(
+def test_existing_refs_for_open_issue_with_a2_authority_are_preserved_and_run_preflights(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """An existing Refs link wins for an OPEN issue without bypassing PR gates."""
@@ -315,7 +334,9 @@ def test_existing_refs_for_open_issue_are_preserved_and_run_preflights(
         monkeypatch.setattr(open_pr, "resolve_branch", lambda: "worktree-issue-330-link-kind")
         monkeypatch.setattr(open_pr, "get_linked_issue_state", lambda repo, issue: "OPEN")
         monkeypatch.setattr(open_pr, "resolve_changed_paths", lambda provided: ["src/example.ts"])
-        monkeypatch.setattr(open_pr, "get_linked_issue_body", lambda repo, issue: "## Allowed Paths\n- example\n")
+        # Issue #2878: Refs is only valid for an OPEN Issue with an authority (here A2:
+        # post-merge live evidence), so the preserved Refs is backed by the Issue contract.
+        monkeypatch.setattr(open_pr, "get_linked_issue_body", lambda repo, issue: A2_ISSUE_BODY)
         monkeypatch.setattr(open_pr, "resolve_head_sha", lambda: "a" * 40)
 
         def fake_validator(body, changed_paths, linked_issue):
@@ -1129,3 +1150,185 @@ def test_japanese_validator_parity_with_update_pr():
         f"シグネチャ不一致: open_pr={list(open_sig.parameters.keys())}, "
         f"update_pr={list(update_sig.parameters.keys())}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #2878 AC1: Closes / Refs / stop is decided by the reference authority, not by Issue state
+# ---------------------------------------------------------------------------
+
+A1_URL = "https://github.com/squne121/loop-protocol/issues/330#issuecomment-4242"
+
+
+def _a1_comment(**overrides):
+    comment = {
+        "url": A1_URL,
+        "id": 4242,
+        "issue_url": "https://api.github.com/repos/squne121/loop-protocol/issues/330",
+        "author_association": "OWNER",
+        "body": "REFERENCE_DECISION_V1: nonclosing issue=#330\n",
+    }
+    comment.update(overrides)
+    return comment
+
+
+def _run_dry_run_with_real_validator(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    state: str,
+    issue_body: str | None,
+    pr_body_suffix: str = "",
+    comment: dict | None = None,
+) -> tuple[int, dict[str, str], str]:
+    real_validator = open_pr._run_pr_body_validator
+    observed = {"body": ""}
+
+    def spying_validator(body, changed_paths, linked_issue, linked_issue_body=None, reference_facts=None):
+        observed["body"] = body
+        return real_validator(body, changed_paths, linked_issue, linked_issue_body, reference_facts)
+
+    monkeypatch.setattr(open_pr, "resolve_repo", lambda: "squne121/loop-protocol")
+    monkeypatch.setattr(open_pr, "resolve_branch", lambda: "worktree-issue-330-authority")
+    monkeypatch.setattr(open_pr, "get_linked_issue_state", lambda repo, issue: state)
+    monkeypatch.setattr(open_pr, "get_linked_issue_body", lambda repo, issue: issue_body)
+    monkeypatch.setattr(open_pr, "fetch_reference_decision_comment", lambda pr_body: comment)
+    monkeypatch.setattr(open_pr, "resolve_changed_paths", lambda provided: ["src/example.ts"])
+    monkeypatch.setattr(open_pr, "_run_pr_body_validator", spying_validator)
+    monkeypatch.setattr(
+        open_pr,
+        "_run_japanese_content_validator",
+        lambda body_text, threshold=0.1: {
+            "status": "pass",
+            "failed_blocks": 0,
+            "aggregate_ratio": 0.5,
+            "threshold": 0.1,
+            "body_sha256": "",
+            "stderr": "",
+        },
+    )
+    monkeypatch.setattr(
+        open_pr,
+        "find_existing_pr",
+        lambda repo, branch: (_ for _ in ()).throw(AssertionError("dry-run must not inspect an existing PR")),
+    )
+    body_path = write_temp_body(load_fixture("valid_not_schema_change.md") + pr_body_suffix)
+    try:
+        rc = open_pr.main(
+            [
+                "--pr-title", "feat: test",
+                "--linked-issue", "330",
+                "--publish", "yes",
+                "--pr-body-file", body_path,
+                "--dry-run",
+            ]
+        )
+    finally:
+        Path(body_path).unlink(missing_ok=True)
+    kv = dict(line.split("=", 1) for line in capsys.readouterr().out.splitlines() if "=" in line)
+    return rc, kv, observed["body"]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        # same OPEN state, authority alone changes the outcome
+        dict(id="open_a3_no_ref_closes", state="OPEN", issue_body=A3_ISSUE_BODY, rc=0, kind="Closes"),
+        dict(id="open_a2_no_ref_refs", state="OPEN", issue_body=A2_ISSUE_BODY, rc=0, kind="Refs"),
+        dict(
+            id="open_a1_valid_refs_even_when_issue_is_a3",
+            state="OPEN",
+            issue_body=A3_ISSUE_BODY,
+            suffix=f"\nReference-Decision: {A1_URL}\n",
+            comment=_a1_comment(),
+            rc=0,
+            kind="Refs",
+        ),
+        dict(
+            id="open_a1_valid_without_applicability_section",
+            state="OPEN",
+            issue_body="## Outcome\n\nno applicability section\n",
+            suffix=f"\nReference-Decision: {A1_URL}\n",
+            comment=_a1_comment(),
+            rc=0,
+            kind="Refs",
+        ),
+        dict(
+            id="open_a1_invalid_does_not_demote_to_a3",
+            state="OPEN",
+            issue_body=A3_ISSUE_BODY,
+            suffix=f"\nReference-Decision: {A1_URL}\n",
+            comment=_a1_comment(author_association="NONE"),
+            rc=2,
+        ),
+        dict(
+            id="open_a1_invalid_does_not_demote_to_a2",
+            state="OPEN",
+            issue_body=A2_ISSUE_BODY,
+            suffix=f"\nReference-Decision: {A1_URL}\n",
+            comment=None,
+            rc=2,
+        ),
+        dict(id="open_unknown_issue_body_stops", state="OPEN", issue_body=None, rc=2),
+        dict(
+            id="open_unresolved_applicability_stops",
+            state="OPEN",
+            issue_body="## Outcome\n\nno applicability section\n",
+            rc=2,
+        ),
+        dict(id="closed_refs", state="CLOSED", issue_body=A3_ISSUE_BODY, rc=0, kind="Refs"),
+        # explicit references
+        dict(
+            id="open_a2_explicit_refs_is_preserved",
+            state="OPEN",
+            issue_body=A2_ISSUE_BODY,
+            suffix="\nRefs #330\n",
+            rc=0,
+            kind="Refs",
+            no_closes=True,
+        ),
+        dict(
+            id="open_a2_explicit_closes_stops", state="OPEN", issue_body=A2_ISSUE_BODY, suffix="\nCloses #330\n", rc=2
+        ),
+        dict(
+            id="open_a3_explicit_refs_without_authority_is_repaired_to_closes",
+            state="OPEN",
+            issue_body=A3_ISSUE_BODY,
+            suffix="\nRefs #330\n",
+            rc=0,
+            kind="Closes",
+        ),
+        dict(
+            id="open_a3_closes_for_other_issue_stops",
+            state="OPEN",
+            issue_body=A3_ISSUE_BODY,
+            suffix="\nFixes #331\n",
+            rc=2,
+        ),
+    ],
+    ids=lambda case: case["id"],
+)
+def test_given_authority_matrix_when_selecting_reference_then_closes_or_refs_or_stop(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], case: dict
+):
+    rc, kv, validated_body = _run_dry_run_with_real_validator(
+        monkeypatch,
+        capsys,
+        state=case["state"],
+        issue_body=case["issue_body"],
+        pr_body_suffix=case.get("suffix", ""),
+        comment=case.get("comment"),
+    )
+
+    assert rc == case["rc"], (case["id"], kv)
+    if case["rc"] == 2:
+        # a stop never reaches the dry-run preview (nothing would be created) and never guesses Closes
+        assert "DRY_RUN" not in kv
+        assert kv.get("ERROR") == "E_PR_BODY_VALIDATION_FAILED"
+        assert "rule_ids=LP057" in kv.get("ERROR_DETAIL", "")
+        return
+    assert kv.get("LINK_KIND") == case["kind"]
+    assert f"{case['kind']} #330" in validated_body
+    if case.get("no_closes"):
+        assert "Closes #330" not in validated_body
+    if case["kind"] == "Refs":
+        assert "Closes #330" not in validated_body

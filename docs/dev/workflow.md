@@ -150,6 +150,67 @@ git worktree remove .claude/worktrees/<slug>
 git branch -d worktree-<slug>
 ```
 
+## PR reference と Issue close の分離（reference の判定規則と close の条件を別々に定める、Issue #2878）
+
+「PR がどの Issue を参照しているか（linked Issue の特定）」と「merge 時にその Issue を close してよいか」は別の判断である。
+両方を `Closes #N` だけで兼用すると、merge 後の live evidence（#2842 型の AC6 / AC7）が揃う前に auto-close が先行する。
+この節が両者を分離する唯一の正本であり、producer（`open-pr`）・validator（`validate_pr_body.py`）・reviewer（`pr-review-judge`）・
+`impl-review-loop` の repair 判定・post-merge consumer（`post-merge-cleanup`）は、いずれもこの decision table を複製せず参照する。
+
+### 単一 evaluator と entrypoint
+
+判断は facts を入力とする **1 つの pure evaluator**（`.claude/skills/open-pr/scripts/validate_pr_body.py` の `evaluate_reference_policy`）に集約する。
+evaluator は GitHub を取得せず、caller が fresh 取得して渡す facts（PR 本文 bytes、linked Issue の state と本文、A1 の comment 事実）だけから
+`decision`（`closing_required` / `nonclosing_required` / `fail_closed`）・`level`（A1 / A2 / A3 / CLOSED）・`reason_code` を返す。
+prose や自由文のキーワードから推測しない。caller は次の entrypoint を実行し、その JSON だけを消費する（出力は decision によらず exit 0）:
+
+```bash
+uv run --locked python3 .claude/skills/open-pr/scripts/validate_pr_body.py --evaluate-reference-policy --body-file <PR本文ファイル> --linked-issue <N> --linked-issue-body-file <Issue本文ファイル> --reference-facts-file <facts JSON>
+```
+
+- facts JSON の exact key: `repo` / `issue_state`（`OPEN` | `CLOSED`）/ `pr_number`（PR 作成前は `null`）/ `decision_comment`（`null` または `url` / `id` / `issue_url` / `author_association` / `body`）。未知 key・型違い・欠落・必須引数の欠落は `fail_closed` / `facts_invalid`。`updated_at` は facts にも authority にも使わない
+- 出力 key: `decision` / `level` / `reason_code` / `repo` / `issue_number` / `pr_number` / `pr_body_sha256`（`--body-file` の bytes の SHA-256。改行変換なし）/ `effective_kind`（`closing` / `non-closing` / `notes-only` / `none`）/ `body_verdict`（`valid` / `repair` / `block`）/ `body_reason`
+- `reason_code`: `issue_closed` / `a1_explicit_decision` / `a1_decision_invalid` / `a1_decision_ambiguous` / `a2_contract_deferred` / `a3_close_ready` / `runtime_applicability_unresolved` / `facts_invalid`
+- `--reference-facts-file` を渡さない既存 caller（`update_pr.py` 経由の本文更新を含む）は従来の LP057（番号一致の検証）のまま動作する。`--reference-facts-file` 単独（`--evaluate-reference-policy` なし）は LP057 を policy 判定へ切り替える（出力は `loop_body_lint/v1` のまま）
+
+### reference の grammar（evaluator が唯一の定義元）
+
+GitHub の closing 判定を over-approximate する保守的な定義とする。
+
+- **closing**: PR 本文の生 text 全体（code fence・inline code・引用行を除外しない）から、GitHub の closing keyword（`close` / `closes` / `closed` / `fix` / `fixes` / `fixed` / `resolve` / `resolves` / `resolved`、大文字小文字無視、keyword の後に任意の `:` と空白）の **直後が actual issue target** の場合だけを closing 候補とする。target は ASCII 数字列を持つ `#N` / `<owner>/<repo>#N` / `https://github.com/<owner>/<repo>/issues/N` の 3 形のみで、番号は文字列として完全一致（`#21010` と `#2101` を混同しない）。keyword の直後が target でない通常 prose（`fixes the typo` 等）は reference ではなく単に無視し、`fail_closed` にしない
+- **non-closing**: code fence・inline code・引用行を除いた text 中の `Refs #N`（ASCII 数字の完全一致）を対象 Issue への参照として数える
+- **effective kind**: 対象への closing keyword が 1 つでもあれば `closing`（`Closes #N` と `Refs #N` の併存も `closing`）、無ければ対象への `Refs` があれば `non-closing`、`Notes` の `Related issue:` が対象番号と完全一致するだけなら `notes-only`、それ以外は `none`。別 Issue・別 repository への closing keyword は常に `block` / `closing_for_other`
+- **body_verdict の写像**: `closing_required` では closing が `valid`、`Refs` のみ（根拠なし）は `repair` / `closing_missing`、`none` / `notes-only` は `block` / `reference_missing`。`closing_required` の `valid` が数える closing は code fence・引用行の外にある closing for target に限る（fence / 引用内だけの closing は `repair` / `closing_missing`）。`nonclosing_required` では `non-closing` が `valid`、`closing` は `block` / `closing_forbidden`、`none` / `notes-only` は `block` / `reference_missing`。CLOSED は `non-closing` と `notes-only` が `valid`、closing は `block` / `closing_forbidden`、`none` は `block` / `reference_missing`。`fail_closed` は常に `block` / `not_evaluated`
+
+### decision table（正本）
+
+評価は上から行い、最初に確定した結果を採る（total な優先順位）。
+
+#### PR reference decision table（判定表の正本）
+
+| 順 | 条件 | decision | level | PR 本文の reference | merge 時の Issue |
+|---|---|---|---|---|---|
+| 0 | linked Issue が CLOSED | `nonclosing_required` | CLOSED | `Refs #N`（closing keyword は block） | 既に CLOSED（authority 評価なし） |
+| 1 | A1 present かつ valid | `nonclosing_required` | A1 | `Refs #N`（Runtime Verification Applicability の状態に依存しない） | merge で close されない（OPEN のまま） |
+| 2 | A1 present かつ invalid（2 行以上を含む） | `fail_closed` | なし | 停止（A2 / A3 へ降格しない） | 停止 |
+| 3 | A1 なし、A2 成立 | `nonclosing_required` | A2 | `Refs #N` | merge で close されない（OPEN のまま） |
+| 4 | A1 なし、A2 不成立、A3 成立 | `closing_required` | A3 | `Closes #N` | merge で auto-close |
+| 5 | 上記以外（Issue state 取得不能、Runtime Verification Applicability の欠落・重複・解釈不能、facts 不正） | `fail_closed` | なし | 停止 | 停止 |
+
+- **A1 explicit reference decision**: PR 本文の行頭が `Reference-Decision:` の行を数える。0 行なら A1 なし、2 行以上は URL が同一でも invalid（`a1_decision_ambiguous`）。ちょうど 1 行の値は `https://github.com/<owner>/<repo>/issues/<N>#issuecomment-<id>` で、(1) owner / repo / N が facts.repo と `--linked-issue` に一致、(2) facts の `decision_comment` の `url` が本文の URL と完全一致し `id` が fragment と一致し `issue_url` が `https://api.github.com/repos/<owner>/<repo>/issues/<N>` と一致、(3) `author_association` が OWNER / MEMBER / COLLABORATOR、(4) comment 本文に完全一致 1 行 `REFERENCE_DECISION_V1: nonclosing issue=#<N>` がちょうど 1 つ、を全て満たす場合だけ valid。comment の取得失敗・別 Issue・権限不足・marker 欠落・複数 marker・URL 不一致は `a1_decision_invalid`
+- **A1 の信頼の限界**: A1 の信頼は Accepted Trust Model（operator-asserted human context、#2086）と同一であり、agent が同一 principal の identity で投稿した comment を排除するものではない。A1 は人間の明示 decision の記録であって、cryptographic な証明ではない
+- **A2 contract deferred**: 対象 Issue 本文の Runtime Verification Applicability が `docs/dev/runtime-verification-policy.md` の正規形（`decision: deferred`、`deferred_destination` の `destination_type: phase` と `destination_ref: post-merge-live-evidence`、非空の `deferred_verification_condition`）を満たす。`post-merge-live-evidence` は予約 literal。section の抽出は `prose_boundary_policy.py::extract_level2_section_with_bounds` を再利用する（fenced code block 内の偽 section を除外、nested 見出しで終端しない、複数 section は不成立）
+- **A3 close-ready**: Runtime Verification Applicability の `decision` が `not_applicable` / `immediate`、または `deferred` で destination が A2 以外
+- `fail_closed` は常に停止し、auto repair しない
+
+### merge と Issue close の分離（close gate）
+
+- merge は PR を取り込むだけで、Issue の close を意味しない。`closing_required`（A3）の PR だけが `Closes #N` により merge で auto-close される
+- `nonclosing_required`（A1 / A2）の PR は `Refs #N` であり、merge しても Issue は OPEN のまま扱う。live evidence の取得・証跡へのリンク・残 AC の充足を確認した後にだけ、operator / orchestrator が明示的に close する。live evidence が未取得の間は OPEN を保つ。adapter・reviewer・本 evaluator は close を実行せず、close 権限も返さない（新たな自動 close 実行器・close eligibility evaluator・ledger は作らない）
+- **merge 時の guard**: reviewer（`pr-review-judge`）が final head の PR 本文に対して fresh な evaluator を実行する。`update_pr.py` は facts 未供給の従来 LP057 のため、review 後の本文編集は次の review で検出する。orchestrator は merge 直前に entrypoint を再実行し（本文は `uv run python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin)["body"] or "")' < <(gh api repos/<owner>/<repo>/pulls/<PR番号>)` のように GitHub の本文文字列そのものを書き出して `--body-file` に渡す）、`pr_body_sha256` を review / attestation 時の値と照合する。不一致または `decision` が変わった場合は merge せず re-review する
+- **post-merge の Task Context binding**: closing relation を持たない `Refs` PR は、orchestrator が fresh snapshot の `pullRequest.body` と entrypoint 結果の 7 key を `non_closing_authority`（snapshot の top-level key）として添えた場合に限り、`--phase merged` / `--phase completed` で対象 Issue に bind できる（`docs/dev/task-context.md` と `.claude/skills/post-merge-cleanup/SKILL.md`）。worktree / branch 削除を実行する `cleanup_exec.py::_verify_linked_issue` の closing relation 非依存認可は別 Outcome（#2891）が所有し、それまで `Refs`-bound PR の削除系 cleanup は `LINKED_ISSUE_MISMATCH` で安全側（削除なし）に停止する
+- `impl-review-loop` の intake における context URL の provenance 判定（`build_intake_capsule.py`）は `Refs`-only PR に対し引き続き fail-closed であり、本節の対象外
+
 ## Issue / PR 種別とテンプレート
 
 ### Issue テンプレート（`.github/ISSUE_TEMPLATE/`）
