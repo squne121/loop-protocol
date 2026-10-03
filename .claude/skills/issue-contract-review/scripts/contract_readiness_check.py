@@ -1117,6 +1117,114 @@ _PREFLIGHT_CATEGORY_TO_READINESS: dict[str, str] = {
 }
 
 
+# Issue #2897: operator-only VC timeout identity pass-through (readiness
+# producer side). Everything below only COPIES identity / applied-budget
+# information a `baseline_vc_preflight/v1` result item already carries; it
+# never estimates, recomputes, or back-derives (e.g. from `duration_ms`) a
+# budget, and never re-reads the history store. The same bounded vocabulary
+# is re-validated independently by the review-merge consumer
+# (`check_issue_contract.py::build_timeout_diagnostics()`), because the
+# readiness result crosses a process / file boundary between the two.
+_TIMEOUT_PROVENANCE_SOURCES = frozenset(
+    {"explicit_override", "static_policy", "static_fallback", "history_estimate"}
+)
+_SHA256_PREFIXED_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_ESTIMATOR_VERSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+_MAX_PROVENANCE_SECONDS = 86_400
+
+
+def _is_plain_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _bounded_sha256(value: Any) -> Optional[str]:
+    """Return `value` only if it is a `sha256:<64 lowercase hex>` string."""
+    if isinstance(value, str) and _SHA256_PREFIXED_RE.match(value):
+        return value
+    return None
+
+
+def _bounded_timeout_provenance(raw: Any) -> Optional[dict]:
+    """Allowlist-copy an existing result item's `timeout_provenance`.
+
+    Returns `None` (never a partially trusted dict) unless all five known
+    fields are present with their bounded types / enumerated values.
+    """
+    if not isinstance(raw, dict):
+        return None
+    timeout_seconds = raw.get("timeout_seconds")
+    cleanup_tail_seconds = raw.get("cleanup_tail_seconds")
+    source = raw.get("source")
+    estimator_version = raw.get("estimator_version")
+    estimator_input_digest = _bounded_sha256(raw.get("estimator_input_digest"))
+    if not (_is_plain_int(timeout_seconds) and 0 < timeout_seconds <= _MAX_PROVENANCE_SECONDS):
+        return None
+    if not (_is_plain_int(cleanup_tail_seconds) and 0 <= cleanup_tail_seconds <= _MAX_PROVENANCE_SECONDS):
+        return None
+    # Type first: an unhashable (list / dict) value must degrade to `None`,
+    # not raise `TypeError` from the frozenset membership test.
+    if not isinstance(source, str) or source not in _TIMEOUT_PROVENANCE_SOURCES:
+        return None
+    if not (isinstance(estimator_version, str) and _ESTIMATOR_VERSION_RE.match(estimator_version)):
+        return None
+    if estimator_input_digest is None:
+        return None
+    return {
+        "timeout_seconds": timeout_seconds,
+        "cleanup_tail_seconds": cleanup_tail_seconds,
+        "source": source,
+        "estimator_version": estimator_version,
+        "estimator_input_digest": estimator_input_digest,
+    }
+
+
+def extract_canonical_plan_binding(preflight_result: Optional[dict]) -> dict:
+    """Read the canonical VC plan digest and the pre-filter `results` count
+    from an existing `baseline_vc_preflight/v1` payload (Issue #2897 In Scope
+    (g)).
+
+    The digest source is exclusively the payload's own
+    `diagnostic_report.canonical_plan_digest`. An early-return / static path
+    reports `diagnostic_report.status == "not_computed"`; the digest is then
+    `None` and is never filled in from the body or the current history.
+    """
+    results = (preflight_result or {}).get("results")
+    results_count = len(results) if isinstance(results, list) else 0
+    report = (preflight_result or {}).get("diagnostic_report")
+    digest: Optional[str] = None
+    if isinstance(report, dict) and report.get("status") != "not_computed":
+        digest = _bounded_sha256(report.get("canonical_plan_digest"))
+    return {"canonical_plan_digest": digest, "results_count": results_count}
+
+
+def _result_item_occurrence_identity(index: int, r: dict, plan_digest: Optional[str]) -> dict:
+    """Allowlisted identity / applied-budget fields for one result item."""
+    runner = r.get("runner")
+    if runner == "exec":
+        execution_source = "executed"
+    elif runner == "dedup_replay":
+        execution_source = "dedup_replay"
+    else:
+        execution_source = "unknown"
+    dedup = r.get("dedup")
+    dedup_source_index = dedup.get("source_result_index") if isinstance(dedup, dict) else None
+    return {
+        # Canonical occurrence index: the position of this item in the
+        # UNFILTERED `results` array (primary identifier).
+        "occurrence_index": index,
+        # `line` is relative to its fenced block, not to the whole body; it
+        # is an auxiliary display value only.
+        "line_coordinate": "block_relative",
+        "execution_key_hash": _bounded_sha256(r.get("execution_key_hash")),
+        "execution_source": execution_source,
+        "dedup_source_result_index": (
+            dedup_source_index if _is_plain_int(dedup_source_index) else None
+        ),
+        "timeout_provenance": _bounded_timeout_provenance(r.get("timeout_provenance")),
+        "canonical_plan_digest": plan_digest,
+    }
+
+
 def map_preflight_result_to_errors(
     preflight_result: dict,
 ) -> tuple[list[dict], str]:
@@ -1238,7 +1346,13 @@ def map_preflight_result_to_errors(
             aggregate = _raise_status(aggregate, readiness_status)
         return errors, aggregate
 
-    for r in preflight_result.get("results", []):
+    # Issue #2897: canonical plan digest, read once from the existing
+    # preflight payload (never recomputed from the body / current history).
+    _plan_digest = extract_canonical_plan_binding(preflight_result)["canonical_plan_digest"]
+
+    # `enumerate()` runs over the UNFILTERED results array, so `occurrence_index`
+    # below is the canonical result order, not a position among emitted errors.
+    for _occurrence_index, r in enumerate(preflight_result.get("results", [])):
         classification = r.get("classification", "")
         category = r.get("category", "")
         decision = r.get("decision", "go")
@@ -1319,6 +1433,11 @@ def map_preflight_result_to_errors(
                         "repair": r.get("repair"),
                         "annotations": r.get("annotations"),
                         "runner_env_delta": r.get("runner_env_delta", {}),
+                        # Issue #2897: allowlisted identity / applied-budget
+                        # pass-through (see `_result_item_occurrence_identity`).
+                        **_result_item_occurrence_identity(
+                            _occurrence_index, r, _plan_digest
+                        ),
                     },
                 }
             )
@@ -2211,7 +2330,7 @@ def build_result(
         fix_hint = first_error.get("fix_hint")
         minimal_context = first_error.get("minimal_context", [])
 
-    return {
+    result: dict = {
         "schema": "ISSUE_CONTRACT_READINESS_RESULT_V1",
         "status": overall_status,
         "body_sha256": body_sha256,
@@ -2220,6 +2339,15 @@ def build_result(
         "minimal_context": minimal_context,
         "fix_hint": fix_hint,
     }
+    if preflight_result is not None:
+        # Issue #2897 In Scope (g): carry the canonical VC plan digest and
+        # the pre-filter `results` count to the top level so the review merge
+        # can bind each timeout occurrence by comparing values inside this
+        # one readiness result (no recomputation downstream). `None` digest
+        # means the preflight payload reported `diagnostic_report:
+        # not_computed`.
+        result.update(extract_canonical_plan_binding(preflight_result))
+    return result
 
 
 # ---------------------------------------------------------------------------
