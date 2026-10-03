@@ -7,7 +7,9 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -1657,7 +1659,14 @@ def step4_persist_vc_adjudication(
     blocking, or unresolved adjudications are never written, so a later
     ``step4_gate_from_loop_state()`` lookup can only ever reuse a genuinely
     valid adjudication (Issue #88 AC5: "valid adjudication のみ再利用").
-    Returns the (possibly unmodified) ``loop_state`` for convenience.
+    Issue #2837 invalidation: the binding key is computed from the
+    caller-supplied binding arguments, never from the result. When the new
+    result does not open the gate, any existing entry stored under that same
+    key is removed, so a previously persisted PASS can never be consumed as
+    evidence after a canonical re-verification of the same binding was
+    blocking / malformed / indeterminate. No time-based TTL or new ledger is
+    introduced; entries for other binding keys are left untouched.
+    Returns the (possibly modified) ``loop_state`` for convenience.
     """
     self_check = evaluate_step4_vc_gate(
         adjudication_result,
@@ -1665,16 +1674,320 @@ def step4_persist_vc_adjudication(
         expected_contract_body_sha256=contract_body_sha256,
         expected_command_hashes=command_hashes,
     )
-    if not self_check["invoke_pr_reviewer"]:
-        return loop_state
-    entries = loop_state.setdefault("vc_adjudication", {})
     binding_key = step4_binding_key(
         head_sha=head_sha,
         contract_body_sha256=contract_body_sha256,
         command_hashes=command_hashes,
     )
+    if not self_check["invoke_pr_reviewer"]:
+        existing = loop_state.get("vc_adjudication")
+        if isinstance(existing, dict):
+            existing.pop(binding_key, None)
+        return loop_state
+    entries = loop_state.setdefault("vc_adjudication", {})
     entries[binding_key] = adjudication_result
     return loop_state
+
+
+# --- Issue #2837: production wiring of the independent-VC consumer -----------
+#
+# ``step4-adjudicate`` (adapt -> adjudicate -> persist -> gate in one process,
+# plus the only writer of ``loop_state["dispatch"]``) and
+# ``step5-terminal-gate`` (terminal approval composition point). No new schema
+# family, ledger, TTL, hook, or route constant is introduced here: only the
+# existing ``vc_adjudication`` mapping plus the single ``dispatch`` key
+# (``binding_key`` / ``seq``) is persisted, and the route decision itself is
+# produced by the existing public wrapper in route_loop_verdict_v2.py.
+
+REASON_VC_GATE_BLOCKING = "vc_gate_blocking"
+REASON_DISPATCH_SEQ_MISMATCH = "dispatch_seq_mismatch"
+REASON_BINDING_CHANGED_SINCE_DISPATCH = "binding_changed_since_dispatch"
+
+_ROUTE_MODULE_PATH = Path(__file__).resolve().parent / "route_loop_verdict_v2.py"
+_ROUTE_MODULE_UNIQUE_NAME = "route_loop_verdict_v2_loaded_by_adjudicate_vc_result"
+_ROUTE_MODULE: Any = None
+
+
+def _load_route_module() -> Any:
+    """Load route_loop_verdict_v2.py under a unique module name.
+
+    A bare ``import route_loop_verdict_v2`` can collide with another file of
+    the same name inside a shared pytest session (sys.modules cache), so the
+    module is loaded by path. Only the public ``ROUTE_*`` constants and the
+    public wrapper ``route_loop_verdict_v2_resolve_semantic_ambiguity()`` are
+    used; ``RouteDecision`` / ``_decision`` internals are not depended on.
+    """
+    global _ROUTE_MODULE
+    if _ROUTE_MODULE is not None:
+        return _ROUTE_MODULE
+    spec = importlib.util.spec_from_file_location(_ROUTE_MODULE_UNIQUE_NAME, _ROUTE_MODULE_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError("route_loop_verdict_v2_unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_ROUTE_MODULE_UNIQUE_NAME] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(_ROUTE_MODULE_UNIQUE_NAME, None)
+        raise
+    _ROUTE_MODULE = module
+    return module
+
+
+def _is_positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _dispatch_record(loop_state: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the well-formed ``loop_state["dispatch"]`` mapping, else None."""
+    dispatch = loop_state.get("dispatch")
+    if not isinstance(dispatch, dict):
+        return None
+    binding_key = dispatch.get("binding_key")
+    if not isinstance(binding_key, str) or not binding_key:
+        return None
+    if not _is_positive_int(dispatch.get("seq")):
+        return None
+    return dispatch
+
+
+def _record_dispatch(loop_state: dict[str, Any], *, binding_key: str) -> int:
+    """Advance ``loop_state["dispatch"]`` by one invoke and return the new seq."""
+    previous = _dispatch_record(loop_state)
+    seq = (previous["seq"] if previous is not None else 0) + 1
+    loop_state["dispatch"] = {"binding_key": binding_key, "seq": seq}
+    return seq
+
+
+def step4_adjudicate(
+    loop_state: dict[str, Any],
+    *,
+    expected_head_sha: str,
+    expected_contract_body_sha256: str,
+    expected_command_hashes: list[str],
+    test_verdict: Any = None,
+    test_verdict_errors: list[str] | None = None,
+    contract_snapshot: Any = None,
+    contract_snapshot_errors: list[str] | None = None,
+    diff_summary: Any = None,
+    diff_summary_errors: list[str] | None = None,
+    allowed_paths: list[str] | None = None,
+    allowed_paths_errors: list[str] | None = None,
+    expected_issue_number: Any = None,
+    expected_pr_number: Any = None,
+    require_producer_receipt: bool = False,
+    reuse_stored: bool = False,
+) -> tuple[int, dict[str, Any]]:
+    """adapt -> adjudicate -> persist -> gate in a single process (Issue #2837).
+
+    Mutates ``loop_state`` in place and returns ``(exit_code, payload)``:
+    0 = invoke (a reviewer dispatch is permitted and recorded under
+    ``loop_state["dispatch"]``), 1 = rerun. Exit code 2 (malformed CLI input)
+    is decided by the caller before this function runs.
+
+    The binding key used for persistence / invalidation is computed from the
+    caller-supplied expected arguments, not from the result, so every
+    non-opening outcome (adapt errors, indeterminate adjudication, missing
+    test-verdict, blocking result) removes an existing PASS stored under the
+    same key. The full (pre-compaction) adjudication result is handed to
+    persist; no intermediate file is involved.
+
+    ``reuse_stored=True`` skips adapt / adjudicate / invalidation entirely and
+    only re-evaluates the stored PASS for the caller-supplied binding.
+    """
+    expected_hashes = list(expected_command_hashes)
+    binding_key = step4_binding_key(
+        head_sha=expected_head_sha,
+        contract_body_sha256=expected_contract_body_sha256,
+        command_hashes=expected_hashes,
+    )
+
+    def _payload(decision: dict[str, Any], *, seq: int | None, summary: dict[str, Any] | None) -> dict[str, Any]:
+        payload = dict(decision)
+        payload["binding_key"] = binding_key
+        payload["seq"] = seq
+        if summary is not None:
+            payload["adjudication"] = summary
+        return payload
+
+    if reuse_stored:
+        decision = step4_gate_from_loop_state(
+            loop_state,
+            expected_head_sha=expected_head_sha,
+            expected_contract_body_sha256=expected_contract_body_sha256,
+            expected_command_hashes=expected_hashes,
+        )
+        if not decision["invoke_pr_reviewer"]:
+            return 1, _payload(decision, seq=None, summary=None)
+        seq = _record_dispatch(loop_state, binding_key=binding_key)
+        return 0, _payload(decision, seq=seq, summary=None)
+
+    adjudication: dict[str, Any] | None = None
+    summary: dict[str, Any] | None = None
+    input_errors: list[str] = []
+    if test_verdict_errors:
+        # Missing / unreadable test-runner report: no adapt, no adjudication.
+        input_errors = list(test_verdict_errors)
+        summary = {"overall_status": "indeterminate", "blocking": True, "errors": input_errors}
+    else:
+        verdict_payload = test_verdict
+        if isinstance(verdict_payload, dict) and isinstance(verdict_payload.get("TEST_VERDICT"), dict):
+            verdict_payload = verdict_payload["TEST_VERDICT"]
+        converted, adapt_errors = adapt_test_verdict_to_current_vc_result(test_verdict)
+        if converted is None or adapt_errors:
+            input_errors = ["adapt_failed", *(adapt_errors or [])]
+            summary = {"overall_status": "indeterminate", "blocking": True, "errors": input_errors}
+        else:
+            adjudication = adjudicate_vc_result(
+                contract_snapshot=contract_snapshot,
+                current_vc_result=converted,
+                diff_summary=diff_summary,
+                allowed_paths=allowed_paths,
+                test_verdict=verdict_payload,
+                require_producer_receipt=require_producer_receipt,
+                expected_issue_number=expected_issue_number,
+                expected_pr_number=expected_pr_number,
+            )
+            for extra in (
+                contract_snapshot_errors,
+                diff_summary_errors,
+                allowed_paths_errors,
+            ):
+                adjudication["errors"].extend(extra or [])
+            if adjudication["errors"]:
+                adjudication["overall_status"] = "indeterminate"
+                adjudication["blocking"] = True
+                adjudication["rerun_required"] = True
+            summary = {
+                "overall_status": adjudication["overall_status"],
+                "blocking": adjudication["blocking"],
+                "errors": list(adjudication["errors"]),
+            }
+
+    step4_persist_vc_adjudication(
+        loop_state,
+        head_sha=expected_head_sha,
+        contract_body_sha256=expected_contract_body_sha256,
+        command_hashes=expected_hashes,
+        adjudication_result=adjudication if adjudication is not None else {},
+    )
+    decision = step4_gate_from_loop_state(
+        loop_state,
+        expected_head_sha=expected_head_sha,
+        expected_contract_body_sha256=expected_contract_body_sha256,
+        expected_command_hashes=expected_hashes,
+    )
+    if not decision["invoke_pr_reviewer"]:
+        return 1, _payload(decision, seq=None, summary=summary)
+    seq = _record_dispatch(loop_state, binding_key=binding_key)
+    return 0, _payload(decision, seq=seq, summary=summary)
+
+
+def _plain_route_decision(decision: Any) -> dict[str, Any]:
+    """Serialize a RouteDecision-shaped object to plain JSON."""
+    return {
+        "route": decision.route,
+        "fail_closed": bool(decision.fail_closed),
+        "reason_code": decision.reason_code,
+        "selected_action": (
+            json.loads(json.dumps(dict(decision.selected_action)))
+            if decision.selected_action is not None
+            else None
+        ),
+        "rerun_required": dict(decision.rerun_required),
+        "errors": list(decision.errors),
+    }
+
+
+def _continue_loop_decision(
+    reason_code: str, *, verification: bool, pr_review: bool, errors: list[str]
+) -> dict[str, Any]:
+    route_module = _load_route_module()
+    return {
+        "route": route_module.ROUTE_CONTINUE_LOOP,
+        "fail_closed": False,
+        "reason_code": reason_code,
+        "selected_action": None,
+        "rerun_required": {"verification": verification, "pr_review": pr_review},
+        "errors": errors,
+    }
+
+
+def step5_terminal_gate(
+    loop_state: dict[str, Any],
+    reviewer_verdict: Any,
+    live_mergeability: Any,
+    *,
+    expected_head_sha: str,
+    expected_contract_body_sha256: str,
+    expected_command_hashes: list[str],
+    dispatch_seq: int,
+    cwd: Any = None,
+) -> tuple[int, dict[str, Any]]:
+    """Terminal approval composition point (Issue #2837).
+
+    Returns ``(exit_code, route_decision_json)``: 0 = approved, 1 = anything
+    else (the route is output as-is, or ``continue_loop`` with one of the
+    gate reason codes). Evaluation order and reason_code priority:
+    ``dispatch_seq_mismatch`` -> ``binding_changed_since_dispatch`` ->
+    ``vc_gate_blocking``. Only a route that is already ``approved`` is
+    subject to these checks; any other route is passed through unchanged.
+    VC is never re-run here.
+    """
+    route_module = _load_route_module()
+    decision = route_module.route_loop_verdict_v2_resolve_semantic_ambiguity(
+        reviewer_verdict,
+        live_mergeability,
+        cwd=cwd if cwd is not None else _REPO_ROOT,
+    )
+    plain = _plain_route_decision(decision)
+    if plain["route"] != route_module.ROUTE_APPROVED:
+        return 1, plain
+
+    dispatch = _dispatch_record(loop_state)
+    if dispatch is None:
+        return 1, _continue_loop_decision(
+            REASON_DISPATCH_SEQ_MISMATCH,
+            verification=False,
+            pr_review=True,
+            errors=["dispatch_missing_or_malformed"],
+        )
+    if dispatch["seq"] != dispatch_seq:
+        return 1, _continue_loop_decision(
+            REASON_DISPATCH_SEQ_MISMATCH,
+            verification=False,
+            pr_review=True,
+            errors=[f"dispatch_seq_mismatch:reviewer_seq={dispatch_seq!r}:current_seq={dispatch['seq']!r}"],
+        )
+
+    live_binding_key = step4_binding_key(
+        head_sha=expected_head_sha,
+        contract_body_sha256=expected_contract_body_sha256,
+        command_hashes=list(expected_command_hashes),
+    )
+    if dispatch["binding_key"] != live_binding_key:
+        return 1, _continue_loop_decision(
+            REASON_BINDING_CHANGED_SINCE_DISPATCH,
+            verification=True,
+            pr_review=True,
+            errors=["dispatch_binding_key_differs_from_live_binding"],
+        )
+
+    gate = step4_gate_from_loop_state(
+        loop_state,
+        expected_head_sha=expected_head_sha,
+        expected_contract_body_sha256=expected_contract_body_sha256,
+        expected_command_hashes=list(expected_command_hashes),
+    )
+    if not gate["invoke_pr_reviewer"]:
+        return 1, _continue_loop_decision(
+            REASON_VC_GATE_BLOCKING,
+            verification=True,
+            pr_review=False,
+            errors=[f"vc_gate:{gate['reason_code']}"],
+        )
+    return 0, plain
+# --- end Issue #2837 production wiring ---------------------------------------
 
 
 def _compact_payload(payload: dict[str, Any], *, truncated: bool, omitted_fields: list[str]) -> dict[str, Any]:
@@ -1724,7 +2037,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "command",
         nargs="?",
         default="adjudicate",
-        choices=["adjudicate", "step4-gate", "adapt"],
+        choices=["adjudicate", "step4-gate", "adapt", "step4-adjudicate", "step5-terminal-gate"],
         help=(
             "adjudicate (default): classify a current VC result against the "
             "baseline contract snapshot. step4-gate (Issue #88 fix_delta "
@@ -1733,7 +2046,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "binding tuple, without re-running test-runner. adapt (Issue #88 "
             "fix_delta Blocker 1): convert a TEST_VERDICT_MACHINE/v2 report "
             "(--test-verdict-file) into the baseline_vc_preflight/v1 shape "
-            "accepted by --current-vc-result-file."
+            "accepted by --current-vc-result-file. step4-adjudicate (Issue "
+            "#2837): adapt -> adjudicate -> persist -> gate in one process, "
+            "the canonical Step 4 entrance that records the reviewer "
+            "dispatch (loop_state['dispatch']). step5-terminal-gate (Issue "
+            "#2837): terminal approval composition point (route + dispatch "
+            "seq/binding + VC gate)."
         ),
     )
     parser.add_argument("--contract-snapshot-file")
@@ -1787,6 +2105,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--adapt-out",
         help="adapt: path to write the converted baseline_vc_preflight/v1 JSON (default: stdout).",
     )
+    parser.add_argument(
+        "--reuse-stored",
+        action="store_true",
+        help=(
+            "step4-adjudicate: re-evaluate the stored PASS for the caller-supplied "
+            "binding without reading a test-runner report (no adapt / adjudicate / "
+            "invalidation); records the dispatch when the gate opens."
+        ),
+    )
+    parser.add_argument(
+        "--reviewer-verdict-file",
+        help="step5-terminal-gate: JSON reviewer_verdict (first input of route_loop_verdict_v2()).",
+    )
+    parser.add_argument(
+        "--live-mergeability-file",
+        help="step5-terminal-gate: JSON live_mergeability (second input of route_loop_verdict_v2()).",
+    )
+    parser.add_argument(
+        "--dispatch-seq",
+        type=int,
+        help=(
+            "step5-terminal-gate: the dispatch seq saved when the reviewer was "
+            "dispatched (never re-read from loop_state after resume)."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.command == "adjudicate":
         if not args.contract_snapshot_file or not args.current_vc_result_file:
@@ -1796,6 +2139,40 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     elif args.command == "adapt":
         if not args.test_verdict_file:
             parser.error("adapt requires --test-verdict-file")
+    elif args.command == "step4-adjudicate":
+        required = [
+            ("--loop-state-file", args.loop_state_file),
+            ("--expected-head-sha", args.expected_head_sha),
+            ("--expected-contract-body-sha256", args.expected_contract_body_sha256),
+            ("--expected-command-hashes-file", args.expected_command_hashes_file),
+        ]
+        if not args.reuse_stored:
+            required += [
+                ("--test-verdict-file", args.test_verdict_file),
+                ("--contract-snapshot-file", args.contract_snapshot_file),
+                ("--diff-summary-file", args.diff_summary_file),
+                ("--allowed-paths-file", args.allowed_paths_file),
+            ]
+        missing = [flag for flag, value in required if not value]
+        if missing:
+            parser.error(f"step4-adjudicate requires: {', '.join(missing)}")
+    elif args.command == "step5-terminal-gate":
+        missing = [
+            flag
+            for flag, value in (
+                ("--loop-state-file", args.loop_state_file),
+                ("--reviewer-verdict-file", args.reviewer_verdict_file),
+                ("--live-mergeability-file", args.live_mergeability_file),
+                ("--expected-head-sha", args.expected_head_sha),
+                ("--expected-contract-body-sha256", args.expected_contract_body_sha256),
+                ("--expected-command-hashes-file", args.expected_command_hashes_file),
+            )
+            if not value
+        ]
+        if args.dispatch_seq is None:
+            missing.append("--dispatch-seq")
+        if missing:
+            parser.error(f"step5-terminal-gate requires: {', '.join(missing)}")
     else:
         missing = [
             flag
@@ -1896,6 +2273,139 @@ def _run_step4_gate(args: argparse.Namespace) -> int:
     return 0 if decision["invoke_pr_reviewer"] else 1
 
 
+def _write_json_atomically(path: str, value: Any) -> None:
+    """Write ``value`` as JSON via a same-directory temp file + rename."""
+    target = Path(path)
+    directory = target.parent if str(target.parent) else Path(".")
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(directory))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(_canonical_json(value))
+            handle.write("\n")
+        os.replace(tmp_name, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _emit_malformed(reason_code: str, errors: list[str]) -> int:
+    sys.stdout.write(
+        _canonical_json({"invoke_pr_reviewer": False, "reason_code": reason_code, "errors": errors}) + "\n"
+    )
+    return 2
+
+
+def _load_loop_state_for_update(path: str, *, create_if_absent: bool) -> tuple[dict[str, Any] | None, list[str]]:
+    """Load LOOP_STATE for read-modify-write. An absent file is an empty
+    mapping when ``create_if_absent``; an unreadable / non-object file is an
+    error (the caller must not write anything)."""
+    if create_if_absent and not Path(path).exists():
+        return {}, []
+    loaded, errors = _load_json_file(path)
+    if errors:
+        return None, errors
+    if not isinstance(loaded, dict):
+        return None, ["loop_state_not_object"]
+    return loaded, []
+
+
+def _run_step4_adjudicate(args: argparse.Namespace) -> int:
+    """CLI entrypoint for `step4-adjudicate` (Issue #2837). Exit codes:
+    0 = invoke (dispatch permitted and recorded), 1 = rerun, 2 = malformed
+    (corrupt LOOP_STATE / expected-command-hashes; nothing is written)."""
+    loop_state, state_errors = _load_loop_state_for_update(args.loop_state_file, create_if_absent=True)
+    if loop_state is None:
+        return _emit_malformed("loop_state_malformed", state_errors)
+    if "dispatch" in loop_state and _dispatch_record(loop_state) is None:
+        return _emit_malformed("loop_state_dispatch_malformed", ["dispatch_missing_or_malformed"])
+    if "vc_adjudication" in loop_state and not isinstance(loop_state["vc_adjudication"], dict):
+        return _emit_malformed("loop_state_malformed", ["vc_adjudication_not_object"])
+
+    expected_hashes, hashes_errors = _load_json_file(args.expected_command_hashes_file)
+    if hashes_errors or not isinstance(expected_hashes, list) or not all(
+        isinstance(item, str) for item in expected_hashes
+    ):
+        return _emit_malformed(
+            "expected_command_hashes_malformed", hashes_errors or ["expected_command_hashes_not_string_list"]
+        )
+
+    if args.reuse_stored:
+        exit_code, payload = step4_adjudicate(
+            loop_state,
+            expected_head_sha=args.expected_head_sha,
+            expected_contract_body_sha256=args.expected_contract_body_sha256,
+            expected_command_hashes=expected_hashes,
+            reuse_stored=True,
+        )
+        if exit_code == 0:
+            _write_json_atomically(args.loop_state_file, loop_state)
+        sys.stdout.write(_canonical_json(payload) + "\n")
+        return exit_code
+
+    test_verdict, test_verdict_errors = _load_json_file(args.test_verdict_file)
+    contract_snapshot, contract_errors = _load_json_file(args.contract_snapshot_file)
+    diff_summary, diff_errors = _load_json_file(args.diff_summary_file)
+    allowed_paths, allowed_errors = _load_allowed_paths(args.allowed_paths_file)
+
+    exit_code, payload = step4_adjudicate(
+        loop_state,
+        expected_head_sha=args.expected_head_sha,
+        expected_contract_body_sha256=args.expected_contract_body_sha256,
+        expected_command_hashes=expected_hashes,
+        test_verdict=test_verdict,
+        test_verdict_errors=test_verdict_errors,
+        contract_snapshot=contract_snapshot,
+        contract_snapshot_errors=contract_errors,
+        diff_summary=diff_summary,
+        diff_summary_errors=diff_errors,
+        allowed_paths=allowed_paths,
+        allowed_paths_errors=allowed_errors,
+        expected_issue_number=args.expected_issue_number,
+        expected_pr_number=args.expected_pr_number,
+        require_producer_receipt=args.require_producer_receipt,
+    )
+    _write_json_atomically(args.loop_state_file, loop_state)
+    sys.stdout.write(_canonical_json(payload) + "\n")
+    return exit_code
+
+
+def _run_step5_terminal_gate(args: argparse.Namespace) -> int:
+    """CLI entrypoint for `step5-terminal-gate` (Issue #2837). Exit codes:
+    0 = approved, 1 = not approved (route JSON on stdout), 2 = malformed
+    (unreadable arguments or corrupt LOOP_STATE). Read-only."""
+    loop_state, state_errors = _load_loop_state_for_update(args.loop_state_file, create_if_absent=False)
+    if loop_state is None:
+        return _emit_malformed("loop_state_malformed", state_errors)
+    reviewer_verdict, verdict_errors = _load_json_file(args.reviewer_verdict_file)
+    if verdict_errors:
+        return _emit_malformed("reviewer_verdict_malformed", verdict_errors)
+    live_mergeability, live_errors = _load_json_file(args.live_mergeability_file)
+    if live_errors:
+        return _emit_malformed("live_mergeability_malformed", live_errors)
+    expected_hashes, hashes_errors = _load_json_file(args.expected_command_hashes_file)
+    if hashes_errors or not isinstance(expected_hashes, list) or not all(
+        isinstance(item, str) for item in expected_hashes
+    ):
+        return _emit_malformed(
+            "expected_command_hashes_malformed", hashes_errors or ["expected_command_hashes_not_string_list"]
+        )
+
+    exit_code, decision = step5_terminal_gate(
+        loop_state,
+        reviewer_verdict,
+        live_mergeability,
+        expected_head_sha=args.expected_head_sha,
+        expected_contract_body_sha256=args.expected_contract_body_sha256,
+        expected_command_hashes=expected_hashes,
+        dispatch_seq=args.dispatch_seq,
+    )
+    sys.stdout.write(_canonical_json(decision) + "\n")
+    return exit_code
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
@@ -1903,6 +2413,10 @@ def main(argv: list[str] | None = None) -> int:
         return _run_step4_gate(args)
     if args.command == "adapt":
         return _run_adapt(args)
+    if args.command == "step4-adjudicate":
+        return _run_step4_adjudicate(args)
+    if args.command == "step5-terminal-gate":
+        return _run_step5_terminal_gate(args)
 
     contract_snapshot, contract_errors = _load_json_file(args.contract_snapshot_file)
     current_vc_result, current_errors = _load_json_file(args.current_vc_result_file)

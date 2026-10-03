@@ -46,6 +46,33 @@ reviewer_verdict（`verdict`/`reviewed_head_sha`/`blockers`/`warnings`）と liv
 | `fail_closed`（`LOOP_STATE.iteration >= LOOP_STATE.max_iterations`） | `termination_reason: max_iterations` を立て、fail-close で人間判断 |
 | `fail_closed`（`concurrent_base_churn_budget_exhausted`） | `evidence_epoch.drift_rebind_attempts` が上限（既定 2、#2039/#1023 の bounded no-progress budget と同じ考え方）を超過。drift 起因の再試行を打ち切り `termination_reason: human_escalation` ではなく機械的な fail-closed 停止として人間判断を仰ぐ（#2102） |
 
+### terminal approval は `step5-terminal-gate` 経由に固定する（Issue #2837）
+
+上表の `approved` は、`step5-terminal-gate` が exit 0 を返した場合にのみ成立する。
+
+`termination_reason: approved` / `merge_ready: true` を確定する terminal approval は、`route_loop_verdict_v2()` を直接呼んだ結果ではなく、`adjudicate_vc_result.py step5-terminal-gate` の出力（exit 0 = approved）だけを根拠にする。この subcommand は既存の公開 wrapper `route_loop_verdict_v2_resolve_semantic_ambiguity()`（`main_drift` が `semantic_ambiguity` を省略している場合に実 git oracle で補完する現行の production 経路。caller が `semantic_ambiguity` を推測・固定値で渡してはならない）を呼んだうえで、route が `approved` の場合に限り次をすべて要求する。VC の再実行は行わず、新しい判定 schema・第二の分類器・新 route 定数も作らない。
+
+1. `--dispatch-seq` が `loop_state["dispatch"]["seq"]` と一致する（不一致、または `dispatch` が欠落・不正: `route: continue_loop` / `reason_code: dispatch_seq_mismatch` / `rerun_required.pr_review: true`）。
+2. `loop_state["dispatch"]["binding_key"]` が live の HEAD / Issue body SHA-256 / 順序付き command hashes から再計算した key と一致する（不一致: `continue_loop` / `binding_changed_since_dispatch` / `rerun_required` の `verification` と `pr_review` が true）。
+3. 当該 binding の VC adjudication が `step4_gate_from_loop_state()` で有効（無効: `continue_loop` / `vc_gate_blocking` / `rerun_required.verification: true`）。
+
+評価順序と `reason_code` の優先順位は `dispatch_seq_mismatch` -> `binding_changed_since_dispatch` -> `vc_gate_blocking` で固定である。`approved` 以外の route はそのまま出力される（`RouteDecision` と同形の plain JSON）。exit code は `0=approved` / `1=approved でない`（route を出力。`continue_loop` 等の通常分岐へ進む）/ `2=malformed`（引数不備、または破損した `loop_state`）。
+
+```bash
+uv run python3 .claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py step5-terminal-gate \
+  --loop-state-file "$LOOP_STATE_FILE" \
+  --reviewer-verdict-file "$REVIEWER_VERDICT" \
+  --live-mergeability-file "$LIVE_MERGEABILITY" \
+  --expected-head-sha "$LIVE_HEAD_SHA" \
+  --expected-contract-body-sha256 "$LIVE_BODY_SHA256" \
+  --expected-command-hashes-file "$EXPECTED_COMMAND_HASHES" \
+  --dispatch-seq "$(cat "$REVIEW_RESULT_DIR/dispatch_seq")"
+```
+
+`--dispatch-seq` には、reviewer を起動する **前** に root が reviewer 結果の保存先と同じ場所へ書き残した `seq`（`step-4-pr-review.md` 参照）を渡す。resume / compaction 後も `loop_state` の最新 `seq` を再読込して渡してはならない（再読込すると検査が空洞化する。reviewer 結果を dispatch に束縛する唯一の手段である）。新しい reviewer を起動し直した（`step4-adjudicate` が再び `invoke` を返した）場合は `seq` が進み、古い reviewer 結果は `dispatch_seq_mismatch` で拒否される。
+
+dispatch 後に HEAD / Issue body / VC binding（command hashes）のいずれかが変化した場合は、古い reviewer 結果で終端承認してはならない（`binding_changed_since_dispatch`）。この場合は `step-4-pr-review.md` の手順で VC を再検証し、新しい reviewer を起動して `seq` を進めてから Step 5 を再実行する。
+
 ### main drift の scope-clean reconciliation 再開（resume）手順（#2102）
 
 `route: route_scope_clean_reconciliation` は Step 5 を終了させず、`decision.selected_action`
