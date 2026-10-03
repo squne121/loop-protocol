@@ -1566,11 +1566,11 @@ class _OwnerRepoCountingRegex:
 
 
 class _OwnerRepoFinditerProxy:
-    """Stands in for ``_OWNER_REPO_HASH_RE``. The counting is enabled only while the
-    consumer's loop body runs (between the yield and the next ``next()``), so the
-    ``finditer`` scan itself (#2881) is excluded. Because this proxy replaces the module-level
-    ``_OWNER_REPO_HASH_RE``, every consumer of it is observed, not only the main owner/repo
-    loop: ``_path_token_spans()`` and the later ``owner_repo_spans`` construction as well."""
+    """Stands in for ``_OWNER_REPO_HASH_RE`` for the test-side reference / mutant functions that
+    call ``.finditer`` directly (since #2881 production no longer does: the production consumers
+    are observed through the ``_scan_owner_repo_hash`` patch in ``_measure_owner_repo_prefix_work``).
+    The counting is enabled only while the consumer's loop body runs (between the yield and the
+    next ``next()``), so the owner/repo scan itself (#2881) is excluded."""
 
     def __init__(self, real, state):
         self._real, self._state = real, state
@@ -1595,7 +1595,7 @@ class _OwnerRepoFinditerProxy:
 
 def _measure_owner_repo_prefix_work(monkeypatch, prompt, find_occurrences=None) -> dict[str, int]:
     """Run ``find_occurrences`` (default: the production ``_find_occurrences``) once on
-    ``prompt`` with the ``_OWNER_REPO_HASH_RE`` consumers instrumented; return the work counters.
+    ``prompt`` with the owner/repo scan consumers instrumented; return the work counters.
     ``loop_iterations`` counts matches yielded to all of those consumers (the main owner/repo
     loop plus the auxiliary scans), so it alone does not prove the main loop ran n times."""
     counters = {"copy_chars": 0, "lookup_work": 0, "unobserved_calls": 0, "loop_iterations": 0}
@@ -1604,6 +1604,25 @@ def _measure_owner_repo_prefix_work(monkeypatch, prompt, find_occurrences=None) 
     authority_text = counting_str(prompt)
 
     real_finditer_owner = classifier._OWNER_REPO_HASH_RE
+    real_scan_owner_repo = classifier._scan_owner_repo_hash
+
+    def _counting_scan_owner_repo(string):
+        # Issue #2881: production consumers (main loop, ``_path_token_spans()`` and the later
+        # ``owner_repo_spans`` construction) go through ``_scan_owner_repo_hash``; observe its
+        # yields with the same on/off toggling as ``_OwnerRepoFinditerProxy.finditer``.
+        iterator = real_scan_owner_repo(string)
+        try:
+            while True:
+                state["on"] = False
+                try:
+                    found = next(iterator)
+                except StopIteration:
+                    return
+                state["on"] = True
+                counters["loop_iterations"] += 1
+                yield found
+        finally:
+            state["on"] = False
 
     class _IterationCounter(_OwnerRepoFinditerProxy):
         def finditer(self, string, *args):
@@ -1613,6 +1632,7 @@ def _measure_owner_repo_prefix_work(monkeypatch, prompt, find_occurrences=None) 
 
     with monkeypatch.context() as patch:
         patch.setattr(classifier, "_OWNER_REPO_HASH_RE", _IterationCounter(real_finditer_owner, state))
+        patch.setattr(classifier, "_scan_owner_repo_hash", _counting_scan_owner_repo)
         patch.setattr(
             classifier, "_PR_PREFIX_RE", _OwnerRepoCountingRegex(classifier._PR_PREFIX_RE, counters, state)
         )
@@ -1810,3 +1830,453 @@ def test_given_twenty_char_boundary_counterexample_when_classified_then_slice_se
     assert not classifier._PR_PREFIX_RE.search(text, max(0, start - 20), start)  # pos/endpos 方式: issue
     (occurrence,) = classifier._find_occurrences(text, None)
     assert occurrence.target.ref_kind == "pr"
+
+
+# ---------------------------------------------------------------------------
+# Issue #2881: owner/repo 走査（`_OWNER_REPO_HASH_RE` 相当）の match 0 件入力に対する
+# 二乗経路の除去。
+#
+# 計数 test は production scanner が呼ぶ module-level の compiled regex（`_OWNER_REPO_*`）を
+# 計数ラッパへ差し替え、各呼び出しが実際に覆った区間（match 成立時は `match.end() - pos`、
+# search 失敗時は `endpos - pos`、match 失敗時は 0）に 1 呼び出しあたり 1 を加えた値を
+# work とする。`pos` から入力末尾までの名目長は使わない。実時間の閾値は使わない。
+# 観測できない呼び出し（ラッパが対応していない属性）は `unobserved_calls` に計上し 0 を assert する。
+#
+# Scope note: 計数対象は owner/repo 走査のみ。この test の PASS は scanner 全体 /
+# `classify()` / hook 全体の線形性を示さない（他の正規表現は未検証）。
+# ---------------------------------------------------------------------------
+
+_SCAN_WORK_CORPORA = [
+    ("a_dot_zero_match", lambda n: "a." * n),
+    ("a_slash_dense_zero_match", lambda n: "a/" * n + "#x"),
+]
+
+_SCAN_WORK_ENTRIES = {
+    "find_occurrences": lambda text: classifier._find_occurrences(text, _PERF_REPO),
+    "needs_current_repo_resolution": lambda text: classifier.needs_current_repo_resolution(text),
+}
+
+
+class _ScanWorkMeter:
+    def __init__(self):
+        self.work = 0
+        self.calls = 0
+        self.unobserved_calls = 0
+
+    def __repr__(self):
+        return f"meter(work={self.work}, calls={self.calls}, unobserved_calls={self.unobserved_calls})"
+
+
+class _CountingRegex:
+    """Counting proxy for a compiled regex. Supports ``search`` / ``match`` / ``fullmatch``;
+    any other attribute is forwarded but recorded as an unobserved call."""
+
+    def __init__(self, real, meter):
+        self._real, self._meter = real, meter
+
+    def _record(self, string, pos, endpos, found, scans_forward):
+        length = len(string)
+        stop = length if endpos is None else min(endpos, length)
+        if found is not None:
+            covered = found.end() - pos
+        elif scans_forward:
+            covered = stop - pos
+        else:
+            covered = 0
+        self._meter.calls += 1
+        self._meter.work += max(covered, 0) + 1
+
+    def search(self, string, pos=0, endpos=None):
+        found = self._real.search(string, pos, len(string) if endpos is None else endpos)
+        self._record(string, pos, endpos, found, scans_forward=True)
+        return found
+
+    def match(self, string, pos=0, endpos=None):
+        found = self._real.match(string, pos, len(string) if endpos is None else endpos)
+        self._record(string, pos, endpos, found, scans_forward=False)
+        return found
+
+    def fullmatch(self, string, pos=0, endpos=None):
+        found = self._real.fullmatch(string, pos, len(string) if endpos is None else endpos)
+        self._record(string, pos, endpos, found, scans_forward=False)
+        return found
+
+    def __getattr__(self, name):
+        self._meter.unobserved_calls += 1
+        return getattr(self._real, name)
+
+
+def _measure_production_scan_work(monkeypatch, entry, text):
+    """Run ``entry(text)`` with every module-level ``_OWNER_REPO_*`` compiled regex of the
+    classifier replaced by a counting proxy (this includes the legacy ``_OWNER_REPO_HASH_RE``:
+    a legacy ``.finditer`` use is unobservable and is reported as ``unobserved_calls``)."""
+    meter = _ScanWorkMeter()
+    with monkeypatch.context() as patch:
+        for name, value in list(vars(classifier).items()):
+            if name.startswith("_OWNER_REPO_") and isinstance(value, re.Pattern):
+                patch.setattr(classifier, name, _CountingRegex(value, meter))
+        entry(text)
+    return meter
+
+
+def _scan_work_pair(measure, build_prompt):
+    small = measure(build_prompt(_PERF_SMALL_N))
+    large = measure(build_prompt(_PERF_LARGE_N))
+    ratio = large.work / small.work if small.work else float("inf")
+    return small, large, ratio
+
+
+def _assert_scan_work_not_quadratic(small, large, ratio):
+    assert small.unobserved_calls == 0 and large.unobserved_calls == 0, (small, large)
+    assert small.work > 0 and large.work > 0, ("vacuous measurement", small, large)
+    assert ratio <= _PERF_MAX_RATIO, (
+        f"scan work grew {ratio:.2f}x (> {_PERF_MAX_RATIO}x) when the input doubled "
+        f"(n={_PERF_SMALL_N}->{_PERF_LARGE_N}): small={small} large={large}"
+    )
+
+
+@pytest.mark.parametrize("entry_name", list(_SCAN_WORK_ENTRIES))
+@pytest.mark.parametrize("corpus_name, build_prompt", _SCAN_WORK_CORPORA, ids=[name for name, _ in _SCAN_WORK_CORPORA])
+def test_given_zero_match_owner_repo_corpus_when_scanned_then_work_not_quadratic(
+    monkeypatch, corpus_name, build_prompt, entry_name
+):
+    entry = _SCAN_WORK_ENTRIES[entry_name]
+    small, large, ratio = _scan_work_pair(
+        lambda text: _measure_production_scan_work(monkeypatch, entry, text), build_prompt
+    )
+    _assert_scan_work_not_quadratic(small, large, ratio)
+
+
+@pytest.mark.parametrize("entry_name", list(_SCAN_WORK_ENTRIES))
+@pytest.mark.parametrize("corpus_name, build_prompt", _SCAN_WORK_CORPORA, ids=[name for name, _ in _SCAN_WORK_CORPORA])
+def test_given_owner_repo_work_counter_when_input_scanned_then_count_is_nonzero(
+    monkeypatch, corpus_name, build_prompt, entry_name
+):
+    entry = _SCAN_WORK_ENTRIES[entry_name]
+    for n in (_PERF_SMALL_N, _PERF_LARGE_N):
+        text = build_prompt(n)
+        assert isinstance(text, str) and type(text) is str  # plain str: no str subclass counting
+        meter = _measure_production_scan_work(monkeypatch, entry, text)
+        # 入力が実際に走査へ到達し計数が非ゼロである（slash なしの "a." * n を含む）。
+        assert meter.calls > 0 and meter.work > 0, (corpus_name, entry_name, n, meter)
+        # 計数に現れない（legacy `.finditer` 等の）呼び出しが残っていない。
+        assert meter.unobserved_calls == 0, (corpus_name, entry_name, n, meter)
+        # 計数は入力長に比例して実際の覆った区間を反映する（定数ではない）。
+        assert meter.work >= n, (corpus_name, entry_name, n, meter)
+
+
+# test-local の negative control。production code は変更せず、同じ計数 harness
+# （`_CountingRegex` / `_scan_work_pair` / `_assert_scan_work_not_quadratic`）に通す。
+_MODEL_START_RE = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z0-9_]")
+_MODEL_RUN_RE = re.compile(r"[A-Za-z0-9_.-]+")
+_MODEL_SLASH_RE = re.compile(r"/")
+_MODEL_PREFIX_RE = re.compile(r"[A-Za-z0-9_./-]*")
+
+
+def _measure_old_regex_candidate_model(text):
+    """旧 regex の candidate-start -> delimiter 探索の model: 各候補開始位置から区切り（"/"）を
+    探して run の末尾まで進み、失敗しても次の位置から再開する（run を飛ばさない）。"""
+    meter = _ScanWorkMeter()
+    start_re = _CountingRegex(_MODEL_START_RE, meter)
+    run_re = _CountingRegex(_MODEL_RUN_RE, meter)
+    pos = 0
+    while True:
+        candidate = start_re.search(text, pos)
+        if candidate is None:
+            return meter
+        run_re.match(text, candidate.start())
+        pos = candidate.start() + 1
+
+
+def _measure_per_slash_prefix_rescan_mutant(text):
+    """各 slash ごとに prefix を先頭から再走査する mutant。"""
+    meter = _ScanWorkMeter()
+    slash_re = _CountingRegex(_MODEL_SLASH_RE, meter)
+    prefix_re = _CountingRegex(_MODEL_PREFIX_RE, meter)
+    pos = 0
+    while True:
+        slash = slash_re.search(text, pos)
+        if slash is None:
+            return meter
+        prefix_re.match(text, 0, slash.start())
+        pos = slash.end()
+
+
+def test_given_old_regex_model_and_per_slash_rescan_mutant_when_measured_by_same_harness_then_work_ratio_exceeds_bound(
+    monkeypatch,
+):
+    controls = [
+        ("old_regex_candidate_start_model", _measure_old_regex_candidate_model, "a_dot_zero_match"),
+        ("per_slash_prefix_rescan_mutant", _measure_per_slash_prefix_rescan_mutant, "a_slash_dense_zero_match"),
+    ]
+    builders = dict(_SCAN_WORK_CORPORA)
+    # positive control: 同じ harness / 同じ ratio assertion を通して production scanner は上限内
+    # （harness が全入力を落とすだけの assertion ではないことを示す）。
+    for corpus_name, build_prompt in _SCAN_WORK_CORPORA:
+        small, large, ratio = _scan_work_pair(
+            lambda text: _measure_production_scan_work(monkeypatch, _SCAN_WORK_ENTRIES["find_occurrences"], text),
+            build_prompt,
+        )
+        _assert_scan_work_not_quadratic(small, large, ratio)
+    for control_name, measure, corpus_name in controls:
+        small, large, ratio = _scan_work_pair(measure, builders[corpus_name])
+        # vacuous ではない（計数は非ゼロ、未観測呼び出しなし）うえで、比が上限を超える。
+        assert small.work > 0 and large.work > 0 and small.unobserved_calls == 0, (control_name, small, large)
+        assert ratio > _PERF_MAX_RATIO, (control_name, ratio, small, large)
+        # production と同じ ratio assertion 自体が ratio 超過で失敗する（collection error ではない）。
+        with pytest.raises(AssertionError, match="scan work grew"):
+            _assert_scan_work_not_quadratic(small, large, ratio)
+
+
+# pre-#2881 behavioral oracle。production に追従して編集しない
+_FROZEN_OWNER_REPO_ORACLE_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?=[A-Za-z0-9_])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)(?![\dA-Za-z_])"
+)
+
+
+def _frozen_owner_repo_matches(text):
+    return [(m.span(), m.group(1), m.group(2)) for m in _FROZEN_OWNER_REPO_ORACLE_RE.finditer(text)]
+
+
+def _frozen_path_token_spans(text):
+    """pre-#2881 ``_path_token_spans`` の凍結コピー（owner/repo 列挙は凍結 oracle のみを通す）。"""
+    spans = []
+    if "#" not in text or "/" not in text:
+        return spans
+    recognised = sorted(
+        [m.span() for m in classifier._GITHUB_URL_RE.finditer(text)]
+        + [m.span() for m in _FROZEN_OWNER_REPO_ORACLE_RE.finditer(text)]
+    )
+    cursor = 0
+    for token in classifier._PATH_TOKEN_RE.finditer(text):
+        while cursor < len(recognised) and recognised[cursor][1] <= token.start():
+            cursor += 1
+        seg_start = token.start()
+        index = cursor
+        while True:
+            while index < len(recognised) and recognised[index][0] < seg_start:
+                index += 1
+            boundary = recognised[index] if index < len(recognised) and recognised[index][0] < token.end() else None
+            seg_end = boundary[0] if boundary else token.end()
+            slash = text.find("/", seg_start, seg_end)
+            if slash != -1:
+                spans.append((slash, seg_end))
+            if boundary is None:
+                break
+            seg_start = boundary[1]
+            index += 1
+            if seg_start >= token.end():
+                break
+    return spans
+
+
+def _frozen_find_occurrences(authority_text, current_repo):
+    """pre-#2881 ``_find_occurrences`` の凍結コピー（naive な prefix 処理。意味論は #2875 前後で同一）。
+    owner/repo の列挙は凍結 oracle のみを通し、production の regex / scanner を参照しない。"""
+    occurrences = []
+
+    for match in classifier._GITHUB_URL_RE.finditer(authority_text):
+        repo, kind_word, number = match.group(1), match.group(2), int(match.group(3))
+        ref_kind = "pr" if kind_word.lower() == "pull" else "issue"
+        target = classifier.Target(repo=repo, ref_kind=ref_kind, ref_number=number, explicit_repo=True)
+        occurrences.append(classifier._Occurrence(target, match.start(), match.end(), classifier.REF_FORM_EXPLICIT))
+
+    for match in _FROZEN_OWNER_REPO_ORACLE_RE.finditer(authority_text):
+        repo, number = match.group(1), int(match.group(2))
+        prefix = authority_text[: match.start()]
+        ref_kind = "pr" if classifier._PR_PREFIX_RE.search(prefix.split("/")[0][-20:] or "") else "issue"
+        target = classifier.Target(repo=repo, ref_kind=ref_kind, ref_number=number, explicit_repo=True)
+        occurrences.append(classifier._Occurrence(target, match.start(), match.end(), classifier.REF_FORM_EXPLICIT))
+
+    path_spans = _frozen_path_token_spans(authority_text)
+    for match in classifier._BARE_HASH_RE.finditer(authority_text):
+        start = match.start()
+        if start > 0 and authority_text[start - 1] == "/":
+            continue
+        if classifier._inside_path_token(start, path_spans):
+            continue
+        number = int(match.group(1))
+        prefix = authority_text[max(0, start - 20) : start]
+        is_pr = bool(classifier._PR_PREFIX_RE.search(prefix))
+        ref_kind = "pr" if is_pr else "issue"
+        form = (
+            classifier.REF_FORM_PREFIXED
+            if (is_pr or classifier._ISSUE_PREFIX_RE.search(prefix))
+            else classifier.REF_FORM_BARE
+        )
+        target = classifier.Target(repo=current_repo, ref_kind=ref_kind, ref_number=number, explicit_repo=False)
+        occurrences.append(classifier._Occurrence(target, match.start(), match.end(), form))
+
+    owner_repo_spans = [m.span() for m in _FROZEN_OWNER_REPO_ORACLE_RE.finditer(authority_text)]
+    for match in classifier._ADJACENT_PREFIX_HASH_RE.finditer(authority_text):
+        if classifier._inside_any_span(match.start(), owner_repo_spans):
+            continue
+        if classifier._inside_path_token(match.end(1), path_spans):
+            continue
+        ref_kind = "issue" if match.group(1).lower() == "issue" else "pr"
+        target = classifier.Target(
+            repo=current_repo, ref_kind=ref_kind, ref_number=int(match.group(2)), explicit_repo=False
+        )
+        occurrences.append(classifier._Occurrence(target, match.start(), match.end(), classifier.REF_FORM_PREFIXED))
+
+    return occurrences
+
+
+def _frozen_needs_current_repo_resolution(prompt):
+    """pre-#2881 ``needs_current_repo_resolution`` の凍結コピー。"""
+    if not prompt:
+        return False
+    slash_match = classifier._SLASH_TASK_RE.match(prompt)
+    if slash_match:
+        raw_target = (slash_match.group(1) or "").strip()
+        if not raw_target:
+            return False
+        if classifier._EXPLICIT_TARGET_URL_RE.match(raw_target) or classifier._EXPLICIT_TARGET_OWNER_REPO_RE.match(
+            raw_target
+        ):
+            return False
+        return bool(
+            classifier._EXPLICIT_TARGET_BARE_RE.match(raw_target)
+            or classifier._EXPLICIT_TARGET_KIND_WORD_RE.match(raw_target)
+        )
+    authority_text = classifier._strip_authority_exclusions(prompt)
+    path_spans = _frozen_path_token_spans(authority_text)
+    for match in classifier._BARE_HASH_RE.finditer(authority_text):
+        start = match.start()
+        if start > 0 and authority_text[start - 1] == "/":
+            continue
+        if classifier._inside_path_token(start, path_spans):
+            continue
+        return True
+    owner_repo_spans = [m.span() for m in _FROZEN_OWNER_REPO_ORACLE_RE.finditer(authority_text)]
+    return any(
+        not classifier._inside_any_span(match.start(), owner_repo_spans)
+        and not classifier._inside_path_token(match.end(1), path_spans)
+        for match in classifier._ADJACENT_PREFIX_HASH_RE.finditer(authority_text)
+    )
+
+
+# 等価 test 用 corpus は小さい n（凍結 oracle は "a." * n で二乗のため数千以下）。
+_FROZEN_ORACLE_N = 2000
+_FROZEN_ORACLE_CORPUS = [
+    "a.b/c.d#1",
+    ".a/b#1",
+    "-a/b#1",
+    "x o/r#1 y a/b#2、c.d/e-f#3 z",
+    "",
+    "o/r#１",
+    "o/r#²",
+    "o/r#1²",
+    "a/b/c#1",
+    "a/b/c/d#1",
+    "a//b#1",
+    "a/b#1/c/d#2",
+    "o/r#1、" * 200,
+    "a." * _FROZEN_ORACLE_N,
+    "a/" * _FROZEN_ORACLE_N + "#x",
+    # 補助: 境界 / 他 consumer との相互作用
+    "a/b#1a",
+    "a/b#1_",
+    "a/b#",
+    "/b#1",
+    "a/#1",
+    "o/r#1.2 o/r#3-x",
+    "o/r#1-a/b#2",
+    "a./b#1 -./-b#2",
+    "pr o/r#1 Issue#12 PR#34",
+    "owner/my-issue#12",
+    "src/ファイル#12 と #13",
+    "https://github.com/o/r/issues/5 and o/r#6 #7",
+    "see src/あ.py と o/r#2。#3",
+    "/task o/r#4",
+    "/task #4",
+    "_a/b#1 x_a/b#2",
+]
+
+
+def test_given_owner_repo_corpus_when_find_occurrences_then_same_as_frozen_oracle():
+    scan = getattr(classifier, "_scan_owner_repo_hash", None)
+    assert scan is not None, "shared owner/repo scanner (_scan_owner_repo_hash) is missing"
+
+    match_counts = set()
+    for text in _FROZEN_ORACLE_CORPUS:
+        expected_matches = _frozen_owner_repo_matches(text)
+        actual_matches = [(m.span(), m.group(1), m.group(2)) for m in scan(text)]
+        assert actual_matches == expected_matches, text[:60]
+        match_counts.add(min(len(expected_matches), 2))
+
+        assert classifier._path_token_spans(text) == _frozen_path_token_spans(text), text[:60]
+        assert classifier.needs_current_repo_resolution(text) == _frozen_needs_current_repo_resolution(text), text[:60]
+        for current_repo in (None, _PERF_REPO):
+            # 順序・form・target・span を含む出力全体の完全一致（期待値は oracle から得る）。
+            assert classifier._find_occurrences(text, current_repo) == _frozen_find_occurrences(
+                text, current_repo
+            ), text[:60]
+
+    # 非 vacuous: corpus は 0 件 / 1 件 / 複数件の owner/repo match を実際に生む。
+    assert match_counts == {0, 1, 2}
+
+
+def test_given_random_owner_repo_fragments_when_scanned_then_same_as_frozen_oracle():
+    scan = getattr(classifier, "_scan_owner_repo_hash", None)
+    assert scan is not None, "shared owner/repo scanner (_scan_owner_repo_hash) is missing"
+
+    import random
+
+    rng = random.Random(2881)
+    fragments = ["a", "B", "1", "_", ".", "-", "/", "#", "１", "²", "、", " ", "o/r#1", "pr ", "Issue", "x/y#２"]
+    seen_matches = 0
+    for _ in range(4000):
+        text = "".join(rng.choice(fragments) for _ in range(rng.randint(0, 12)))
+        expected_matches = _frozen_owner_repo_matches(text)
+        actual_matches = [(m.span(), m.group(1), m.group(2)) for m in scan(text)]
+        assert actual_matches == expected_matches, text
+        seen_matches += len(expected_matches)
+        assert classifier._find_occurrences(text, _PERF_REPO) == _frozen_find_occurrences(text, _PERF_REPO), text
+        assert classifier.needs_current_repo_resolution(text) == _frozen_needs_current_repo_resolution(text), text
+    assert seen_matches > 100
+
+
+class _FinditerSentinel:
+    """Stands in for ``_OWNER_REPO_HASH_RE``: only ``.finditer`` raises; every other attribute
+    (``.match`` / ``.search`` / ``.pattern`` ...) is forwarded to the real compiled regex."""
+
+    def __init__(self, real):
+        self._real = real
+
+    def finditer(self, *args, **kwargs):
+        raise AssertionError("legacy _OWNER_REPO_HASH_RE.finditer was called by a production consumer")
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_given_legacy_finditer_sentinel_when_production_consumers_run_then_no_direct_finditer_use(monkeypatch):
+    # `_OWNER_REPO_HASH_RE` 定数は定義が残る（既存 test の seam が解決できる）。
+    assert isinstance(classifier._OWNER_REPO_HASH_RE, re.Pattern)
+    prompts = [
+        "a.b/c.d#1",
+        "x o/r#1 y a/b#2、c.d/e-f#3 z",
+        "a/b/c#1 と a/b#1/c/d#2",
+        "a." * 50,
+        "a/" * 50 + "#x",
+        "o/r#1、" * 20,
+        "Issue#12 owner/my-issue#12 src/ファイル#12",
+        "",
+    ]
+    expected = [
+        (
+            classifier._find_occurrences(text, _PERF_REPO),
+            classifier.needs_current_repo_resolution(text),
+            classifier._path_token_spans(text),
+        )
+        for text in prompts
+    ]
+    monkeypatch.setattr(classifier, "_OWNER_REPO_HASH_RE", _FinditerSentinel(classifier._OWNER_REPO_HASH_RE))
+    for text, want in zip(prompts, expected):
+        got = (
+            classifier._find_occurrences(text, _PERF_REPO),
+            classifier.needs_current_repo_resolution(text),
+            classifier._path_token_spans(text),
+        )
+        assert got == want, text[:60]
