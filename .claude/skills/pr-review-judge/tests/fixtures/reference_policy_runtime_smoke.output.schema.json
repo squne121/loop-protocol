@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "reference_policy_runtime_smoke_output",
+  "description": "Issue #2878 AC9 smoke fixture only. pr-review-judge の最小 output convention（verdict / reviewed_head_sha / blockers / warnings）に、smoke 用の linked_issue_resolution / smoke_marker を加えた最終応答の JSON Schema。汎用 schema registry ではない。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "verdict",
+    "reviewed_head_sha",
+    "blockers",
+    "warnings",
+    "linked_issue_resolution",
+    "smoke_marker"
+  ],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["APPROVE", "REQUEST_CHANGES", "HUMAN_REVIEW_REQUIRED"]
+    },
+    "reviewed_head_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "blockers": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "warnings": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "linked_issue_resolution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "issue_number", "decision", "body_verdict"],
+      "properties": {
+        "source": {"type": "string", "enum": ["refs", "closes"]},
+        "issue_number": {"type": "integer", "minimum": 1},
+        "decision": {"type": "string", "enum": ["closing_required", "nonclosing_required", "fail_closed"]},
+        "body_verdict": {"type": "string", "enum": ["valid", "repair", "block"]}
+      }
+    },
+    "smoke_marker": {
+      "type": "string",
+      "const": "REFERENCE_POLICY_SMOKE_OK"
+    }
+  }
+}

@@ -26,7 +26,7 @@ Codex CLI では、このステップ専用の custom agent `post-merge-cleanup-
 ## 通常経路: Task Context の信頼済み merge commit point（Issue #2565）
 
 cleanup work を select、resume、または dispatch する前に、orchestrator は fresh merged-PR GraphQL snapshot を取得する。snapshot は
-`closingIssuesReferences(first: 2) { nodes { number repository { nameWithOwner } } }` を含め、candidate Issue は
+`closingIssuesReferences(first: 2) { nodes { number repository { nameWithOwner } } }` と `pullRequest.body`（`Refs`-bound PR の `non_closing_authority` の `pr_body_sha256` を束縛する本文。下記「`Refs` を使う PR を closing relation に依存せず対象 Issue へ束縛する規則」）を含め、candidate Issue は
 repository identity と Issue number の組で照合する（同番号でも別 repository は non-mutating mismatch）。
 `.claude/skills/post-merge-cleanup/scripts/task_context_workflow_signal.py --phase merged` を呼び出す。merge signal が `applied` または同一 Task の
 `duplicate_noop` の場合だけ durable cleanup selection を試行できる。続く cleanup-begin outcome が `selected`
@@ -42,7 +42,7 @@ outcome は `cleanup_completed` を emit せず dispatch も再開しない。ad
 - 「fresh」とは、その invocation（`--phase recover` または `--phase local-only`）の直前に orchestrator が取得した snapshot を指す。adapter は GitHub I/O を行わないため、検証可能な定義として **snapshot file の mtime が adapter 起動時刻から 300 秒以内**を要求し、超過した場合は `deferred` / `SNAPSHOT_STALE`（書き込み 0）になる。
 - **前回 invocation の snapshot の再利用は禁止**する。`--phase merged` で使った snapshot を `--phase recover` や `--phase local-only` へ流用せず、毎回直前に取得し直す。
 - repository identity の束縛範囲は、snapshot 自身の `repository.nameWithOwner` と `closingIssuesReferences` node の `repository.nameWithOwner` との一致（snapshot identity と closing relation）だけである。adapter は GitHub I/O を行わず、ローカル checkout の remote は検証しないため、snapshot を正しい repository から取得する責務は orchestrator が負う。
-- `--merge-identity <40 hex>` は必須で、snapshot の merge OID と完全一致し、かつ `^[0-9a-f]{40}$` に一致しなければ `rejected_evidence` / `MERGE_IDENTITY_MISMATCH` になる。PR 本文の `Closes #N` 文字列は authority にしない（`closingIssuesReferences` だけを使う）。
+- `--merge-identity <40 hex>` は必須で、snapshot の merge OID と完全一致し、かつ `^[0-9a-f]{40}$` に一致しなければ `rejected_evidence` / `MERGE_IDENTITY_MISMATCH` になる。PR 本文の `Closes #N` 文字列そのものは authority にしない。closing relation のある PR は `closingIssuesReferences` だけで binding し、closing relation の無い PR（`Refs`-bound）は下記の `non_closing_authority`（`--phase merged` / `--phase completed` に限る。`recover` / `local-only` は受理しない）だけで binding する。
 
 ### 決定表（`--phase merged` の結果 → 復旧 / local-only）
 
@@ -58,6 +58,38 @@ outcome は `cleanup_completed` を emit せず dispatch も再開しない。ad
 | snapshot 不正（`RELATION_UNAVAILABLE` / `MERGED_SNAPSHOT_INVALID` / `RELATION_ISSUE_MISMATCH` / `MERGE_OID_INVALID`）、`ADAPTER_UNAVAILABLE` など Task Context が応答しない結果 | 停止（local-only なし、削除なし）。Task Context 無応答は 1 回だけ bounded retry して停止 | 停止（recover も呼ばない） |
 
 `recovery_rejected` は `--phase recover` が `conflict/*` を返した場合だけを指す。recover が `deferred/*`（`SNAPSHOT_STALE` / `unbound` など）、`rejected_evidence/*`、または `ADAPTER_UNAVAILABLE` を返した場合は `recovery_rejected` ではなく**停止**し、削除に進まない。復旧後の `--phase merged` 再実行結果が `selected` でない場合は、その結果が local-only 許可集合に含まれるときだけ**その結果を outcome として** local-only に進み、含まれなければ停止する。
+
+### `Refs` を使う PR を closing relation に依存せず対象 Issue へ束縛する規則（Issue #2878）
+
+post-merge で live evidence を待つ Issue（#2842 型）の PR は `Closes` ではなく `Refs #N` を使うため `closingIssuesReferences.nodes` が空になる。
+adapter は GitHub I/O を行わず PR 本文の grammar も再実装しないので、orchestrator が fresh snapshot を取得し、`docs/dev/workflow.md` の entrypoint
+（`uv run --locked python3 .claude/skills/open-pr/scripts/validate_pr_body.py --evaluate-reference-policy ...`、facts は gh で fresh 取得）を **snapshot の `pullRequest.body` と同じ本文 bytes** に対して実行し、
+その出力のうち **7 key**（`decision` / `level` / `reason_code` / `repo` / `issue_number` / `pr_number` / `pr_body_sha256`。`effective_kind` / `body_verdict` / `body_reason` は含めない）を、
+snapshot JSON object の **top-level key `non_closing_authority`**（`pullRequest` の兄弟であり内側ではない）として添える。`body_verdict` が `valid` の場合だけ添える。
+
+- adapter が binding を認める条件（`--phase merged` / `--phase completed` のみ、全て満たす場合）: `closingIssuesReferences.nodes` が空、`non_closing_authority.decision == nonclosing_required` かつ `level` が A1 または A2、`repo`（大文字小文字を区別せず）/ `issue_number` / `pr_number` が snapshot と一致、`pr_body_sha256` が snapshot の `pullRequest.body`（欠落・非 string は拒否）の UTF-8 bytes の SHA-256 と一致。
+- 上記以外は既存の reason code（`RELATION_ISSUE_MISMATCH` 等）で拒否し、書き込み 0。closing node が 1 件以上ある場合は従来規則のまま（別 Issue の node があれば拒否し、non-closing 判定へ fall through しない）。`--phase recover` / `--phase local-only` は non-closing binding を受理せず従来どおり停止する。
+- `non_closing_authority` は orchestrator-attested であり、snapshot 自体と同じ trust 境界にある（adapter は snapshot の真正性を独立検証しない）。producer（`open_pr.py::classify_closing_issue_relation(..., non_closing_authority=...)`）は同じ 7 key の dict を引数で受け取り、snapshot → adapter の入力と同一の写像である。
+- adapter は GitHub に対して close を一切行わず、close 権限も返さない。Issue の close は下記の close gate に従う operator / orchestrator の明示操作である。
+- **既知の制限（#2891）**: worktree / branch 削除を実行する `scripts/agent-ops/cleanup_exec.py::_verify_linked_issue` は `closingIssuesReferences` または research fallback を要求するため、`Refs`-bound PR に `linked_issue_number` を渡すと `LINKED_ISSUE_MISMATCH` で停止する。この closing relation 非依存の認可は follow-up #2891 が所有し、それまで `Refs`-bound PR の削除系 cleanup は安全側（削除なし）に停止したままとする。`linked_issue_number` を省略して認可を迂回する運用は採らない。
+
+### merge と Issue close の close gate（`docs/dev/workflow.md` と同一の正本表）
+
+decision table と grammar の正本は `docs/dev/workflow.md` の「PR reference と Issue close の分離」であり、次の表はその写しである（2 文書の表は一致させる）。
+
+#### PR reference decision table（判定表の正本）
+
+| 順 | 条件 | decision | level | PR 本文の reference | merge 時の Issue |
+|---|---|---|---|---|---|
+| 0 | linked Issue が CLOSED | `nonclosing_required` | CLOSED | `Refs #N`（closing keyword は block） | 既に CLOSED（authority 評価なし） |
+| 1 | A1 present かつ valid | `nonclosing_required` | A1 | `Refs #N`（Runtime Verification Applicability の状態に依存しない） | 本文は close しない（本文以外の自動 close 経路が無いと native auto-close risk check で確認できた場合に OPEN を維持） |
+| 2 | A1 present かつ invalid（2 行以上を含む） | `fail_closed` | なし | 停止（A2 / A3 へ降格しない） | 停止 |
+| 3 | A1 なし、A2 成立 | `nonclosing_required` | A2 | `Refs #N` | 本文は close しない（本文以外の自動 close 経路が無いと native auto-close risk check で確認できた場合に OPEN を維持） |
+| 4 | A1 なし、A2 不成立、A3 成立 | `closing_required` | A3 | `Closes #N` | merge で auto-close |
+| 5 | 上記以外（Issue state 取得不能、Runtime Verification Applicability の欠落・重複・解釈不能、facts 不正） | `fail_closed` | なし | 停止 | 停止 |
+
+- merge は Issue の close を意味しない。`Refs` 本文だけでは OPEN 維持を保証せず、本文以外の自動 close 経路（native closing relation / 採用される merge message）が無いと native auto-close risk check で確認できた場合に OPEN が維持される。live evidence が未取得の間は Refs-bound Issue を OPEN に保ち、live evidence の取得・証跡へのリンク・残 AC の充足を確認した後にだけ operator / orchestrator が明示的に close する。
+- merge 時の guard は final head の PR 本文に対する reviewer の fresh な evaluator 実行であり、orchestrator は merge 直前に entrypoint を再実行して `pr_body_sha256` を attested 値と照合する（不一致なら merge せず re-review）。`nonclosing_required` では加えて native auto-close risk check を final message / final native relation に対して再実行する（または検証済み message をそのまま使う）。PR 本文 / Issue 本文の hash だけでは本文以外の自動 close 経路を保証できない（`docs/dev/workflow.md` の「native auto-close risk check」）。
 
 ### `unbound` の原因別フォールバック/エスカレーション（Issue #2790 AC8、PR #2795 review fix_delta P2-C 改訂）
 

@@ -16,11 +16,43 @@ description: implementation child issue に紐づく PR をレビューし、lin
 
 `PR author == 実行アカウント` の場合でも、投稿は常に通常の `gh pr comment --body-file`・`event: COMMENT` 相当固定（`--approve` / `--request-changes` を意味する formal review event は生成しない。専用 semantic publisher は使用しない。詳細は「6) verdict 投稿」参照）。
 
-### 1) Linked Issue を特定
+### 1) Linked Issue を特定（reference の判定は entrypoint の結果で決める、Issue #2878）
 
-`Closes #N` を PR 本文から抽出し、紐づく Issue の `Outcome` / `Acceptance Criteria` / `Allowed Paths` / `Verification Commands` を取得。
+linked Issue は PR 本文の `Closes #N` だけでなく `Refs #N` からも特定する。ただし「この reference が妥当か」「`Closes` が必要か」は reviewer が PR 本文の文字列から推測せず、
+`open-pr` の単一 evaluator（`validate_pr_body.py`）の entrypoint 結果だけで決める。候補 Issue 番号 `N` は PR 本文が参照する `Closes #N` / `Refs #N`（または `closingIssuesReferences`）から取り、facts を gh で fresh 取得して実行する
+（reviewer は Bash でファイルを書けないため、入力は process substitution で渡す。`decision_comment` は PR 本文に `Reference-Decision:` 行がある場合のみ `gh api repos/<owner>/<repo>/issues/comments/<id>` の `html_url` / `id` / `issue_url` / `author_association` / `body` を `url` / `id` / `issue_url` / `author_association` / `body` として渡し、無ければ `null`）。
 
-- `Closes #N` が無い場合は `REQUEST_CHANGES`。
+```bash
+uv run --locked python3 .claude/skills/open-pr/scripts/validate_pr_body.py --evaluate-reference-policy --body-file <(gh api repos/<owner>/<repo>/pulls/<PR番号> --jq '.body // ""') --linked-issue <N> --linked-issue-body-file <(gh api repos/<owner>/<repo>/issues/<N> --jq '.body // ""') --reference-facts-file <(jq -n --arg repo <owner>/<repo> --arg state <OPEN|CLOSED> --argjson pr <PR番号> --argjson comment <decision_comment JSON | null> '{repo:$repo,issue_state:$state,pr_number:$pr,decision_comment:$comment}')
+```
+
+出力は JSON object 1 つ（decision によらず exit 0）。読む field は `decision`（`closing_required` / `nonclosing_required` / `fail_closed`）、`level`、`reason_code`、`body_verdict`（`valid` / `repair` / `block`）、`body_reason` のみ:
+
+- `reason_code`: `issue_closed` / `a1_explicit_decision` / `a1_decision_invalid` / `a1_decision_ambiguous` / `a2_contract_deferred` / `a3_close_ready` / `runtime_applicability_unresolved` / `facts_invalid`
+- `body_verdict: valid` → linked Issue を `Closes` または `Refs` から特定したものとして扱い、`Closes` 不在だけを理由に `REQUEST_CHANGES` にしない（`nonclosing_required` では `Refs` が正しい reference）。Refs 経由でも linked Issue の `Outcome` / `Acceptance Criteria` / `Allowed Paths` / `Verification Commands` を取得し、AC / evidence を通常どおり評価する
+- `decision: closing_required` かつ `body_verdict: repair`（`closing_missing`。根拠のない Refs-only）→ `Closes` 不足を blocker として `REQUEST_CHANGES`
+- `body_verdict: block`（`closing_for_other` / `closing_forbidden` / `reference_missing`）→ blocker として `REQUEST_CHANGES`
+- `decision: fail_closed`（A1 invalid / ambiguous、authority 不明、facts 不正）→ fail-closed。`blockers[]` に `reason_code` を記載して `REQUEST_CHANGES`（auto repair 前提にしない）
+- entrypoint を実行できない、候補 Issue 番号が特定できない場合も fail-closed（`REQUEST_CHANGES`）
+
+**native auto-close risk check（`decision: nonclosing_required`、level A1 / A2 のときだけ追加で実行する）**: `Refs` の本文は「本文は close しない」ことしか示さず、
+GitHub の手動 closing relation（Development 欄）や、採用される merge message の closing keyword では Issue が close され得る。そこで本文の判定とは別に、同じ `validate_pr_body.py` の次の entrypoint を実行する
+（evaluator の結果を再利用する pure 関数で、grammar は複製しない。facts は gh で fresh 取得して `<native facts JSON>` に渡す: `closing_relations` は PR の `closingIssuesReferences` の `number` と `repository`（`owner/name`）の list、
+`closing_relations_complete` は取り切れたか、`merge_settings` は `gh api repos/<owner>/<repo>` の live な `allow_squash_merge` / `allow_merge_commit` / `allow_rebase_merge` / `squash_merge_commit_title` / `squash_merge_commit_message`、
+`merge_method` は採用予定の方式（未定なら `null`）、`pr_title` / `pr_body` / `commit_messages`（`gh api repos/<owner>/<repo>/pulls/<PR番号>/commits --paginate` の full message の list）、`final_squash_message` は確定済みの title / body（無ければ `null`）。
+exact key は `docs/dev/workflow.md` の「native auto-close risk check」が正本）:
+
+```bash
+uv run --locked python3 .claude/skills/open-pr/scripts/validate_pr_body.py --evaluate-native-auto-close-risk --body-file <PR本文ファイル> --linked-issue <N> --linked-issue-body-file <Issue本文ファイル> --reference-facts-file <facts JSON> --native-close-facts-file <native facts JSON>
+```
+
+- `status: clear` → 本文以外の自動 close 経路が無いと確認できた状態。このときに限り「`Refs` なので Issue は OPEN のまま維持される」とみなす
+- `status: blocked`（`native_relation_present` / `effective_message_closing_keyword`）→ blocker として `REQUEST_CHANGES`。`blockers[]` に `reason_code` と `findings` の具体的な矛盾を記載する
+- `status: fail_closed`（facts / 設定 / relation 取得が不完全）→ fail-closed。`blockers[]` に `reason_code` を記載して `REQUEST_CHANGES`
+- `status: not_applicable`（A3 / CLOSED）→ 追加の判定なし
+- この結果は review 時点のものである。人間は merge 画面で final squash message や relation を変更できるため、merge 直前に final message / final native relation に対して再実行する（または検証済み message を変更せず使う）ことを merge の最終 precondition とする。PR / Issue 本文の hash だけでは保証にならない（`docs/dev/workflow.md`）
+
+`pr-reviewer-lite` の allow-list は `Closes #N` の存在を要求するため、`Refs`-bound PR（`nonclosing_required`）は lite の適用対象外であり、この `pr-review-judge`（Sonnet `pr-reviewer`）で扱う（`pr-reviewer-lite.md` 自体は変更しない）。decision table と grammar の正本は `docs/dev/workflow.md` の「PR reference と Issue close の分離」。
 
 ### 2) Mergeability 取得
 
@@ -151,7 +183,7 @@ provider 呼び出し・fan-out・grounding evidence 検証を含む差分）ま
 - blocker あり → `REQUEST_CHANGES`
 - blocker なし → `APPROVE`
 
-Issue #1873 以降、機械的に対応可能な不備（`Closes` 不足、PR body hygiene 欠陥等）を
+Issue #1873 以降、機械的に対応可能な不備（entrypoint が `closing_required` / `body_verdict: repair` を返した場合の `Closes` 不足、PR body hygiene 欠陥等。`nonclosing_required` の `Refs` は不備ではない）を
 `required_auto_actions` という専用構造化フィールドで自己申告しない。これらは具体的な内容を
 `blockers[]` に記載した上で `REQUEST_CHANGES` を返す（`references/required-auto-actions.md` 参照）。
 `BEHIND` の update_branch 対応も reviewer が申告せず、control-plane が live mergeability から
