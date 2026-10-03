@@ -46,6 +46,42 @@ reviewer_verdict（`verdict`/`reviewed_head_sha`/`blockers`/`warnings`）と liv
 | `fail_closed`（`LOOP_STATE.iteration >= LOOP_STATE.max_iterations`） | `termination_reason: max_iterations` を立て、fail-close で人間判断 |
 | `fail_closed`（`concurrent_base_churn_budget_exhausted`） | `evidence_epoch.drift_rebind_attempts` が上限（既定 2、#2039/#1023 の bounded no-progress budget と同じ考え方）を超過。drift 起因の再試行を打ち切り `termination_reason: human_escalation` ではなく機械的な fail-closed 停止として人間判断を仰ぐ（#2102） |
 
+### terminal approval は `step5-terminal-gate` 経由に固定する（Issue #2837）
+
+上表の `approved` は、`step5-terminal-gate` が exit 0 を返した場合にのみ成立する。
+
+`termination_reason: approved` / `merge_ready: true` を確定する terminal approval は、`route_loop_verdict_v2()` を直接呼んだ結果ではなく、`adjudicate_vc_result.py step5-terminal-gate` の出力（exit 0 = approved）だけを根拠にする。この subcommand は既存の公開 wrapper `route_loop_verdict_v2_resolve_semantic_ambiguity()`（`main_drift` が `semantic_ambiguity` を省略している場合に実 git oracle で補完する現行の production 経路。caller が `semantic_ambiguity` を推測・固定値で渡してはならない）を呼んだうえで、route が `approved` の場合に限り次をすべて要求する。VC の再実行は行わず、新しい判定 schema・第二の分類器・新 route 定数も作らない。
+
+1. `--dispatch-seq` が `loop_state["dispatch"]["seq"]` と一致する（不一致、または `dispatch` が欠落・不正: `route: continue_loop` / `reason_code: dispatch_seq_mismatch` / `rerun_required.pr_review: true`）。
+2. `loop_state["dispatch"]["binding_key"]` が live の HEAD / Issue body SHA-256 / 順序付き command hashes から再計算した key と一致する（不一致: `continue_loop` / `binding_changed_since_dispatch` / `rerun_required` の `verification` と `pr_review` が true）。あわせて `--live-mergeability-file` の `head_sha` が `--expected-head-sha` と一致することも要求する（reviewer / mergeability 側の HEAD と VC 側の binding HEAD が食い違った split-head の合成承認を防ぐ。不一致や `head_sha` 欠落・非 object は fail-closed で同じ `binding_changed_since_dispatch`）。
+3. 当該 binding の VC adjudication が `step4_gate_from_loop_state()` で有効（無効: `continue_loop` / `vc_gate_blocking` / `rerun_required.verification: true`）。
+
+評価順序と `reason_code` の優先順位は `dispatch_seq_mismatch` -> `binding_changed_since_dispatch` -> `vc_gate_blocking` で固定である。`approved` 以外の route はそのまま出力される（`RouteDecision` と同形の plain JSON）。exit code は `0=approved` / `1=approved でない`（route を出力。`continue_loop` 等の通常分岐へ進む）/ `2=malformed`（引数不備、または破損した `loop_state`）。
+
+`--expected-head-sha` と `--live-mergeability-file` は、**同一の `gh pr view --json headRefOid,mergeable,mergeStateStatus` の 1 回の応答**から組み立てる。別々の時点・別の取得で作ったり、resume 後に残った古いファイルを混ぜたりしない（入力同士の取り違えが split-head の主因である）。`step4-adjudicate` 側の `--expected-head-sha` も同じ応答の `headRefOid` を使う。
+
+```bash
+LIVE_PR_JSON="$(gh pr view "$PR_NUMBER" --json headRefOid,mergeable,mergeStateStatus)"
+LIVE_HEAD_SHA="$(jq -r .headRefOid <<<"$LIVE_PR_JSON")"
+LIVE_MERGEABILITY="$REVIEW_RESULT_DIR/live_mergeability.json"
+jq '{head_sha: .headRefOid, mergeable: .mergeable, merge_state_status: .mergeStateStatus}' <<<"$LIVE_PR_JSON" > "$LIVE_MERGEABILITY"
+
+uv run python3 .claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py step5-terminal-gate \
+  --loop-state-file "$LOOP_STATE_FILE" \
+  --reviewer-verdict-file "$REVIEWER_VERDICT" \
+  --live-mergeability-file "$LIVE_MERGEABILITY" \
+  --expected-head-sha "$LIVE_HEAD_SHA" \
+  --expected-contract-body-sha256 "$LIVE_BODY_SHA256" \
+  --expected-command-hashes-file "$EXPECTED_COMMAND_HASHES" \
+  --dispatch-seq "$(cat "$REVIEW_RESULT_DIR/dispatch_seq")"
+```
+
+`--dispatch-seq` には、reviewer を起動する **前** に root が reviewer 結果の保存先と同じ場所へ書き残した `seq`（`step-4-pr-review.md` 参照）を渡す。resume / compaction 後も `loop_state` の最新 `seq` を再読込して渡してはならない（再読込すると検査が空洞化する。reviewer 結果を dispatch に束縛する唯一の手段である）。新しい reviewer を起動し直した（`step4-adjudicate` が再び `invoke` を返した）場合は `seq` が進み、古い reviewer 結果は `dispatch_seq_mismatch` で拒否される。
+
+dispatch 後に HEAD / Issue body / VC binding（command hashes）のいずれかが **実際に** 変化した場合は、古い reviewer 結果で終端承認してはならない（`binding_changed_since_dispatch`）。この場合は `step-4-pr-review.md` の手順で VC を再検証し、新しい reviewer を起動して `seq` を進めてから Step 5 を再実行する。
+
+`binding_changed_since_dispatch` が `live_mergeability_head_sha_differs_from_expected_head_sha` を示している場合は、まず上記の 1 回の `gh pr view` 応答で `--expected-head-sha` と live mergeability file を取り直し、入力の取り違えかどうかを確認する。取り直した live HEAD が dispatch 時の binding HEAD と同一であれば、入力の取り違えにすぎないので full verification / pr-review を再実行せず、metadata を取り直して Step 5 を再実行するだけでよい。実際に HEAD（または Issue body / command hashes）が変わっていた場合のみ、その HEAD について Step 2 / Step 4 を fresh にやり直す。
+
 ### main drift の scope-clean reconciliation 再開（resume）手順（#2102）
 
 `route: route_scope_clean_reconciliation` は Step 5 を終了させず、`decision.selected_action`
