@@ -144,14 +144,47 @@ semantic planning・overlap・contract snapshot・body SHA・artifact 異常に�
 3. `reviewed_head_sha` が現在 head と不一致の場合、dispatch 前に PR review を再実行する
 4. 再実行後に得られた新しい `reviewer_verdict` / `live_mergeability` で再度 `route_loop_verdict_v2()` を評価する
 
-body-only な自動修正（`update_pr_body_hygiene`、`ensure_closing_keyword` 追加等）が必要な場合も、reviewer は
+body-only な自動修正（`update_pr_body_hygiene`、reference authority entrypoint が `closing_required` を返した場合に限る `ensure_closing_keyword` 追加等）が必要な場合も、reviewer は
 自己申告せず、具体的な内容を `blockers[]`/`warnings[]` に記載する。
 control-plane はその記述を読み、`REQUEST_CHANGES` として `continue_loop` 経路で次イテレーションへ回すか、
-機械的に修正可能と判断した場合のみ `implementation-worker` の該当 mode（`ensure_closing_keyword` /
+機械的に修正可能と判断した場合のみ `implementation-worker` の該当 mode（entrypoint が `closing_required` の場合のみ `ensure_closing_keyword` /
 `update_pr_body_hygiene`）に委譲する。これらの body-only 対応は head SHA を変えないため、`update_branch`
 と異なり verification の再実行は不要で、PR review のみ再実行する。`blockers` が非空のまま
 `verdict == APPROVE` を返した reviewer 結果は `route_loop_verdict_v2()` が `fail_closed`
 （`approve_with_blockers_inconsistent`）として扱う。
+
+### `ensure_closing_keyword` の適用条件（reference authority entrypoint、Issue #2878）
+
+`ensure_closing_keyword`（`Closes #N` 追記による body-only repair）は無条件の自動修復ではない。`Refs #N` が妥当な PR
+（post-merge live evidence を待つ #2842 型の OPEN Issue 等）に `Closes` を追記すると、merge が Issue を live evidence より先に close する。
+repair 判定は `open-pr` の単一 evaluator の entrypoint 結果（`decision` / `body_verdict` / `body_reason`）だけで行い、
+control-plane は facts（linked Issue の state / 本文、A1 の comment 事実）を gh で fresh 取得して次を実行する（grammar を再実装しない。`action` 名・schema は変更しない）:
+
+```bash
+uv run --locked python3 .claude/skills/open-pr/scripts/validate_pr_body.py --evaluate-reference-policy --body-file <PR本文ファイル> --linked-issue <N> --linked-issue-body-file <Issue本文ファイル> --reference-facts-file <facts JSON>
+```
+
+出力 JSON の `reason_code` は `issue_closed` / `a1_explicit_decision` / `a1_decision_invalid` / `a1_decision_ambiguous` / `a2_contract_deferred` / `a3_close_ready` / `runtime_applicability_unresolved` / `facts_invalid` のいずれか。
+step-5 の扱いは次の表が正本で、表に無い組合せは `blocker` として扱う:
+
+| decision | body_verdict | body_reason | step-5 の扱い |
+|---|---|---|---|
+| closing_required | repair | closing_missing | repair（`ensure_closing_keyword`: 根拠のない Refs-only に `Closes #N` を追記） |
+| closing_required | block | reference_missing | repair（`ensure_closing_keyword`: reference が無い本文に `Closes #N` を追記） |
+| closing_required | valid | ok | none（repair 不要） |
+| nonclosing_required | valid | ok | none（`Refs` が正しい reference。`Closes` へ戻さない） |
+| nonclosing_required | block | closing_forbidden | blocker（closing keyword は auto repair しない） |
+| nonclosing_required | block | reference_missing | blocker（auto repair しない） |
+| nonclosing_required | block | closing_for_other | blocker（番号違いの closing keyword は auto repair しない） |
+| closing_required | block | closing_for_other | blocker（番号違いの closing keyword は auto repair しない） |
+| fail_closed | block | not_evaluated | stop（auto repair しない。`reason_code` を blocker に記載して人間判断へ） |
+
+`nonclosing_required` / `valid` / `ok` の `none` は **PR 本文の判定**であり、本文以外の自動 close 経路（GitHub の手動 closing relation、採用される squash message の closing keyword）が無いことまでは保証しない。
+`nonclosing_required`（A1 / A2）の PR は merge 前に、`validate_pr_body.py --evaluate-native-auto-close-risk`（native auto-close risk check、手順と facts の exact key は `docs/dev/workflow.md` が正本）を
+**merge 直前の final message / final native relation に対して**再実行する（または `adopted_message_sha256` が一致する検証済み message を変更せず使う）。`status: blocked` / `fail_closed` の間は merge せず、`blockers[]` に `reason_code` と具体的な矛盾（relation の解除、message の修正）を記載して `REQUEST_CHANGES` とする。これは body-only repair の対象ではなく auto repair しない。PR / Issue 本文の hash だけでは自動 close の不在を保証しない。
+
+`fail_closed`（A1 invalid / ambiguous、authority 不明、facts 不正）は常に停止し、`ensure_closing_keyword` を発行しない。
+CLOSED の linked Issue（`level: CLOSED`）は常に `nonclosing_required` で、`Refs` が valid、closing keyword は `blocker`。
 
 ### worker_status_result_routing（`implementation-worker` 結果の routing）
 

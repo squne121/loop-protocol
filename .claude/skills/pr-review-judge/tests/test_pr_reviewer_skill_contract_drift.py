@@ -587,3 +587,283 @@ def test_consumer_inventory_matches_real_route_loop_verdict_v2_branches() -> Non
             f"{name}: expected route {expected_route!r}, got {decision.route!r} "
             f"(reason_code={decision.reason_code!r})"
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #2878 AC3: Step 1 resolves the linked Issue via the reference authority entrypoint,
+# not from `Closes` alone (Refs-bound PRs are first-class; Closes-absence alone is not a blocker)
+# ---------------------------------------------------------------------------
+
+VALIDATE_PR_BODY_PATH = REPO_ROOT / ".claude" / "skills" / "open-pr" / "scripts" / "validate_pr_body.py"
+PR_REVIEWER_LITE_PATH = REPO_ROOT / ".claude" / "agents" / "pr-reviewer-lite.md"
+REFERENCE_POLICY_REASON_CODES = (
+    "issue_closed",
+    "a1_explicit_decision",
+    "a1_decision_invalid",
+    "a1_decision_ambiguous",
+    "a2_contract_deferred",
+    "a3_close_ready",
+    "runtime_applicability_unresolved",
+    "facts_invalid",
+)
+_RVA_A3 = "## Runtime Verification Applicability\n\n- decision: immediate\n- reason: x\n"
+_RVA_A2 = (
+    "## Runtime Verification Applicability\n\n"
+    "- decision: deferred\n"
+    "- reason: merge 後の live evidence\n"
+    "- deferred_destination:\n"
+    "    - destination_type: phase\n"
+    "    - destination_ref: post-merge-live-evidence\n"
+    "- deferred_verification_condition: merge 後に取得する\n"
+)
+
+
+def _step1_section() -> str:
+    text = SKILL_PATH.read_text(encoding="utf-8")
+    start = text.index("### 1) Linked Issue を特定")
+    end = text.index("### 2) Mergeability 取得")
+    return text[start:end]
+
+
+def _documented_entrypoint_command() -> str:
+    commands = [
+        line.strip()
+        for line in _step1_section().splitlines()
+        if line.strip().startswith("uv run --locked python3 .claude/skills/open-pr/scripts/validate_pr_body.py")
+        and "--evaluate-reference-policy" in line
+    ]
+    assert len(commands) == 1, commands
+    return commands[0]
+
+
+def _documented_native_risk_command() -> str:
+    commands = [
+        line.strip()
+        for line in _step1_section().splitlines()
+        if line.strip().startswith("uv run --locked python3 .claude/skills/open-pr/scripts/validate_pr_body.py")
+        and "--evaluate-native-auto-close-risk" in line
+    ]
+    assert len(commands) == 1, commands
+    return commands[0]
+
+
+def _run_documented_entrypoint(tmp_path: Path, *, pr_body: str, issue_body: str, state: str = "OPEN", comment=None):
+    import json
+    import subprocess
+    import sys
+
+    (tmp_path / "body.md").write_bytes(pr_body.encode("utf-8"))
+    (tmp_path / "issue.md").write_text(issue_body, encoding="utf-8")
+    (tmp_path / "facts.json").write_text(
+        json.dumps(
+            {"repo": "squne121/loop-protocol", "issue_state": state, "pr_number": 9, "decision_comment": comment}
+        ),
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [
+            sys.executable, str(VALIDATE_PR_BODY_PATH), "--evaluate-reference-policy",
+            "--body-file", str(tmp_path / "body.md"), "--linked-issue", "42",
+            "--linked-issue-body-file", str(tmp_path / "issue.md"),
+            "--reference-facts-file", str(tmp_path / "facts.json"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def test_given_refs_binding_when_step1_then_issue_resolved_by_entrypoint_not_closes_only(tmp_path):
+    import subprocess
+    import sys
+
+    step1 = _step1_section()
+
+    # (1) the documented command line really exists and every flag it uses is a real option
+    command = _documented_entrypoint_command()
+    assert VALIDATE_PR_BODY_PATH.exists()
+    help_text = subprocess.run(
+        [sys.executable, str(VALIDATE_PR_BODY_PATH), "--help"], capture_output=True, text=True, check=True
+    ).stdout
+    validator_flags = {
+        "--evaluate-reference-policy", "--body-file", "--linked-issue", "--linked-issue-body-file",
+        "--reference-facts-file",
+    }
+    for flag in validator_flags:
+        assert re.search(rf"(?<![\w-]){re.escape(flag)}(?![\w-])", command), f"documented command lacks {flag}"
+        assert flag in help_text, f"documented flag {flag} is not accepted by validate_pr_body.py"
+
+    # (2) the entrypoint returns the expected decision for Refs-bound and Closes-bound matrix rows
+    comment = {
+        "url": "https://github.com/squne121/loop-protocol/issues/42#issuecomment-8",
+        "id": 8,
+        "issue_url": "https://api.github.com/repos/squne121/loop-protocol/issues/42",
+        "author_association": "OWNER",
+        "body": "REFERENCE_DECISION_V1: nonclosing issue=#42",
+    }
+    matrix = [
+        # pr_body, issue_body, state, comment, expected (decision, body_verdict, body_reason)
+        ("本文\n\nRefs #42\n", _RVA_A2, "OPEN", None, ("nonclosing_required", "valid", "ok")),
+        ("本文\n\nCloses #42\n", _RVA_A3, "OPEN", None, ("closing_required", "valid", "ok")),
+        ("本文\n\nRefs #42\n", _RVA_A3, "OPEN", None, ("closing_required", "repair", "closing_missing")),
+        ("本文\n\nCloses #42\n", _RVA_A2, "OPEN", None, ("nonclosing_required", "block", "closing_forbidden")),
+        (
+            "本文\n\nRefs #42\nReference-Decision: https://github.com/squne121/loop-protocol/issues/42#issuecomment-8\n",
+            _RVA_A3, "OPEN", comment, ("nonclosing_required", "valid", "ok"),
+        ),
+        ("本文\n\nRefs #42\n", _RVA_A3, "CLOSED", None, ("nonclosing_required", "valid", "ok")),
+        ("本文\n\nRefs #42\n", "## Outcome\n", "OPEN", None, ("fail_closed", "block", "not_evaluated")),
+    ]
+    for pr_body, issue_body, state, comment_fact, expected in matrix:
+        result = _run_documented_entrypoint(tmp_path, pr_body=pr_body, issue_body=issue_body, state=state,
+                                            comment=comment_fact)
+        assert (result["decision"], result["body_verdict"], result["body_reason"]) == expected, (pr_body, result)
+
+    # (3) SKILL.md Step 1 names the decisions, the verdict handling and every reason code the evaluator can emit
+    for reason_code in REFERENCE_POLICY_REASON_CODES:
+        assert reason_code in step1, reason_code
+    for token in ("closing_required", "nonclosing_required", "fail_closed", "body_verdict", "body_reason"):
+        assert token in step1, token
+
+    # (4) Refs resolves the linked Issue and AC / evidence are still evaluated through the Issue contract
+    assert "`Refs #N`" in step1 and "Acceptance Criteria" in step1 and "Allowed Paths" in step1
+    assert "`Closes` 不在だけを理由に `REQUEST_CHANGES` にしない" in step1
+    assert "fail_closed" in step1 and "REQUEST_CHANGES" in step1
+
+    # (5) pr-reviewer-lite is out of scope for Refs-bound PRs, and lite itself is untouched
+    assert "pr-reviewer-lite" in step1 and "適用対象外" in step1
+    lite = PR_REVIEWER_LITE_PATH.read_text(encoding="utf-8")
+    assert "linked_issue_present: true" in lite and "Closes #N" in lite
+
+    # (6) no unconditional `Closes`-absence instruction remains anywhere in SKILL.md
+    skill_text = SKILL_PATH.read_text(encoding="utf-8")
+    assert "`Closes #N` が無い場合は `REQUEST_CHANGES`。" not in skill_text
+    for match in re.finditer(r"`Closes`\s*不足", skill_text):
+        window = skill_text[max(0, match.start() - 160): match.end() + 160]
+        assert "closing_required" in window or "body_verdict" in window, (
+            f"unqualified `Closes` 不足 instruction: {window!r}"
+        )
+
+
+def test_given_reference_policy_smoke_fixture_when_checked_statically_then_markers_follow_procedure_order():
+    """AC9 fixture hygiene (static only; the real-runtime run is the AC9 VC): the three ordered markers
+    correspond to Procedure headings of SKILL.md in declared order, and the single fixture schema is a valid
+    JSON Schema that fixes the minimal pr-review-judge output convention plus the smoke fields."""
+    import json
+
+    from jsonschema import Draft7Validator
+    from jsonschema.validators import validator_for
+
+    fixtures = Path(__file__).resolve().parent / "fixtures"
+    prompt = (fixtures / "reference_policy_runtime_smoke.prompt.md").read_text(encoding="utf-8")
+    schema = json.loads((fixtures / "reference_policy_runtime_smoke.output.schema.json").read_text(encoding="utf-8"))
+
+    skill = SKILL_PATH.read_text(encoding="utf-8")
+    headings = [
+        skill.index("### 1) Linked Issue を特定"),
+        skill.index("### 5) PR Evidence / AC の一致"),
+        skill.index("### 5) verdict 決定"),
+    ]
+    assert headings == sorted(headings), "Procedure headings are no longer in the declared order"
+
+    markers = [
+        "REFERENCE_POLICY_STEP1_LINKED_ISSUE_RESOLVED_FROM_REFS",
+        "REFERENCE_POLICY_STEP_AC_EVIDENCE_EVALUATED",
+        "REFERENCE_POLICY_STEP_VERDICT_EMITTED",
+    ]
+    positions = [prompt.index(marker) for marker in markers]
+    assert positions == sorted(positions)
+    assert "REFERENCE_POLICY_SMOKE_OK" in prompt and "pr-reviewer" in prompt
+    assert "Refs #900002" in prompt  # synthetic Refs-bound fixture, not a real Issue
+
+    validator_for(schema).check_schema(schema)
+    validator = Draft7Validator(schema)
+    valid = {
+        "verdict": "APPROVE",
+        "reviewed_head_sha": "1" * 40,
+        "blockers": [],
+        "warnings": [],
+        "linked_issue_resolution": {
+            "source": "refs", "issue_number": 900002, "decision": "nonclosing_required", "body_verdict": "valid",
+        },
+        "smoke_marker": "REFERENCE_POLICY_SMOKE_OK",
+    }
+    assert list(validator.iter_errors(valid)) == []
+    assert set(schema["required"]) >= {"verdict", "reviewed_head_sha", "blockers", "warnings"}
+    for required in schema["required"]:
+        broken = {key: value for key, value in valid.items() if key != required}
+        assert list(validator.iter_errors(broken)), f"schema must require {required}"
+    assert list(validator.iter_errors({**valid, "smoke_marker": "OTHER"}))
+    assert list(validator.iter_errors({**valid, "verdict": "MAYBE"}))
+
+
+def test_given_nonclosing_required_when_step1_then_native_auto_close_risk_entrypoint_is_documented_and_real(tmp_path):
+    """PR #2896 review P1-A: a `Refs` body alone does not keep the Issue OPEN. Step 1 documents a second
+    entrypoint whose flags are real and whose documented statuses are the ones the CLI emits."""
+    import json
+    import subprocess
+    import sys
+
+    step1 = _step1_section()
+    command = _documented_native_risk_command()
+    help_text = subprocess.run(
+        [sys.executable, str(VALIDATE_PR_BODY_PATH), "--help"], capture_output=True, text=True, check=True
+    ).stdout
+    for flag in (
+        "--evaluate-native-auto-close-risk", "--body-file", "--linked-issue", "--linked-issue-body-file",
+        "--reference-facts-file", "--native-close-facts-file",
+    ):
+        assert re.search(rf"(?<![\w-]){re.escape(flag)}(?![\w-])", command), f"documented command lacks {flag}"
+        assert flag in help_text, f"documented flag {flag} is not accepted by validate_pr_body.py"
+
+    # the documented statuses / reason codes are what the CLI really returns (clear and blocked rows)
+    (tmp_path / "body.md").write_bytes("本文\n\nRefs #42\n".encode("utf-8"))
+    (tmp_path / "issue.md").write_text(_RVA_A2, encoding="utf-8")
+    (tmp_path / "facts.json").write_text(
+        json.dumps({"repo": "squne121/loop-protocol", "issue_state": "OPEN", "pr_number": 9, "decision_comment": None}),
+        encoding="utf-8",
+    )
+    native = {
+        "repo": "squne121/loop-protocol",
+        "closing_relations": [],
+        "closing_relations_complete": True,
+        "merge_settings": {
+            "allow_squash_merge": True, "allow_merge_commit": False, "allow_rebase_merge": False,
+            "squash_merge_commit_title": "PR_TITLE", "squash_merge_commit_message": "PR_BODY",
+        },
+        "merge_method": None,
+        "pr_title": "feat: x",
+        "pr_body": "Refs #42",
+        "commit_messages": ["feat: x"],
+        "final_squash_message": None,
+    }
+
+    def run(native_facts):
+        (tmp_path / "native.json").write_text(json.dumps(native_facts), encoding="utf-8")
+        proc = subprocess.run(
+            [
+                sys.executable, str(VALIDATE_PR_BODY_PATH), "--evaluate-native-auto-close-risk",
+                "--body-file", str(tmp_path / "body.md"), "--linked-issue", "42",
+                "--linked-issue-body-file", str(tmp_path / "issue.md"),
+                "--reference-facts-file", str(tmp_path / "facts.json"),
+                "--native-close-facts-file", str(tmp_path / "native.json"),
+            ],
+            capture_output=True, text=True, check=False,
+        )
+        assert proc.returncode == 0, proc.stderr
+        return json.loads(proc.stdout)
+
+    assert run(native)["status"] == "clear"
+    blocked = run({**native, "closing_relations": [{"number": 42, "repository": "squne121/loop-protocol"}]})
+    assert (blocked["status"], blocked["reason_code"]) == ("blocked", "native_relation_present")
+
+    for token in (
+        "nonclosing_required", "clear", "blocked", "fail_closed", "not_applicable", "native_relation_present",
+        "effective_message_closing_keyword", "final_squash_message", "merge 直前",
+    ):
+        assert token in step1, token
+    # the guarantee is conditional, and a body / Issue hash alone is stated to be insufficient
+    assert "hash だけでは保証にならない" in step1
+    assert "OPEN のまま維持される」とみなす" in step1

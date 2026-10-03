@@ -1788,7 +1788,34 @@ Task を推測して attach しない。`task-contextctl signal recover` も pay
 - **merge identity**: snapshot の merge OID が `^[0-9a-f]{40}$` に一致しない、または `--merge-identity` と不一致なら
   `rejected_evidence` / `MERGE_IDENTITY_MISMATCH`。
 - **snapshot の安全条件**: 既存 `_merged_evidence` の検証（`closingIssuesReferences(first: 2)`、repository identity、
-  merge OID）を再利用する。PR 本文の `Closes #N` 文字列は authority にしない。新しい証明書・署名・長寿命 token は追加しない。
+  merge OID）を再利用する。PR 本文の `Closes #N` 文字列そのものは authority にしない（closing relation のある PR は
+  `closingIssuesReferences` だけで、closing relation の無い `Refs`-bound PR は次の `non_closing_authority` だけで binding する）。
+  新しい証明書・署名・長寿命 token は追加しない。
+- **`non_closing_authority`（Issue #2878、`--phase merged` / `--phase completed` のみ）**: closing relation を持たない `Refs` PR を
+  対象 Issue に束縛するための orchestrator-attested な入力。orchestrator は fresh snapshot の query に `pullRequest.body` を追加し、
+  `open-pr` の reference authority entrypoint（`validate_pr_body.py --evaluate-reference-policy`。`docs/dev/workflow.md` の
+  「PR reference と Issue close の分離」）の出力のうち 7 key だけを、snapshot JSON object の **top-level key `non_closing_authority`**
+  （`pullRequest` の兄弟であり内側ではない）として添える:
+
+  ```json
+  {
+    "data": {"repository": {"nameWithOwner": "<owner>/<repo>", "pullRequest": {"number": 21, "merged": true, "body": "<PR 本文>", "mergeCommit": {"oid": "<40 hex>"}, "closingIssuesReferences": {"nodes": []}}}},
+    "non_closing_authority": {
+      "decision": "nonclosing_required", "level": "A2", "reason_code": "a2_contract_deferred",
+      "repo": "<owner>/<repo>", "issue_number": 20, "pr_number": 21, "pr_body_sha256": "<64 hex>"
+    }
+  }
+  ```
+
+  `effective_kind` / `body_verdict` / `body_reason` は含めない。adapter は GitHub I/O も PR 本文の grammar の再実装も行わず、次を全て満たす場合だけ
+  binding を認める: `closingIssuesReferences.nodes` が空、`decision == nonclosing_required` かつ `level` が A1 または A2（A1 / A2 は評価時点で Issue が
+  OPEN であることを含意するため adapter は Issue state を再判定しない）、`repo`（大文字小文字を区別せず）/ `issue_number` / `pr_number` が snapshot と一致、
+  `pr_body_sha256` が snapshot の `pullRequest.body`（欠落・非 string は拒否）の UTF-8 bytes の SHA-256（正規化・改行変換なし）と一致。それ以外は
+  既存の reason code（`RELATION_ISSUE_MISMATCH` 等）で拒否し、書き込み 0。closing node が 1 件以上ある場合は従来規則のまま
+  （別 Issue の node があれば拒否し、non-closing 判定へ fall through しない）。`--phase recover` / `--phase local-only`
+  （`_fresh_merged_evidence`）は受理せず従来どおり停止する。signal_kind 集合・`disposition` / `reason_code` の既存値・各 phase の出力意味は変えない。
+  `non_closing_authority` は orchestrator-attested であり、snapshot 自体と同じ trust 境界にある（adapter は snapshot の真正性を独立検証しない）。
+  producer（`open_pr.py::classify_closing_issue_relation(..., non_closing_authority=...)`）は同じ 7 key の dict を引数で受け取る（key の追加・改名はしない）。
 - **repository identity の束縛範囲**: AC1 が検証する repository identity は、snapshot 自身の `repository.nameWithOwner` と
   `closingIssuesReferences` の node の `repository.nameWithOwner` が（大文字小文字を除き）一致すること、すなわち
   snapshot identity と closing relation との束縛だけである。adapter は GitHub I/O を行わず、ローカル checkout の
