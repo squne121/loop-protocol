@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Issue #2898 runtime smoke output contract (existing IMPL_REVIEW_LOOP_RESULT_V1 required fields only)",
+  "description": "REQUIRED_RESULT_FIELDS of validate_autonomy_policy_result.py. status / termination_reason enums list only values documented in impl-review-loop SKILL.md and steps/step-5-feedback-and-termination.md.",
+  "type": "object",
+  "required": ["schema_version", "status", "termination_reason", "merge_ready"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "status": {"enum": ["draft_pr_ready", "no_change_required"]},
+    "termination_reason": {
+      "enum": ["approved", "max_iterations", "human_escalation", "intake_gate_failed", "already_satisfied"]
+    },
+    "merge_ready": {"type": "boolean"}
+  }
+}
