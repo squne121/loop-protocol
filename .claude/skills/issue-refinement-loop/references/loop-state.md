@@ -244,6 +244,20 @@ classifier 例外・fresh readback の transport failure のような integrity/
 failure が普通の `no_change` / `proven_no_change` に化けることを防ぐ。新しい schema/key-set は
 追加しない。
 
+`refinement_preflight_result_v1.contract_update`（既存 schema family）は
+`status: failed` のとき必ず bounded closed-set `reason_code` を含む。たとえば
+`unsafe_unstructured_patch_operation`（consumer が raw section append を拒否）、
+`contract_patch_plan_missing`、`post_update_gate_failed`、既知の `invalid_*`、
+未知の transaction failure に対する `contract_update_failed` である。
+`handoff_required` は従来の二つの `issue_editor_required` reason を持ち、
+`applied` / `no_change` / `rebased` は `reason_code` を持たない。
+`CONTRACT_UPDATE_REASON_CODE` stdout と result artifact は同じ値を投影し、
+OWNER の原文・body・callback exception text を診断へ転記しない。
+`PLANNER_FAIL_CLOSED` および `planner_fail_closed` / `planner_fail_closed_reason_codes`
+は planner の `fail_closed.required` / `reason_codes` にのみ基づく。
+consumer や post-update gate の failure は別 blocker `CONTRACT_UPDATE_FAILED` と
+上記 `contract_update.reason_code` を持ち、planner telemetry を変更しない。
+
 **`reviewer_feedback_url` の伝搬範囲（PR #2623 review fix、finding 4）**: 上表の
 `reviewer_feedback_url` は `consume_trusted_anchor_contract_patch_plan()` の内部 consumer
 結果（`rewrite_route.reviewer_feedback_url`）にのみ存在する。`_bounded_contract_update_

@@ -353,6 +353,10 @@ ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS = frozenset(
         "contract_update.run.with_anchor",
         "contract_update.run.with_human_context",
         "decide.run",
+        # Local-only producer writes only to the issue-scoped artifact root.
+        # Its canonical main-root invocation must not depend on a linked
+        # issue worktree (the same invariant as decide.run).
+        "authority_transport.produce",
         # PR #2694 review fix_delta (P1-2): read-only/local-only, never
         # writes anything (`allowed_write_roots: []`) -- see the comment on
         # the `eligible_command_ids["owner_reaction.decide"]` entry above.
@@ -441,6 +445,15 @@ _ROOT_NO_WORKTREE_POLICY_INVARIANTS: dict[str, dict[str, Any]] = {
             "artifacts/{active_issue}/issue-metadata/",
         ],
     },
+    "authority_transport.produce": {
+        "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_AUTHORITY_TRANSPORT_PRODUCER,
+        "required_cwd": "canonical_main_root",
+        "required_branch": "default_branch",
+        "network_effect": "local_only",
+        "allowed_write_roots": [
+            ".claude/artifacts/issue-refinement-loop/{active_issue}/",
+        ],
+    },
     "decide.run": {
         "execution_class": SKILL_RUNTIME_EXECUTION_CLASS_DECIDE,
         "required_cwd": "canonical_main_root",
@@ -505,7 +518,7 @@ class ExactSkillRuntimeCommand:
 
 
 def command_allows_root_no_worktree(parsed: ExactSkillRuntimeCommand) -> bool:
-    """Return True only for the explicitly allowlisted root preflight profile."""
+    """Return True only for explicitly allowlisted canonical-root profiles."""
     if parsed.command_id not in ROOT_NO_WORKTREE_ALLOWED_COMMAND_IDS:
         return False
     policy = SKILL_RUNTIME_COMMAND_POLICY_V2["eligible_command_ids"].get(parsed.command_id)
@@ -1345,30 +1358,38 @@ def parse_exact_skill_runtime_authority_transport_produce_command(
     )
 
 
+def authority_transport_produce_rejection_reason(
+    command: str, cwd: str, project_root: str, deadline: Deadline | None = None
+) -> str | None:
+    """Fixed rejection taxonomy for this exact local-only command class.
+
+    None means the canonical root/default-branch/repo and the current
+    registry-backed root-no-worktree invariant all pass. Never return a
+    caller-supplied value or a Git subprocess error as a diagnostic.
+    """
+    parsed = parse_exact_skill_runtime_authority_transport_produce_command(command, project_root)
+    if parsed is None:
+        return "invalid_argv"
+    if os.path.realpath(cwd) != os.path.realpath(project_root):
+        return "cwd_mismatch"
+    branch = current_branch(project_root, deadline)
+    if not branch or branch != resolve_default_branch(project_root, deadline):
+        return "branch_mismatch"
+    if resolve_repo_slug(project_root, deadline) != parsed.repo:
+        return "repo_mismatch"
+    if not command_allows_root_no_worktree(parsed):
+        return "root_no_worktree_policy_mismatch"
+    return None
+
+
 def is_exact_skill_runtime_authority_transport_produce_executor_command(
     command: str, cwd: str, project_root: str, deadline: Deadline | None = None
 ) -> bool:
-    """Same trusted-repo / default-branch / canonical-root / active-issue
-    safety boundary as `is_exact_skill_runtime_executor_command`, applied to
-    the `authority_transport.produce` command class (#2086 AC9/AC10).
-    `authority_transport.produce` is bound to the issue's own active
-    worktree -- unlike `decide.run`, it is not root-no-worktree eligible."""
-    parsed = parse_exact_skill_runtime_authority_transport_produce_command(command, project_root)
-    if parsed is None:
-        return False
-    if os.path.realpath(cwd) != os.path.realpath(project_root):
-        return False
-    branch = current_branch(project_root, deadline)
-    default_branch = resolve_default_branch(project_root, deadline)
-    if not branch or branch != default_branch:
-        return False
-    repo_slug = resolve_repo_slug(project_root, deadline)
-    if repo_slug != parsed.repo:
-        return False
-    active_issue, entry = resolve_active_issue(project_root, cwd, deadline)
-    if active_issue != parsed.issue_number or entry is None:
-        return False
-    return True
+    """Canonical main root/default branch/repo, with zero linked issue
+    worktrees permitted by command_allows_root_no_worktree(). Invalid
+    registry-policy drift fails closed rather than bypassing the invariant.
+    """
+    return authority_transport_produce_rejection_reason(command, cwd, project_root, deadline) is None
 
 
 def parse_exact_skill_runtime_repair_action_apply_command(

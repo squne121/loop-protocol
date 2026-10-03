@@ -307,8 +307,37 @@
           ]
         },
         "reason_code": {
-          "description": "Present only for disposition full_rewrite_required / invalid; the classifier's reason_code.",
-          "type": "string"
+          "description": "Bounded failure reason (required for failed) or canonical full-rewrite handoff reason (required for handoff_required). Forbidden for applied/no_change/rebased. Never raw OWNER text.",
+          "type": "string",
+          "enum": [
+            "unsafe_unstructured_patch_operation",
+            "contract_patch_plan_missing",
+            "contract_patch_plan_operations_not_list",
+            "invalid_scope_delta_decision_binding",
+            "invalid_scope_delta_decision",
+            "invalid_patch_plan_producer_unavailable",
+            "invalid_operations_key_missing",
+            "invalid_operations_not_list",
+            "invalid_allowed_path_deltas_not_list",
+            "invalid_blank_delta_entry",
+            "invalid_anchor_binding_mismatch",
+            "invalid_source_evidence_binding_mismatch",
+            "invalid_allowed_paths_parser_unavailable",
+            "human_review_directive_route_import_failed",
+            "human_review_directive_route_classifier_error",
+            "human_review_directive_route_fresh_readback_failed",
+            "scope_reframe_router_import_failed",
+            "scope_delta_status_required_when_allowed_path_deltas_present",
+            "candidate_readiness_not_go",
+            "anchor_identity_or_trust_changed",
+            "body_drift_retry_exhausted",
+            "final_readback_postcondition_failed",
+            "section_postcondition_failed",
+            "post_update_gate_failed",
+            "contract_update_failed",
+            "approved_scope_requires_full_contract_rewrite",
+            "explicit_trusted_human_directive_requires_issue_editor"
+          ]
         },
         "writes": {
           "type": "integer",
@@ -337,7 +366,35 @@
         "fresh_readiness": {
           "type": "string"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"status": {"enum": ["failed", "handoff_required"]}},
+            "required": ["status"]
+          },
+          "then": {"required": ["reason_code"]},
+          "else": {"not": {"required": ["reason_code"]}}
+        },
+        {
+          "if": {
+            "properties": {"status": {"const": "handoff_required"}},
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {"reason_code": {"enum": [
+              "approved_scope_requires_full_contract_rewrite",
+              "explicit_trusted_human_directive_requires_issue_editor"
+            ]}}
+          },
+          "else": {
+            "properties": {"reason_code": {"not": {"enum": [
+              "approved_scope_requires_full_contract_rewrite",
+              "explicit_trusted_human_directive_requires_issue_editor"
+            ]}}}
+          }
+        }
+      ]
     },
     "artifacts": {
       "type": "object",

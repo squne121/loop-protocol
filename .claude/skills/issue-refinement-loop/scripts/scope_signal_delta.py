@@ -683,6 +683,83 @@ _NON_QUOTED_GROUP = (
 )
 
 
+_URL_START_RE = re.compile(r"(?<![\w/])(?:https?://|www\.)", re.IGNORECASE)
+_LINK_OPEN_RE = re.compile(r"\]\(\s*")
+_REFERENCE_DESTINATION_RE = re.compile(r"(?m)^[ \t]{0,3}\[[^\]\n]+\]:[ \t]*(?:\n[ \t]{0,3})?")
+_ANGLE_PATH_DESTINATION_RE = re.compile(r"<(?:(?:\.claude|docs|src|scripts|tests|\.github)/)[^>\n]+>")
+
+
+def _without_link_destinations(text: str) -> str:
+    """Mask source spans, not candidate substrings, before matching paths.
+
+    A URL's `/docs/...` is a valid-looking suffix even though the *whole*
+    URL is not a repository path. Keep the original character coordinates and
+    surrounding prose so adjacent real literals remain independently visible.
+    This is a bounded destination pre-pass, not a Markdown document parser.
+    """
+    spans: list[tuple[int, int]] = []
+    for match in _LINK_OPEN_RE.finditer(text):
+        start = match.end()
+        if start < len(text) and text[start] == "<":
+            end = text.find(">", start + 1)
+            if end != -1 and "\n" not in text[start:end]:
+                spans.append((start, end + 1))
+            continue
+        depth = 0
+        end = start
+        while end < len(text) and text[end] not in "\n\r":
+            ch = text[end]
+            if ch == "\\" and end + 1 < len(text) and text[end + 1] not in "\n\r":
+                # CommonMark backslash-escaped punctuation is literal URL
+                # content, not a nesting delimiter (notably \\) and \\().
+                end += 2
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+            end += 1
+        if end < len(text) and text[end] == ")":
+            spans.append((start, end))
+    for match in _REFERENCE_DESTINATION_RE.finditer(text):
+        start = match.end()
+        if start < len(text) and text[start] == "<":
+            end = text.find(">", start + 1)
+            if end != -1 and "\n" not in text[start:end]:
+                spans.append((start, end + 1))
+        else:
+            end = start
+            while end < len(text) and not text[end].isspace():
+                end += 1
+            spans.append((start, end))
+    spans.extend(match.span() for match in _ANGLE_PATH_DESTINATION_RE.finditer(text))
+    for match in _URL_START_RE.finditer(text):
+        # Explicit backtick-quoted URLs are unsafe literal *candidates*, not
+        # link destinations. Preserve the pre-existing mixed-literal veto.
+        if text[:match.start()].count("`") % 2:
+            continue
+        end = match.end()
+        depth = 0
+        while end < len(text) and not text[end].isspace() and text[end] not in "<>`":
+            if text[end] == "\\" and end + 1 < len(text) and text[end + 1] not in "\n\r":
+                end += 2
+                continue
+            if text[end] == "(":
+                depth += 1
+            elif text[end] == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+            end += 1
+        spans.append((match.start(), end))
+    chars = list(text)
+    for start, end in spans:
+        chars[start:end] = " " * (end - start)
+    return "".join(chars)
+
+
 def _extract_path_literals_from_text(text: str) -> list[str]:
     """Extract only safe repository-relative Allowed Paths literals.
 
@@ -694,7 +771,7 @@ def _extract_path_literals_from_text(text: str) -> list[str]:
     if _allowed_paths_expansion_is_negated(text):
         return []
     path_literals: list[str] = []
-    for match in PATH_TOKEN_RE.finditer(text or ""):
+    for match in PATH_TOKEN_RE.finditer(_without_link_destinations(text or "")):
         candidate = match.group("path") or match.group("bare") or ""
         normalized = _normalize_exact_repository_path_literal(candidate)
         if normalized is None:
@@ -1402,63 +1479,244 @@ _MARKER_TO_CONTRACT_SECTION = {
 }
 
 
-def derive_contract_patch_operations(evidence_list: list) -> list:
-    """Derive section-bound operations from normalized directives.
+_COMMENT_SECTION_HEADINGS = {
+    "revised acceptance criteria": "Acceptance Criteria",
+    "revised ac": "Acceptance Criteria",
+    "acceptance criteria": "Acceptance Criteria",
+    "stop condition": "Stop Conditions",
+    "stop conditions": "Stop Conditions",
+    "verification command": "Verification Commands",
+    "verification commands": "Verification Commands",
+    "allowed paths": "Allowed Paths",
+    "allowed paths expansion": "Allowed Paths",
+    "in scope": "In Scope",
+    "out of scope": "Out of Scope",
+}
+_AC_LINE_RE = re.compile(r"-\s+(?:\[[ xX]\]\s*)?AC[0-9]+\s*:\s*\S.*", re.IGNORECASE)
+_STOP_DIRECTIVE_RE = re.compile(r"Stop Condition\s*を追加してください\s*:\s*(\S.*)", re.IGNORECASE)
+_VC_DIRECTIVE_RE = re.compile(r"Verification Commands?\s*:\s*((?:-\s+|\$\s+)\S.*)", re.IGNORECASE)
+# A single inline, backtick-quoted command is a structured VC item only when
+# its entire payload is one bounded argv-like command (no shell metacharacters).
+_VC_BACKTICK_DIRECTIVE_RE = re.compile(
+    r"Verification Commands?\s*:\s*`(?P<command>(?:uv|pnpm|python3|node|git|rg)"
+    r"(?:[ \t]+[A-Za-z0-9_./:=+@-]+)+)`",
+    re.IGNORECASE,
+)
+_INLINE_SECTION_LABEL_RE = re.compile(r"(?:Stop Conditions?|Verification Commands?)\s*:", re.IGNORECASE)
+_CONFLICTING_PATH_BULLET_LABEL_RE = re.compile(
+    r"^(?:Stop Conditions?|Verification Commands?|Acceptance Criteria|Revised AC|In Scope|Out of Scope)\s*[:：]",
+    re.IGNORECASE,
+)
+# Indentation is not section authority: a nested directive under a numbered AC
+# must not be laundered into its continuation text by a pre-existing plan.
+_CROSS_SECTION_CONTINUATION_RE = re.compile(
+    r"(?:[-*]\s+)?(?:Allowed Paths?|Stop Conditions?|Verification Commands?|In Scope|Out of Scope)"
+    r"\s*(?:[:：]|(?:を|に)\s*追加してください\s*[:：]?)",
+    re.IGNORECASE,
+)
 
-    ``CONTRACT_PATCH_PLAN_V1`` deliberately retains its existing ``append``
-    wire grammar.  The consumer below turns these entries into transaction-
-    local desired section state; keeping that detail out of the plan avoids a
-    schema migration while preventing the former sections × directives fanout.
+
+def _structured_comment_items(body: str) -> list[tuple[str | None, str, str]]:
+    """Associate the *actual* bullet with its H2 section without changing evidence keys.
+
+    Only indented continuation lines of a bullet are retained. Unrelated
+    paragraphs and bullets outside recognized sections do not become patches.
     """
-    operations = []
+    canonical = _canonicalize_cf_html_envelope(body)
+    if canonical is None:
+        return []
+    items: list[tuple[str | None, str, str]] = []
+    current: str | None = None
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+    for line in (canonical or "").splitlines():
+        if in_fence:
+            if _is_fence_closer(line, fence_char, fence_len):
+                in_fence = False
+            continue
+        opener = _parse_fence_opener(line)
+        if opener:
+            fence_char, fence_len = opener
+            in_fence = True
+            continue
+        heading = _parse_heading(line)
+        if heading is not None:
+            current = _COMMENT_SECTION_HEADINGS.get(heading.lower())
+            continue
+        stripped = line.strip()
+        bullet = _BULLET_LINE_RE.fullmatch(line)
+        if bullet:
+            content = stripped[2:].strip() if stripped.startswith(("- ", "* ")) else stripped[
+                _ORDERED_LIST_ITEM_PREFIX_RE.match(stripped).end():
+            ].strip()
+            items.append((current, content, ""))
+        elif items and current == items[-1][0] and line.startswith(("  ", "\t")) and stripped:
+            section, content, continuation = items[-1]
+            items[-1] = (section, content, continuation + "\n" + line)
+    return items
+
+
+def is_safe_contract_patch_append(operation: dict, *, anchor_body: str | None = None) -> bool:
+    """Validate a bounded section-bound append independent of producer claims."""
+    if not isinstance(operation, dict) or operation.get("op", operation.get("kind")) != "append":
+        return False
+    section, text = operation.get("section"), operation.get("text")
+    if not isinstance(text, str) or not text.strip() or "\x00" in text or "\r" in text:
+        return False
+    lines = text.split("\n")
+    if any(not line.strip() or line.lstrip().startswith("##") for line in lines):
+        return False
+    if section == "Allowed Paths":
+        for line in lines:
+            match = re.fullmatch(r"- `([^`\n]+)`", line)
+            if not match or _normalize_exact_repository_path_literal(match.group(1)) != match.group(1):
+                return False
+        return True
+    if section == "Acceptance Criteria":
+        # A structured numbered AC may have indented continuations, or a
+        # pre-existing plan may contain several independently numbered ACs.
+        # Never promote raw prose (or a new H2) merely because the first line
+        # is well formed.
+        if not _AC_LINE_RE.fullmatch(lines[0]):
+            return False
+        return all(
+            _AC_LINE_RE.fullmatch(line)
+            or (line.startswith(("  ", "\t"))
+                and not _CROSS_SECTION_CONTINUATION_RE.match(line.strip()))
+            for line in lines[1:]
+        )
+    if section == "Stop Conditions":
+        for line in lines:
+            # A pre-existing plan must not bypass the producer's conflicting
+            # H2/inline Allowed Paths check by presenting the request as Stop.
+            if _ALLOWED_PATHS_DIRECTIVE_RE.search(line):
+                return False
+            # An inline request marker does not turn its raw-prose payload into
+            # a section-bound Stop Condition merely by prefixing the request.
+            if _STOP_DIRECTIVE_RE.fullmatch(line.removeprefix("- ").strip()):
+                return False
+            if any(_is_unsafe_path_literal(token) for token in re.findall(r"`([^`]+)`", line)):
+                return False
+            if not re.fullmatch(r"-\s+\S.+", line):
+                return False
+        return True
+    if section == "Verification Commands":
+        return all(re.fullmatch(
+            r"(?:-\s+)?\$\s+\S.+|(?:-\s+)(?:uv|pnpm|python3|node|git|rg)\s+\S.+", line
+        ) for line in lines)
+    if section in {"In Scope", "Out of Scope"}:
+        return all(re.fullmatch(r"-\s+\S.+", line) for line in lines)
+    return False
+
+
+def derive_contract_patch_operations(evidence_list: list, *, source_body: str | None = None) -> list:
+    """Map explicit, section-bound OWNER bullets to the existing append wire shape.
+
+    If any recognized directive fails normalization, discard the *whole* plan:
+    partial success could record an applied mutation while losing Stop/VC or an
+    authorization-bearing path. Background prose with no mapping is ignored.
+    """
+    operations: list[dict] = []
     for index, evidence in enumerate(evidence_list):
+        if not isinstance(evidence, dict):
+            continue
         markers = evidence.get("directive_markers") or []
         directives = evidence.get("extracted_directives") or []
-        if not markers:
+        if not markers or not isinstance(directives, list):
             continue
-        texts = directives or [f"Reflect reviewer directive ({markers[0]})"]
-        for text in texts:
+        if source_body is not None:
+            records = _structured_comment_items(source_body)
+            if [record[1] for record in records] != directives:
+                return []  # An evidence/body mismatch cannot authorize a patch.
+        else:
+            records = [(None, item, "") for item in directives]
+        for explicit_section, item, continuation in records:
+            if not isinstance(item, str):
+                return []
+            text = item.strip()
             lowered = text.lower()
-            if "allowed path" in lowered:
-                marker = "allowed paths"
-            elif "verification command" in lowered:
-                marker = "verification command"
-            elif "stop condition" in lowered:
-                marker = "stop condition"
-            elif "precondition" in lowered or "前提条件" in text:
-                marker = "precondition"
-            elif "ac" in lowered or "acceptance criteria" in lowered:
-                marker = "revised acceptance criteria"
+            # A numbered AC is already section-bound. Its content can mention
+            # "stop conditions" (as in the real #1270 OWNER fixture) without
+            # requesting an append to Stop Conditions. Keep the mixed-plan
+            # veto for separate, malformed directives later in the records.
+            if _AC_LINE_RE.fullmatch(f"- {text}"):
+                inline_sections = ["Acceptance Criteria"]
             else:
-                marker = next(
-                    (candidate for candidate in markers if candidate in _MARKER_TO_CONTRACT_SECTION),
-                    "revised acceptance criteria",
-                )
-            if marker == "allowed paths":
-                # Never append untrusted prose to the authorization-bearing
-                # Allowed Paths section.  A mixed or malformed directive
-                # produces no operation; classification separately routes it
-                # to human escalation before a transaction can be prepared.
-                for path in _extract_path_literals_from_text(text):
-                    operations.append(
-                        {
-                            "section": _MARKER_TO_CONTRACT_SECTION[marker],
-                            "op": "append",
-                            "text": f"- `{path}`",
-                            "rationale": "Exact Allowed Paths delta extracted from trusted review comment",
-                            "source_evidence_index": index,
-                        }
-                    )
+                inline_sections = [
+                    name for name, matches in (
+                        ("Allowed Paths", "allowed path" in lowered),
+                        ("Verification Commands", "verification command" in lowered),
+                        ("Stop Conditions", "stop condition" in lowered),
+                    ) if matches
+                ]
+            # An Allowed Paths heading cannot turn a differently labelled
+            # bullet (or a mixed per-bullet request) into path authority. Reject
+            # the whole plan, including any earlier valid paths, before emitting.
+            if explicit_section == "Allowed Paths" and (
+                any(name != "Allowed Paths" for name in inline_sections)
+                or _CONFLICTING_PATH_BULLET_LABEL_RE.match(text)
+            ):
+                return []
+            if len(inline_sections) > 1 and (explicit_section is None or explicit_section not in inline_sections):
+                return []  # A mixed, ambiguous section request is not a partial plan.
+            # An H2 Stop/VC context cannot authorize a path expansion just
+            # because its bullet says "Allowed Paths ...". Do not silently
+            # append that bullet as a Stop/VC item or apply earlier safe items.
+            if explicit_section and explicit_section != "Allowed Paths" and "Allowed Paths" in inline_sections:
+                return []
+            section = explicit_section or (inline_sections[0] if len(inline_sections) == 1 else None)
+            # A Revised AC H2 is context, not an override for a different
+            # explicitly labelled bullet. Numbered ACs above still stay ACs,
+            # even if their prose happens to mention Stop/VC.
+            if (explicit_section == "Acceptance Criteria" and len(inline_sections) == 1
+                    and inline_sections[0] in {"Stop Conditions", "Verification Commands"}
+                    and _INLINE_SECTION_LABEL_RE.match(text)):
+                section = inline_sections[0]
+            if section is None and set(markers) <= {"revised ac", "revised acceptance criteria"}:
+                section = "Acceptance Criteria"
+            if section is None:
                 continue
-            operations.append(
-                {
-                    "section": _MARKER_TO_CONTRACT_SECTION[marker],
-                    "op": "append",
-                    "text": text,
-                    "rationale": f"Directive extracted from trusted review comment ({marker})",
-                    "source_evidence_index": index,
-                }
-            )
+            marker = {
+                "Acceptance Criteria": "revised ac" if "revised ac" in markers else "revised acceptance criteria",
+                "Stop Conditions": "stop condition",
+                "Verification Commands": "verification command",
+                "Allowed Paths": "allowed paths",
+                "In Scope": "in scope",
+                "Out of Scope": "out of scope",
+            }[section]
+            if section == "Allowed Paths":
+                paths = _extract_path_literals_from_text(text)
+                if not paths:
+                    return []
+                for path in paths:
+                    operations.append({
+                        "section": section, "op": "append", "text": f"- `{path}`",
+                        "rationale": "Exact Allowed Paths delta extracted from trusted review comment",
+                        "source_evidence_index": index,
+                    })
+                continue
+            if section == "Stop Conditions" and _STOP_DIRECTIVE_RE.fullmatch(text):
+                normalized = f"- {text}"
+            elif section == "Verification Commands" and (match := _VC_BACKTICK_DIRECTIVE_RE.fullmatch(text)):
+                normalized = f"- {match.group('command')}"
+            elif section == "Verification Commands" and (match := _VC_DIRECTIVE_RE.fullmatch(text)):
+                normalized = match.group(1)
+            elif section == "Acceptance Criteria" and _AC_LINE_RE.fullmatch(f"- {text}"):
+                normalized = f"- {text}"
+            elif section in {"Stop Conditions", "Verification Commands", "In Scope", "Out of Scope"}:
+                normalized = f"- {text}"
+            else:
+                normalized = text
+            normalized += continuation
+            operation = {
+                "section": section, "op": "append", "text": normalized,
+                "rationale": f"Directive extracted from trusted review comment ({marker})",
+                "source_evidence_index": index,
+            }
+            if not is_safe_contract_patch_append(operation, anchor_body=source_body):
+                return []
+            operations.append(operation)
     return operations
 
 
@@ -2280,6 +2538,7 @@ def classify_scope_delta_authority(
     base_issue_body_sha256=None,
     expected_repo=None,
     investigation_derived_path_literals=None,
+    source_body: str | None = None,
 ) -> dict:
     """#2053 AC6 public wrapper: partitions `evidence` into same-target and
     cross-target (a different Issue than `target_issue_number`) before
@@ -2326,6 +2585,7 @@ def classify_scope_delta_authority(
         base_issue_body_sha256=base_issue_body_sha256,
         expected_repo=expected_repo,
         investigation_derived_path_literals=investigation_derived_path_literals,
+        source_body=source_body,
     )
 
     if cross_target_follow_ups:
@@ -2352,6 +2612,7 @@ def _classify_scope_delta_authority_core(
     base_issue_body_sha256=None,
     expected_repo=None,
     investigation_derived_path_literals=None,
+    source_body: str | None = None,
 ) -> dict:
     """AC1-AC19: classify scope_delta_authority for a scope signal delta.
 
@@ -2530,7 +2791,13 @@ def _classify_scope_delta_authority_core(
             target_issue_number=target_issue_number,
             base_issue_body_sha256=base_issue_body_sha256,
             source_evidence=[_patch_source_evidence_entry(item) for item in evidence_list],
-            operations=derive_contract_patch_operations(evidence_list),
+            operations=(derive_contract_patch_operations(evidence_list, source_body=source_body)
+                        if source_body is None or (
+                            len(evidence_list) == 1
+                            and evidence_list[0].get("body_sha256") == hashlib.sha256(
+                                source_body.encode("utf-8")
+                            ).hexdigest()
+                        ) else []),
         )
         return result
 
