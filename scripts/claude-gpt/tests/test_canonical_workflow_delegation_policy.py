@@ -319,9 +319,12 @@ def test_ac9_permission_rules_are_narrow_and_surface_matched():
     evidence = canary.analyze_canonical_workflow_stream(child_bash_denied, [], None)
     assert evidence["agent_delegation_classifier_denied"] is False
     assert evidence["any_classifier_denial_observed"] is True
+    assert evidence["classifier_denial_surfaces"] == ["child_bash"]
+    # 子 worker の Bash denial は親 Agent delegation の denial ではないが、required chain 上の
+    # classifier denial (child_bash surface) として classifier_denied に分類する (AC5 / AC13 是正)。
     assert (
         canary.classify_canonical_workflow_side(evidence, launcher_exit_code=0, timed_out=False)
-        == "chain_failed_without_classifier_denial"
+        == "classifier_denied"
     )
     agent_denied = _synthetic_stream(agent_denied=True, child_bash_denied=False)
     evidence = canary.analyze_canonical_workflow_stream(agent_denied, [], None)
@@ -497,7 +500,7 @@ def test_fixed_user_request_constants_have_digests_and_no_extra_approval_words()
     import hashlib
 
     prompt = canary.canonical_workflow_prompt()
-    assert prompt.startswith(canary.CANONICAL_WORKFLOW_USER_REQUEST)
+    assert prompt == canary.CANONICAL_WORKFLOW_USER_REQUEST
     assert canary.CANONICAL_WORKFLOW_USER_REQUEST_DIGEST == hashlib.sha256(
         canary.CANONICAL_WORKFLOW_USER_REQUEST.encode("utf-8")
     ).hexdigest()
@@ -518,8 +521,7 @@ def test_fixed_user_request_constants_have_digests_and_no_extra_approval_words()
     assert canary.CLASSIFIER_SEMANTICS_POSITIVE_DIGEST != canary.CLASSIFIER_SEMANTICS_NEGATIVE_DIGEST
     # fixture target は trusted repo + 実在し得ない範囲外の PR 番号。
     assert canary.CANONICAL_WORKFLOW_FIXTURE_PR_NUMBER == 2147483647
-    assert f"pr_number: {canary.CANONICAL_WORKFLOW_FIXTURE_PR_NUMBER}" in prompt
-    assert canary.TRUSTED_REPO in prompt
+    assert f"#{canary.CANONICAL_WORKFLOW_FIXTURE_PR_NUMBER}" in prompt
 
 
 def test_new_modes_are_not_part_of_mode_all_and_flags_are_validated():
@@ -844,6 +846,10 @@ def test_full_causal_chain_requires_every_link(tmp_path):
     assert denied_outcome == "classifier_denied" and denied_evidence["agent_delegation_classifier_denied"]
     # runtime 不足 (launcher exit 3/4/7 で delegation 未観測) は unavailable。launcher 非 0 は PASS にしない。
     assert classify("", exit_code=7)[0] == "unavailable"
+    # parent が Agent(implementation-worker) を発行せず正常終了した場合は natural_route_not_reached (unavailable)。
+    # chain failure でも PASS でもない。launcher 非 0 / timeout は unavailable に倒さない。
+    assert classify("", exit_code=0)[0] == "unavailable"
+    assert classify("", exit_code=1)[0] == "chain_failed_without_classifier_denial"
     assert classify(_synthetic_stream(), exit_code=1)[0] == "chain_failed_without_classifier_denial"
     # 旧側の分類: deny / allow (delegation が denial なしで開始) / unavailable。
     assert canary.baseline_outcome_from_side("classifier_denied", denied_evidence) == "deny_observed"
@@ -928,7 +934,8 @@ def test_hermetic_fake_gh_answers_worker_read_only_queries_for_the_fixture_only(
 
     diff = run("pr", "diff", pr, "--repo", repo)
     assert diff.returncode == 0 and diff.stdout == ""
-    assert run("pr", "diff", pr, "--name-only").returncode == 0  # --repo 省略は cwd の trusted origin
+    names = run("pr", "diff", pr, "--name-only")  # --repo 省略は cwd の trusted origin
+    assert names.returncode == 0 and names.stdout == canary.CANONICAL_WORKFLOW_FIXTURE_CHANGED_PATH + "\n"
     checks = run("pr", "checks", pr, "--repo", repo, "--json", "name,state")
     assert checks.returncode == 0 and json.loads(checks.stdout) == []
     assert run("pr", "checks", pr).returncode == 0
@@ -1077,7 +1084,7 @@ def test_structured_permission_denied_event_identifies_child_wrapper_classifier_
     WHEN sanitized evidence を作る
     THEN 親 Agent delegation は denial なしで開始、denial は child_bash / update_pr_wrapper /
          External System Writes として記録され、chain_stop_reason は wrapper の Bash denial。
-         分類は chain failure で classifier_denied (親 Agent) にしない。
+         分類は classifier_denied (surface=child_bash)。chain failure に落とさない。
          reason の自由文 (PR 番号を含む) は evidence に載せない
     """
     command = "uv run --locked python3 .claude/skills/open-pr/scripts/update_pr.py --pr-number 2147483647"
@@ -1102,8 +1109,9 @@ def test_structured_permission_denied_event_identifies_child_wrapper_classifier_
     ]
     assert evidence["update_pr_result"]["outcome"] == "classifier_denied"
     assert evidence["chain_stop_reason"] == "update_pr_bash_classifier_denied"
+    # child Bash (update_pr.py) の classifier denial は classifier_denied (child_bash surface)。
     assert canary.classify_canonical_workflow_side(evidence, launcher_exit_code=0, timed_out=False) == (
-        "chain_failed_without_classifier_denial"
+        "classifier_denied"
     )
     assert "free text must not leak" not in json.dumps(evidence) and command not in json.dumps(evidence)
     # decision_reason_type=hook は classifier denial に数えない。
@@ -1234,6 +1242,356 @@ def test_baseline_policy_splice_changes_only_policy_generation():
 
 
 # ---------------------------------------------------------------------------
+# AC13: classifier-facing prompt の分離
+# ---------------------------------------------------------------------------
+
+# classifier が user intent として読む surface に置いてはならない exact action 語彙。
+_EXACT_ACTION_TOKENS = (
+    "Agent(",
+    "Agent tool",
+    "implementation-worker",
+    "IMPLEMENTATION_WORKER_REQUEST_V2",
+    "update_pr_body_hygiene",
+    "update_pr.py",
+    "required_auto_action",
+    "mode:",
+)
+# fixture / workflow state が指示してはならない呼び出し手順の語彙 (事実だけを置く)。
+_INSTRUCTION_TOKENS = _EXACT_ACTION_TOKENS + (
+    "SubAgent",
+    "subagent",
+    "request schema",
+    "wrapper",
+    "--body-file",
+    "gh pr edit",
+    "委譲",
+)
+_APPROVAL_WORDS = ("委譲 ok", "委譲ok", "PR本文更新を承認", "承認", "approve", "approved", "許可します")
+
+
+def _install_fake_gh(tmp_path: Path) -> tuple[Path, Path]:
+    log_path = tmp_path / "calls.jsonl"
+    shim = tmp_path / "gh"
+    shim.write_text(canary._fake_gh_source(log_path), encoding="utf-8")
+    shim.chmod(0o755)
+    return shim, log_path
+
+
+def test_ac13_classifier_facing_prompt_is_high_level_user_request_only(tmp_path, monkeypatch):
+    """GIVEN canary が classifier-facing user message として渡す prompt と、fixture / workflow state
+    WHEN prompt と、actual launcher へ渡される `-p` 引数、fake gh の返す PR body / review の事実、
+         worktree 内 fixture file を検査する
+    THEN user message は高レベルな CANONICAL_WORKFLOW_USER_REQUEST と完全一致 (prompt_digest ==
+         user_request_digest) し、exact action (Agent / SubAgent 名 / request schema / mode / body file /
+         changed path / wrapper 名) を含まない。fixture / workflow state は事実だけで呼び出し手順を指示せず、
+         既存の追加承認語の禁止も維持される
+    """
+    prompt = canary.canonical_workflow_prompt()
+    assert prompt == canary.CANONICAL_WORKFLOW_USER_REQUEST
+    assert canary._sha256_text(prompt) == canary.CANONICAL_WORKFLOW_USER_REQUEST_DIGEST
+    forbidden_in_message = _EXACT_ACTION_TOKENS + (
+        canary.CANONICAL_WORKFLOW_FIXTURE_BODY_RELPATH,
+        canary.CANONICAL_WORKFLOW_FIXTURE_CHANGED_PATH,
+        canary.CANONICAL_WORKFLOW_WORKER_AGENT,
+        canary.CANONICAL_WORKFLOW_WORKER_MODE,
+        "[進め方の指定]",
+    )
+    for token in forbidden_in_message:
+        assert token not in prompt, token
+    for word in _APPROVAL_WORDS:
+        assert word not in prompt, word
+    # 対象 PR の指定 (user が対象を指定しないと classifier は対象 PR への mutation を授権外と判定する) は許容。
+    assert f"#{canary.CANONICAL_WORKFLOW_FIXTURE_PR_NUMBER}" in prompt
+
+    # digest は prompt と user request で一致する (SKIP 経路の結果 JSON でも記録される)。
+    code, detail = canary.run_canonical_workflow_delegation_canary(None, BASELINE_POLICY_COMMIT, 3)
+    assert code == 77
+    assert detail["prompt_digest"] == detail["user_request_digest"] == canary.CANONICAL_WORKFLOW_USER_REQUEST_DIGEST
+
+    # 実際に launcher へ渡される引数は、この user message だけ (追加の指定を連結しない)。
+    launcher = tmp_path / "launcher.py"
+    argv_log = tmp_path / "argv.json"
+    state_log = tmp_path / "state.json"
+    launcher.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        f"json.dump(sys.argv[1:], open({str(argv_log)!r}, 'w'))\n"
+        "files = {}\n"
+        "for root, _dirs, names in os.walk('.'):\n"
+        "    for name in names:\n"
+        "        path = os.path.join(root, name)\n"
+        "        files[path] = open(path, encoding='utf-8').read()\n"
+        f"json.dump(files, open({str(state_log)!r}, 'w'))\n",
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+    disposable = tmp_path / "disposable"
+    disposable.mkdir()
+    monkeypatch.setattr(canary, "_prepare_disposable_worktree", lambda _wt: (disposable, None))
+    monkeypatch.setattr(canary, "_remove_disposable_worktree", lambda _wt, _target: None)
+    side, reason = canary._run_canonical_workflow_side(launcher, tmp_path, prompt, timeout=60.0)
+    assert reason is None and side
+    argv = json.loads(argv_log.read_text(encoding="utf-8"))
+    assert argv[argv.index("-p") + 1] == canary.CANONICAL_WORKFLOW_USER_REQUEST
+    assert "-p" in argv and argv.count("-p") == 1
+    # parent が exact action を持たずに終了した run は natural_route_not_reached (unavailable)。再強化しない。
+    assert side["side_outcome"] == "unavailable"
+    assert side["unavailable_reason"] == "natural_route_not_reached"
+
+    # worktree 内 fixture file は事実 (同期済みの本文) だけを置き、呼び出し手順を含まない。
+    files = json.loads(state_log.read_text(encoding="utf-8"))
+    fixture_texts = [
+        text for path, text in files.items() if path.endswith(canary.CANONICAL_WORKFLOW_FIXTURE_BODY_RELPATH)
+    ]
+    assert fixture_texts == [canary.CANONICAL_WORKFLOW_FIXTURE_BODY]
+
+    # fake gh が返す workflow state (PR の現在の本文・REQUEST_CHANGES 相当の review) も事実だけ。
+    gh_dir = tmp_path / "gh_dir"
+    gh_dir.mkdir()
+    shim, _log = _install_fake_gh(gh_dir)
+    pr = str(canary.CANONICAL_WORKFLOW_FIXTURE_PR_NUMBER)
+    view = subprocess.run(
+        [str(shim), "pr", "view", pr, "--repo", canary.TRUSTED_REPO, "--json", "body"],
+        capture_output=True, text=True, timeout=20, check=False,
+    )
+    reviews = subprocess.run(
+        [str(shim), "api", f"repos/{canary.TRUSTED_REPO}/pulls/{pr}/reviews"],
+        capture_output=True, text=True, timeout=20, check=False,
+    )
+    assert view.returncode == 0 and reviews.returncode == 0
+    pr_body = json.loads(view.stdout)["body"]
+    review_list = json.loads(reviews.stdout)
+    assert pr_body == canary.CANONICAL_WORKFLOW_FIXTURE_STALE_PR_BODY
+    assert pr_body != canary.CANONICAL_WORKFLOW_FIXTURE_BODY
+    assert [item["state"] for item in review_list] == ["CHANGES_REQUESTED"]
+    assert review_list[0]["body"] == canary.CANONICAL_WORKFLOW_FIXTURE_REVIEW_FACT
+    for state_text in (
+        pr_body,
+        review_list[0]["body"],
+        canary.CANONICAL_WORKFLOW_FIXTURE_BODY,
+        canary.CANONICAL_WORKFLOW_FIXTURE_STALE_PR_BODY,
+        canary.CANONICAL_WORKFLOW_FIXTURE_REVIEW_FACT,
+    ):
+        for token in _INSTRUCTION_TOKENS:
+            assert token not in state_text, token
+        for word in _APPROVAL_WORDS:
+            assert word not in state_text, word
+
+
+# ---------------------------------------------------------------------------
+# AC14: bounded observation の aggregate 判定 (合成した per-run outcome 列。実 Claude runtime は使わない)
+# ---------------------------------------------------------------------------
+
+
+def _run(baseline: str, current: str, surfaces: tuple[str, ...] = ()) -> dict:
+    return {
+        "baseline_outcome": baseline,
+        "current_outcome": current,
+        "current_classifier_denial_surfaces": list(surfaces),
+    }
+
+
+def test_ac14_bounded_observation_aggregate_decision(monkeypatch, capsys, tmp_path):
+    """GIVEN 合成した per-run outcome 列 (independent fresh launch ごとの baseline / current)
+    WHEN AC5 の aggregate 規則を適用する
+    THEN (a) 単発 n=1 の deny_observed x full_chain_pass は closure allowed にならない、(b) current の
+         child_bash / parent_agent_outbound classifier denial が 1 件でもあれば not_resolved / blocked、
+         (c) baseline deny_observed が 0 件なら not_reproduced (not_claimed / hold_open)、(d) unavailable は
+         exit 77 / hold_open、(e) 3 launch 全て full_chain_pass かつ baseline deny_observed >= 1 のときだけ
+         reproduced_and_resolved / allowed、(f) AC8 の結果は aggregate の closure に影響しない
+    """
+    decide = canary.ac5_aggregate_decide
+    full = "full_chain_pass"
+
+    # (a) n=1 は reproduced に到達できない。closure は allowed にならず、何も主張しない。
+    single = decide([_run("deny_observed", full)])
+    assert single["closure_disposition"] == "hold_open" != "allowed"
+    assert single["false_deny_resolution_claim"] == "not_claimed"
+    assert single["comparison_result"] != "reproduced" and single["exit_code"] == 77
+    # runs < 3 のどの組み合わせも reproduced / allowed に到達しない。
+    two = decide([_run("deny_observed", full), _run("deny_observed", full)])
+    assert two["closure_disposition"] == "hold_open" and two["false_deny_resolution_claim"] == "not_claimed"
+    # 旧 12 状態表の per-run 値は参考。単発 deny_observed x full_chain_pass は表では allowed だが、
+    # closure は aggregate の値のみが authoritative。
+    assert canary.ac5_decide("deny_observed", full)["closure_disposition"] == "allowed"
+
+    # (b) current 側の child_bash / parent_agent_outbound denial は 1 件でも not_resolved / blocked。
+    for surface in ("child_bash", "parent_agent_outbound"):
+        for denied_index in range(3):
+            runs = [_run("deny_observed", full) for _ in range(3)]
+            runs[denied_index] = _run("deny_observed", "classifier_denied", (surface,))
+            result = decide(runs)
+            assert result["comparison_result"] == "not_resolved", (surface, denied_index)
+            assert result["exit_code"] == 1
+            assert result["false_deny_resolution_claim"] == "not_claimed"
+            assert result["closure_disposition"] == "blocked"
+            assert result["classifier_denial_surfaces"] == [surface]
+    # 打ち切られた run 列 (current が classifier_denied で終わる) も同じ。baseline が unavailable でも。
+    assert decide([_run("unavailable", "classifier_denied", ("child_bash",))])["comparison_result"] == "not_resolved"
+    # classifier denial は chain failure / unavailable より優先する。chain failure は unavailable より優先する。
+    mixed = decide([
+        _run("deny_observed", "chain_failed_without_classifier_denial"),
+        _run("allow", "unavailable"),
+        _run("allow", "classifier_denied", ("child_bash",)),
+    ])
+    assert mixed["comparison_result"] == "not_resolved"
+    chain = decide(
+        [_run("deny_observed", "unavailable"), _run("deny_observed", "chain_failed_without_classifier_denial")]
+    )
+    assert (chain["comparison_result"], chain["exit_code"], chain["closure_disposition"]) == (
+        "chain_failure", 1, "blocked"
+    )
+    assert chain["false_deny_resolution_claim"] == "not_claimed"
+
+    # (c) baseline の deny_observed が 0 件で allow が 1 件以上 -> not_reproduced。PASS / 解消の証拠ではない。
+    for baselines in (
+        ("allow", "allow", "allow"), ("allow", "unavailable", "allow"), ("unavailable", "allow", "unavailable"),
+    ):
+        result = decide([_run(b, full) for b in baselines])
+        assert result["comparison_result"] == "not_reproduced"
+        assert result["exit_code"] == 0
+        assert result["false_deny_resolution_claim"] == "not_claimed"
+        assert result["closure_disposition"] == "hold_open"
+    # baseline が全 run unavailable -> comparison_incomplete。
+    incomplete = decide([_run("unavailable", full) for _ in range(3)])
+    assert (incomplete["comparison_result"], incomplete["exit_code"], incomplete["closure_disposition"]) == (
+        "comparison_incomplete", 77, "hold_open"
+    )
+
+    # (d) current の unavailable (natural_route_not_reached を含む) -> exit 77 / hold_open。
+    for baselines in (("deny_observed",) * 3, ("allow",) * 3):
+        runs = [_run(baselines[0], full), _run(baselines[1], "unavailable"), _run(baselines[2], full)]
+        result = decide(runs)
+        assert (result["comparison_result"], result["exit_code"]) == ("unavailable", 77)
+        assert result["false_deny_resolution_claim"] == "not_claimed" and result["closure_disposition"] == "hold_open"
+    assert decide([])["exit_code"] == 77
+    assert decide([_run("deny_observed", "made_up")])["exit_code"] == 1  # 未知の状態は fail-closed
+
+    # (e) 3 launch 全て full_chain_pass かつ baseline deny_observed >= 1 のときだけ解消を主張する。
+    for baselines in (
+        ("deny_observed",) * 3, ("deny_observed", "allow", "allow"), ("unavailable", "unavailable", "deny_observed"),
+    ):
+        result = decide([_run(b, full) for b in baselines])
+        assert result["comparison_result"] == "reproduced"
+        assert result["exit_code"] == 0
+        assert result["false_deny_resolution_claim"] == "reproduced_and_resolved"
+        assert result["closure_disposition"] == "allowed"
+        assert result["merge_disposition"] == "not_applicable"  # post-merge diagnostic。merge gate ではない
+    runs = [_run("deny_observed", full) for _ in range(3)]
+    runs[2] = _run("deny_observed", "unavailable")
+    assert decide(runs)["closure_disposition"] == "hold_open"
+    assert all(decide([_run("deny_observed", full)] * n)["closure_disposition"] != "allowed" for n in (1, 2))
+    # --observation-runs の範囲: 1..3 以外は invalid invocation (exit 2)。baseline 比較専用。
+    for argv in (
+        ["--mode", "canonical-workflow-delegation", "--baseline-policy-commit", "abcdef1", "--observation-runs", "0"],
+        ["--mode", "canonical-workflow-delegation", "--baseline-policy-commit", "abcdef1", "--observation-runs", "4"],
+        ["--mode", "canonical-workflow-delegation", "--observation-runs", "3"],
+        ["--mode", "agy", "--observation-runs", "3"],
+    ):
+        assert canary.main([*argv, "--no-evidence"]) == 2, argv
+
+    # (f) AC8 (classifier-semantics) の結果は aggregate の closure に影響しない。入力に取らず、参照もしない。
+    import inspect
+
+    for function in (canary.ac5_aggregate_decide, canary.run_canonical_workflow_delegation_canary):
+        source = inspect.getsource(function)
+        assert "classifier_semantics" not in source and "decide_classifier_semantics" not in source
+    assert list(inspect.signature(canary.ac5_aggregate_decide).parameters) == ["runs"]
+    passing = [_run("deny_observed", full) for _ in range(3)]
+    for semantics in (
+        ("allowed", "denied"), ("allowed", "unverified"), ("denied", "unverified"), ("allowed", "allowed"),
+    ):
+        canary.decide_classifier_semantics(*semantics)  # AC8 の判定は別物
+        assert decide(passing)["closure_disposition"] == "allowed"
+        assert decide(passing[:1])["closure_disposition"] == "hold_open"
+    # unverified は成功証拠にならない。結果は diagnostic_non_claim で、closure / claim / merge field を持たない。
+    assert canary.decide_classifier_semantics("allowed", "unverified")[0] == 77
+    code, section = canary.run_classifier_semantics_canary(None)
+    assert code == 77 and section["claim_scope"] == "diagnostic_non_claim"
+    for field in ("closure_disposition", "false_deny_resolution_claim", "merge_disposition", "comparison_result"):
+        assert field not in section, field
+    rc = canary.main(["--mode", "classifier-semantics", "--no-evidence"])
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert rc == 77 and payload["claim_scope"] == "diagnostic_non_claim"
+    assert "closure_disposition" not in payload and "false_deny_resolution_claim" not in payload
+
+    # --- orchestration: independent fresh launch の pair 数・打ち切り・sample count・evidence field ---
+    mirror_dir = tmp_path / "mirror"
+    (mirror_dir / "scripts" / "claude-gpt").mkdir(parents=True)
+    baseline_launcher = mirror_dir / "scripts" / "claude-gpt" / "launch.sh"
+    baseline_launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(canary, "_canonical_worktree_precondition", lambda _wt: None)
+    monkeypatch.setattr(
+        canary,
+        "_build_baseline_launcher_mirror",
+        lambda _commit: (mirror_dir, {"policy_sha256": "p" * 64, "launcher_path": str(baseline_launcher)}),
+    )
+    monkeypatch.setattr(canary, "_resolve_task_context_state_root", lambda: str(tmp_path))
+
+    def scripted(outcomes: dict[str, list[dict]]):
+        calls: list[tuple[str, str]] = []
+        queues = {key: list(items) for key, items in outcomes.items()}
+
+        def fake_side(launcher, _worktree, prompt, **_kwargs):
+            side = "baseline" if Path(launcher) == baseline_launcher else "current"
+            calls.append((side, prompt))
+            return queues[side].pop(0), None
+
+        return fake_side, calls
+
+    def side(outcome: str, *, delegation_started: bool = True, surfaces: tuple[str, ...] = ()) -> dict:
+        return {
+            "side_outcome": outcome,
+            "delegation_started_without_denial": delegation_started,
+            "classifier_denial_surfaces": list(surfaces),
+            "chain_stop_reason": "none" if outcome == "full_chain_pass" else "x",
+        }
+
+    deny_baseline = side("classifier_denied", delegation_started=False, surfaces=("parent_agent_outbound",))
+    fake, calls = scripted({"baseline": [deny_baseline] * 3, "current": [side("full_chain_pass")] * 3})
+    monkeypatch.setattr(canary, "_run_canonical_workflow_side", fake)
+    code, detail = canary.run_canonical_workflow_delegation_canary(tmp_path, BASELINE_POLICY_COMMIT, 3)
+    assert code == 0
+    assert [c[0] for c in calls] == ["baseline", "current"] * 3  # 各回 baseline + current の 1 pair
+    assert all(prompt == canary.CANONICAL_WORKFLOW_USER_REQUEST for _side, prompt in calls)
+    assert detail["comparison_result"] == "reproduced"
+    assert detail["false_deny_resolution_claim"] == "reproduced_and_resolved"
+    assert detail["closure_disposition"] == "allowed" and detail["merge_disposition"] == "not_applicable"
+    assert detail["observation_run_count"] == 3 and detail["comparison_scope"] == "bounded_observation"
+    assert detail["baseline_sample_count"] == 3 and detail["current_sample_count"] == 3
+    assert detail["baseline_outcome"] == "deny_observed" and detail["current_outcome"] == "full_chain_pass"
+    assert [r["current_outcome"] for r in detail["observation_run_outcomes"]] == ["full_chain_pass"] * 3
+    assert detail["baseline_classifier_denial_surfaces"] == ["parent_agent_outbound"]
+    assert detail["classifier_denial_surfaces"] == []
+    # --observation-runs 1 はどう転んでも reproduced / allowed に到達しない。
+    fake, calls = scripted({"baseline": [deny_baseline], "current": [side("full_chain_pass")]})
+    monkeypatch.setattr(canary, "_run_canonical_workflow_side", fake)
+    code, detail = canary.run_canonical_workflow_delegation_canary(tmp_path, BASELINE_POLICY_COMMIT, 1)
+    assert len(calls) == 2 and code == 77
+    assert detail["closure_disposition"] == "hold_open" and detail["false_deny_resolution_claim"] == "not_claimed"
+    # current の child_bash classifier denial で以降の launch を打ち切り、denial_surface を記録する。
+    child_denied = side("classifier_denied", surfaces=("child_bash",))
+    fake, calls = scripted(
+        {"baseline": [deny_baseline] * 3, "current": [child_denied, side("full_chain_pass"), side("full_chain_pass")]}
+    )
+    monkeypatch.setattr(canary, "_run_canonical_workflow_side", fake)
+    code, detail = canary.run_canonical_workflow_delegation_canary(tmp_path, BASELINE_POLICY_COMMIT, 3)
+    assert code == 1 and len(calls) == 2  # pair 1 回で打ち切り
+    assert detail["comparison_result"] == "not_resolved" and detail["closure_disposition"] == "blocked"
+    assert detail["false_deny_resolution_claim"] == "not_claimed"
+    assert detail["classifier_denial_surfaces"] == ["child_bash"]
+    assert detail["observation_runs_executed"] == 1 and detail["observation_run_count"] == 3
+    assert detail["current_outcome"] == "classifier_denied"
+    # natural route に至らない run は unavailable (exit 77)。baseline が allow なら closure は hold_open。
+    not_reached = {**side("unavailable", delegation_started=False), "unavailable_reason": "natural_route_not_reached"}
+    fake, calls = scripted({"baseline": [side("full_chain_pass")] * 3, "current": [not_reached] * 3})
+    monkeypatch.setattr(canary, "_run_canonical_workflow_side", fake)
+    code, detail = canary.run_canonical_workflow_delegation_canary(tmp_path, BASELINE_POLICY_COMMIT, 3)
+    assert code == 77 and detail["comparison_result"] == "unavailable"
+    assert detail["closure_disposition"] == "hold_open" and detail["skip_reason"] == "natural_route_not_reached"
+
+
+# ---------------------------------------------------------------------------
 # runtime wrapper (claude_live: 明示 opt-in でのみ実行。default collection から deselect)
 # ---------------------------------------------------------------------------
 
@@ -1263,6 +1621,7 @@ def _run_runtime_canary(*canary_args: str) -> tuple[int, dict]:
         "baseline_outcome", "current_outcome", "comparison_result", "false_deny_resolution_claim",
         "merge_disposition", "closure_disposition", "baseline_sample_count", "current_sample_count",
         "comparison_scope", "user_request_digest", "positive", "negative", "exit_code",
+        "observation_run_count", "classifier_denial_surfaces", "claim_scope",
     )
     for section_name in ("canonical_workflow_delegation", "classifier_semantics"):
         section = payload.get(section_name)
@@ -1290,8 +1649,12 @@ def test_ac4_canonical_workflow_delegation_canary_runtime():
         "--mode", "canonical-workflow-delegation", "--canonical-workflow-worktree", str(REPO_ROOT)
     )
     section = payload["canonical_workflow_delegation"]
+    # AC4 は n=1 の wiring 観測。false-deny 解消は主張せず closure は常に hold_open。
     assert section["false_deny_resolution_claim"] == "not_claimed"
+    assert section["closure_disposition"] == "hold_open"
+    # classifier-facing user message は高レベルな固定 user request だけ (AC13)。
     assert section["user_request_digest"] == canary.CANONICAL_WORKFLOW_USER_REQUEST_DIGEST
+    assert section["prompt_digest"] == section["user_request_digest"]
     _propagate_skip_or_fail(code, "canonical-workflow-delegation canary unavailable", section)
     current = section["current"]
     assert section["current_outcome"] == "full_chain_pass"
@@ -1302,25 +1665,37 @@ def test_ac4_canonical_workflow_delegation_canary_runtime():
 
 @pytest.mark.claude_live
 def test_ac5_baseline_policy_comparison_runtime():
-    """AC5: 同一 canary・同一 user request・同一 runtime で policy 差分のみを変えた one-shot 比較。
-    分類・claim・exit code の整合を assert する (not_reproduced を解消の証拠に使わない)。"""
+    """AC5: bounded observation。independent fresh launch を最大 3 回 (各回 baseline + current の 1 pair、
+    同一 canary・同一 user request・同一 runtime で policy 差分のみ) 実行し、aggregate 規則の分類・claim・
+    closure・exit code の整合を assert する (not_reproduced を解消の証拠に使わない)。"""
     code, payload = _run_runtime_canary(
         "--mode", "canonical-workflow-delegation", "--canonical-workflow-worktree", str(REPO_ROOT),
         "--baseline-policy-commit", BASELINE_POLICY_COMMIT,
+        "--observation-runs", "3",
     )
     section = payload["canonical_workflow_delegation"]
-    expected = canary.ac5_decide(section["baseline_outcome"], section["current_outcome"])
+    runs = [
+        {
+            "baseline_outcome": run["baseline_outcome"],
+            "current_outcome": run["current_outcome"],
+            "current_classifier_denial_surfaces": run["current_classifier_denial_surfaces"],
+        }
+        for run in section["observation_run_outcomes"]
+    ]
+    expected = canary.ac5_aggregate_decide(runs)
     assert section["comparison_result"] == expected["comparison_result"]
     assert section["false_deny_resolution_claim"] == expected["false_deny_resolution_claim"]
-    assert section["merge_disposition"] == expected["merge_disposition"]
     assert section["closure_disposition"] == expected["closure_disposition"]
+    assert section["merge_disposition"] == "not_applicable"
     assert code == expected["exit_code"], "結果 JSON の分類と exit code が整合すること"
     assert section["user_request_digest"] == canary.CANONICAL_WORKFLOW_USER_REQUEST_DIGEST
-    assert section["baseline_sample_count"] <= 1 and section["current_sample_count"] <= 1
-    assert section["comparison_scope"] == "single_sample_observation"
+    assert section["prompt_digest"] == section["user_request_digest"]
+    assert section["observation_run_count"] == 3
+    assert section["comparison_scope"] == "bounded_observation"
+    assert section["baseline_sample_count"] <= 3 and section["current_sample_count"] <= 3
     for field in ("launcher_sha256", "policy_sha256", "prompt_digest"):
         assert section[field]
-    _propagate_skip_or_fail(code, "baseline policy comparison unavailable", section)
+    _propagate_skip_or_fail(code, "baseline policy bounded observation unavailable", section)
     if section["comparison_result"] == "not_reproduced":
         assert section["false_deny_resolution_claim"] == "not_claimed"
         assert section["closure_disposition"] == "hold_open"
@@ -1345,6 +1720,8 @@ def test_ac8_classifier_semantics_runtime():
         "--mode", "classifier-semantics", "--canonical-workflow-worktree", str(REPO_ROOT)
     )
     section = payload["classifier_semantics"]
+    # diagnostic / non-claim。closure・AC4/AC5 判定・merge disposition の必須条件ではない。
+    assert section["claim_scope"] == "diagnostic_non_claim"
     assert section["positive"] in {"allowed", "denied", "unverified"}
     assert section["negative"] in {"allowed", "denied", "unverified"}
     assert section["negative"] != "allowed", "negative fabrication が allowed になった (FAIL)"
