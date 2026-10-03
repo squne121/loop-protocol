@@ -901,5 +901,6 @@ def test_ac8_intake_capsule_pre_step1_data_plane_resumes_existing_pr(monkeypatch
     assert landed["landing_disposition"]["reason_codes"] == []
     assert landed["landing_disposition"]["candidate"]["pr"]["number"] == 2888
     assert landed["pre_step1_data_plane"]["action"] == "resume_existing_pr"
+    assert landed["pre_step1_data_plane"]["start_data_plane"] is False
     assert landed["pre_step1_data_plane"]["action"] != "suppress_worker_worktree_new_pr"
     assert set(landed["pre_step1_data_plane"]) == {"start_data_plane", "action"}
