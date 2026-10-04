@@ -62,7 +62,11 @@ _SCRIPTED_CLAUDE = textwrap.dedent(
         command = re.search(r"run exactly: (.*?)  After it finishes", prompt, re.S).group(1)
         if os.environ.get("FAKE_SKIP_CLASSIFIER_EXEC") != "1":
             subprocess.run(["sh", "-c", command], check=False)
-        tool("Bash", "")
+        if os.environ.get("FAKE_BASH_RESULT_ERROR") == "1":
+            emit({{"type": "system", "subtype": "permission_denied", "tool": "Bash"}})
+            tool("Bash", "Permission denied by classifier. key sk-abcdefgh12345678 " + "x" * 600, is_error=True)
+        else:
+            tool("Bash", "")
         if os.environ.get("FAKE_PROXY_LOG"):
             with open(os.environ["FAKE_PROXY_LOG"], "a", encoding="utf-8") as fh:
                 for i, model in enumerate(os.environ.get("FAKE_PROXY_MODELS", "").split(",")):
@@ -266,6 +270,36 @@ def test_auto_classifier_scenario_fails_when_the_classified_operation_did_not_co
     assert proc.returncode == 1
     assert payload["auto_mode"]["classifier_file_create_completed"] is False
     assert payload["status"] == "fail"
+
+
+def test_failed_step_records_public_safe_failure_detail_and_passing_steps_do_not(tmp_path, smoke_repo):
+    # 失敗した step にだけ failure_detail（診断）を付ける。PASS 判定そのものは変えない。
+    with H.FakeServer() as server:
+        proc, payload = _run_smoke(
+            tmp_path,
+            smoke_repo,
+            ["--scenario", "auto_classifier"],
+            server_url=server.url,
+            FAKE_BASH_RESULT_ERROR="1",
+        )
+    assert proc.returncode == 1 and payload["status"] == "fail"
+    check = payload["steps"][0]["check"]
+    assert check["ok"] is False and check["tool_completed_with_marker"] is False
+    detail = check["failure_detail"]
+    assert detail["tool_use_present"] is True
+    result = detail["tool_results"][0]
+    assert result["tool_result_present"] is True and result["tool_result_is_error"] is True
+    assert result["tool_result_head"].startswith("Permission denied by classifier.")
+    assert len(result["tool_result_head"]) <= 300
+    assert "sk-abcdefgh12345678" not in json.dumps(payload) and "[REDACTED]" in result["tool_result_head"]
+    assert "system/permission_denied" in detail["permission_denial_event_kinds"]
+    # 成功 step は failure_detail を持たない。
+    ok_dir = tmp_path / "ok"
+    ok_dir.mkdir()
+    with H.FakeServer() as server:
+        ok_proc, ok_payload = _run_smoke(ok_dir, smoke_repo, ["--scenario", "auto_classifier"], server_url=server.url)
+    assert ok_proc.returncode == 0
+    assert all("failure_detail" not in step["check"] for step in ok_payload["steps"])
 
 
 def test_auto_classifier_scenario_records_observed_routing_models_only_from_the_proxy_log(tmp_path, smoke_repo):

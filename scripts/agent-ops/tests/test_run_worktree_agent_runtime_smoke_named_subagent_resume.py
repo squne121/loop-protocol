@@ -719,6 +719,11 @@ def test_role_subagent_real_shape_handback_is_taken_from_subagent_handback_tool_
         ("handback_belongs_to_another_agent_call", dict(handback="272000", handback_parent="toolu_other")),
         ("context_starved_handback", dict(handback="INSUFFICIENT_CONTEXT")),
         ("requested_result_missing", dict(handback="I could not find the value.")),
+        # 値を特定できなかった `status: inconclusive` の report は、値の文字列を含んでいても PASS にしない。
+        ("inconclusive_without_value",
+         dict(handback="status: inconclusive\nfailure_reason: shell symbol extraction failed")),
+        ("inconclusive_even_if_value_string_echoed",
+         dict(handback="status: inconclusive\nfailure_reason: could not confirm 272000")),
         # prompt (Agent tool_use input) carries the requested value, but nothing was handed back.
         ("value_only_in_dispatch_prompt", dict(handback=None, prompt_text="the value is 272000")),
     ],
@@ -752,6 +757,7 @@ def test_role_subagent_handback_normal_controls_pass():
         ("no_parent_handback", dict(handback=None)),
         ("context_starved_stop", dict(handback="INSUFFICIENT_CONTEXT")),
         ("requested_result_missing", dict(handback="I could not find the value.")),
+        ("inconclusive_without_value", dict(handback="status: inconclusive\nfailure_reason: no value found")),
         ("spawn_never_started", dict(handback="272000", start=False)),
         ("stop_precedes_start", dict(handback="272000", stop_before_start=True)),
         ("different_subagent_type_requested", dict(handback="272000", call_type="general-purpose")),
@@ -1669,3 +1675,14 @@ def test_freshness_rejects_recorded_evidence_of_a_failed_run():
     # producer/consumer contract: the flat record carries the run-level exit code
     evidence = {"adapter": "native", "verdict": "pass", "runner_exit_code": 1}
     assert MODULE.freshness_record_from_evidence(evidence)["runner_exit_code"] == 1
+
+
+def test_haiku_prompt_targets_a_python_literal_not_a_shell_variable():
+    prompt = ROLE.haiku_prompt("/repo")
+    assert f"/repo/{ROLE.HAIKU_TARGET_RELATIVE_PATH}" in prompt and ROLE.HAIKU_TARGET_RELATIVE_PATH.endswith(".py")
+    assert f"target_symbol: {ROLE.HAIKU_TARGET_SYMBOL}" in prompt
+    assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" in prompt and "lib.sh" not in prompt
+    # 調査対象 file が実際に symbol と literal を持つ（prompt と対象の乖離を static に固定する）。
+    target = (REPO_ROOT / ROLE.HAIKU_TARGET_RELATIVE_PATH).read_text(encoding="utf-8")
+    assert f"{ROLE.HAIKU_TARGET_SYMBOL} = {{" in target
+    assert any("CLAUDE_CODE_AUTO_COMPACT_WINDOW" in line and "272000" in line for line in target.splitlines())

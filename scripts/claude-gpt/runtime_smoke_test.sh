@@ -138,6 +138,7 @@ trap 'rm -rf "$WORKDIR"' EXIT
 CHECKER_PY="$WORKDIR/check_stream.py"
 cat > "$CHECKER_PY" <<'CHECKER_PY_EOF'
 import json
+import re
 import sys
 
 # usage: check_stream.py <stdout_path> <marker> <expect_tool> [<expect_tool_marker>]
@@ -163,8 +164,16 @@ tool_results = {}
 handback_uses = []
 final_text = ""
 result_is_error = None
+# failure_detail 用（check 失敗時のみ出力する診断。PASS 判定には使わない）。
+permission_denial_kinds = []
 for event in events:
     etype = event.get("type")
+    _kind = "%s/%s" % (etype, event.get("subtype")) if event.get("subtype") else str(etype)
+    if (
+        any(token in _kind.lower() for token in ("denied", "denial", "permission"))
+        and _kind not in permission_denial_kinds
+    ):
+        permission_denial_kinds.append(_kind)
     if etype == "system" and event.get("subtype") == "init":
         permission_mode = event.get("permissionMode")
         model = event.get("model")
@@ -189,6 +198,9 @@ for event in events:
     elif etype == "result":
         final_text = str(event.get("result") or "")
         result_is_error = bool(event.get("is_error"))
+        _denials = event.get("permission_denials")
+        if isinstance(_denials, list) and _denials and "result/permission_denials" not in permission_denial_kinds:
+            permission_denial_kinds.append("result/permission_denials")
 
 wanted = {expect_tool} if expect_tool != "Agent" else {"Agent", "Task"}
 matched_tool_use = [tid for tid, name in tool_use_ids.items() if name in wanted] if expect_tool != "-" else []
@@ -238,6 +250,36 @@ summary = {
     and (result_is_error is False)
     and (expect_tool == "-" or tool_completed),
 }
+
+
+def _public_safe(value, limit=300):
+    """secret らしき token を伏せ、各 field を limit 文字に truncate する（診断専用）。"""
+    text = re.sub(
+        r"(?i)(bearer\s+|sk-|ghp_|gho_|github_pat_|api[_-]?key[\"'=: ]+|token[\"'=: ]+)[A-Za-z0-9._\-]{8,}",
+        r"\1[REDACTED]",
+        str(value or ""),
+    )
+    return text[:limit]
+
+
+if not summary["ok"]:
+    # 失敗原因を evidence から特定できるようにするための診断のみ。PASS 判定ロジックは変更しない。
+    _matched_results = []
+    for tid in matched_tool_use:
+        body, is_error = tool_results.get(tid, (None, None))
+        _matched_results.append(
+            {
+                "tool_result_present": body is not None,
+                "tool_result_is_error": is_error,
+                "tool_result_head": _public_safe(body) if body is not None else None,
+            }
+        )
+    summary["failure_detail"] = {
+        "tool_use_present": bool(matched_tool_use),
+        "tool_results": _matched_results[:3],
+        "permission_denial_event_kinds": [_public_safe(k) for k in permission_denial_kinds[:10]],
+        "final_text_head": _public_safe(final_text),
+    }
 print(json.dumps(summary))
 sys.exit(0 if summary["ok"] else 1)
 CHECKER_PY_EOF

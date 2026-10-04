@@ -22,6 +22,13 @@ repository contract 由来の `human_judgment_required` 等の terminal reason �
   - 対象 Issue 番号: 環境変数 `CLAUDE_GPT_AC5_ISSUE_NUMBER`（既定 2889。OPEN の Issue のみ）。この
     テストは対象 Issue へ termination report 等を実際に投稿しうる live 検証である。
 
+workflow を実行する場所（claude の cwd）は canonical main root checkout（`git rev-parse
+--git-common-dir` から解決）でなければならない。canonical `preflight.run` は「canonical main root /
+default branch」を要求し、#2925 の isolation worktree を cwd にすると `exact command class rejected`
+で planner / SubAgent が一度も起動しないため。起動する launcher は引き続き PR worktree 側
+（SUT）の `scripts/claude-gpt/launch.sh` を絶対 path で指定する。canonical main root が解決できない・
+存在しない・default branch 上にない場合は SKIP（exit 77。PASS ではない）。
+
 `evaluate_workflow_stream` は pure で、実 process を起動しない（下の hermetic test が positive /
 negative control を固定する）。
 """
@@ -59,6 +66,37 @@ def _load_runner():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _git(root: Path, *args: str) -> str | None:
+    proc = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, timeout=30)
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def resolve_canonical_main_root(sut_root: Path) -> tuple[Path | None, str | None]:
+    """Resolve the canonical main root checkout from any checkout/worktree of the repository.
+
+    Returns ``(root, None)`` when the main root exists and is on the repository default branch,
+    else ``(None, reason)`` (the caller SKIPs with exit 77; never a PASS)."""
+    common = _git(sut_root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if not common:
+        return None, "git common dir of the SUT checkout could not be resolved"
+    common_dir = Path(common)
+    if common_dir.name != ".git":
+        return None, f"git common dir {common_dir} is not a `.git` directory (bare repository?)"
+    root = common_dir.parent
+    if not root.is_dir():
+        return None, f"canonical main root {root} does not exist"
+    if _git(root, "rev-parse", "--is-inside-work-tree") != "true":
+        return None, f"canonical main root {root} is not a work tree"
+    default = _git(root, "symbolic-ref", "--short", "refs/remotes/origin/HEAD") or "origin/main"
+    default_branch = default.split("/", 1)[1] if default.startswith("origin/") else default
+    current = _git(root, "branch", "--show-current")
+    if current != default_branch:
+        return None, (
+            f"canonical main root {root} is on {current or 'a detached HEAD'}, not the default branch {default_branch}"
+        )
+    return root, None
 
 
 def _events(stdout: str):
@@ -166,6 +204,10 @@ def test_workflow_evaluator_accepts_a_run_that_reaches_a_canonical_terminal_step
         ("no_terminal_step", _FULL[:2], [], False),
         ("no_planner", [_FULL[0], _FULL[2]], [], False),
         ("no_github_read", ["echo hello", "echo again"], [], False),
+        # preflight が cwd 不適合で拒否され、planner / SubAgent / terminal step が一度も走らなかった run。
+        ("preflight_rejected_planner_never_ran",
+         [_FULL[0], "uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py"],
+         [], False),
         ("claude_result_is_error", _FULL, [], True),
         ("dispatch_only_subagent", _FULL,
          [{"hook_event": "SubagentStart", "agent_id": "a1"}], False),
@@ -183,6 +225,43 @@ def test_workflow_evaluator_accepts_completed_subagents():
     ]
     result = evaluate_workflow_stream(_stream(_FULL), events)
     assert result["ok"] is True and result["subagents_completed"] == 1
+
+
+def _init_repo(path: Path) -> None:
+    path.mkdir(parents=True)
+    for cmd in (
+        ["git", "init", "-q", "-b", "main"],
+        ["git", "-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "i"],
+    ):
+        subprocess.run(cmd, cwd=path, check=True, capture_output=True)
+
+
+def test_canonical_main_root_is_resolved_from_a_linked_worktree(tmp_path):
+    main = tmp_path / "main"
+    _init_repo(main)
+    linked = tmp_path / "wt"
+    subprocess.run(["git", "worktree", "add", "-q", "-b", "feature", str(linked)], cwd=main, check=True,
+                   capture_output=True)
+    root, reason = resolve_canonical_main_root(linked)
+    assert reason is None and root is not None and root.resolve() == main.resolve()
+    # main root 自身から解決しても同じ（merge 後は SUT と canonical main root が同一）。
+    root_self, reason_self = resolve_canonical_main_root(main)
+    assert reason_self is None and root_self is not None and root_self.resolve() == main.resolve()
+
+
+def test_canonical_main_root_not_on_default_branch_or_unresolvable_is_a_skip_reason(tmp_path):
+    main = tmp_path / "main"
+    _init_repo(main)
+    linked = tmp_path / "wt"
+    subprocess.run(["git", "worktree", "add", "-q", "-b", "feature", str(linked)], cwd=main, check=True,
+                   capture_output=True)
+    subprocess.run(["git", "checkout", "-q", "-b", "other"], cwd=main, check=True, capture_output=True)
+    root, reason = resolve_canonical_main_root(linked)
+    assert root is None and "not the default branch" in (reason or "")
+    plain = tmp_path / "not_a_repo"
+    plain.mkdir()
+    root, reason = resolve_canonical_main_root(plain)
+    assert root is None and reason
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +305,10 @@ def test_live_issue_refinement_loop_through_minimal_claude_gpt():
     if check.returncode != 0:
         _skip("connected claude-code-proxy unavailable or its model catalog is incomplete")
 
+    workflow_root, root_problem = resolve_canonical_main_root(_REPO_ROOT)
+    if workflow_root is None:
+        _skip(f"canonical main root checkout unavailable for the workflow ({root_problem})")
+
     runner = _load_runner()
     prompt = (
         "Run the repository's issue-refinement-loop skill for Issue "
@@ -234,8 +317,10 @@ def test_live_issue_refinement_loop_through_minimal_claude_gpt():
         "canonical termination publish. If the repository workflow itself stops with "
         "human_judgment_required, report that terminal reason; do not work around the stop."
     )
+    # claude の cwd は canonical main root（preflight.run が要求する場所）。launcher は SUT（PR worktree）の
+    # launch.sh を絶対 path で指定する。
     rc, out, err, timed_out = runner.run_structured_claude(
-        str(_REPO_ROOT), prompt, 1800.0, 120, claude_bin=str(_LAUNCHER), claude_adapter="claude-gpt"
+        str(workflow_root), prompt, 1800.0, 120, claude_bin=str(_LAUNCHER), claude_adapter="claude-gpt"
     )
     hook_events = runner.extract_claude_hook_lifecycle_events(out)
     summary = evaluate_workflow_stream(out, hook_events)
@@ -246,6 +331,14 @@ def test_live_issue_refinement_loop_through_minimal_claude_gpt():
         "ac": "AC5",
         "command": "pytest -m claude_live scripts/claude-gpt/tests/test_runtime_smoke_issue_to_impl_live.py",
         "tested_head": head,
+        "sut_launcher": {"path": str(_LAUNCHER), "git_head": head},
+        "claude_cwd": {
+            "kind": "canonical_main_root",
+            "path": str(workflow_root),
+            "is_sut_checkout": workflow_root.resolve() == _REPO_ROOT.resolve(),
+            "git_head": _git(workflow_root, "rev-parse", "HEAD"),
+            "branch": _git(workflow_root, "branch", "--show-current"),
+        },
         "issue_number": int(issue_number),
         "claude_exit_code": rc,
         "timed_out": timed_out,

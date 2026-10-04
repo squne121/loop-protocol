@@ -143,8 +143,16 @@ def evaluate_role_subagent(
     }
 
 
+_INCONCLUSIVE_RE = re.compile(r"status[\"']?\s*[:=]\s*[\"']?inconclusive\b", re.IGNORECASE)
+
+
 def validate_haiku_handback(text: str) -> bool:
-    """`codebase-investigator` に頼んだ調査結果（lib.sh の compaction window 値）を含むこと。"""
+    """`codebase-investigator` に頼んだ調査結果（docs の `CLAUDE_CODE_AUTO_COMPACT_WINDOW` の値）を含むこと。
+
+    `status: inconclusive` の hand-back は、たまたま値の文字列を含んでいても PASS にしない
+    （値を特定できなかったという SubAgent 自身の報告を、要求結果の取得とは扱わない）。"""
+    if _INCONCLUSIVE_RE.search(text):
+        return False
     return "272000" in text
 
 
@@ -153,12 +161,22 @@ def validate_sonnet_handback(text: str) -> bool:
     return bool(re.search(r"assessment[\"']?\s*[:=]\s*[\"']?(clear|findings)\b", text))
 
 
+HAIKU_TARGET_RELATIVE_PATH = "scripts/claude-gpt/tests/test_minimal_default_contract.py"
+HAIKU_TARGET_SYMBOL = "EXPECTED_ADDED_ENV"
+
+
 def haiku_prompt(repo_root: str) -> str:
+    # 調査対象は literal が明示的に書かれた Python の module-level 定数にする。AGY 委譲側
+    # （local_asset_research / Serena）は、shell script 内の変数代入（旧: lib.sh）や Markdown では
+    # symbol を抽出できず `inconclusive` になることが live で観測された。Python の named symbol なら抽出できる。
     return (
         "You are running inside an automated runtime smoke test. Use the Agent tool exactly once with "
         f"subagent_type \"{HAIKU_AGENT}\". Give the SubAgent exactly this task: "
-        f"target_path: {repo_root}/scripts/claude-gpt/lib.sh ; purpose: report the numeric value assigned "
-        "to CLAUDE_GPT_AUTO_COMPACT_WINDOW and the file/line where it is assigned ; "
+        f"target_path: {repo_root}/{HAIKU_TARGET_RELATIVE_PATH} ; target_symbol: {HAIKU_TARGET_SYMBOL} ; "
+        f"purpose: {HAIKU_TARGET_SYMBOL} is a module-level dict constant in that Python file; report the "
+        "string value mapped to the key CLAUDE_CODE_AUTO_COMPACT_WINDOW and the line number of that entry ; "
+        "context_file: pass that same Python file itself as the single --context-file of the delegation "
+        "request so the delegate receives its full text (do not substitute a summary or a different file) ; "
         "agy_advisory_native_fallback_allowed: true. Wait for the SubAgent to finish, then reply with the "
         "SubAgent's report verbatim."
     )
