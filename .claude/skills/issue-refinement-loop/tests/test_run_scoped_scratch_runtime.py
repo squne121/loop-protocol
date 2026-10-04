@@ -22,8 +22,8 @@
   (c) 固定 ``/tmp`` scratch が新規生成されていないこと、を実データで照合する。
 
 契約 (Issue #2860 AC5):
-- 実行不能 (CI / linked worktree 外 / 認証・CLI・launcher・ネットワーク不可 / runner SKIP) は stdout ``SKIP: <reason>`` + exit 77。
-  SKIP は PASS ではない。
+- 実行不能 (CI / linked worktree 外 / 認証・CLI・launcher・ネットワーク不可 / runner SKIP) は
+  stdout ``SKIP: <reason>`` + exit 77。SKIP は PASS ではない。
 - fallback-only (claude-gpt launcher 経由でない、marker のみで workspace 実体がない等) は FAIL (exit 1)。
 - fake marker・人工 SubAgent・fake ``gh`` で PASS を作らない。native 専用の
   ``--expect-skill-command`` / ``--expect-marker-source main`` は使わない。
@@ -110,10 +110,12 @@ def build_prompt(*, fixture_path: str) -> str:
 2. producer: workspace 内に `draft.md`（任意の短い本文 draft）を書き、次に read-only の offline refinement preflight
    `{PREFLIGHT_SCRIPT_REL}` を `--issue-number {ISSUE_NUMBER} --repo {REPO_SLUG} --fixture {fixture_path}`
    で 1 回実行し、その stdout を workspace 内の `preflight_stdout.txt` に capture する。
-   完了直後、assistant の通常 text として 1 行 `{ORDERED_MARKERS[1]} exit=<preflight の exit code>` を書く（次の tool call より前）。
+   完了直後、assistant の通常 text として
+   1 行 `{ORDERED_MARKERS[1]} exit=<preflight の exit code>` を書く（次の tool call より前）。
 3. consumer: `preflight_stdout.txt` の `ARTIFACT:` 節にある `refinement_preflight_result_v1` の path を読み、
    その JSON ファイルを読み、内容を変更せず workspace 内の `consumer_readback.json` に書く。
-   完了直後、assistant の通常 text として 1 行 `{ORDERED_MARKERS[2]}` を書き、その後の最終回答として同じ JSON を ```json フェンス 1 つだけで返す。
+   完了直後、assistant の通常 text として 1 行 `{ORDERED_MARKERS[2]}` を書き、
+   その後の最終回答として同じ JSON を ```json フェンス 1 つだけで返す。
 
 具体 path は Bash call をまたいで環境変数に頼らず、各 call で明示する。workspace を削除しない。
 GitHub への書き込み、Issue/PR の変更、リポジトリの tracked file の編集はしない。
@@ -176,7 +178,11 @@ def adjudicate(
         return "FAIL", "output_schema_unverified", f"canonical schema validation not verified: {schema_validation!r}"
     # marker / schema だけでは不十分: 実 workspace の実体と producer->consumer を独立に照合する。
     if len(new_workspaces) != 1:
-        return "FAIL", "marker_only_no_workspace", f"expected exactly 1 new owned workspace under tmp/, got {new_workspaces!r}"
+        return (
+            "FAIL",
+            "marker_only_no_workspace",
+            f"expected exactly 1 new owned workspace under tmp/, got {new_workspaces!r}",
+        )
     if not WORKSPACE_NAME_RE.match(new_workspaces[0]):
         return "FAIL", "workspace_name_not_mktemp_shape", new_workspaces[0]
     for required in ("draft.md", "preflight_stdout.txt", "consumer_readback.json"):
@@ -331,7 +337,8 @@ def _write_artifact_log(
         "AC: AC5 (Issue #2860) claude-gpt-auto-scratch",
         f"Timestamp: {started.isoformat()}",
         f"Tested Head: {head or 'unresolved'}",
-        "Launch Environment: scripts/claude-gpt/launch.sh via run_worktree_agent_runtime_smoke.py --claude-adapter claude-gpt --mode structured",
+        "Launch Environment: scripts/claude-gpt/launch.sh via run_worktree_agent_runtime_smoke.py "
+        "--claude-adapter claude-gpt --mode structured",
         f"Entrypoint: {command}",
         "",
         "--- Observations (bounded) ---",
@@ -394,7 +401,9 @@ def run_case() -> int:
                 argv, cwd=REPO_ROOT, capture_output=True, text=True, check=False, timeout=OUTER_TIMEOUT_SECONDS
             )
         except subprocess.TimeoutExpired as exc:
-            runner_stdout = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            runner_stdout = (
+                exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            )
             raise Skip("runner_timeout", f"outer timeout {OUTER_TIMEOUT_SECONDS}s before the runner finished") from exc
         runner_stdout, runner_stderr = proc.stdout, proc.stderr
 
@@ -457,14 +466,18 @@ def run_case() -> int:
                 and _safe_json(workspace_files.get("consumer_readback.json")) == artifact_json
             ),
             "new_fixed_tmp_entries": new_fixed,
-            "mtime_order_ns_relative": {k: v - min(mtimes_ns.values()) for k, v in mtimes_ns.items()} if mtimes_ns else {},
+            "mtime_order_ns_relative": (
+                {k: v - min(mtimes_ns.values()) for k, v in mtimes_ns.items()} if mtimes_ns else {}
+            ),
             "git_status_changed": porcelain_changed,
             "permission": summarize_permissions(evidence),
             "runner_evidence_subset": _evidence_subset(evidence),
             "classification_of_failure_layer": {
                 "launcher/adapter": "claude_adapter, claude_gpt_launcher_receipt, claude_gpt_proxy_sidechannel",
                 "classifier/hook denial": "permission_denials (runner-reported)",
-                "harness limitation": "preflight.run executor needs canonical main root; offline fixture producer observed instead",
+                "harness limitation": (
+                    "preflight.run executor needs canonical main root; offline fixture producer observed instead"
+                ),
             },
         }
         exit_code = {"PASS": EXIT_OK, "SKIP": EXIT_SKIP}.get(verdict, EXIT_FAIL)
