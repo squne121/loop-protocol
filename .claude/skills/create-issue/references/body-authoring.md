@@ -170,7 +170,7 @@ fixture proxy の path/version のみを記載した evidence は、canonical ru
 
 `docs/dev/extension-surface-runtime-policy.yaml` の risk-trigger rule に **hard** で一致する Allowed Paths を宣言した Issue は、その rule が要求する `verification_profile` の `assertions[]`（証明すべき postcondition）を、どの runtime AC が担うかを `runtime_assertion_bindings` として明示する。`enforcement == advisory` のみで到達した profile / assertion は required set に含まれない（PR #2370 の advisory non-blocking 方針を継続する）。
 
-**canonical wire format**（`profile` / `assertion` / `ac` の3フィールドのみ。`vc:` やコマンド本文をここに複製しない — VC 本体は既存の `## Verification Commands` の `# AC<N>` 参照で紐づける）:
+**canonical wire format**（entry ごとに `disposition` を選ぶ。`vc:` やコマンド本文をここに複製しない — VC 本体は既存の `## Verification Commands` の `# AC<N>` 参照で紐づける）。`disposition` は閉じた enum（`dispositive` / `non_dispositive_readiness_compat` / `not_applicable`）で、disposition ごとに使える key 集合も閉じている。集合外の key を足した entry は malformed として拒否される:
 
 ```yaml
 ## Runtime Verification Applicability
@@ -178,36 +178,49 @@ fixture proxy の path/version のみを記載した evidence は、canonical ru
 decision: immediate
 applicable_acs:
   - AC3
-  - AC4
 runtime_assertion_bindings:
+  # (1) 今回の runtime AC が検証する（key 集合: profile / assertion / ac / disposition）
   - profile: skill-invocation-runtime-smoke
     assertion: procedure_steps_executed_in_declared_order
     ac: AC3
-  - profile: skill-invocation-runtime-smoke
-    assertion: output_contract_schema_fields_present
-    ac: AC4
+    disposition: dispositive
+  # (2) 別の既存 AC が substantive verification を所有する（key 集合: profile / assertion / disposition / demonstrated_by / reason。ac は書かない）
+  - profile: hook-chain-runtime-smoke
+    assertion: sibling_side_effect_inventory_complete
+    disposition: non_dispositive_readiness_compat
+    demonstrated_by: AC18
+    reason: "deny 経路の fault-injection pytest は AC18 が所有する"
+  # (3) 今回の change surface に対象の振る舞い自体が存在しない（key 集合: profile / assertion / disposition / reason。ac / demonstrated_by は書かない）
+  - profile: subagent-lifecycle-causal-evidence-smoke
+    assertion: subagent_start_stop_causal_evidence_correlated
+    disposition: not_applicable
+    reason: "scratch から SubAgent への handoff が production path に存在しない"
 ```
 
-**hard-required 時の生成規則**:
+- `disposition` を省略した `profile` / `assertion` / `ac` の旧 3 field 形式は読み取り互換として受理され、内部では `dispositive` 相当（`disposition_source: legacy_default`）に扱われる。ただし「実証済み」の意味は付与されないため、新規に起票する Issue は `disposition` を明示する。
+- `demonstrated_by` は **実在する既存 AC の参照（`AC<N>`）のみ**を書く。当該 AC は Acceptance Criteria に実在し、`## Verification Commands` に `# AC<N>` canonical reference を持たなければならない（`applicable_acs` / runtime-verification タグへの追加は不要）。test path / pytest node-id は書かない。
+- `reason` の機械検証は非空文字列のみである。`: ` や `#` を含む理由は YAML の誤解釈を避けるためダブルクォートで囲む。
 
-- Allowed Paths が hard selector に一致する rule ごとに、その `verification_profile` の `assertions[]` 全件（`docs/dev/extension-surface-runtime-policy.yaml` の `verification_profiles.<profile_id>.assertions[].id`）を洗い出す。
-- 各 assertion について、それを実証する runtime AC（`applicable_acs` に含まれ、`<!-- runtime-verification: true -->` タグを持ち、`## Verification Commands` に `# AC<N>` canonical reference がある AC）を1つ選び `runtime_assertion_bindings` に1エントリとして書く。
-- 同一 `verification_profile` が複数 selector（enforcement が異なるものを含む）でマッチした場合でも、profile 単位でいずれか1つが hard なら全 assertions が required になる（advisory な selector が assertion を個別に部分追加することはない）。
-- 複数 profile が同時に要求される場合（Issue #2467 のような同時適用）は、各 profile の assertions を漏れなく列挙する。
+**生成規則（この順序で判断する）**:
 
-**識別子の組み合わせ（composite identity）と 1 key = 1 ac の制約**:
+1. policy から candidate assertion を得る: Allowed Paths が hard selector に一致する rule ごとに、その `verification_profile` の `assertions[]` 全件（`docs/dev/extension-surface-runtime-policy.yaml` の `verification_profiles.<profile_id>.assertions[].id`）を洗い出す。同一 `verification_profile` が複数 selector（enforcement が異なるものを含む）でマッチした場合でも、profile 単位でいずれか 1 つが hard なら全 assertions が candidate になる。複数 profile が同時に要求される場合（Issue #2467 のような同時適用）は、各 profile の assertions を漏れなく列挙する。
+2. candidate ごとに、今回の change surface に対する applicability を分類する（その振る舞いが今回の変更に存在するか）。
+3. applicable なものだけ、substantive verification の宛先（`ac`）を結ぶ（`disposition: dispositive`）。宛先の AC は `applicable_acs` に含まれ、`<!-- runtime-verification: true -->` タグを持ち、`## Verification Commands` に `# AC<N>` canonical reference がある runtime AC とする。
+4. 別の既存 AC が substantive verification を所有する場合に限り `non_dispositive_readiness_compat`（`demonstrated_by` + `reason`）を使う。compat は runtime PASS ではなく、通ったからといって実証済みとは扱われない。
+5. 対象の振る舞い自体が今回の change surface に無い場合は、`not_applicable` と理由（`reason`）を必ず書く。
+6. 構造上の完全性を作るためだけに、dummy AC（ダミー AC）・人工的な SubAgent・空の runtime log・無関係な marker へ押し込んで bind してはならない。
+
+`not_applicable` の `reason` に使えない理由: 「runner が無い」「認証できない」「test が未実装」は `not_applicable` の理由にならない。対象の振る舞いが今回の変更に関係するのに未観測の assertion は unverified であり、`not_applicable` でも PASS でもない。実証できない事情がある場合は、その事情を Stop Condition / Scope 分割として扱い、`not_applicable` で隠さない。これらの理由の妥当性は既存 semantic review の責務で、machine 検証は非空 `reason` と AC の実在・VC 参照までである（機械的に強制されるとは主張しない）。
+
+**識別子の組み合わせ（composite identity）と 1 key = 1 binding の制約**:
 
 - 各エントリの識別子は `(profile, assertion)` の組（composite identity）である。`assertion` の `id` は policy 上 profile 内でのみ一意性が保証されるため、`profile` を含めない `assertion` 単独を識別子にしてはならない。
-- **1つの `(profile, assertion)` key は高々1つの `ac` にのみ bind できる**。同じ key を2回以上宣言してはならない（bind 先の `ac` が同一でも異なっても duplicate として拒否される）。
-- 一方、**複数の異なる key が同一の `ac` を指すことは許容される**。1つの AC/VC が複数 assertion の evidence を兼ねてよい。
-
-**#2775 未解決時の escape valve**（author-facing）:
-
-`skill-invocation-runtime-smoke` を要求する Issue で、対象 Skill に `output_contract_schema_fields_present` を実証できる canonical な output schema が実在しないと判断した場合（#2775 が指摘する構造的不整合 — 29 Skill 中 `schemas/` を持つのは4件のみ）、その assertion の binding を、同じ profile の `procedure_steps_executed_in_declared_order` を証明する runtime AC と **同一の** `ac` へ bind してよい（AC4 が明示的に許容する「複数 assertion が同一 AC を共有する」ケース）。この場合、その AC/VC が両方の assertion の意味を実際に十分証明しているかの判断（semantic sufficiency）は、以下の structural completeness gate の責務ではなく既存 semantic review（`pr-review-judge` 等）の責務になる。#2775 の解決を本 escape valve の適用条件・マージ順序の前提条件にはしない。
+- **1つの `(profile, assertion)` key は高々1つの binding にのみ宣言できる**。同じ key を2回以上宣言してはならない（disposition の組合せを問わず duplicate として拒否される）。policy が candidate としない key への `not_applicable` も unknown として拒否される。
+- 一方、**複数の異なる key が同一の `ac` を指すことは許容される**。1つの AC/VC が複数 assertion の evidence を兼ねてよい。ただし、その assertion を実際に実証できているかの判断は semantic review の責務であり、実証できない assertion を手順実行を証明する AC に同居させて structural completeness を作ってはならない（上記 6）。
 
 **structural completeness と semantic sufficiency の責務境界**:
 
-`runtime_assertion_bindings` の機械判定（`scripts/agent-guards/extension_surface_policy_matcher.py` の `evaluate_runtime_assertion_binding_coverage()`）が保証するのは、宣言漏れ・未知宣言・重複宣言の不在と binding 先 AC の referential integrity（実在確認 / `applicable_acs` 包含 / runtime-verification タグ整合 / VC canonical reference 存在）という **structural completeness** のみである。binding された VC が assertion の意味を実際に証明しているか（**semantic sufficiency**）は判定しない。この境界は Issue 起票時にも維持し、「binding が揃っている」ことを「動作検証の意味的な十分性が保証された」と混同しないこと。
+`runtime_assertion_bindings` の機械判定（`scripts/agent-guards/extension_surface_policy_matcher.py` の `evaluate_runtime_assertion_binding_coverage()`）が保証するのは、宣言漏れ・未知宣言・重複宣言の不在と binding 先 AC の referential integrity（実在確認 / `applicable_acs` 包含 / runtime-verification タグ整合 / VC canonical reference 存在）という **structural completeness** のみである。binding された VC が assertion の意味を実際に証明しているか（**semantic sufficiency**）は判定しない。この境界は Issue 起票時にも維持し、「binding が揃っている」ことを「動作検証の意味的な十分性が保証された」と混同しないこと。`dispositive` の宣言は「実行済み / 観測済み」ではなく、`non_dispositive_readiness_compat` / `not_applicable` は runtime PASS ではない（成功ではなく、別 AC への参照または対象外の宣言である）。`disposition` 省略（旧 3 field 形式）も「実証済み」を意味しない。`reason` / `demonstrated_by` の妥当性も判定しない。分類は `review-issue` / `issue-contract-review` の公開結果に非 blocking の `runtime_assertion_disposition_classification` として現れるが、これも実証の根拠ではなく分類の記録である。
 
 ## VC 作成ガイダンス
 

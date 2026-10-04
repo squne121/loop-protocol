@@ -1682,7 +1682,16 @@ def check_extension_surface_risk_trigger(body: str) -> list[dict]:
 # filters on the same `category` string independently since it lives in a
 # different dynamically-loaded module) treat this category consistently as
 # never contributing to a blocking verdict.
-_NON_BLOCKING_READINESS_ERROR_CATEGORIES = {"extension_surface_candidate_advisory"}
+#
+# Issue #2852: `runtime_assertion_disposition_classification` (RUNTIMEASSERT003,
+# `check_runtime_assertion_disposition_classification()`) is the second
+# non-blocking category: a pure classification carrier that follows the same
+# EXTSURF003 precedent (kept out of every status-driving error list).
+_RUNTIME_ASSERTION_DISPOSITION_CARRIER_CATEGORY = "runtime_assertion_disposition_classification"
+_NON_BLOCKING_READINESS_ERROR_CATEGORIES = {
+    "extension_surface_candidate_advisory",
+    _RUNTIME_ASSERTION_DISPOSITION_CARRIER_CATEGORY,
+}
 
 
 def check_extension_surface_advisory(body: str) -> list[dict]:
@@ -1756,51 +1765,13 @@ def check_runtime_assertion_binding_coverage(body: str) -> list[dict]:
     semantic judgment of whether the bound VC proves the assertion (Issue
     #2771 Outcome / AC10).
     """
-    if not _is_canonical_implementation_issue(body):
+    evaluated = _evaluate_runtime_assertion_binding_coverage_for_body(body)
+    if evaluated is None:
         return []
+    verdict, policy_error, section_start_line, section_end_line = evaluated
 
-    allowed_path_entries = _extract_allowed_paths(body)
-    if not allowed_path_entries:
-        return []
-
-    rva_section = _extract_rva_section(body)
-    rva_section_text = rva_section[0] if rva_section is not None else ""
-    ac_section = _extract_ac_section(body)
-    ac_section_text = ac_section[0] if ac_section is not None else ""
-    # Issue #2771 PR #2780 OWNER F2 review: use the same GFM-aware section
-    # extraction (fence-aware, closing-hash-tolerant, nested-heading-safe)
-    # already used for the RVA / Acceptance Criteria sections above, and
-    # already used independently by review-issue's C15
-    # (`check_c15_runtime_assertion_binding_coverage` -> `extract_section()`)
-    # -- NOT the legacy `extract_verification_commands_section()` regex
-    # (``^##\s+Verification Commands\s*$(.+?)(?=^##|\Z)``), which fails to
-    # extract a GFM closing-hash heading (``## Verification Commands ##``)
-    # and can be cut short by a nested ``### Runtime checks`` subheading or
-    # a ``##``-prefixed line inside a fenced code example. Using a
-    # different extractor than review-issue's C15 for the SAME input body
-    # let the two consumers disagree on `ac_vc_refs` for identical Issues
-    # even though both call the exact same shared evaluator function.
-    vc_section = _extract_section_by_canonical_name(body, "Verification Commands")
-    vc_section_text = vc_section[0] if vc_section is not None else ""
-
-    vc_parse_result = _parse_vc_section(vc_section_text)
-    ac_vc_refs = {re.sub(r"^AC", "", ref) for ref in vc_parse_result.ac_refs}
-
-    evaluator = _load_extension_surface_policy_matcher()
-    if evaluator is None:
-        return []
-
-    section_start_line = rva_section[1] if rva_section is not None else 0
-    section_end_line = rva_section[2] if rva_section is not None else 0
-
-    try:
-        verdict = evaluator.evaluate_runtime_assertion_binding_coverage(
-            allowed_path_entries=allowed_path_entries,
-            rva_section_text=rva_section_text,
-            ac_section_text=ac_section_text,
-            ac_vc_refs=ac_vc_refs,
-        )
-    except evaluator.PolicyLoadError as exc:
+    if policy_error is not None:
+        exc = policy_error
         # Issue #2771 AC6: a policy integrity defect (dangling profile
         # reference / duplicate assertion id within a profile) is not
         # Issue-author-fixable -- mirrors check_extension_surface_risk_
@@ -1839,11 +1810,128 @@ def check_runtime_assertion_binding_coverage(body: str) -> list[dict]:
             "line_end": section_end_line,
             "minimal_context": verdict["reasons"],
             "fix_hint": (
-                "Declare a `runtime_assertion_bindings` entry (profile/assertion/ac) for every "
-                "hard-required (verification_profile, assertion) pair, remove any binding that is "
-                "not hard-required or duplicated, and ensure each bound ac exists, is listed in "
-                "applicable_acs, carries the runtime-verification tag, and is referenced from "
-                "## Verification Commands: " + "; ".join(verdict["reasons"])
+                "Declare a `runtime_assertion_bindings` entry for every hard-required "
+                "(verification_profile, assertion) pair: `profile`/`assertion`/`ac` "
+                "(optionally `disposition: dispositive`) when this Issue's runtime AC verifies "
+                "it, `disposition: non_dispositive_readiness_compat` with `demonstrated_by: AC<N>` "
+                "+ `reason` when another existing AC owns the substantive verification, or "
+                "`disposition: not_applicable` with `reason` when the change surface has no such "
+                "behaviour. Remove any binding that is not hard-required or duplicated, and "
+                "ensure each dispositive ac exists, is listed in applicable_acs, carries the "
+                "runtime-verification tag, and is referenced from ## Verification Commands: "
+                + "; ".join(verdict["reasons"])
+            ),
+            "autofixable": False,
+        }
+    ]
+
+
+def _evaluate_runtime_assertion_binding_coverage_for_body(body: str):
+    """Run the shared evaluator for RUNTIMEASSERT001/002 and the Issue #2852
+    RUNTIMEASSERT003 carrier.
+
+    Returns ``None`` when the check does not apply (non-canonical-
+    implementation Issue, no Allowed Paths, evaluator not loadable);
+    otherwise ``(verdict, policy_error, section_start_line, section_end_line)``
+    with exactly one of ``verdict`` / ``policy_error`` set.
+    """
+    if not _is_canonical_implementation_issue(body):
+        return None
+
+    allowed_path_entries = _extract_allowed_paths(body)
+    if not allowed_path_entries:
+        return None
+
+    rva_section = _extract_rva_section(body)
+    rva_section_text = rva_section[0] if rva_section is not None else ""
+    ac_section = _extract_ac_section(body)
+    ac_section_text = ac_section[0] if ac_section is not None else ""
+    # Issue #2771 PR #2780 OWNER F2 review: use the same GFM-aware section
+    # extraction (fence-aware, closing-hash-tolerant, nested-heading-safe)
+    # already used for the RVA / Acceptance Criteria sections above, and
+    # already used independently by review-issue's C15
+    # (`check_c15_runtime_assertion_binding_coverage` -> `extract_section()`)
+    # -- NOT the legacy `extract_verification_commands_section()` regex
+    # (``^##\s+Verification Commands\s*$(.+?)(?=^##|\Z)``), which fails to
+    # extract a GFM closing-hash heading (``## Verification Commands ##``)
+    # and can be cut short by a nested ``### Runtime checks`` subheading or
+    # a ``##``-prefixed line inside a fenced code example. Using a
+    # different extractor than review-issue's C15 for the SAME input body
+    # let the two consumers disagree on `ac_vc_refs` for identical Issues
+    # even though both call the exact same shared evaluator function.
+    vc_section = _extract_section_by_canonical_name(body, "Verification Commands")
+    vc_section_text = vc_section[0] if vc_section is not None else ""
+
+    vc_parse_result = _parse_vc_section(vc_section_text)
+    ac_vc_refs = {re.sub(r"^AC", "", ref) for ref in vc_parse_result.ac_refs}
+
+    evaluator = _load_extension_surface_policy_matcher()
+    if evaluator is None:
+        return None
+
+    section_start_line = rva_section[1] if rva_section is not None else 0
+    section_end_line = rva_section[2] if rva_section is not None else 0
+
+    try:
+        verdict = evaluator.evaluate_runtime_assertion_binding_coverage(
+            allowed_path_entries=allowed_path_entries,
+            rva_section_text=rva_section_text,
+            ac_section_text=ac_section_text,
+            ac_vc_refs=ac_vc_refs,
+        )
+    except evaluator.PolicyLoadError as exc:
+        return None, exc, section_start_line, section_end_line
+    return verdict, None, section_start_line, section_end_line
+
+
+def check_runtime_assertion_disposition_classification(body: str) -> list[dict]:
+    """Issue #2852 AC9: non-blocking disposition classification carrier
+    (RUNTIMEASSERT003, category ``runtime_assertion_disposition_classification``).
+
+    Companion to ``check_runtime_assertion_binding_coverage()`` (the unchanged
+    blocking RUNTIMEASSERT001/002 gate), following the EXTSURF003 /
+    ``check_extension_surface_advisory()`` precedent: its return value MUST NOT
+    be passed into any status-driving error list in ``build_result()`` -- it is
+    included in ``all_errors`` for display / merge routing only, so
+    ``overall_status`` is never raised by it.
+
+    Returns ``[]`` unless the structural evaluation APPROVES (the carrier never
+    decorates a needs_fix result or a policy-unavailable human_judgment) and at
+    least one binding is explicit / ``not_applicable`` / compat (pure legacy
+    3-field input emits nothing). ``minimal_context`` is the carrier's
+    verbatim one-line-per-binding evidence from the shared evaluator module's
+    formatter (the same one ``review-issue`` uses). Classification only --
+    never runtime PASS evidence.
+    """
+    evaluated = _evaluate_runtime_assertion_binding_coverage_for_body(body)
+    if evaluated is None:
+        return []
+    verdict, policy_error, section_start_line, section_end_line = evaluated
+    if policy_error is not None or verdict is None:
+        return []
+
+    evaluator = _load_extension_surface_policy_matcher()
+    if evaluator is None:
+        return []
+    lines = evaluator.format_runtime_assertion_disposition_carrier_lines(verdict)
+    if not lines:
+        return []
+
+    return [
+        {
+            "rule_id": "RUNTIMEASSERT003",
+            "severity": "info",
+            "source_check": "contract_readiness_check",
+            "category": _RUNTIME_ASSERTION_DISPOSITION_CARRIER_CATEGORY,
+            "section": "Runtime Verification Applicability",
+            "line_start": section_start_line,
+            "line_end": section_end_line,
+            "minimal_context": lines,
+            "fix_hint": (
+                "Non-blocking: runtime_assertion_bindings carries an explicit disposition "
+                "(dispositive / non_dispositive_readiness_compat / not_applicable). This is a "
+                "structural classification only, not runtime verification PASS evidence; "
+                "semantic sufficiency of each reason / demonstrated_by stays with semantic review."
             ),
             "autofixable": False,
         }
@@ -2249,6 +2337,14 @@ def build_result(
     # included in `all_errors` for display only.
     ext_surface_advisory_errors = check_extension_surface_advisory(body)
     runtime_assertion_binding_errors = check_runtime_assertion_binding_coverage(body)
+    # Issue #2852: non-blocking disposition classification carrier
+    # (RUNTIMEASSERT003). Kept OUT of `runtime_assertion_binding_errors` (the
+    # status-driving variable below) and out of `compute_aggregate_status()`;
+    # included in `all_errors` for display / merge routing only, mirroring the
+    # EXTSURF003 `ext_surface_advisory_errors` handling.
+    runtime_assertion_disposition_advisory_errors = (
+        check_runtime_assertion_disposition_classification(body)
+    )
 
     preflight_errors: list[dict] = []
     preflight_aggregate = "go"
@@ -2270,6 +2366,7 @@ def build_result(
         + ext_surface_errors
         + ext_surface_advisory_errors
         + runtime_assertion_binding_errors
+        + runtime_assertion_disposition_advisory_errors
         + static_vc_errors
         + preflight_errors
     )
