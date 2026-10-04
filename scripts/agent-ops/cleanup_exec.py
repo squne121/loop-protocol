@@ -92,6 +92,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -477,7 +478,10 @@ def _pr_body_has_exact_refs(body: str, issue_number: int) -> bool:
     before a later, legitimate ``Refs #<issue_number>`` in the same body is
     ever reached.
     """
-    if not body:
+    # Issue #2891: a non-string body (e.g. a number from a malformed ``gh`` payload) is a
+    # fallback miss, not a ``TypeError`` that would abort ``run()`` before the authority
+    # path (and its structured ``LINKED_ISSUE_MISMATCH``) is ever reached.
+    if not isinstance(body, str) or not body:
         return False
     target = str(issue_number)
     for match in _REFS_ISSUE_PATTERN.finditer(body):
@@ -571,6 +575,53 @@ def _research_fallback_authorized(
     return True
 
 
+# Issue #2891: orchestrator-attested ``non_closing_authority`` (the 7-key contract fixed by
+# #2878). This is a minimal twin of ``open_pr.non_closing_authority_binds`` (producer) and
+# ``task_context_workflow_signal._non_closing_authority_binds`` (adapter); a parity test
+# (``test_cleanup_exec_non_closing_authority.py``) keeps them aligned. The 7 keys are NOT
+# redefined here, and no live Issue state is re-fetched: level A1 / A2 mean the Issue was
+# OPEN when the evaluator ran.
+_NON_CLOSING_AUTHORITY_KEYS = frozenset(
+    {"decision", "level", "reason_code", "repo", "issue_number", "pr_number", "pr_body_sha256"}
+)
+
+
+def _non_closing_authority_binds(
+    authority: object, pr: dict, repo_slug: str, issue_number: int, pr_number: int
+) -> bool:
+    """Whether ``authority`` binds this PR to ``issue_number`` (Issue #2891). Fail-closed.
+
+    ``repo_slug`` is the caller's trusted ``_repo_slug()`` value; ``authority["repo"]`` is
+    compared to it case-insensitively. ``pr_body_sha256`` must equal the SHA-256 of the
+    already-fetched ``pr["body"]`` UTF-8 bytes (no strip / newline normalization).
+    """
+    if not isinstance(authority, dict) or set(authority) != _NON_CLOSING_AUTHORITY_KEYS:
+        return False
+    # ``isinstance(str)`` before set membership: a list / object ``level`` is a structured
+    # rejection, never a ``TypeError`` from hashing it.
+    level = authority["level"]
+    if authority["decision"] != "nonclosing_required":
+        return False
+    if not isinstance(level, str) or level not in {"A1", "A2"}:
+        return False
+    authority_repo = authority["repo"]
+    if (
+        not isinstance(authority_repo, str)
+        or not isinstance(repo_slug, str)
+        or authority_repo.lower() != repo_slug.lower()
+    ):
+        return False
+    if type(authority["issue_number"]) is not int or authority["issue_number"] != issue_number:
+        return False
+    if type(authority["pr_number"]) is not int or authority["pr_number"] != pr_number:
+        return False
+    body = pr.get("body")
+    if not isinstance(body, str):
+        return False
+    digest = authority["pr_body_sha256"]
+    return isinstance(digest, str) and digest == hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
 def _verify_linked_issue(
     req: dict, pr: dict, project_root: str, repo_slug: str, deadline: Deadline
 ) -> tuple[bool, str | None]:
@@ -585,19 +636,33 @@ def _verify_linked_issue(
     Canonical fast path: when ``linked_issue_number`` is present in the PR's
     ``closingIssuesReferences``, authorize immediately — no additional Issue
     fetch is performed. Only when that fast path does NOT authorize is the
-    research fallback (``_research_fallback_authorized``) evaluated. Any
-    failure fails closed to the existing ``LINKED_ISSUE_MISMATCH`` reason
-    code — no new reason code is introduced.
+    research fallback (``_research_fallback_authorized``) evaluated. Only when
+    neither authorizes AND the PR has no closing node at all is the Issue #2891
+    ``non_closing_authority`` evaluated. Any failure fails closed to the
+    existing ``LINKED_ISSUE_MISMATCH`` reason code — no new reason code is
+    introduced.
     """
     linked = req.get("linked_issue_number")
     if linked is None:
         return True, None
     linked = int(linked)
-    refs = {r.get("number") for r in (pr.get("closingIssuesReferences") or [])}
+    closing_nodes = pr.get("closingIssuesReferences") or []
+    refs = {r.get("number") for r in closing_nodes}
     if linked in refs:
         return True, None
     if _research_fallback_authorized(linked, pr, project_root, repo_slug, deadline):
         return True, None
+    # Issue #2891: third and last path. Only a PR with NO closing node at all can
+    # bind the linked Issue through an orchestrator-attested ``non_closing_authority``.
+    # A PR that closes a different Issue never falls through to this path.
+    authority = req.get("non_closing_authority")
+    if not closing_nodes and authority is not None:
+        try:
+            pr_number = int(req["pr_number"])
+        except (KeyError, TypeError, ValueError):
+            return False, LINKED_ISSUE_MISMATCH
+        if _non_closing_authority_binds(authority, pr, repo_slug, linked, pr_number):
+            return True, None
     return False, LINKED_ISSUE_MISMATCH
 
 
@@ -1699,7 +1764,26 @@ def _discard_result(status: str, reason: str | None, verified: dict, actions: li
     }
 
 
+def _load_non_closing_authority_file(path: str | None) -> dict | None:
+    """Read the ``--non-closing-authority-file`` JSON object (Issue #2891).
+
+    An unreadable file, invalid JSON, or a non-object root is treated exactly like
+    "authority not supplied" (``None``): no new reason code, and the linked-Issue
+    check then fails closed to ``LINKED_ISSUE_MISMATCH`` as before.
+    """
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def main(argv: list[str] | None = None) -> int:
+    # Issue #2891 adds ONLY the optional ``--non-closing-authority-file``; the discard
+    # lane below still has no CLI flag here.
     # Issue #1523: this CLI shape is intentionally UNCHANGED (AC6) — the
     # discard lane (``verify_discard_authorization`` / ``run_discard_check`` /
     # ``run_discard_consume``) is a Python-level entry point only, invoked from
@@ -1711,6 +1795,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--linked-issue-number", type=int, default=None)
     p.add_argument("--worktree-path", required=True)
     p.add_argument("--branch-name", required=True)
+    # Issue #2891: optional path to a JSON object file holding the orchestrator-attested
+    # 7-key ``non_closing_authority`` (same file-passing convention as ``--snapshot-file``).
+    p.add_argument("--non-closing-authority-file", default=None)
     p.add_argument("--json", action="store_true")
     a = p.parse_args(argv)
     req = {
@@ -1720,6 +1807,9 @@ def main(argv: list[str] | None = None) -> int:
         "worktree_path": a.worktree_path,
         "branch_name": a.branch_name,
     }
+    authority = _load_non_closing_authority_file(a.non_closing_authority_file)
+    if authority is not None:
+        req["non_closing_authority"] = authority
     # Blocker 5: the executor always resolves the trusted root itself; there is no
     # agent-facing --project-root retargeting.
     result = run(req)
