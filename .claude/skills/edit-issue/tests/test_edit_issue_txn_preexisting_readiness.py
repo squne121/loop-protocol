@@ -148,6 +148,7 @@ def _install(
     *,
     live_body: str,
     state: str | None = "CLOSED",
+    state_error: str | None = None,
     readiness: Callable[[list[str], int], _CP] | None = None,
     hygiene: Callable[[list[str]], _CP] | None = None,
     readback_body: Callable[[str], str] | None = None,
@@ -159,16 +160,21 @@ def _install(
         executor_inputs=[],
         children=[],
         fetches=0,
+        state_fetches=0,
         remote={"body": live_body, "updatedAt": LIVE_UPDATED_AT},
         readiness_calls=0,
     )
 
     def _fetch(*_args: object, **_kwargs: object) -> tuple[dict | None, str]:
         env.fetches += 1
-        issue: dict[str, Any] = {"title": "t", "body": env.remote["body"], "updatedAt": env.remote["updatedAt"]}
-        if state is not None:
-            issue["state"] = state
-        return issue, ""
+        # `_fetch_issue` never carries `state` (its gh argv is the pre-PR form).
+        return {"title": "t", "body": env.remote["body"], "updatedAt": env.remote["updatedAt"]}, ""
+
+    def _fetch_state(*_args: object, **_kwargs: object) -> tuple[str | None, str]:
+        env.state_fetches += 1
+        if state_error is not None or state is None:
+            return None, state_error or "gh_issue_view_state_missing"
+        return state, ""
 
     def _run(args: list[str], **_kwargs: object) -> _CP:
         if not allow_children:
@@ -196,6 +202,7 @@ def _install(
         return _CP(0), {"new_body_sha256": txn._sha256_text(new_body)}
 
     monkeypatch.setattr(txn, "_fetch_issue", _fetch)
+    monkeypatch.setattr(txn, "_fetch_issue_state", _fetch_state)
     monkeypatch.setattr(txn, "_run_command", _run)
     monkeypatch.setattr(txn, "_invoke_controlled_exec", _invoke)
     return env
@@ -297,13 +304,14 @@ def test_preexisting_readiness_open_issue_unchanged(
     live = _body(defects=("a",))
     new = _body(defects=("a",), notes="note")
 
-    # needs_fix forwarding: immediate rejection, no child process at all.
+    # needs_fix forwarding: rejection after the live state readback, no child process at all.
     result, env = _run_lane(
         monkeypatch, repo_tmp, live_body=live, new_body=new, forwarded_status="needs_fix",
         state=state, allow_children=False,
     )
     _assert_rejected(result, env, NEEDS_FIX_ERROR)
     assert env.children == []
+    assert env.state_fetches == 1
 
     # candidate static readiness failure: legacy rejection even with the same live defect.
     result, env = _run_lane(
@@ -423,6 +431,7 @@ def test_preexisting_readiness_human_judgment_fail_closed(
     assert result["mutation_started"] is False
     assert env.invoked == []
     assert env.fetches == 0  # fail-closed before any live readback
+    assert env.state_fetches == 0
     assert result["errors"][0]["code"] == "readiness_forwarding_requires_human_judgment"
 
 
@@ -457,8 +466,8 @@ def _relationships(**overrides: Any) -> dict[str, Any]:
 )
 def test_preexisting_readiness_relationship_noop_predicate(relationships: Any, expected: bool) -> None:
     assert txn._native_relationships_is_noop(relationships) is expected
-    assert txn._compat_lane_preconditions_met("CLOSED", {"required": False}, relationships) is expected
-    assert txn._compat_lane_preconditions_met("OPEN", {"required": False}, relationships) is False
+    assert txn._compat_lane_static_preconditions_met({"required": False}, relationships) is expected
+    assert txn._compat_lane_static_preconditions_met({"required": True}, relationships) is False
 
 
 @LANES
@@ -497,6 +506,7 @@ def test_preexisting_readiness_title_or_relationship_rejected(
     )
     result = txn.run_transaction(payload)
     _assert_rejected(result, env, reject_code)
+    assert env.state_fetches == 0  # cheap static preconditions fail first; no state readback needed
 
 
 # --- AC8 --------------------------------------------------------------------
@@ -701,3 +711,87 @@ def test_preexisting_readiness_result_schema_unchanged(
     # only used as a required-key floor, not as a closed validator).
     assert set(_result_schema()["required"]) <= set(lane_result)
     assert lane_result["schema"] == txn.RESULT_SCHEMA
+
+
+# --- live state readback is a separate, lazily-invoked helper -----------------
+
+
+@LANES
+@pytest.mark.parametrize(
+    "state_kwargs",
+    [{"state_error": "gh: boom"}, {"state": None}, {"state": ""}],
+    ids=["gh_failure", "state_missing", "state_empty"],
+)
+def test_preexisting_readiness_state_readback_failure_fail_closed(
+    repo_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    forwarded_status: str,
+    reject_code: str,
+    state_kwargs: dict[str, Any],
+) -> None:
+    live = _body(defects=("a",))
+    new = _body(defects=("a",), notes="note")
+    result, env = _run_lane(
+        monkeypatch, repo_tmp, live_body=live, new_body=new, forwarded_status=forwarded_status, **state_kwargs
+    )
+    _assert_rejected(result, env, reject_code)
+    assert env.state_fetches == 1
+    if forwarded_status == "needs_fix":
+        assert env.children == []  # original rejection: no child process at all
+
+
+@pytest.mark.parametrize("forwarded_status", ["needs_fix", "go"])
+def test_preexisting_readiness_state_fetched_only_when_lane_needed(
+    repo_tmp: Path, monkeypatch: pytest.MonkeyPatch, forwarded_status: str
+) -> None:
+    # Normal clean path: candidate static readiness passes (forwarded `go`), so
+    # the compat lane is never entered and no state readback happens.
+    clean_live = _body()
+    clean_new = _body(notes="note")
+    if forwarded_status == "go":
+        result, env = _run_lane(
+            monkeypatch, repo_tmp, live_body=clean_live, new_body=clean_new, forwarded_status="go"
+        )
+        assert result["status"] == "ok", result["errors"]
+        assert env.state_fetches == 0
+        return
+
+    # needs_fix forwarding needs the lane -> exactly one state readback, reused
+    # by the later candidate-readiness decision (cached, not re-fetched).
+    live = _body(defects=("a",))
+    new = _body(defects=("a",), notes="note")
+    result, env = _run_lane(monkeypatch, repo_tmp, live_body=live, new_body=new, forwarded_status="needs_fix")
+    assert result["status"] == "ok", result["errors"]
+    assert env.state_fetches == 1
+
+
+def test_preexisting_readiness_candidate_lane_state_fetched_once_on_readiness_failure(
+    repo_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    live = _body(defects=("a",))
+    new = _body(defects=("a",), notes="note")
+    result, env = _run_lane(monkeypatch, repo_tmp, live_body=live, new_body=new, forwarded_status="go")
+    assert result["status"] == "ok", result["errors"]
+    assert env.state_fetches == 1
+
+
+# --- forwarded needs_fix + CLOSED + unchanged body (reviewer warning 2) -------
+
+
+def test_preexisting_readiness_needs_fix_closed_unchanged_body_current_behavior(
+    repo_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pins the current minimal behavior: a CLOSED Issue whose body is
+    byte-identical to live (body_change_requested is False) is not rejected by
+    the needs_fix guard and is not mutated either -- the transaction reports
+    `no_change` with no body update, no error and no executor invocation."""
+    live = _body(defects=("a",), notes="existing note")
+    result, env = _run_lane(
+        monkeypatch, repo_tmp, live_body=live, new_body=live, forwarded_status="needs_fix"
+    )
+    assert result["status"] == "no_change", result["errors"]
+    assert result["errors"] == []
+    assert result["mutation_started"] is False
+    assert result["body_update"]["attempted"] is False
+    assert env.invoked == []
+    assert env.state_fetches == 1

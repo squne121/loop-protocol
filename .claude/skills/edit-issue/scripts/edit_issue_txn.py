@@ -800,7 +800,7 @@ def _child_error(cp: subprocess.CompletedProcess[str], code: str) -> dict[str, s
 def _fetch_issue(issue_number: int, repo: str) -> tuple[dict[str, Any] | None, str]:
     gh = shutil.which("gh") or "gh"
     cp = _run_command(
-        [gh, "issue", "view", str(issue_number), "--repo", repo, "--json", "title,body,updatedAt,state"],
+        [gh, "issue", "view", str(issue_number), "--repo", repo, "--json", "title,body,updatedAt"],
         env=_sanitized_gh_env(),
     )
     if cp.returncode != 0:
@@ -809,6 +809,32 @@ def _fetch_issue(issue_number: int, repo: str) -> tuple[dict[str, Any] | None, s
         return json.loads(cp.stdout), ""
     except json.JSONDecodeError:
         return None, "gh_issue_view_non_json"
+
+
+def _fetch_issue_state(issue_number: int, repo: str) -> tuple[str | None, str]:
+    """Live Issue state via a dedicated `gh issue view --json state` readback.
+
+    Kept separate from `_fetch_issue` so that every existing `_fetch_issue`
+    caller / fake keeps its exact `--json title,body,updatedAt` argv. Only the
+    pre-existing readiness compatibility lane calls this, and only when it
+    actually needs the live state. Any failure returns (None, reason) so the
+    caller fails closed with the original rejection.
+    """
+    gh = shutil.which("gh") or "gh"
+    cp = _run_command(
+        [gh, "issue", "view", str(issue_number), "--repo", repo, "--json", "state"],
+        env=_sanitized_gh_env(),
+    )
+    if cp.returncode != 0:
+        return None, _bounded(cp.stderr.strip() or cp.stdout.strip())
+    try:
+        data = json.loads(cp.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None, "gh_issue_view_state_non_json"
+    live_state = data.get("state") if isinstance(data, dict) else None
+    if not isinstance(live_state, str) or not live_state:
+        return None, "gh_issue_view_state_missing"
+    return live_state, ""
 
 
 # Issue #2922: pre-existing readiness defect compatibility lane.
@@ -832,15 +858,13 @@ def _native_relationships_is_noop(relationship_input: Any) -> bool:
     return not any(relationship_input.get(field) for field in NATIVE_RELATIONSHIP_LIST_FIELDS)
 
 
-def _compat_lane_preconditions_met(
-    live_state: Any, title_update: dict[str, Any], relationship_input: Any
-) -> bool:
-    """Cheap preconditions that need no child process (live state, title, relationships)."""
-    return (
-        live_state == "CLOSED"
-        and not title_update.get("required")
-        and _native_relationships_is_noop(relationship_input)
-    )
+def _compat_lane_static_preconditions_met(title_update: dict[str, Any], relationship_input: Any) -> bool:
+    """Preconditions that need no gh call (title / native relationship scope).
+
+    The live state precondition (CLOSED) is checked separately through a live
+    `_fetch_issue_state` readback, only once this cheap check has passed.
+    """
+    return not title_update.get("required") and _native_relationships_is_noop(relationship_input)
 
 
 def _split_h2_sections(body: str) -> list[tuple[str | None, str]]:
@@ -1194,14 +1218,22 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             errors=state.errors,
         )
 
+    # The CLOSED precondition is a live `gh issue view --json state` readback
+    # (never caller-declared). It runs lazily and at most once, only when the
+    # compat lane actually needs it; any failure / unparsable / missing state
+    # is treated as "not CLOSED" (fail-closed, original rejection).
+    compat_lane_static_ok = _compat_lane_static_preconditions_met(title_update, input_data.get("native_relationships"))
+    live_state_cache: list[str | None] = []
+
+    def _live_state_is_closed() -> bool:
+        if not live_state_cache:
+            live_state_cache.append(_fetch_issue_state(state.issue_number, state.repo)[0])
+        return live_state_cache[0] == "CLOSED"
+
+    if deferred_needs_fix and not compat_lane_static_ok:
+        return _reject_needs_fix_without_resolution_evidence()
     issue_data, issue_error = _fetch_issue(state.issue_number, state.repo)
-    compat_lane_preconditions = bool(
-        issue_data is not None
-        and _compat_lane_preconditions_met(
-            issue_data.get("state"), title_update, input_data.get("native_relationships")
-        )
-    )
-    if deferred_needs_fix and not compat_lane_preconditions:
+    if deferred_needs_fix and (issue_data is None or not _live_state_is_closed()):
         return _reject_needs_fix_without_resolution_evidence()
     if issue_data is None:
         state.errors.append({"code": "issue_readback_failed", "message": issue_error})
@@ -1366,8 +1398,10 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             # readiness, is only tolerated when the pre-existing readiness
             # compatibility lane proves the defect multiset is unchanged.
             if deferred_needs_fix or readiness_cp.returncode != 0:
-                compat_lane_ok = compat_lane_preconditions and _preexisting_readiness_defects_unchanged(
-                    current_body, mutated_candidate, readiness_cp
+                compat_lane_ok = (
+                    compat_lane_static_ok
+                    and _live_state_is_closed()
+                    and _preexisting_readiness_defects_unchanged(current_body, mutated_candidate, readiness_cp)
                 )
                 if not compat_lane_ok and deferred_needs_fix:
                     state.errors.append(
