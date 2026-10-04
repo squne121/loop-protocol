@@ -10,6 +10,13 @@ observability hooks introduced for Issue #2015) to the structured-lane
 (``CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS``), which made every structured-lane
 launcher invocation a deterministic BLOCKED (PR #2176 AC3 finding).
 
+Issue #2925 supersedes the narrow-channel fix below for the claude-gpt adapter:
+the launcher is now a thin wrapper that forwards every argument after its own
+``--`` to claude and no longer owns any smoke-only hook channel, so the claude-gpt
+adapter passes the same fixed ``--settings <JSON>`` observation overlay as the
+native adapter (after the ``--`` separator) and sets no
+``CLAUDE_GPT_RUNTIME_SMOKE_HOOKS`` variable. The historical description follows.
+
 This module verifies the narrow-channel fix:
 
 - when ``--claude-bin`` is supplied, ``--settings`` is never appended to
@@ -37,6 +44,7 @@ test suite), following the convention established by
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import subprocess
@@ -127,17 +135,17 @@ exit 0
 """
 
 
-def test_claude_gpt_adapter_omits_settings_flag_and_sets_env_channel(repo_with_worktree, tmp_path):
-    """Issue #2174 AC1 fix_delta: with ``--claude-bin`` AND the explicit
-    ``--claude-adapter claude-gpt`` opt-in, the structured-lane invocation
-    never carries a ``--settings`` flag on argv, and instead sets
-    ``CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-start-stop`` in the child
-    process environment. (Renamed from
-    ``test_claude_bin_override_omits_settings_flag_and_sets_env_channel``:
-    this launcher-specific behavior is no longer implied by
-    ``bool(--claude-bin)`` alone -- see
-    ``test_claude_bin_without_adapter_keeps_native_argv_shape`` below for the
-    corrected default.)"""
+def test_claude_gpt_adapter_forwards_observation_settings_after_separator_without_env_channel(
+    repo_with_worktree, tmp_path
+):
+    """Issue #2925 (supersedes Issue #2174 AC1 fix_delta): the Claude-GPT launcher is a
+    thin wrapper that forwards everything after its own ``--`` to claude, so with
+    ``--claude-bin`` AND the explicit ``--claude-adapter claude-gpt`` opt-in the
+    structured-lane invocation carries the SAME fixed ``--settings <JSON>``
+    observation overlay as the native adapter AFTER the literal ``--`` separator,
+    and never sets the removed launcher-owned ``CLAUDE_GPT_RUNTIME_SMOKE_HOOKS``
+    environment channel. (``test_claude_bin_without_adapter_keeps_native_argv_shape``
+    below still pins the native default.)"""
     repo, worktree = repo_with_worktree
 
     launcher_dir = tmp_path / "claude-gpt-launcher"
@@ -162,19 +170,22 @@ def test_claude_gpt_adapter_omits_settings_flag_and_sets_env_channel(repo_with_w
     assert result.returncode == 0, result.stderr
     assert argv_marker.exists(), "launcher was not invoked"
     recorded_argv = argv_marker.read_text(encoding="utf-8")
-    assert "--settings" not in recorded_argv, (
-        "structured lane must never pass --settings to a --claude-adapter "
-        "claude-gpt launcher (forbidden extra flag, PR #2176 AC3 BLOCKED finding)"
-    )
     argv_lines = recorded_argv.splitlines()
     assert argv_lines and argv_lines[0] == "--", (
         "the claude-gpt launcher only accepts its own launcher options "
         "before a literal -- separator (unknown_launcher_option "
         "otherwise); the -- must be the first forwarded token"
     )
+    settings_index = argv_lines.index("--settings")
+    assert settings_index > 0, "--settings must come after the launcher separator"
+    overlay = json.loads(argv_lines[settings_index + 1])
+    assert set(overlay["hooks"]) == {"SubagentStart", "SubagentStop"}
     assert env_marker.exists()
     recorded_env = env_marker.read_text(encoding="utf-8").strip()
-    assert recorded_env == "CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-start-stop"
+    assert recorded_env == "", (
+        "the launcher-owned CLAUDE_GPT_RUNTIME_SMOKE_HOOKS channel was removed "
+        f"(Issue #2925); got env: {recorded_env!r}"
+    )
 
 
 def test_claude_bin_without_adapter_keeps_native_argv_shape(repo_with_worktree, tmp_path):

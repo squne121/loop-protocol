@@ -10,6 +10,15 @@
 # NOT treated as success on its own -- required models must actually be
 # present in the live catalog afterwards (AC5).
 #
+# Issue #2925 AC3 (scope of the repair): this helper repairs a BINARY, not a
+# running SERVER. It installs a compatible binary under `$CLAUDE_GPT_HOME/bin`
+# (or `CLAUDE_CODE_PROXY_INSTALL_DIR`) and verifies that binary on a throwaway
+# loopback port that it starts and stops itself. The default launcher
+# (`launch.sh`) never starts, stops or restarts a proxy, so the server that
+# `ANTHROPIC_BASE_URL` points at keeps running the OLD binary until its owner
+# restarts it with the repaired binary. The result JSON therefore always carries
+# `repaired_scope: binary_only` and `server_restart_required: true`.
+#
 # This helper does not build a custom downloader / checksum framework: it
 # fetches the upstream installer script text and executes it as-is (the
 # installer performs its own artifact download and checksum verification).
@@ -159,9 +168,10 @@ if [ -n "$MISSING_MODELS_NL" ]; then
   exit 2
 fi
 
-printf '{"schema":"CLAUDE_GPT_REPAIR_PROXY_RESULT_V1","status":"ok","installed_path":%s,"installed_version":%s,"install_dir":%s,"required_models":%s}\n' \
+printf '{"schema":"CLAUDE_GPT_REPAIR_PROXY_RESULT_V1","status":"ok","repaired_scope":"binary_only","server_restart_required":true,"installed_path":%s,"installed_version":%s,"install_dir":%s,"required_models":%s}\n' \
   "$(claude_gpt_json_escape "$INSTALLED_BIN")" \
   "$(claude_gpt_json_escape "$INSTALLED_VERSION")" \
   "$(claude_gpt_json_escape "$INSTALL_DIR")" \
   "$(claude_gpt_json_array_from_lines "$REQUIRED_MODELS_NL")"
+echo "NOTE: repaired binary only (${INSTALLED_BIN}); the running server that ANTHROPIC_BASE_URL points at was NOT restarted. Its owner must restart it with this binary for the fix to take effect." >&2
 exit 0

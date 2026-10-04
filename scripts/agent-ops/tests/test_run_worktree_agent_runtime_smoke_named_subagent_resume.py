@@ -4,6 +4,10 @@ This module covers
 
 - AC1  the scenario's ``--settings`` overlay / argv (and that the default smoke is unchanged),
 - AC2  the evidence records runtime identity and the causal chain,
+- Issue #2925 AC4  the Claude-GPT live wrapper additionally requires the role-routed SubAgents
+  (``model: haiku`` ``codebase-investigator`` and ``model: sonnet`` ``issue-design-reviewer``) to
+  spawn -> terminally complete -> hand back a real result, judged by
+  ``_claude_gpt_role_subagent_smoke.evaluate_role_subagent`` (hermetically unit-tested below)
 - AC3/AC4  live wrapper tests for Native and the repository-owned Claude-GPT launcher
   (skipped under ``CI`` with an explicit reason, SKIP exit 77 propagated, never PASS),
 - AC6  runner-side generic name <-> agent ID correlation controls (real behavioural
@@ -58,6 +62,13 @@ def _load_module():
 
 
 MODULE = _load_module()
+
+_ROLE_HELPER_PATH = Path(__file__).resolve().parent / "_claude_gpt_role_subagent_smoke.py"
+_role_spec = importlib.util.spec_from_file_location("claude_gpt_role_subagent_smoke_2925", _ROLE_HELPER_PATH)
+assert _role_spec is not None and _role_spec.loader is not None
+ROLE = importlib.util.module_from_spec(_role_spec)
+sys.modules[_role_spec.name] = ROLE
+_role_spec.loader.exec_module(ROLE)
 FIRST = MODULE.NAMED_SUBAGENT_RESUME_FIRST_MARKER
 SECOND = MODULE.NAMED_SUBAGENT_RESUME_SECOND_MARKER
 NAME = MODULE.NAMED_SUBAGENT_RESUME_AGENT_NAME
@@ -326,21 +337,25 @@ def test_scenario_settings_drop_only_sendmessage_deny_and_default_unchanged(monk
     flags = [tok for tok in scenario_argv if tok.startswith("-") and tok != "--"]
     assert set(MODULE.named_resume_invocation_flag_readback("native", True)) == set(flags)
 
-    # claude-gpt adapter: launcher-owned fixed value, never a caller --settings.
+    # claude-gpt adapter (Issue #2925): the thin launcher forwards everything after its own
+    # ``--``, so the runner passes the SAME fixed scenario overlay as the native adapter and
+    # sets no launcher-owned env channel.
     MODULE.run_structured_claude(
         str(tmp_path), "p", 5.0, 7, claude_bin="/abs/launch.sh", claude_adapter="claude-gpt",
         named_subagent_resume=True, append_system_prompt_file="/abs/compat.md",
     )
-    assert captured["env"]["CLAUDE_GPT_RUNTIME_SMOKE_HOOKS"] == "subagent-name-resume"
-    assert "--settings" not in captured["argv"]
+    assert captured["env"] is None or "CLAUDE_GPT_RUNTIME_SMOKE_HOOKS" not in captured["env"]
     assert captured["argv"][1] == "--"
+    assert captured["argv"].index("--settings") > 1
+    assert _settings_arg(captured["argv"]) == _settings_arg(scenario_argv)
     assert set(MODULE.named_resume_invocation_flag_readback("claude-gpt", True)) == {
         tok for tok in captured["argv"] if tok.startswith("-") and tok != "--"
     }
     MODULE.run_structured_claude(
         str(tmp_path), "p", 5.0, 7, claude_bin="/abs/launch.sh", claude_adapter="claude-gpt"
     )
-    assert captured["env"]["CLAUDE_GPT_RUNTIME_SMOKE_HOOKS"] == "subagent-start-stop"
+    assert captured["env"] is None or "CLAUDE_GPT_RUNTIME_SMOKE_HOOKS" not in captured["env"]
+    assert _settings_arg(captured["argv"])["permissions"]["deny"] == ["SendMessage", "ListAgents"]
     assert "--no-session-persistence" in captured["argv"]
 
     # The compat note is scenario-only: never a permanent injection into other lanes.
@@ -522,8 +537,84 @@ def test_live_native_named_subagent_resume():
     assert evidence["same_agent_id_after_resume"] is True
 
 
+def _run_default_runtime_smoke(out_root: Path) -> dict:
+    """Issue #2925 AC4: text / Read / Bash / SubAgent tool use through the Minimal launcher.
+
+    Runs ``scripts/claude-gpt/runtime_smoke_test.sh --scenario default`` (exit 77 = SKIP is propagated,
+    never a PASS) and adjudicates ONLY from the evidence JSON it writes."""
+    head = _git_head()
+    evidence_path = out_root / f"runtime-verification-2925-claude-gpt-smoke-{head[:8]}.json"
+    proc = subprocess.run(
+        ["sh", str(REPO_ROOT / "scripts" / "claude-gpt" / "runtime_smoke_test.sh"),
+         "--scenario", "default", "--evidence-out", str(evidence_path)],
+        cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=900,
+    )
+    if proc.returncode == 77:
+        pytest.exit(f"{SKIP_REASON_TOKEN}: runtime_smoke_test.sh exited 77 (SKIP); never a PASS", returncode=77)
+    assert proc.returncode == 0, f"smoke exit={proc.returncode}: {(proc.stdout + proc.stderr)[-1500:]}"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["status"] == "pass" and evidence["sut"]["git_head"] == head
+    assert [step["name"] for step in evidence["steps"]] == ["text", "read", "bash", "subagent"]
+    assert all(step["check"]["ok"] for step in evidence["steps"])
+    return evidence
+
+
+def _run_role_routed_subagents(out_root: Path) -> dict:
+    """Issue #2925 AC4: haiku ``codebase-investigator`` and sonnet ``issue-design-reviewer``."""
+    launcher = REPO_ROOT / "scripts" / "claude-gpt" / "launch.sh"
+    results: dict = {}
+
+    haiku_prompt = ROLE.haiku_prompt(str(REPO_ROOT))
+    rc, out, err, timed_out = MODULE.run_structured_claude(
+        str(REPO_ROOT), haiku_prompt, 600.0, 30, claude_bin=str(launcher), claude_adapter="claude-gpt")
+    assert not timed_out and rc == 0, f"haiku role run rc={rc} timed_out={timed_out}: {err[-800:]}"
+    results["haiku"] = ROLE.evaluate_role_subagent(
+        out, ROLE.HAIKU_AGENT, ROLE.validate_haiku_handback,
+        hook_events=MODULE.extract_claude_hook_lifecycle_events(out))
+
+    spec = importlib.util.spec_from_file_location(
+        "semantic_review_transport_2925",
+        REPO_ROOT / ".claude" / "skills" / "issue-refinement-loop" / "scripts" / "semantic_review_transport.py")
+    assert spec is not None and spec.loader is not None
+    transport = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = transport
+    spec.loader.exec_module(transport)
+    pinned = transport.pin_bundle(
+        issue_number=2925, body_text=ROLE.SAMPLE_ISSUE_BODY, prompt_version="2925-smoke",
+        requested_model="sonnet", artifacts_root=Path(tempfile.mkdtemp(prefix="role-subagent-bundle-")))
+    rc, out, err, timed_out = MODULE.run_structured_claude(
+        str(REPO_ROOT), ROLE.sonnet_prompt(pinned["invocation_dir"]), 600.0, 30,
+        claude_bin=str(launcher), claude_adapter="claude-gpt")
+    assert not timed_out and rc == 0, f"sonnet role run rc={rc} timed_out={timed_out}: {err[-800:]}"
+    results["sonnet"] = ROLE.evaluate_role_subagent(
+        out, ROLE.SONNET_AGENT, ROLE.validate_sonnet_handback,
+        hook_events=MODULE.extract_claude_hook_lifecycle_events(out))
+
+    artifact = out_root / f"runtime-verification-2925-role-subagents-{_git_head()[:8]}.json"
+    artifact.write_text(json.dumps(results, indent=2), encoding="utf-8")
+    return results
+
+
+def _skip_unless_connected_server_available() -> None:
+    """Issue #2925: the Minimal launcher never starts a proxy, so an unreachable / incomplete
+    connected server is an UNAVAILABLE runtime (exit 77), never a FAIL and never a PASS."""
+    if os.environ.get("CI"):
+        return  # `_run_live_wrapper` reports the explicit CI skip
+    check = subprocess.run(
+        ["sh", str(REPO_ROOT / "scripts" / "claude-gpt" / "launch.sh"), "--check-only"],
+        cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=60,
+    )
+    if check.returncode != 0:
+        pytest.exit(
+            f"{SKIP_REASON_TOKEN}: launch.sh --check-only exited {check.returncode} (connected "
+            "claude-code-proxy unavailable or its model catalog is incomplete); never a PASS",
+            returncode=77,
+        )
+
+
 @pytest.mark.claude_live
 def test_live_claude_gpt_named_subagent_resume():
+    _skip_unless_connected_server_available()
     evidence = _run_live_wrapper("claude-gpt", out_root=_live_artifacts_dir())
     assert evidence["agent_kind"]["kind"] == "ordinary_subagent"
     assert evidence["same_agent_id_after_resume"] is True
@@ -531,6 +622,89 @@ def test_live_claude_gpt_named_subagent_resume():
     assert evidence["hook_event_counts"]["SubagentStart"] >= 2
     assert evidence["hook_event_counts"]["SubagentStop"] >= 2
     assert evidence["launcher"]["path"] == "scripts/claude-gpt/launch.sh"
+
+    # Issue #2925 AC4: same current Claude Code binary / same repository HEAD, Minimal Claude-GPT.
+    _run_default_runtime_smoke(_live_artifacts_dir())
+    roles = _run_role_routed_subagents(_live_artifacts_dir())
+    assert roles["haiku"]["ok"], roles["haiku"]
+    assert roles["sonnet"]["ok"], roles["sonnet"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #2925 AC4: role-routed SubAgent hand-back evaluator (hermetic; dispatch-only,
+# fixture-only and context-starved stops are never a PASS)
+# ---------------------------------------------------------------------------
+
+
+def _role_stream(agent_type: str, *, handback: str | None, start: bool = True, stop: bool = True,
+                 stop_before_start: bool = False, call_type: str | None = None) -> str:
+    stream = Stream()
+    stream.agent_call("toolu_role_1", None, subagent_type=call_type or agent_type)
+    if stop_before_start and stop:
+        stream.stop("agent-R", agent_type=agent_type)
+    if start:
+        stream.start("agent-R", agent_type=agent_type)
+    if stop and not stop_before_start:
+        stream.stop("agent-R", agent_type=agent_type)
+    if handback is not None:
+        stream.add({
+            "type": "user", "session_id": stream.session,
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_role_1",
+                 "content": [{"type": "text", "text": handback}]}]},
+        })
+    stream.result()
+    return stream.text()
+
+
+def _evaluate_role(stdout: str, agent_type: str, validator) -> dict:
+    return ROLE.evaluate_role_subagent(
+        stdout, agent_type, validator, hook_events=MODULE.extract_claude_hook_lifecycle_events(stdout))
+
+
+def test_role_subagent_handback_normal_controls_pass():
+    haiku = _evaluate_role(
+        _role_stream(ROLE.HAIKU_AGENT, handback="CLAUDE_GPT_AUTO_COMPACT_WINDOW is 272000 (lib.sh)"),
+        ROLE.HAIKU_AGENT, ROLE.validate_haiku_handback)
+    assert haiku["ok"] is True, haiku
+    sonnet = _evaluate_role(
+        _role_stream(ROLE.SONNET_AGENT, handback='{"assessment": "clear", "findings": []}'),
+        ROLE.SONNET_AGENT, ROLE.validate_sonnet_handback)
+    assert sonnet["ok"] is True, sonnet
+
+
+@pytest.mark.parametrize(
+    "label, kwargs",
+    [
+        ("dispatch_only_no_completion", dict(handback=None, stop=False)),
+        ("no_parent_handback", dict(handback=None)),
+        ("context_starved_stop", dict(handback="INSUFFICIENT_CONTEXT")),
+        ("requested_result_missing", dict(handback="I could not find the value.")),
+        ("spawn_never_started", dict(handback="272000", start=False)),
+        ("stop_precedes_start", dict(handback="272000", stop_before_start=True)),
+        ("different_subagent_type_requested", dict(handback="272000", call_type="general-purpose")),
+    ],
+)
+def test_role_subagent_handback_negative_controls_are_never_a_pass(label, kwargs):
+    result = _evaluate_role(_role_stream(ROLE.HAIKU_AGENT, **kwargs), ROLE.HAIKU_AGENT, ROLE.validate_haiku_handback)
+    assert result["ok"] is False, (label, result)
+
+
+def test_role_subagent_sonnet_handback_requires_the_semantic_review_object():
+    for text in ("Looks fine to me.", '{"verdict": "clear"}', "INSUFFICIENT_CONTEXT"):
+        result = _evaluate_role(
+            _role_stream(ROLE.SONNET_AGENT, handback=text), ROLE.SONNET_AGENT, ROLE.validate_sonnet_handback)
+        assert result["ok"] is False, (text, result)
+    accepted = _evaluate_role(
+        _role_stream(ROLE.SONNET_AGENT, handback='{"assessment": "findings", "findings": []}'),
+        ROLE.SONNET_AGENT, ROLE.validate_sonnet_handback)
+    assert accepted["ok"] is True
+
+
+def test_role_subagent_agents_resolve_to_the_pinned_role_aliases():
+    for agent, role in ((ROLE.HAIKU_AGENT, "haiku"), (ROLE.SONNET_AGENT, "sonnet")):
+        text = (REPO_ROOT / ".claude" / "agents" / f"{agent}.md").read_text(encoding="utf-8")
+        assert f"model: {role}" in text, agent
 
 
 def test_live_wrapper_skip_is_explicit_and_never_adjudicated_as_pass(tmp_path, monkeypatch):
@@ -1062,7 +1236,7 @@ def test_main_maps_chain_verdict_to_exit_code_and_writes_public_evidence(tmp_pat
     assert code == 77 and evidence["verdict"] == "skip" and evidence["runner_exit_code"] == 77
 
 
-def test_main_resolves_repo_launcher_and_passes_only_fixed_launcher_value(tmp_path, hermetic_worktree):
+def test_main_resolves_repo_launcher_and_forwards_only_the_fixed_scenario_overlay(tmp_path, hermetic_worktree):
     compat = tmp_path / "compat.md"
     compat.write_text("compat note\n", encoding="utf-8")
     launcher = hermetic_worktree / "scripts" / "claude-gpt" / "launch.sh"
@@ -1089,10 +1263,11 @@ def test_main_resolves_repo_launcher_and_passes_only_fixed_launcher_value(tmp_pa
     ])
     assert code == 0
     text = record.read_text(encoding="utf-8")
-    assert "HOOKS=subagent-name-resume" in text
+    # Issue #2925: no launcher-owned env channel; the fixed scenario overlay is forwarded after ``--``.
+    assert "HOOKS=\n" in text
     argv_line = next(line for line in text.splitlines() if line.startswith("ARGV:"))
     assert argv_line.split()[1] == "--"
-    assert "--settings" not in argv_line and "--permission-mode" not in argv_line
+    assert "--settings" in argv_line and "--permission-mode" not in argv_line
     assert "--no-session-persistence" not in argv_line
     assert f"--append-system-prompt-file {compat}" in argv_line
     evidence = json.loads(evidence_json.read_text(encoding="utf-8"))

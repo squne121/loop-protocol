@@ -1,42 +1,38 @@
 """scripts/claude-gpt/tests/test_runtime_smoke_issue_to_impl_live.py
 
-Issue #2340 AC7 (Runtime Verification Applicability: `decision: immediate`).
+Issue #2925 AC5 (Runtime Verification Applicability: `decision: immediate`).
 
-Claude-GPT live canary: measures `root_github_read` and
-`controlled_github_read` actor-equivalent read-only probes against the live
-runtime this process is actually running in, and confirms the GitHub
-credential carrier the Claude-GPT launcher shares (`GH_TOKEN` / `GITHUB_TOKEN`
-/ `GH_CONFIG_DIR`, per #2299 / PR #2303) survives BOTH the launcher's
-isolated-`HOME`/`XDG_*` boundary AND the controlled executor's
-noise-sanitization boundary (Issue #2340 fix_delta P1-2, PR #2357 review,
-2026-08-27).
+Repository workflow smoke: Minimal Claude-GPT（`scripts/claude-gpt/launch.sh` の default path）から
+representative な `issue-refinement-loop` を current canonical entry で実行し、次まで到達することを
+実 Claude Code process の stream-json で確認する。
 
-Runtime prerequisite unavailable (no `gh` binary, not authenticated,
-network/API unreachable) -> SKIP via `pytest.exit(..., returncode=77)`
-(SKIP is NOT PASS). Spark `fallback_only`/`unavailable`, or AGY
-unavailable, are legitimate DEGRADED live measurements recorded as
-evidence -- they never get silently promoted into a claim that Spark/AGY
-themselves are live-available (Runtime Verification Applicability
-`fallback_policy.fallback_success_is_pass: false`).
+  - GitHub read（native `gh` 経由。launcher は認証 carrier を再注入しない）
+  - planner / preflight（`plan_refinement_loop.py`）
+  - 起動された SubAgent の completion（Start だけで Stop の無い dispatch-only を許さない）
+  - controlled Issue mutation（`edit_issue_txn.py`）または canonical termination publish
+    （`publish_termination_report.py`）
 
-Evidence-scope note (fix_delta P1-2): this test does NOT invoke
-`scripts/claude-gpt/launch.sh` itself, and its `same_identity` field does
-NOT claim "same token authority" -- a shared GitHub *login* does not prove
-identical token scope/permission (fine-grained tokens for the same account
-can differ in write access). What this test DOES reproduce and assert is
-narrower and load-bearing: an isolated `HOME` / `XDG_CONFIG_HOME` /
-`XDG_CACHE_HOME` boundary (mirroring `launch.sh`'s isolation) plus the
-launcher's `GH_CONFIG_DIR` / `GH_TOKEN` / `GITHUB_TOKEN` passthrough, and
-that BOTH the root-style probe and the controlled-executor-equivalent
-sanitized-env probe still resolve a live GitHub identity from within that
-boundary -- i.e. the credential carrier was not silently dropped by
-isolation or by sanitization anywhere along that path.
+repository contract 由来の `human_judgment_required` 等の terminal reason は launcher FAIL としない
+（terminal reason は証跡に記録するだけ）。ただしこの AC の PASS は通信・報告経路が機能している
+ことの確認に限り、実用性の PASS ではない（実用性は AC7 の merge 後 trial で判定する）。
+
+実行条件（満たさなければ SKIP: exit 77。SKIP は PASS ではない）:
+  - 実 `claude` と、`ANTHROPIC_BASE_URL` の接続先で動いている互換 claude-code-proxy
+  - 認証済みの `gh`
+  - 対象 Issue 番号: 環境変数 `CLAUDE_GPT_AC5_ISSUE_NUMBER`（既定 2889。OPEN の Issue のみ）。この
+    テストは対象 Issue へ termination report 等を実際に投稿しうる live 検証である。
+
+`evaluate_workflow_stream` は pure で、実 process を起動しない（下の hermetic test が positive /
+negative control を固定する）。
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -45,192 +41,218 @@ from pathlib import Path
 import pytest
 
 _TESTS_DIR = Path(__file__).resolve().parent
-_SCRIPTS_DIR = _TESTS_DIR.parent
-_REPO_ROOT = _SCRIPTS_DIR.parent.parent
-_GUARDS_DIR = _REPO_ROOT / "scripts" / "agent-guards"
-
-for _p in (_SCRIPTS_DIR, _GUARDS_DIR):
-    if str(_p) not in sys.path:
-        sys.path.insert(0, str(_p))
-
-import workflow_capability_preflight as wcp  # noqa: E402
-import controlled_skill_mutation_exec as _exec  # noqa: E402
-
+_REPO_ROOT = _TESTS_DIR.parent.parent.parent
+_RUNNER_PATH = _REPO_ROOT / "scripts" / "agent-ops" / "run_worktree_agent_runtime_smoke.py"
+_LAUNCHER = _REPO_ROOT / "scripts" / "claude-gpt" / "launch.sh"
 _REPO = "squne121/loop-protocol"
+_DEFAULT_ISSUE = "2889"
+
+_PLANNER_MARKER = "plan_refinement_loop.py"
+_TERMINAL_MARKERS = ("publish_termination_report.py", "edit_issue_txn.py")
+_GITHUB_READ_RE = re.compile(r"\bgh\s+(issue|api|repo|pr)\b|run_refinement_preflight\.py|plan_refinement_loop\.py")
+
+
+def _load_runner():
+    spec = importlib.util.spec_from_file_location("run_worktree_agent_runtime_smoke_2925_ac5", _RUNNER_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _events(stdout: str):
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(obj, dict):
+                yield obj
+
+
+def evaluate_workflow_stream(stdout: str, hook_events: list[dict]) -> dict:
+    """Judge the issue-refinement-loop run from structured events only."""
+    bash_commands: list[str] = []
+    tool_use_ids: dict[str, str] = {}
+    errored_results = 0
+    final_text = ""
+    result_is_error = None
+    for event in _events(stdout):
+        message = event.get("message") if isinstance(event.get("message"), dict) else {}
+        content = message.get("content") if isinstance(message.get("content"), list) else []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and block.get("name") == "Bash":
+                command = (block.get("input") or {}).get("command")
+                if isinstance(command, str):
+                    bash_commands.append(command)
+                    if block.get("id"):
+                        tool_use_ids[block["id"]] = command
+            elif block.get("type") == "tool_result" and block.get("is_error"):
+                errored_results += 1
+        if event.get("type") == "result":
+            final_text = str(event.get("result") or "")
+            result_is_error = bool(event.get("is_error"))
+
+    joined = "\n".join(bash_commands)
+    starts = {e.get("agent_id") for e in hook_events if e.get("hook_event") == "SubagentStart" and e.get("agent_id")}
+    stops = {e.get("agent_id") for e in hook_events if e.get("hook_event") == "SubagentStop" and e.get("agent_id")}
+    terminal = next((m for m in _TERMINAL_MARKERS if m in joined), None)
+    reason_match = re.search(
+        r"\b(human_judgment_required|approved|needs_fix|max_iterations_reached|scope_change|blocked)\b", final_text
+    )
+    summary = {
+        "github_read": bool(_GITHUB_READ_RE.search(joined)),
+        "planner_ran": _PLANNER_MARKER in joined,
+        "subagents_started": len(starts),
+        "subagents_completed": len(starts & stops),
+        "dispatch_only_subagents": sorted(a for a in starts - stops if a),
+        "terminal_step": terminal,
+        "canonical_terminal_reason": reason_match.group(1) if reason_match else None,
+        "result_is_error": result_is_error,
+        "errored_tool_results": errored_results,
+    }
+    summary["ok"] = bool(
+        summary["github_read"]
+        and summary["planner_ran"]
+        and summary["terminal_step"]
+        and not summary["dispatch_only_subagents"]
+        and result_is_error is False
+    )
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# hermetic controls for the evaluator (always run; no live process)
+# ---------------------------------------------------------------------------
+
+
+def _bash(command: str, tool_id: str) -> str:
+    return json.dumps({
+        "type": "assistant",
+        "message": {"content": [{"type": "tool_use", "id": tool_id, "name": "Bash", "input": {"command": command}}]},
+    })
+
+
+def _stream(commands, *, is_error=False, final="terminal reason: human_judgment_required"):
+    lines = [_bash(cmd, f"toolu_{i}") for i, cmd in enumerate(commands)]
+    lines.append(json.dumps({"type": "result", "is_error": is_error, "result": final}))
+    return "\n".join(lines) + "\n"
+
+
+_FULL = [
+    "gh issue view 2889 --repo squne121/loop-protocol --json title,body",
+    "uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/plan_refinement_loop.py --issue-number 2889",
+    "uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/publish_termination_report.py "
+    "--input-file x.json",
+]
+
+
+def test_workflow_evaluator_accepts_a_run_that_reaches_a_canonical_terminal_step():
+    result = evaluate_workflow_stream(_stream(_FULL), [])
+    assert result["ok"] is True, result
+    # repository contract 由来の human_judgment_required は launcher FAIL ではない。
+    assert result["canonical_terminal_reason"] == "human_judgment_required"
+    assert result["terminal_step"] == "publish_termination_report.py"
+
+
+@pytest.mark.parametrize(
+    "label, commands, hook_events, is_error",
+    [
+        ("no_terminal_step", _FULL[:2], [], False),
+        ("no_planner", [_FULL[0], _FULL[2]], [], False),
+        ("no_github_read", ["echo hello", "echo again"], [], False),
+        ("claude_result_is_error", _FULL, [], True),
+        ("dispatch_only_subagent", _FULL,
+         [{"hook_event": "SubagentStart", "agent_id": "a1"}], False),
+    ],
+)
+def test_workflow_evaluator_rejects_runs_that_stop_short(label, commands, hook_events, is_error):
+    result = evaluate_workflow_stream(_stream(commands, is_error=is_error), hook_events)
+    assert result["ok"] is False, (label, result)
+
+
+def test_workflow_evaluator_accepts_completed_subagents():
+    events = [
+        {"hook_event": "SubagentStart", "agent_id": "a1"},
+        {"hook_event": "SubagentStop", "agent_id": "a1"},
+    ]
+    result = evaluate_workflow_stream(_stream(_FULL), events)
+    assert result["ok"] is True and result["subagents_completed"] == 1
+
+
+# ---------------------------------------------------------------------------
+# live (Runtime Verification: immediate)
+# ---------------------------------------------------------------------------
+
+
+def _skip(reason: str):
+    print(f"SKIP: {reason}")
+    pytest.exit(f"SKIP: runtime_smoke_issue_to_impl_live unavailable ({reason}); never a PASS", returncode=77)
 
 
 def _write_artifact(payload: dict) -> Path:
     artifact_dir = Path(os.environ.get("RUNTIME_VERIFICATION_ARTIFACT_DIR", "artifacts"))
     artifact_dir.mkdir(parents=True, exist_ok=True)
     artifact = artifact_dir / (
-        "runtime-verification-AC7-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + ".log"
+        "runtime-verification-2925-AC5-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + ".json"
     )
     artifact.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return artifact
 
 
-def _login(gh: str, env: dict | None):
-    try:
-        proc = subprocess.run(
-            [gh, "api", "--hostname", "github.com", "user", "--jq", "{login: .login}"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            env=env,
-        )
-    except OSError:
-        return None, "exec_failed"
-    if proc.returncode != 0:
-        return None, f"exit_{proc.returncode}"
-    try:
-        return json.loads(proc.stdout).get("login"), ""
-    except (json.JSONDecodeError, ValueError):
-        return None, "non_json_stdout"
-
-
-@pytest.mark.github_live
-def test_actor_scoped_capability_and_credential_parity_live_canary(monkeypatch, tmp_path):
-    gh, gh_err = _exec._find_gh_bin()
-    if gh is None:
-        print(f"SKIP: gh CLI unavailable in trusted PATH ({gh_err})")
-        pytest.exit("SKIP: runtime_smoke_issue_to_impl_live unavailable (gh not found)", returncode=77)
-
-    # -- Reproduce the launcher's isolation + credential-passthrough
-    #    boundary (fix_delta P1-2): pin the pre-isolation native gh config
-    #    dir (mirrors launch.sh's CLAUDE_NATIVE_GH_CONFIG_DIR_TARGET, derived
-    #    BEFORE HOME is swapped), then replace HOME / XDG_CONFIG_HOME /
-    #    XDG_CACHE_HOME with empty isolated directories (no ambient SSH/GPG
-    #    key reachability). GH_TOKEN / GITHUB_TOKEN / GH_HOST / GH_REPO pass
-    #    through verbatim if already set in this process's ambient
-    #    environment -- they are never forced or fabricated here.
-    native_gh_config_dir = os.environ.get("GH_CONFIG_DIR") or str(Path.home() / ".config" / "gh")
-    isolated_home = tmp_path / "isolated-home"
-    isolated_xdg_config = tmp_path / "isolated-xdg-config"
-    isolated_xdg_cache = tmp_path / "isolated-xdg-cache"
-    for d in (isolated_home, isolated_xdg_config, isolated_xdg_cache):
-        d.mkdir(parents=True, exist_ok=True)
-
-    monkeypatch.setenv("HOME", str(isolated_home))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(isolated_xdg_config))
-    monkeypatch.setenv("XDG_CACHE_HOME", str(isolated_xdg_cache))
-    monkeypatch.setenv("GH_CONFIG_DIR", native_gh_config_dir)
-
-    # -- root_github_read (launcher-isolated equivalent): gh auth status +
-    #    gh repo view under the isolated-HOME + credential-passthrough
-    #    environment constructed above (this process's `os.environ`, which
-    #    every ambient-env subprocess.run(..., env=None) call below
-    #    inherits) -- NOT this pytest process's original un-isolated env.
-    try:
-        auth_proc = subprocess.run([gh, "auth", "status"], capture_output=True, text=True, timeout=15)
-    except OSError as exc:
-        print(f"SKIP: gh auth status could not be executed ({exc})")
-        pytest.exit("SKIP: runtime_smoke_issue_to_impl_live unavailable (gh auth exec failed)", returncode=77)
-    if auth_proc.returncode != 0:
-        print(
-            "SKIP: gh auth status did not succeed under isolated HOME + native "
-            "GH_CONFIG_DIR pin (no live GitHub credential reachable in this runtime)"
-        )
-        pytest.exit("SKIP: runtime_smoke_issue_to_impl_live unavailable (gh auth unavailable)", returncode=77)
-
-    root_repo_read_ok = wcp._github_repo_read_ok(_REPO)
-    root_github_read = {
-        "status": "ready" if root_repo_read_ok else "unavailable",
-        "reason_code": None if root_repo_read_ok else "root_github_repo_read_failed",
-        "probe_execution_class": "root_shell_gh_repo_view",
-    }
-    if not root_repo_read_ok:
-        print("SKIP: root gh repo view read failed in this runtime (no live repo access)")
-        pytest.exit("SKIP: runtime_smoke_issue_to_impl_live unavailable (root repo read failed)", returncode=77)
-
-    # -- controlled_github_read: consumer-equivalent sanitized-env probe,
-    #    built from the SAME isolated-launcher environment above.
-    controlled_github_read = wcp._controlled_github_read_capability(_REPO)
-    if controlled_github_read["status"] != "ready":
-        # This IS the exact class of failure Issue #2340 exists to catch --
-        # do not silently skip it. A genuinely broken runtime (rather than a
-        # credential-parity regression) would already have failed the
-        # root_github_read gate above.
-        pytest.fail(
-            "controlled_github_read probe failed live while root_github_read succeeded -- "
-            f"this is the credential-context divergence Issue #2340 fixes: {controlled_github_read}"
-        )
-
-    # -- credential_carrier_reachable: read-only identity probe under BOTH
-    #    the isolated-launcher env (root-style, unsanitized) and the
-    #    controlled sanitized env, both built from the SAME isolation
-    #    boundary set up above. This does NOT claim "same token authority"
-    #    (fix_delta P1-2) -- a shared GitHub login is not proof of identical
-    #    token scope/permission. It claims only that the credential carrier
-    #    the launcher shares was not silently dropped by isolation or by
-    #    noise-sanitization anywhere along this path.
-    isolated_login, isolated_err = _login(gh, None)
-    controlled_login, controlled_err = _login(gh, wcp._sanitized_controlled_env())
-    if isolated_login is None or controlled_login is None:
-        print(
-            "SKIP: could not resolve identity under isolated-launcher env for "
-            f"credential-carrier comparison ({isolated_err}/{controlled_err})"
-        )
-        pytest.exit("SKIP: runtime_smoke_issue_to_impl_live unavailable (identity probe failed)", returncode=77)
-
-    credential_carrier_reachable = isolated_login == controlled_login
-
-    # -- Spark route status: retired (Issue #2651). GPT-5.3-Codex-Spark
-    # delegation no longer has a live binary/auth-based judgment -- any
-    # non-None directive deterministically retires. Recorded as evidence
-    # only (never promoted to a claim that a live Spark route exists),
-    # consistent with this file's pre-existing advisory-measurement intent.
-    spark_status = wcp._spark_status("preferred")
-
-    artifact = _write_artifact(
-        {
-            "ac": "AC7",
-            "command": "pytest -m github_live -k actor_scoped_capability_and_credential_parity_live_canary",
-            "run_head_sha": _current_head_sha(),
-            "launcher_identity": "test_runtime_smoke_issue_to_impl_live",
-            "isolation_boundary": {
-                "home_isolated": True,
-                "xdg_config_home_isolated": True,
-                "xdg_cache_home_isolated": True,
-                "gh_config_dir_pinned_to_native": True,
-            },
-            "actor_capabilities": {
-                "root_github_read": root_github_read,
-                "controlled_github_read": controlled_github_read,
-            },
-            # Renamed/narrowed from the prior "same_identity" claim
-            # (fix_delta P1-2): this is credential-carrier reachability
-            # across isolation + sanitization, not a token-authority proof.
-            "credential_carrier_reachable": credential_carrier_reachable,
-            "spark_route_status": spark_status,
-            "cleanup_result": "read_only_no_mutation_performed",
-        }
+@pytest.mark.claude_live
+def test_live_issue_refinement_loop_through_minimal_claude_gpt():
+    if os.environ.get("CI"):
+        pytest.skip("RUNTIME_VERIFICATION_SKIPPED_NOT_PASS: live Claude-GPT workflow smoke is not run in CI")
+    if shutil.which("gh") is None:
+        _skip("gh CLI unavailable")
+    if subprocess.run(["gh", "auth", "status"], capture_output=True, text=True, timeout=30).returncode != 0:
+        _skip("gh is not authenticated")
+    issue_number = os.environ.get("CLAUDE_GPT_AC5_ISSUE_NUMBER", _DEFAULT_ISSUE)
+    view = subprocess.run(
+        ["gh", "issue", "view", issue_number, "--repo", _REPO, "--json", "state", "-q", ".state"],
+        capture_output=True, text=True, timeout=60,
     )
-
-    # credential_carrier_reachable is the core claim of this Issue's live
-    # canary (fix_delta P1-2): under the SAME isolated-launcher boundary,
-    # the root-style probe and the controlled-executor-equivalent sanitized
-    # probe must resolve to the SAME identity -- both draw on the identical
-    # single credential store this repository's automation uses, so a
-    # mismatch here would indicate the credential was lost or redirected
-    # somewhere between isolation and the controlled boundary, not that two
-    # independently-scoped tokens happen to differ.
-    assert credential_carrier_reachable, (
-        f"credential carrier did not reach through isolation+sanitization consistently: "
-        f"isolated={isolated_login!r} controlled={controlled_login!r} (artifact: {artifact})"
+    if view.returncode != 0 or view.stdout.strip() != "OPEN":
+        _skip(f"representative Issue #{issue_number} is not an OPEN Issue")
+    check = subprocess.run(
+        ["sh", str(_LAUNCHER), "--check-only"], capture_output=True, text=True, timeout=60, cwd=str(_REPO_ROOT)
     )
-    # Issue #2651: Spark is retired, so a "preferred" directive always
-    # yields SPARK_RETIRED deterministically now (never a live-observed
-    # eligible/fallback_only/unavailable judgment) -- only assert the
-    # status is the known retired value so a malformed/None result still
-    # fails closed.
-    assert spark_status == wcp.SPARK_RETIRED
+    if check.returncode != 0:
+        _skip("connected claude-code-proxy unavailable or its model catalog is incomplete")
 
-
-def _current_head_sha() -> str | None:
-    try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10, cwd=str(_REPO_ROOT)
-        )
-    except OSError:
-        return None
-    return proc.stdout.strip() if proc.returncode == 0 else None
+    runner = _load_runner()
+    prompt = (
+        "Run the repository's issue-refinement-loop skill for Issue "
+        f"#{issue_number} in {_REPO} using the current canonical entry (max_iterations: 1). Follow the "
+        "skill's documented procedure autonomously up to its documented terminal boundary, including the "
+        "canonical termination publish. If the repository workflow itself stops with "
+        "human_judgment_required, report that terminal reason; do not work around the stop."
+    )
+    rc, out, err, timed_out = runner.run_structured_claude(
+        str(_REPO_ROOT), prompt, 1800.0, 120, claude_bin=str(_LAUNCHER), claude_adapter="claude-gpt"
+    )
+    hook_events = runner.extract_claude_hook_lifecycle_events(out)
+    summary = evaluate_workflow_stream(out, hook_events)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(_REPO_ROOT), capture_output=True, text=True, check=True
+    ).stdout.strip()
+    artifact = _write_artifact({
+        "ac": "AC5",
+        "command": "pytest -m claude_live scripts/claude-gpt/tests/test_runtime_smoke_issue_to_impl_live.py",
+        "tested_head": head,
+        "issue_number": int(issue_number),
+        "claude_exit_code": rc,
+        "timed_out": timed_out,
+        "workflow": summary,
+        "launcher_receipt": runner.extract_claude_gpt_launcher_receipt(err),
+        "scope_note": "AC5 PASS confirms the communication/reporting path only; practical usability is judged by AC7.",
+    })
+    assert not timed_out, f"timed out; artifact={artifact}"
+    assert rc == 0, f"claude exit={rc}; artifact={artifact}; stderr tail={err[-600:]}"
+    assert summary["ok"], f"{summary}; artifact={artifact}"

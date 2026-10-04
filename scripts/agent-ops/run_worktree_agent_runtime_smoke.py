@@ -667,10 +667,11 @@ _CLAUDE_SPAWN_HOOK_OBSERVABILITY_WITH_USER_PROMPT_EXPANSION_SETTINGS_JSON = json
 # kept; no permission mode is set here (never a bypass mode).  The hook set is
 # GENERIC observation only (``cat`` echoes the hook's own stdin payload so the
 # stream-json channel carries it): it never carries a Task Context verdict.
-# ``NAMED_SUBAGENT_RESUME_OBSERVATION_HOOKS`` is the single definition shared by
-# this overlay and the launcher-owned fixed value
-# (``CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-name-resume``); the AC1 tests assert
-# both sides carry exactly this set.
+# ``NAMED_SUBAGENT_RESUME_OBSERVATION_HOOKS`` is the single definition of this
+# overlay's hook set; the AC1 tests assert the overlay carries exactly this set.
+# Issue #2925: both adapters (native and claude-gpt) receive this overlay through
+# the same invocation-local ``--settings`` flag; the Claude-GPT launcher no longer
+# owns any smoke-only hook channel.
 NAMED_SUBAGENT_RESUME_OBSERVATION_HOOKS = (
     ("SubagentStart", None),
     ("SubagentStop", None),
@@ -695,10 +696,6 @@ _NAMED_SUBAGENT_RESUME_SETTINGS_JSON = json.dumps({
     "hooks": _named_subagent_resume_hooks_payload(),
 })
 
-# Launcher-owned fixed ``CLAUDE_GPT_RUNTIME_SMOKE_HOOKS`` value for this scenario
-# (``scripts/claude-gpt/launch.sh``).  The runner only ever sets this one fixed
-# string; no caller-supplied JSON / ``--settings`` crosses the launcher boundary.
-NAMED_SUBAGENT_RESUME_LAUNCHER_SMOKE_HOOKS = "subagent-name-resume"
 
 
 # ---------------------------------------------------------------------------
@@ -1100,15 +1097,16 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
     honored (see below)."""
     argv = [claude_bin]
     if claude_adapter == "claude-gpt":
-        # Issue #2176 (live AC3 finding): ``scripts/claude-gpt/launch.sh``
+        # Issue #2176 (live AC3 finding) / Issue #2925: ``scripts/claude-gpt/launch.sh``
         # only accepts its own launcher options (``--claude-bin``,
         # ``--check-only``, ``--dry-run``) before a literal ``--``
         # separator; any other ``-*`` token there is rejected as
-        # ``unknown_launcher_option`` (confirmed against the launcher
-        # committed at Issue #2158 / PR #2162's worktree HEAD). Everything
-        # after ``--`` is forwarded to the underlying claude binary
-        # unparsed. The 'native' adapter never receives this separator, so
-        # its argv shape is unchanged.
+        # ``unknown_launcher_option``. Everything after ``--`` is forwarded
+        # to the underlying claude binary unparsed (the Issue #2925 minimal
+        # launcher no longer rejects ``--settings`` etc.; it only adds the
+        # upstream Minimal client contract env and then ``exec``s claude).
+        # The 'native' adapter never receives this separator, so its argv
+        # shape is unchanged.
         argv.append("--")
     # Issue #2840: a name-addressed ``SendMessage`` resume re-reads the child's
     # persisted transcript, so the opt-in named SubAgent resume scenario (and
@@ -1129,92 +1127,73 @@ def run_structured_claude(worktree: str, prompt: str, timeout_seconds: float,
     # own per-invocation capability (never a permanent system-prompt injection).
     if append_system_prompt_file:
         argv += ["--append-system-prompt-file", append_system_prompt_file]
-    # Issue #2176: a launcher wrapper pinned via ``--claude-bin`` (e.g.
-    # ``scripts/claude-gpt/launch.sh``) rejects any ``--settings`` CLI flag
-    # outright as a policy-weakening extra flag
-    # (``CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS``), so unconditionally appending
-    # the fixed SubagentStart/SubagentStop observability
-    # ``--settings <JSON>`` flag here (as done for the native ``claude``
-    # binary below) would make every structured-lane launcher invocation a
-    # deterministic BLOCKED. Instead, when the caller explicitly opted into
-    # ``--claude-adapter claude-gpt``, request the same fixed hook pair
-    # through a narrow, value-fixed environment variable
-    # (``CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-start-stop``) that the
-    # launcher itself interprets and materializes into its own
-    # launcher-managed settings file -- no caller-supplied JSON ever
-    # crosses the launcher's forbidden-flags boundary. For the ``native``
-    # adapter (default, regardless of whether --claude-bin was given), this
-    # branch is not taken and argv keeps the pre-existing fixed
-    # ``--settings <JSON>`` flag unchanged (AC6 backward compatibility).
+    # Issue #2925: the Claude-GPT launcher is now a thin wrapper that forwards
+    # every argument after ``--`` to claude, so the claude-gpt adapter observes
+    # SubagentStart/SubagentStop through the SAME runner-owned, invocation-local
+    # ``--settings`` overlay as the native adapter (the observation hooks live in
+    # the smoke runner's opt-in, never in the everyday launcher; the former
+    # launcher-owned ``CLAUDE_GPT_RUNTIME_SMOKE_HOOKS`` channel was removed).
     launch_env = None
-    if claude_adapter == "claude-gpt":
-        if approval_settings_json is not None or approval_child_env is not None:
-            # Issue #2839: launcher は ``--settings`` を policy-weakening flag として拒否する
-            # ため、carrier は native adapter 専用である (呼び出し側の precondition の二重防御)。
-            raise ValueError("approval carrier requires the native adapter")
-        launch_env = os.environ.copy()
-        launch_env["CLAUDE_GPT_RUNTIME_SMOKE_HOOKS"] = (
-            NAMED_SUBAGENT_RESUME_LAUNCHER_SMOKE_HOOKS
-            if named_subagent_resume
-            else "subagent-start-stop"
-        )
-    else:
-        settings_json = select_native_observation_settings_json(
-            include_user_prompt_expansion_hook=include_user_prompt_expansion_hook,
-            include_hook_chain_evidence_hooks=include_hook_chain_evidence_hooks,
-            named_subagent_resume=named_subagent_resume,
-        )
-        if approval_settings_json is not None:
-            # Issue #2839: carrier の overlay は、上で選択した観測 overlay と同じ内容に
-            # ``autoMode`` だけを足したものでなければならない。それ以外 (観測 hooks の欠落や
-            # 任意 key の混入) は fail-closed で拒否し、``--settings`` は常に 1 個だけ渡す。
-            approval_obj = json.loads(approval_settings_json)
-            if (
-                not isinstance(approval_obj, dict)
-                or approval_obj.pop("autoMode", None) is None
-                or approval_obj != json.loads(settings_json)
-            ):
-                raise ValueError(
-                    "approval overlay must equal the selected observation overlay plus autoMode"
-                )
-            settings_json = approval_settings_json
-        if approval_child_env is not None:
-            launch_env = dict(approval_child_env)
-        argv += ["--settings", settings_json]
-        if include_hook_chain_evidence_hooks:
-            # Issue #2663 AC2 live-trial fix, corrected by PR #2668
-            # fix_delta (P1-1, anchor review
-            # https://github.com/squne121/loop-protocol/pull/2668#issuecomment-5737957277):
-            # the expected cohort is explicitly defined as "current PROJECT
-            # settings (.claude/settings.json)". Claude Code's own
-            # ``--setting-sources`` flag (per the official CLI reference,
-            # https://code.claude.com/docs/en/cli-reference: "Comma-
-            # separated list of setting sources to load (user, project,
-            # local)") controls ONLY which SETTINGS FILES are read to
-            # assemble a session's static hook configuration -- it does
-            # NOT, and cannot, exclude hooks registered by managed policy,
-            # plugins, or Skills, which register independently of
-            # ``--setting-sources`` (an earlier revision of this comment
-            # incorrectly claimed a broader "user/local/managed" exclusion;
-            # corrected here). Fixing this to ``"project"`` (never caller-
-            # configurable) is confirmed live to exclude the user/local
-            # settings.json FILE sources specifically -- e.g. it prevents a
-            # host's own ``~/.claude/settings.json`` PreToolUse/Bash hook
-            # from leaking into the observed cohort. Any managed/plugin/
-            # Skill-registered hook sharing the same event+tool remains
-            # observationally indistinguishable from a genuine unknown/
-            # duplicate entry on this channel regardless of this flag, and
-            # is handled the same way everywhere else in this module:
-            # ``unattributable_extra_hook_execution`` (unverified, never
-            # silently promoted to pass or fail) -- see the "Confirmed
-            # runtime-capability boundary" comment above
-            # ``_hook_chain_self_echo_fields`` for the full handler-
-            # identity limitation this flag does NOT resolve.
-            # ``--settings <JSON>`` (this runner's own additive observer
-            # overlay, appended above) is a SEPARATE mechanism from the
-            # ``--setting-sources`` file-source allowlist and is confirmed
-            # live to still apply even when only "project" is loaded.
-            argv += ["--setting-sources", "project"]
+    if claude_adapter == "claude-gpt" and (approval_settings_json is not None or approval_child_env is not None):
+        # Issue #2839: the approval carrier stays native-adapter-only (a
+        # precondition double-guard for the caller).
+        raise ValueError("approval carrier requires the native adapter")
+    settings_json = select_native_observation_settings_json(
+        include_user_prompt_expansion_hook=include_user_prompt_expansion_hook,
+        include_hook_chain_evidence_hooks=include_hook_chain_evidence_hooks,
+        named_subagent_resume=named_subagent_resume,
+    )
+    if approval_settings_json is not None:
+        # Issue #2839: carrier の overlay は、上で選択した観測 overlay と同じ内容に
+        # ``autoMode`` だけを足したものでなければならない。それ以外 (観測 hooks の欠落や
+        # 任意 key の混入) は fail-closed で拒否し、``--settings`` は常に 1 個だけ渡す。
+        approval_obj = json.loads(approval_settings_json)
+        if (
+            not isinstance(approval_obj, dict)
+            or approval_obj.pop("autoMode", None) is None
+            or approval_obj != json.loads(settings_json)
+        ):
+            raise ValueError(
+                "approval overlay must equal the selected observation overlay plus autoMode"
+            )
+        settings_json = approval_settings_json
+    if approval_child_env is not None:
+        launch_env = dict(approval_child_env)
+    argv += ["--settings", settings_json]
+    if include_hook_chain_evidence_hooks:
+        # Issue #2663 AC2 live-trial fix, corrected by PR #2668
+        # fix_delta (P1-1, anchor review
+        # https://github.com/squne121/loop-protocol/pull/2668#issuecomment-5737957277):
+        # the expected cohort is explicitly defined as "current PROJECT
+        # settings (.claude/settings.json)". Claude Code's own
+        # ``--setting-sources`` flag (per the official CLI reference,
+        # https://code.claude.com/docs/en/cli-reference: "Comma-
+        # separated list of setting sources to load (user, project,
+        # local)") controls ONLY which SETTINGS FILES are read to
+        # assemble a session's static hook configuration -- it does
+        # NOT, and cannot, exclude hooks registered by managed policy,
+        # plugins, or Skills, which register independently of
+        # ``--setting-sources`` (an earlier revision of this comment
+        # incorrectly claimed a broader "user/local/managed" exclusion;
+        # corrected here). Fixing this to ``"project"`` (never caller-
+        # configurable) is confirmed live to exclude the user/local
+        # settings.json FILE sources specifically -- e.g. it prevents a
+        # host's own ``~/.claude/settings.json`` PreToolUse/Bash hook
+        # from leaking into the observed cohort. Any managed/plugin/
+        # Skill-registered hook sharing the same event+tool remains
+        # observationally indistinguishable from a genuine unknown/
+        # duplicate entry on this channel regardless of this flag, and
+        # is handled the same way everywhere else in this module:
+        # ``unattributable_extra_hook_execution`` (unverified, never
+        # silently promoted to pass or fail) -- see the "Confirmed
+        # runtime-capability boundary" comment above
+        # ``_hook_chain_self_echo_fields`` for the full handler-
+        # identity limitation this flag does NOT resolve.
+        # ``--settings <JSON>`` (this runner's own additive observer
+        # overlay, appended above) is a SEPARATE mechanism from the
+        # ``--setting-sources`` file-source allowlist and is confirmed
+        # live to still apply even when only "project" is loaded.
+        argv += ["--setting-sources", "project"]
     # Issue #1734 fix_delta 3 (AC7): purely additive, opt-in persona binding.
     # When ``claude_agent_name`` is provided, insert ``--agent <name>`` so the
     # underlying ``claude`` process actually launches with that Agent as the
@@ -1265,11 +1244,11 @@ def extract_claude_gpt_launcher_receipt(stderr: str) -> dict | None:
     """Best-effort extraction of ``scripts/claude-gpt/launch.sh``'s own
     ``CLAUDE_GPT_LAUNCH_RESULT_V1`` JSON receipt line from ``stderr`` (Issue
     #2174 AC8). This runner does not implement or duplicate the launcher's
-    forbidden-flag policy -- it only surfaces the launcher's own,
-    already-structured refusal/success receipt as evidence, so a matrix
-    combination that structurally fails (e.g. claude-gpt adapter + hermetic
-    --settings forwarding) is independently observable rather than silently
-    swallowed as an opaque non-zero exit. Returns ``None`` when no such
+    own argument policy (Issue #2925: only permission-bypass flags are
+    refused) -- it only surfaces the launcher's own, already-structured
+    refusal/diagnostic receipt as evidence, so a launcher refusal (e.g.
+    an unreachable connected server) is independently observable rather
+    than silently swallowed as an opaque non-zero exit. Returns ``None`` when no such
     receipt line is present (e.g. native adapter, or a run that never
     reached the point of emitting one)."""
     match = _CLAUDE_GPT_LAUNCH_RESULT_RE.search(stderr or "")
@@ -4766,9 +4745,9 @@ def verify_no_forbidden_marker(
 # channel replaces transcript-existence as the interactive lane's PASS
 # authority. Every function below consumes already-parsed hook sink RECORDS
 # (never the raw sink file text, never raw prompt/response content) -- the
-# sink itself is written by a launcher-owned (``launch.sh``, "claude-gpt") or
-# harness-owned (native adapter) fixed hook command, never from a
-# caller-influenced string.
+# sink itself is written by a harness-owned fixed hook command (both adapters
+# since Issue #2925 removed the launcher-owned ``hook-sink-multi-turn`` gate),
+# never from a caller-influenced string.
 # ---------------------------------------------------------------------------
 
 # The ONLY keys a well-formed hook sink record may carry (AC13: no raw
@@ -4783,15 +4762,12 @@ _HOOK_SINK_LIFECYCLE_EVENTS = frozenset(
 # (defense in depth against a corrupted/runaway sink being read wholesale).
 _MAX_HOOK_SINK_LINES = 20000
 
-# Native-adapter hook sink writer (Issue #2219 In Scope: native adapter is
-# wired entirely from THIS harness, never scripts/claude-gpt/**). Same
-# record schema and same single-bounded-``printf``-equivalent-write
-# atomicity guarantee (AC15: one ``open(..., "a")`` + one ``write()`` call
-# per invocation, each record well under PIPE_BUF) as the claude-gpt
-# adapter's inline hook command in ``scripts/claude-gpt/launch.sh``'s
-# ``hook-sink-multi-turn`` gate -- kept in sync deliberately (same record
-# shape, same field names) so both adapters' sinks are parsed by the exact
-# same ``parse_claude_gpt_hook_sink_records``.
+# Hook sink writer (Issue #2219 In Scope: wired entirely from THIS harness,
+# never scripts/claude-gpt/**; Issue #2925: used for BOTH adapters because the
+# launcher's former ``hook-sink-multi-turn`` gate was removed). Single-bounded-
+# write atomicity guarantee (AC15: one ``open(..., "a")`` + one ``write()``
+# call per invocation, each record well under PIPE_BUF); the records are parsed
+# by ``parse_claude_gpt_hook_sink_records``.
 _HOOK_SINK_WRITER_SOURCE = '''\
 import hashlib
 import json
@@ -4981,29 +4957,6 @@ def verify_claude_gpt_hook_sink_no_raw_content(records: list[dict]) -> dict:
     return {"verified": not violations, "violating_events": violations}
 
 
-def claude_gpt_proxy_state_dir_python() -> Path:
-    """Python-side mirror of ``scripts/claude-gpt/lib.sh``'s
-    ``claude_gpt_proxy_state_dir()`` -- ``$CLAUDE_GPT_HOME/state`` (default
-    ``~/.claude-gpt/state`` when ``CLAUDE_GPT_HOME`` is unset). Mirrors the
-    launcher's own default expression exactly (same pattern as
-    ``_resolve_claude_projects_root``) rather than re-deriving a different
-    one, so an operator-set ``CLAUDE_GPT_HOME`` is honored identically on
-    both sides. This IS the "launcher-owned constant" the Issue body
-    requires the sink path be built from (AC14) -- never any
-    caller-supplied value (worktree path, CLI argument, etc.)."""
-    claude_gpt_home = os.environ.get("CLAUDE_GPT_HOME") or str(Path.home() / ".claude-gpt")
-    return Path(claude_gpt_home) / "state"
-
-
-def claude_gpt_hook_sink_path(nonce: str) -> Path:
-    """Deterministic sink path for the ``claude-gpt`` adapter (Issue #2219
-    AC14), built ONLY from ``claude_gpt_proxy_state_dir_python()`` (a
-    launcher-owned constant) and the run nonce -- never from ``worktree``,
-    CLI args, or any other caller-supplied value. Must byte-for-byte match
-    the path ``scripts/claude-gpt/launch.sh`` computes for the same nonce
-    (see the ``hook-sink-multi-turn`` gate there)."""
-    return claude_gpt_proxy_state_dir_python() / f"hook-sink-{nonce}.jsonl"
-
 
 def extract_claude_child_agent_type_with_source(stdout: str) -> tuple[str | None, str | None]:
     """``(agent_type, source)`` -- the agent type together with the provenance
@@ -5145,43 +5098,22 @@ def extract_claude_child_session_id(
 # TUI prose -- see the existing documented ``spawn_events: None`` gap for
 # this lane).
 #
-# Issue #2219 fix_delta iteration 2 (live verification finding against the
-# real claude-gpt adapter, https://github.com/squne121/loop-protocol/pull/2222#issuecomment-5307351011):
-# ``<projects-root>`` above is NOT always ``~/.claude/projects``. The
-# ``claude-gpt`` adapter isolates its whole Claude Code config root to
-# ``$CLAUDE_GPT_HOME/claude`` (default ``~/.claude-gpt/claude`` -- see
-# ``scripts/claude-gpt/lib.sh``'s ``claude_gpt_claude_config_dir``, exported
-# as ``CLAUDE_CONFIG_DIR`` by ``launch.sh`` before the isolated session ever
-# starts), so its session transcript is persisted under
-# ``$CLAUDE_GPT_HOME/claude/projects`` instead -- the old hardcoded
-# ``~/.claude/projects`` scan could never find it, producing a false
-# ``interactive_transcript_found: False``. Live filesystem inspection of a
-# real isolated claude-gpt session
-# (``~/.claude-gpt/claude/projects/<cwd-slug>/<session-id>.jsonl``) confirms
-# the SAME flat, single-file, native stream-json-shaped transcript format the
-# native adapter writes -- there is no adapter-specific transcript shape to
-# special-case here; only the ROOT directory differs, and it differs for the
-# exact same reason (and using the exact same resolution logic) the launcher
-# itself already isolates it. ``_resolve_claude_projects_root`` below mirrors
-# ``lib.sh``'s own default expression exactly, rather than re-deriving a
-# different one, so an operator-set ``CLAUDE_GPT_HOME`` is honored
-# identically on both sides.
+# Issue #2925: ``<projects-root>`` is ``~/.claude/projects`` for BOTH adapters.
+# The Claude-GPT launcher no longer isolates its Claude Code config root to
+# ``$CLAUDE_GPT_HOME/claude`` (it shares the ambient Native user/config surface),
+# so a claude-gpt session persists its transcript under the same ambient
+# ``~/.claude/projects`` the native adapter uses (the former adapter-specific
+# root was removed together with the launcher's CLAUDE_CONFIG_DIR isolation).
 # ---------------------------------------------------------------------------
 
 
 def _resolve_claude_projects_root(claude_adapter: str) -> Path:
     """The Claude Code ``projects`` directory root this run's own session
-    transcript was actually persisted under, based on which adapter
-    launched it (Issue #2219 fix_delta iteration 2). ``native`` (the
-    default) uses ``~/.claude/projects`` directly. ``claude-gpt`` isolates
-    its Claude Code config root to ``$CLAUDE_GPT_HOME/claude`` (default
-    ``~/.claude-gpt/claude`` when ``CLAUDE_GPT_HOME`` is unset -- mirrors
-    ``scripts/claude-gpt/lib.sh``'s ``claude_gpt_claude_config_dir``
-    default expression exactly), so its transcript lives under
-    ``$CLAUDE_GPT_HOME/claude/projects`` instead."""
-    if claude_adapter == "claude-gpt":
-        claude_gpt_home = os.environ.get("CLAUDE_GPT_HOME") or str(Path.home() / ".claude-gpt")
-        return Path(claude_gpt_home) / "claude" / "projects"
+    transcript was persisted under. Issue #2925: identical for ``native`` and
+    ``claude-gpt`` -- the minimal Claude-GPT launcher shares the ambient
+    ``~/.claude`` surface instead of isolating a separate config root.
+    ``claude_adapter`` is accepted for call-site compatibility only."""
+    del claude_adapter
     return Path.home() / ".claude" / "projects"
 
 
@@ -6491,11 +6423,14 @@ def run_interactive_herdr_isolated(
             forwarder_path = Path(claude_bin_shim_dir) / "claude"
             _escaped_target = resolved_claude_bin_override.replace("'", "'\\''")
             _escaped_receipt = claude_bin_receipt_path.replace("'", "'\\''")
+            # Issue #2925: ``launch.sh`` only forwards claude arguments after its
+            # own ``--``, so the claude-gpt forwarder inserts the separator.
+            _forwarder_separator = " --" if claude_adapter == "claude-gpt" else ""
             forwarder_path.write_text(
                 "#!/bin/sh\n"
                 "umask 0077\n"
                 f"printf '%s' '{claude_bin_launcher_nonce}' > '{_escaped_receipt}'\n"
-                f"exec '{_escaped_target}' \"$@\"\n",
+                f"exec '{_escaped_target}'{_forwarder_separator} \"$@\"\n",
                 encoding="utf-8",
             )
             forwarder_path.chmod(0o700)
@@ -6524,17 +6459,12 @@ def run_interactive_herdr_isolated(
                     "--env", "CLAUDE_GPT_CLAUDE_BIN=" + claude_gpt_real_claude_bin,
                 ]
 
-        # Claude-GPT accepts the runtime-smoke peer policy only through its
-        # existing fixed launcher-owned channel.  Thread the default fixed
-        # value through both workspace creation and the already-running pane
-        # shell, because rc files can otherwise erase an inherited value.  A
-        # hook-sink run upgrades this same fixed channel below; no caller value
-        # is accepted or forwarded.
+        # Issue #2925: the Claude-GPT launcher no longer owns a smoke-only hook
+        # channel (``CLAUDE_GPT_RUNTIME_SMOKE_HOOKS`` was removed). Both adapters
+        # receive the runner-owned observation settings through the invocation-
+        # local ``--settings`` flag (see ``agent_extra_args`` below) or the
+        # harness-owned hook-sink config dir.
         launcher_env_pairs: list[tuple[str, str]] = []
-        if runtime == "claude" and claude_adapter == "claude-gpt":
-            launcher_env_pairs = [
-                ("CLAUDE_GPT_RUNTIME_SMOKE_HOOKS", "subagent-start-stop"),
-            ]
 
         # Issue #2219 AC2/AC3/AC13-AC17 (OWNER anchor decision, hook-event
         # evidence channel): wire the interactive lane's durable hook sink
@@ -6552,65 +6482,37 @@ def run_interactive_herdr_isolated(
         if runtime == "claude" and hook_sink_enabled:
             hook_sink_nonce = uuid.uuid4().hex
             evidence["hook_sink_nonce"] = hook_sink_nonce
-            if claude_adapter == "claude-gpt":
-                # Path built ONLY from the launcher-owned constant
-                # (``claude_gpt_proxy_state_dir_python()`` mirrors
-                # ``scripts/claude-gpt/lib.sh``'s
-                # ``claude_gpt_proxy_state_dir()`` exactly) plus the nonce
-                # generated above -- never from ``worktree`` or any other
-                # caller-supplied value (AC14). ``scripts/claude-gpt/
-                # launch.sh``'s own ``hook-sink-multi-turn`` gate computes
-                # the identical path for the same nonce.
-                hook_sink_path = claude_gpt_hook_sink_path(hook_sink_nonce)
-                hook_sink_path.parent.mkdir(parents=True, exist_ok=True)
-                evidence["hook_sink_path"] = str(hook_sink_path)
-                # Replace only the default fixed launcher channel with the
-                # other already-recognized fixed channel.  This remains a
-                # harness-selected value, never public caller input.
-                launcher_env_pairs[0] = (
-                    "CLAUDE_GPT_RUNTIME_SMOKE_HOOKS", "hook-sink-multi-turn"
-                )
-                hook_sink_env_pairs = [
-                    ("CLAUDE_GPT_HOOK_SINK_NONCE", hook_sink_nonce),
-                    # launch.sh independently computes this SAME path from
-                    # its own launcher-owned constant + this nonce; also
-                    # exporting it here is redundant-but-harmless
-                    # observability, never an input launch.sh trusts for
-                    # path construction (AC14).
-                    ("CLAUDE_GPT_HOOK_SINK_PATH", str(hook_sink_path)),
-                ]
-            else:
-                # native adapter (Issue #2219 In Scope: "native adapter は
-                # scripts/claude-gpt/** を一切変更せず harness 側のみで完結
-                # させる"): a harness-owned CLAUDE_CONFIG_DIR pointing at a
-                # generated settings.json with the SAME fixed hook set
-                # (UserPromptSubmit/Stop/StopFailure/SubagentStart/
-                # SubagentStop), all self-contained in a fresh temp dir
-                # this function itself controls -- no scripts/claude-gpt/**
-                # file is read or written for this branch.
-                hook_sink_shim_dir = tempfile.mkdtemp(prefix="worktree-agent-runtime-smoke-hook-sink-")
-                os.chmod(hook_sink_shim_dir, 0o700)
-                hook_sink_path = Path(hook_sink_shim_dir) / f"hook-sink-{hook_sink_nonce}.jsonl"
-                hook_sink_writer_path = Path(hook_sink_shim_dir) / "hook_sink_writer.py"
-                hook_sink_writer_path.write_text(_HOOK_SINK_WRITER_SOURCE, encoding="utf-8")
-                hook_sink_writer_path.chmod(0o700)
-                claude_config_dir = Path(hook_sink_shim_dir) / "claude-config"
-                claude_config_dir.mkdir(parents=True, exist_ok=True)
-                settings_path = claude_config_dir / "settings.json"
-                hook_command = f'python3 "{hook_sink_writer_path}"'
-                settings_payload = {
-                    "hooks": {
-                        event_name: [{"hooks": [{"type": "command", "command": hook_command}]}]
-                        for event_name in sorted(_HOOK_SINK_LIFECYCLE_EVENTS)
-                    },
-                }
-                settings_path.write_text(json.dumps(settings_payload, indent=2), encoding="utf-8")
-                evidence["hook_sink_path"] = str(hook_sink_path)
-                hook_sink_env_pairs = [
-                    ("CLAUDE_CONFIG_DIR", str(claude_config_dir)),
-                    ("CLAUDE_GPT_HOOK_SINK_NONCE", hook_sink_nonce),
-                    ("CLAUDE_GPT_HOOK_SINK_PATH", str(hook_sink_path)),
-                ]
+            # Both adapters (Issue #2219 In Scope: harness-side only; Issue
+            # #2925: the minimal Claude-GPT launcher has no hook-sink gate any
+            # more): a harness-owned CLAUDE_CONFIG_DIR pointing at a
+            # generated settings.json with the SAME fixed hook set
+            # (UserPromptSubmit/Stop/StopFailure/SubagentStart/
+            # SubagentStop), all self-contained in a fresh temp dir
+            # this function itself controls -- no scripts/claude-gpt/**
+            # file is read or written for this branch.
+            hook_sink_shim_dir = tempfile.mkdtemp(prefix="worktree-agent-runtime-smoke-hook-sink-")
+            os.chmod(hook_sink_shim_dir, 0o700)
+            hook_sink_path = Path(hook_sink_shim_dir) / f"hook-sink-{hook_sink_nonce}.jsonl"
+            hook_sink_writer_path = Path(hook_sink_shim_dir) / "hook_sink_writer.py"
+            hook_sink_writer_path.write_text(_HOOK_SINK_WRITER_SOURCE, encoding="utf-8")
+            hook_sink_writer_path.chmod(0o700)
+            claude_config_dir = Path(hook_sink_shim_dir) / "claude-config"
+            claude_config_dir.mkdir(parents=True, exist_ok=True)
+            settings_path = claude_config_dir / "settings.json"
+            hook_command = f'python3 "{hook_sink_writer_path}"'
+            settings_payload = {
+                "hooks": {
+                    event_name: [{"hooks": [{"type": "command", "command": hook_command}]}]
+                    for event_name in sorted(_HOOK_SINK_LIFECYCLE_EVENTS)
+                },
+            }
+            settings_path.write_text(json.dumps(settings_payload, indent=2), encoding="utf-8")
+            evidence["hook_sink_path"] = str(hook_sink_path)
+            hook_sink_env_pairs = [
+                ("CLAUDE_CONFIG_DIR", str(claude_config_dir)),
+                ("CLAUDE_GPT_HOOK_SINK_NONCE", hook_sink_nonce),
+                ("CLAUDE_GPT_HOOK_SINK_PATH", str(hook_sink_path)),
+            ]
 
         # Issue #2568 In Scope: additive Task Context env/carrier
         # passthrough, threaded through the SAME herdr `workspace create
@@ -6700,16 +6602,15 @@ def run_interactive_herdr_isolated(
         # that has not been separately confirmed to be honored by an
         # interactive Claude Code launch.
         # ``herdr agent start`` explicitly supports ``-- [AGENT_ARG]...``.
-        # Native Claude receives the same fixed, invocation-local policy used
-        # by the structured subprocess. Claude-GPT keeps its launcher-owned
-        # policy channel instead: forwarding --settings to that launcher is a
-        # rejected policy-bypass input. Neither branch alters the isolated
-        # Herdr lifecycle or routes structured execution through Herdr.
-        agent_extra_args: list[str] = []
-        if claude_adapter == "native":
-            agent_extra_args = [
-                "--", "--settings", _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON,
-            ]
+        # Both adapters receive the same fixed, invocation-local observation
+        # policy used by the structured subprocess (Issue #2925: the minimal
+        # Claude-GPT launcher forwards every argument after its own ``--`` to
+        # claude, so the forwarder below inserts that separator for claude-gpt).
+        # Neither branch alters the isolated Herdr lifecycle or routes
+        # structured execution through Herdr.
+        agent_extra_args: list[str] = [
+            "--", "--settings", _CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON,
+        ]
 
         # A freshly created workspace's shell may not be an "available shell"
         # yet (still initializing). Retry ``agent start`` with a bounded,
@@ -8046,9 +7947,10 @@ def named_resume_invocation_flag_readback(adapter: str, compat_note_applied: boo
     """Flag-token readback of the fixed argv ``run_structured_claude`` builds for
     the named SubAgent resume scenario (flag names only -- never a value/path).
     A test pins this against the argv actually handed to the subprocess layer."""
-    flags = ["-p", "--output-format", "--include-hook-events", "--max-turns", "--verbose"]
-    if adapter == "native":
-        flags.append("--settings")
+    # Issue #2925: both adapters pass the fixed ``--settings`` observation overlay
+    # (the claude-gpt launcher forwards it after its own ``--``).
+    del adapter
+    flags = ["-p", "--output-format", "--include-hook-events", "--max-turns", "--verbose", "--settings"]
     if compat_note_applied:
         flags.append("--append-system-prompt-file")
     return flags
@@ -8664,11 +8566,10 @@ def main(argv: list[str] | None = None) -> int:
     # channel this whole capability reads).
     if args.require_hook_chain_evidence and (args.runtime != "claude" or args.mode != "structured"):
         parser.error("--require-hook-chain-evidence requires --runtime claude --mode structured")
-    # The observer-hook / --setting-sources injection above (see
-    # run_structured_claude) is only wired into the native adapter's
-    # branch -- the claude-gpt launcher owns its own separate settings
-    # mechanism (CLAUDE_GPT_RUNTIME_SMOKE_HOOKS) and forbids any
-    # additional --settings/--setting-sources flag outright.
+    # The hook-chain evidence opt-in (--setting-sources project) stays scoped to the
+    # native adapter's opt-in lane: the claude-gpt adapter shares the ambient
+    # Native config surface since Issue #2925, so a project-only cohort comparison
+    # has not been re-validated for it.
     if args.require_hook_chain_evidence and args.claude_adapter != "native":
         parser.error("--require-hook-chain-evidence requires --claude-adapter native")
 

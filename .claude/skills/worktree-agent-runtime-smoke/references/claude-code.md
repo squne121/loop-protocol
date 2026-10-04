@@ -168,53 +168,39 @@ claude-gpt launcher）の絶対パスを明示的に指定できる。
 - `--claude-bin` 未指定時（既定の `None`）は、structured lane・interactive
   lane のいずれも既存の `shutil.which("claude")` PATH 解決から一切変更されない。
 
-## `--claude-adapter` による launcher 固有 argv/env 制御（Issue #2174 AC1 fix_delta）
+## `--claude-adapter` による launcher 固有 argv 制御（Issue #2174 AC1 fix_delta、Issue #2925 で更新）
 
 OWNER REQUEST_CHANGES（https://github.com/squne121/loop-protocol/issues/2174#issuecomment-5302215173）
 により、`--claude-bin` 単体（`bool(--claude-bin)`）を launcher 固有挙動の判定材料に
-してはならないと修正された。従来の実装は `--claude-bin` が指定されているという
-事実だけで、常に structured lane の argv 先頭へ `--` separator を挿入し、固定
-`--settings <hook-observability-json>` を省略して代わりに
-`CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-start-stop` 環境変数を注入していた。
-これは「binary path」と「launcher protocol」を混同する設計であり、絶対パス指定の
-native claude binary や透過的な wrapper に対しても意図せず claude-gpt 固有の
-argv/env 変換が適用されてしまう欠陥だった。
-
-`--claude-adapter native|claude-gpt`（既定 `native`）は、この launcher 固有挙動を
-`--claude-bin` から独立させた明示入力である:
+してはならないと修正された。`--claude-adapter native|claude-gpt`（既定 `native`）は、この
+launcher 固有挙動を `--claude-bin` から独立させた明示入力である:
 
 - `native`（既定）: `--claude-bin`（指定時）は純粋な binary path override。argv は
   PATH 解決時と byte-identical（固定 `--settings <hook-observability-json>` を維持）。
-  `CLAUDE_GPT_RUNTIME_SMOKE_HOOKS` は一切設定しない。
 - `claude-gpt`: `--claude-bin` の指定が必須（未指定なら `parser.error` で起動前に
   blocked）。structured lane の固定 argv 先頭に literal `--` separator を挿入し
   （`scripts/claude-gpt/launch.sh` は自身のオプション（`--claude-bin` /
   `--check-only` / `--dry-run`）の後に `--` を要求し、以降を claude 本体へ素通しする）、
-  `--settings <JSON>` の代わりに `CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-start-stop`
-  環境変数を子プロセスへ設定する（launcher が `--settings` を含む policy-weakening
-  flag を forbidden として拒否するため）。hermetic no-mutation lane
-  （`--hermetic-agent-definition`）が同時に有効な場合、hermetic 用の
-  `--settings <hermetic_settings_file>` は引き続き argv へ追加されるため、
-  `--` の後に launcher が拒否する `--settings` が渡り launcher 自身の
-  `unknown_launcher_option`/`policy_weakening_flag_rejected` 拒否で構造的に失敗する
-  （Issue #2174 AC8 が要求する検出可能な組み合わせ）。この拒否 receipt は
-  `extract_claude_gpt_launcher_receipt()` で stderr の `CLAUDE_GPT_LAUNCH_RESULT_V1`
-  JSON 行から抽出され、evidence の `claude_gpt_launcher_receipt` に記録される。
+  native adapter と同じ固定 `--settings <hook-observability-json>` overlay をその後ろに渡す。
+  Issue #2925 以前は launcher が `--settings` を policy-weakening flag として拒否していたため、
+  `CLAUDE_GPT_RUNTIME_SMOKE_HOOKS` 環境変数の固定値 channel を使っていたが、launcher の薄い wrapper 化に
+  伴いこの channel は撤去した。観測 hook は smoke 実行側の opt-in であり、日常の launcher には常設しない。
+  launcher は permission bypass flag（`--dangerously-skip-permissions` 系と
+  `--permission-mode bypassPermissions`）だけを引き続き拒否し、その receipt
+  （`CLAUDE_GPT_LAUNCH_RESULT_V1`）は evidence の `claude_gpt_launcher_receipt` として記録される。
+  interactive lane では、forwarder script が claude-gpt adapter の場合に限り launcher 呼び出しへ
+  `--` を挿入し、Herdr の `agent start ... -- --settings <JSON>` pass-through で同じ overlay を渡す。
 
-## `--check-only` receipt の multi-line 埋め込み（Issue #2153 実装時の live 発見）
+## `--check-only` receipt（Issue #2153 実装時の live 発見、Issue #2925 で更新）
 
-`scripts/claude-gpt/launch.sh --check-only` が成功時に出力する
-`CLAUDE_GPT_LAUNCH_RESULT_V1` receipt は、ネストされた `preflight` object を
-pretty-print（複数行）で埋め込む。`extract_claude_gpt_launcher_receipt()` の
-単一行 regex（`[^\n]*`）はこの receipt を抽出できないことを live 実行で確認
-済み（拒否系の単一行 receipt は引き続き正しく抽出できる）。この
-`--check-only` receipt のような multi-line embedded JSON を消費する呼び出し元
-は、単一行 regex ではなく `json.JSONDecoder.raw_decode()`（bracket-aware）で
-receipt marker 位置から parse する必要がある。`.claude/skills/
-issue-refinement-loop/scripts/run_native_session_continuation_canary.py` の
-`_parse_claude_gpt_receipt()` がこの local workaround の実装例（Issue #2153
-AC6 の reuse 境界により、この workaround 自体は本 SKILL の汎用 harness へは
-追加していない）。
+`scripts/claude-gpt/launch.sh --check-only` は、Issue #2925 以降、接続先 server の診断結果
+（`connected_server` / `local_proxy_binary_auxiliary` / `launch_env`）を含む
+`CLAUDE_GPT_LAUNCH_RESULT_V1` receipt を **単一行 JSON** で stdout に出力する（旧 launcher の
+複数行 `preflight` object の埋め込みは無い）。`extract_claude_gpt_launcher_receipt()` の
+単一行 regex で抽出できる。複数行 JSON を消費する呼び出し元は従来どおり
+`json.JSONDecoder.raw_decode()`（bracket-aware）で receipt marker 位置から parse する。
+`.claude/skills/issue-refinement-loop/scripts/run_native_session_continuation_canary.py` の
+`_parse_claude_gpt_receipt()` がその local workaround の実装例である。
 
 ## Herdr baseline-preservation の明示 opt-in（Issue #2437）
 
@@ -232,8 +218,9 @@ FAIL とする。`preexisting_herdr_preserved` はこの opt-in の observed evi
 ## claude-gpt launcher の同一 session multi-turn / 複数 SubAgent lifecycle / proxy cleanup（Issue #2219、同一セッション複数ターン・複数サブエージェント生存確認）
 
 `--claude-adapter claude-gpt` の run では、以下 3 種類の追加証明が opt-in フラグ経由で
-可能になる。いずれも `scripts/claude-gpt/launch.sh` 自体には手を入れず、launcher が
-既に emit している stdout stream-json / stderr `KEY=value` 行を parse するだけである。
+可能になる。いずれも `scripts/claude-gpt/launch.sh` 自体には手を入れず、claude の stdout stream-json を
+parse するだけである（Issue #2925 以降 launcher は proxy を起動しないため、stderr の proxy `KEY=value` 行は
+emit されず、proxy cleanup の独立再確認は `checked: False`（未確認）になる）。
 
 ### 同一 main session 内で最低 N turn（`--require-min-turns`）
 
@@ -307,19 +294,13 @@ structured lane の stdout と同じ stream-json イベント形状（`session_i
 **Issue #2219 fix_delta iteration 2（claude-gpt adapter に対する live 再検証で発見した
 2 つの実バグの修正）**:
 
-1. **projects root のハードコード**: 旧実装は `~/.claude/projects` を常に固定で
-   走査していたため、`--claude-adapter claude-gpt` の run では常に
-   `interactive_transcript_found: False` になっていた（`scripts/claude-gpt/launch.sh`
-   は自身の Claude Code config root を `$CLAUDE_GPT_HOME/claude`（既定
-   `~/.claude-gpt/claude`、`scripts/claude-gpt/lib.sh` の
-   `claude_gpt_claude_config_dir` と同じ既定式）に隔離し、`CLAUDE_CONFIG_DIR` として
-   export するため、実際の session transcript は
-   `$CLAUDE_GPT_HOME/claude/projects/<cwd-slug>/<session-id>.jsonl` に永続化される）。
-   `_resolve_claude_projects_root()` を新設し、`claude_adapter` に応じて正しい root
-   を返すよう修正した。live filesystem 調査（`~/.claude-gpt/claude/projects/.../<session-id>.jsonl`
-   の直接確認）の結果、claude-gpt adapter は native adapter と **全く同じ flat
-   single-file の stream-json 形状** で transcript を書き出しており、adapter 固有の
-   transcript 形状の作り分けは不要と判明した（root だけが異なる）。
+1. **projects root のハードコード**（Issue #2925 で更新）: 旧実装は `~/.claude/projects` を常に固定で
+   走査していた。当時の `scripts/claude-gpt/launch.sh` は Claude Code config root を
+   `$CLAUDE_GPT_HOME/claude` に隔離していたため、claude-gpt adapter の transcript は別 root に永続化され、
+   `_resolve_claude_projects_root()` を adapter 別に分けていた。Issue #2925 で launcher が
+   `CLAUDE_CONFIG_DIR` を隔離しなくなった（ambient な Native surface を共有する）ため、現在は両 adapter とも
+   `~/.claude/projects` を返す。claude-gpt adapter の transcript は native adapter と **全く同じ flat
+   single-file の stream-json 形状** で書き出されており、形状の作り分けは不要である。
 2. **`cwd` フィールドの位置の誤仮定**: 旧実装は transcript の **先頭行のみ**
    `cwd` フィールドを確認していたが、live transcript（native / claude-gpt 双方）を
    実地確認した結果、先頭行は `{"type": "mode", ...}` のような session
@@ -349,19 +330,16 @@ validate される。
 
 1. `uuid.uuid4().hex` で `hook_sink_nonce` を生成する（この run 専用、caller
    から渡されない）。
-2. **claude-gpt adapter**: `claude_gpt_hook_sink_path(nonce)`
-   （= `claude_gpt_proxy_state_dir_python() / f"hook-sink-{nonce}.jsonl"`、
-   `scripts/claude-gpt/lib.sh` の `claude_gpt_proxy_state_dir()` の Python
-   ミラー）でパスを決定し、`CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=hook-sink-multi-turn`
-   と `CLAUDE_GPT_HOOK_SINK_NONCE=<nonce>` を `herdr workspace create --env`
-   （かつ pane 再 pin の `export`）で isolated session に注入する。
-   `scripts/claude-gpt/launch.sh` 自身がこの2つの env var からパスを
-   再構築し、settings.json の `hooks`/`env` ブロックへ書き込む。
-3. **native adapter**: `tempfile.mkdtemp()` で harness 専用ディレクトリを作り、
-   `hook_sink_writer.py`（`_HOOK_SINK_WRITER_SOURCE` 定数）と、5 hook すべてを
+2. **両 adapter 共通**（Issue #2925 で旧 claude-gpt 専用 gate を撤去）: `tempfile.mkdtemp()` で harness 専用
+   ディレクトリを作り、`hook_sink_writer.py`（`_HOOK_SINK_WRITER_SOURCE` 定数）と、5 hook すべてを
    `python3 "<writer>"` にバインドした `settings.json` をそこに書き、
-   `CLAUDE_CONFIG_DIR=<そのディレクトリ>/claude-config` を同じ `--env`/
-   pane 再 pin パターンで注入する（`scripts/claude-gpt/**` は一切触らない）。
+   `CLAUDE_CONFIG_DIR=<そのディレクトリ>/claude-config` と `CLAUDE_GPT_HOOK_SINK_NONCE` /
+   `CLAUDE_GPT_HOOK_SINK_PATH` を `herdr workspace create --env`（かつ pane 再 pin の `export`）で
+   isolated session に注入する（`scripts/claude-gpt/**` は一切触らない）。旧 `launch.sh` の
+   `CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=hook-sink-multi-turn` 固定値ゲートと launcher-owned の state directory 定数は
+   撤去済み。
+3. interactive lane の `herdr agent start` には、両 adapter とも固定 `--settings` overlay を
+   `-- --settings <JSON>` で渡す（claude-gpt adapter の forwarder は launcher 呼び出しへ `--` を挿入する）。
 4. run 終了直前（`finally` で一時ディレクトリを消す前）に
    `parse_claude_gpt_hook_sink_records(sink_path)` で sink を読み、
    `evidence["hook_sink_records"]` / `evidence["hook_sink_malformed_line_count"]`
@@ -465,7 +443,7 @@ poll-with-retry（既定 3 回、0.5 秒間隔）で再実行する。自己申�
 
 ### claude-gpt adapter のセッションデータの実際の形状（Issue #2219 fix_delta iteration 2 live 調査）
 
-`$CLAUDE_GPT_HOME/claude/projects/<cwd-slug>/<session-id>/subagents/` 配下には
+`~/.claude/projects/<cwd-slug>/<session-id>/subagents/`（Issue #2925 以降は native と同じ ambient root。旧 launcher は `$CLAUDE_GPT_HOME/claude/projects` に隔離していた）配下には
 spawn された SubAgent ごとに `agent-<agent-id>.meta.json`
 （`{"agentType", "description", "toolUseId", "spawnDepth", "parentAgentId"?,
 "worktreeCleanlyRemoved"?}`）が書かれる。**これは spawn 時のメタデータのみであり、

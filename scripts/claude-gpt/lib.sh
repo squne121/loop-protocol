@@ -2,418 +2,84 @@
 # scripts/claude-gpt/lib.sh
 #
 # claude-gpt launcher の共有関数ライブラリ。POSIX sh 準拠、外部ライブラリ依存なし。
-# `launch.sh` / `preflight.sh` / `runtime_smoke_test.sh` から `. lib.sh` で source される。
-# 単体実行は想定しない（source only）。
+# `launch.sh` / `preflight.sh` / `runtime_smoke_test.sh` / `repair_proxy.sh` から
+# `. lib.sh` で source される。単体実行は想定しない（source only）。
 #
-# Issue #2158 / Parent #2154 「アーキテクチャ決定（A〜E）」「GPT Launcher Contract」参照。
-# PR #2162 OWNER REQUEST_CHANGES 反映（proxy 専用 HOME 分離・runtime smoke 強化）。
-
-# --- 定数（GPT 専用ディレクトリ分離。CLAUDE_CONFIG_DIR / CCP_CONFIG_DIR / XDG_STATE_HOME 相当） ---
-
-# CLAUDE_GPT_HOME を上書きしない限り $HOME/.claude-gpt を使う。
+# Issue #2925: default launcher を upstream claude-code-proxy の Minimal client
+# contract（https://claude-code-proxy.raine.dev/using/configure-claude-code/）へ
+# 縮退した。このライブラリは、その薄い wrapper が必要とする以下だけを持つ。
 #
-# Issue #2455: launcher が後段で `HOME` を child Claude 用の isolated HOME へ
-# 差し替える（launch.sh の `export HOME="$CLAUDE_ISOLATED_HOME_TARGET"`）ため、
-# ここで解決した canonical runtime root を明示的に `export` しておかないと、
-# child Claude セッションから同じ launcher/lib.sh を self-launch した際に
-# `CLAUDE_GPT_HOME` が未継承のまま isolated HOME を基準に再導出され、nested
-# `<isolated-claude-home>/.claude-gpt` root へ再基準化されてしまう
-# （Background/Outcome 節参照）。復元経路は launcher が child process
-# environment へ export するこの単一経路のみとし、生成済み settings 経由の
-# 別経路は追加しない（AC1）。`CLAUDE_GPT_HOME_ROOT`（Latitude telemetry 用の
-# derived mirror。Issue #2426）はこの root authority の fallback には使わない
-# （AC1/AC2 の回帰テスト対象）。
-: "${CLAUDE_GPT_HOME:=${HOME}/.claude-gpt}"
-export CLAUDE_GPT_HOME
-
-claude_gpt_claude_config_dir() {
-  printf '%s/claude\n' "$CLAUDE_GPT_HOME"
-}
-
-claude_gpt_proxy_config_dir() {
-  printf '%s/proxy-config\n' "$CLAUDE_GPT_HOME"
-}
-
-claude_gpt_proxy_state_dir() {
-  printf '%s/state\n' "$CLAUDE_GPT_HOME"
-}
-
-# proxy 専用 HOME（P0-2）。upstream raine/claude-code-proxy は CCP_CONFIG_DIR 配下に
-# credential が無い場合 $HOME/.config/claude-code-proxy/codex/auth.json の legacy
-# credential へフォールバックするため、呼び出し元の実 HOME をそのまま proxy へ渡すと
-# profile 側 credential が空でも global legacy credential を暗黙利用できてしまう。
-# login/status/serve すべてをこの専用 HOME で統一実行することで isolation を成立させる。
-claude_gpt_proxy_home_dir() {
-  printf '%s/proxy-home\n' "$CLAUDE_GPT_HOME"
-}
-
-# --- Claude/AGY プロセス専用の隔離 HOME / XDG directories（P0-6）。
-# OWNER adversarial review（PR #2214 コメント）は、Claude process が proxy 専用 HOME
-# 分離とは独立に、呼び出し元の実 HOME をそのまま継承しているため ambient 実 HOME 配下の
-# SSH key/GPG key 等の無関係な secret へ到達可能である点を指摘した。ここで用意する
-# ディレクトリは空のまま launch.sh が Claude 子プロセスの `HOME` / `XDG_CONFIG_HOME` /
-# `XDG_CACHE_HOME` として注入する。GitHub auth（`GH_TOKEN`/`GH_CONFIG_DIR` 系）は
-# Issue #2299 により native 同等に共有する方針へ変更したため、`GH_CONFIG_DIR` は
-# この隔離ディレクトリを使わず launch.sh が ambient 値をそのまま渡す
-# （`claude_gpt_claude_isolated_gh_config_dir` は撤去済み）。
-claude_gpt_claude_isolated_home_dir() {
-  printf '%s/claude-home\n' "$CLAUDE_GPT_HOME"
-}
-
-claude_gpt_claude_isolated_xdg_config_dir() {
-  printf '%s/claude-xdg-config\n' "$CLAUDE_GPT_HOME"
-}
-
-claude_gpt_claude_isolated_xdg_cache_dir() {
-  printf '%s/claude-xdg-cache\n' "$CLAUDE_GPT_HOME"
-}
-
-claude_gpt_mcp_config_path() {
-  printf '%s/mcp-empty.json\n' "$(claude_gpt_claude_config_dir)"
-}
-
-claude_gpt_session_settings_path() {
-  printf '%s/settings.local.json\n' "$(claude_gpt_claude_config_dir)"
-}
-
-claude_gpt_evidence_dir() {
-  # スクリプト自身の場所からリポジトリ内の scripts/claude-gpt/.evidence を解決する
-  script_dir=$(CDPATH= cd -- "$(dirname -- "$1")" && pwd -P)
-  printf '%s/.evidence\n' "$script_dir"
-}
-
-# --- Latitude telemetry package identity（Issue #2426）。
-# launcher-owned Latitude Stop hook adapter（scripts/claude-gpt/latitude_hook.py）が
-# 起動する telemetry package の exact pinned identity を一箇所の SSOT で固定する
-# （Design 4節「再現可能な exact identity を一箇所の SSOT で pin する」）。
-# versionless / floating `npx -y @latitude-data/claude-code-telemetry` を新しい
-# canonical production command にしない（docs/dev/secret-policy.md の
-# `activation_denied_if: unpinned_npx` と同じ禁止事項）。
-# docs/dev/secret-policy.md の LATITUDE_DISTRIBUTION_GATE_V1.package_spec /
-# tarball_sha256 プレースホルダはこの値と同期させる（このファイルが正本、
-# secret-policy.md 側は mirror）。
-claude_gpt_latitude_package_name() {
-  printf '@latitude-data/claude-code-telemetry\n'
-}
-
-claude_gpt_latitude_package_version() {
-  printf '0.0.14\n'
-}
-
-claude_gpt_latitude_package_spec() {
-  printf '%s@%s\n' "$(claude_gpt_latitude_package_name)" "$(claude_gpt_latitude_package_version)"
-}
-
-# claude_gpt_native_latitude_project: Native user settings（引数1）の `env` から
-# `LATITUDE_PROJECT` の値だけを返す（Issue #2426 PR #2439 P0 fix-delta,
-# OWNER REQUEST_CHANGES）。
+#   1. Minimal Default Contract と現行 role alias の定数
+#   2. 接続先 server（`ANTHROPIC_BASE_URL`）の到達性と `/v1/models` catalog の診断
+#   3. 補助 evidence（PATH 上の claude-code-proxy の path / version）の取得
+#   4. 証跡用の小さな helper（sha256 / git / JSON escape）
 #
-# Design 3節: 「`LATITUDE_PROJECT` は secret ではないため、既存 #2375（PR #2392）
-# collector が同一 project を解決できるよう runtime から解決可能にしてよい」-- した
-# がってこの値は（`LATITUDE_API_KEY` とは異なり）生成済み Claude-GPT settings の
-# `env` へそのまま焼き込んでよい。実際の値読み取りは、closed allowlist の実装が
-# 存在する唯一の SSOT である `latitude_hook.py` の `read_native_latitude_allowlist()`
-# を再利用する（同じ allowlist ロジックを shell 側に複製しない）。
-#
-# 引数1: Native user settings の絶対パス（`~/.claude/settings.json` 相当）
-# 引数2: `latitude_hook.py` の絶対パス（`read_native_latitude_allowlist()` を
-#        import するために使う。呼び出し元がすでに解決済みの
-#        `CLAUDE_GPT_LATITUDE_HOOK` をそのまま渡すこと）
-# 戻り値: LATITUDE_PROJECT の値（非空文字列）。未設定・読み取り失敗時は空文字列
-#         （fail-open。既存 `read_native_latitude_allowlist()` の fail-open 契約と
-#         同じ）。`LATITUDE_API_KEY` はこの関数が扱う値に一切含まれない
-#         （`allowlist.get("LATITUDE_PROJECT")` のみを取り出す）。
-claude_gpt_native_latitude_project() {
-  native_settings_path="$1"
-  hook_path="$2"
-  if [ -z "$native_settings_path" ] || [ -z "$hook_path" ] || ! command -v python3 >/dev/null 2>&1; then
-    printf ''
-    return 0
-  fi
-  python3 -c '
-import importlib.util
-import sys
+# 次の層は意図的に持たない（旧 launcher の履歴は Git history が rollback authority）:
+# isolated HOME / XDG / CLAUDE_CONFIG_DIR、launcher 生成 `--settings`、strict MCP、
+# custom autoMode prose、`CCP_AUTO_REVIEW_MODEL` 注入、isolation 補償用 credential /
+# path carrier、hook / settings injection、proxy lifecycle（起動・停止）。
 
-hook_path, settings_path = sys.argv[1], sys.argv[2]
-spec = importlib.util.spec_from_file_location(
-    "claude_gpt_latitude_hook_lib_native_project", hook_path
-)
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-allowlist = module.read_native_latitude_allowlist(settings_path)
-sys.stdout.write(allowlist.get("LATITUDE_PROJECT") or "")
-' "$hook_path" "$native_settings_path" 2>/dev/null
-}
+# --- Minimal client contract（upstream の source of truth に合わせる） ---
 
-# claude_gpt_resolve_native_settings_path: Native Latitude settings.json
-# authority への絶対パスを、isolated HOME / Claude-GPT config-root への切替
-# *前* の ambient 環境から一度だけ resolve する（Issue #2448。PR #2439 owner
-# review P2 note の follow-up、OWNER review issuecomment-5477101989 の P0
-# self-launch 誤認指摘を受けた precedence 設計）。
-#
-# precedence（決定論的、上から順に最初に非空だったものを採用）:
-#   1. 引数1（inherited `CLAUDE_GPT_NATIVE_SETTINGS_PATH`）— outer launcher が
-#      既に resolve 済みの re-entrant carrier。self-launch（同一 launcher の
-#      再起動）境界を跨いでも exact identity を維持するため、非空なら
-#      無条件でそのまま採用し、二重解決（isolated HOME を基準にした再導出）
-#      は行わない。
-#   2. 引数2（ambient `CLAUDE_CONFIG_DIR`）— Claude Code 公式の Native profile
-#      authority。非空なら `${CLAUDE_CONFIG_DIR}/settings.json` を採用する。
-#      `CLAUDE_CONFIG_DIR` が絶対パスならそのまま使う。相対パスの場合は
-#      PR #2466 OWNER review（issuecomment-5478243138 P1）が指摘したとおり、
-#      焼き込んだ carrier 文字列がその後の CWD 変化（self-launch を含む）で
-#      別の filesystem object を指してしまう exact-identity 破綻を防ぐため、
-#      この関数呼び出し時点の outer CWD（`$(pwd)`）を基準に一度だけ**lexical
-#      に**絶対化する（`realpath`/symlink 解決や existence 検証は行わない。
-#      `~` の展開もしない — 既存の絶対パス値の挙動を変えないため）。
-#   3. 引数3（`HOME`）を使った `${HOME}/.claude/settings.json` フォールバック
-#      （従来からの既定動作。#2426 の挙動を保つ）。
-#
-# 呼び出し側は isolated HOME 切替（`export HOME="$CLAUDE_ISOLATED_HOME_TARGET"`）
-# より前の行でこの関数を呼び出すこと。ambient `CLAUDE_GPT_NATIVE_SETTINGS_PATH`
-# / `CLAUDE_CONFIG_DIR` を上書きしないよう、呼び出し側は展開済みの値を引数と
-# して渡す（この関数自体は環境変数を直接読まない）。
-#
-# 引数1: inherited `CLAUDE_GPT_NATIVE_SETTINGS_PATH`（空文字列可）
-# 引数2: ambient `CLAUDE_CONFIG_DIR`（空文字列可。絶対/相対いずれも可）
-# 引数3: `HOME`（非空を期待。isolated HOME 切替前の ambient 実 HOME）
-# 戻り値: resolve された Native settings.json への絶対パス（改行付き）
-claude_gpt_resolve_native_settings_path() {
-  inherited_native_settings_path="$1"
-  ambient_claude_config_dir="$2"
-  ambient_home="$3"
-  if [ -n "$inherited_native_settings_path" ]; then
-    printf '%s\n' "$inherited_native_settings_path"
-    return 0
-  fi
-  if [ -n "$ambient_claude_config_dir" ]; then
-    case "$ambient_claude_config_dir" in
-      /*)
-        printf '%s/settings.json\n' "$ambient_claude_config_dir"
-        ;;
-      *)
-        printf '%s/%s/settings.json\n' "$(pwd)" "$ambient_claude_config_dir"
-        ;;
-    esac
-    return 0
-  fi
-  printf '%s/.claude/settings.json\n' "$ambient_home"
-}
+# upstream 既定の loopback endpoint（https://claude-code-proxy.raine.dev/using/configure-claude-code/）。
+# 呼び出し元が `ANTHROPIC_BASE_URL` を設定していればそちらが接続先 authority になる。
+CLAUDE_GPT_DEFAULT_BASE_URL="http://127.0.0.1:18765"
 
-# claude_gpt_resolve_task_context_state_root: Task Context canonical
-# absolute state root を、isolated HOME / XDG への切替 *前* の ambient 環境
-# から resolve する（Issue #2567 In Scope carrier precedence: 「未設定の
-# 通常operatorだけambient user XDG/HOMEからcanonical rootをHOME isolation前
-# に解決する」）。
-#
-# 既存 SSOT である `scripts/task-context/task_context_config.py` の
-# `resolve_state_root()`（#2563 canonical state-root 契約）をそのまま呼び出す
-# だけで、state-root 導出ロジック自体はここに複製しない。この関数は単に
-# 「isolated HOME へ切り替わる前の ambient HOME/XDG_STATE_HOME で
-# resolve_state_root() を呼ぶ」という *タイミング* だけを担う。
-#
-# 呼び出し側は isolated HOME 切替（`export HOME="$CLAUDE_ISOLATED_HOME_TARGET"`）
-# より前の行でこの関数を呼び出すこと（`claude_gpt_resolve_native_settings_path`
-# と同じ理由）。呼び出し側はさらに、inherited `LOOP_TASK_CONTEXT_STATE_ROOT`
-# が既に非空の場合はこの関数を呼ばず、その値をそのまま保持すること（AC3:
-# runtime-smoke override を上書きしない -- この関数自身は env を読まないので
-# その判定は呼び出し側の責務のまま）。
-#
-# 引数1: `scripts/task-context/task_context_config.py` への絶対パス
-# 引数2: repo_instance_key の `git rev-parse` 解決に使う repo/worktree cwd
-# 戻り値: resolve された canonical absolute state root（改行付き）。
-#         python3 未対応・resolve 失敗時は空文字列。
-#
-#         PR #2696 review fix_delta (P1-1): 呼び出し側（launch.sh）は、この
-#         関数が実際に呼ばれた（= inherited override が無かった）にも関わらず
-#         空文字列を返した場合、もはや「解決できなかった」を fail-open で
-#         isolated-HOME-based 挙動へ静かに戻す degrade として扱ってはならない
-#         -- isolated HOME 切替前に fail-fast で起動を止めること（AC1/AC2:
-#         isolated HOME 由来の split-brain Task Context DB を防ぐ）。この
-#         関数自身の戻り値契約（失敗時は空文字列）は変更しない -- fail-fast
-#         判断は呼び出し側の責務のまま。
-claude_gpt_resolve_task_context_state_root() {
-  config_path="$1"
-  repo_cwd="$2"
-  if [ -z "$config_path" ] || [ -z "$repo_cwd" ] || ! command -v python3 >/dev/null 2>&1; then
-    printf ''
-    return 0
-  fi
-  python3 -c '
-import importlib.util
-import sys
+CLAUDE_GPT_AUTH_TOKEN_PLACEHOLDER="unused"
 
-config_path, repo_cwd = sys.argv[1], sys.argv[2]
-spec = importlib.util.spec_from_file_location(
-    "claude_gpt_task_context_config_lib", config_path
-)
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-try:
-    sys.stdout.write(str(module.resolve_state_root(cwd=repo_cwd)))
-except Exception:
-    pass
-' "$config_path" "$repo_cwd" 2>/dev/null
-}
-
-# claude_gpt_link_native_sessions_dir: Native Claude Code の cross-session
-# messaging（ListAgents/SendMessage）が Claude-GPT session を peer として
-# 発見できるようにする、narrow な同一 machine 内 discovery bridge。
-#
-# PR #2696 review fix_delta (P1-2, OWNER REQUEST_CHANGES)。公式ドキュメント
-# （https://code.claude.com/docs/en/cross-session-messaging「Message sessions
-# on other machines」節、及び https://code.claude.com/docs/en/settings の
-# `CLAUDE_CONFIG_DIR` 説明。2026-09-21 時点で web-researcher 相当の直接取得で
-# 確認、実機 `~/.claude/sessions/<pid>.json` のファイル構造でも確認済み）:
-# 「Each session registers itself in files on disk. ... two sessions can
-# reach each other only when they can see the same files.」-- Native session
-# は `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions/` 配下に自身を登録する。
-# この launcher は Claude-GPT 用に `CLAUDE_CONFIG_DIR` を isolated
-# `$CLAUDE_GPT_HOME/claude` へ切り替えるため、そのままでは Claude-GPT
-# session は `$CLAUDE_GPT_HOME/claude/sessions/` という Native とは別の
-# ディレクトリへ登録され、`ListAgents`/`SendMessage` は互いを発見できない
-# （公式ドキュメントが同じ理由で説明する WSL2 セッションと native Windows
-# セッションが互いを発見できないケースと同型の構造的分断）。
-#
-# この関数は isolated `sessions/` ディレクトリが未作成（かつ既存ファイルが
-# 一切無い）場合に限り、それを Native の `sessions/` ディレクトリへの
-# symlink として作成する。これにより両 runtime の session registration
-# ファイルが同一ディレクトリを共有し、native `ListAgents`/`SendMessage` が
-# 実際に機能するようになる -- `LOOP_TASK_CONTEXT_SESSION_REGISTRY_DIR`
-# （Task Context 側の advisory guard 専用 lookup）とは独立した、Claude Code
-# 本体の native transport 自体に対する fix である。
-#
-# 既に何か（symlink・real directory・その他）が isolated 側に存在する場合は
-# 一切変更しない（idempotent re-launch、pre-fix launcher で既に生成された
-# session データの破壊防止）。best-effort・non-blocking: どの失敗経路でも
-# 起動そのものは止めない（Fix 1 の state-root fail-fast とは異なり、これは
-# safety-critical isolation control ではなく additive discovery bridge）。
-#
-# 引数1: native sessions directory（ambient `CLAUDE_CONFIG_DIR`/`HOME` から
-#         isolated HOME 切替前に解決済みのもの。呼び出し側の責務）
-# 引数2: isolated Claude-GPT sessions directory
-#         （`${CLAUDE_CONFIG_DIR_TARGET}/sessions`）
-claude_gpt_link_native_sessions_dir() {
-  native_sessions_dir="$1"
-  isolated_sessions_dir="$2"
-  if [ -z "$native_sessions_dir" ] || [ -z "$isolated_sessions_dir" ]; then
-    return 0
-  fi
-  if [ -e "$isolated_sessions_dir" ] || [ -L "$isolated_sessions_dir" ]; then
-    # 既に symlink・real directory・その他何かが存在する -- 既存の状態
-    # （pre-fix launcher が作った real directory の session データを含む）
-    # を破壊しないため、一切触らない。
-    return 0
-  fi
-  mkdir -p "$native_sessions_dir" 2>/dev/null || return 0
-  ln -s "$native_sessions_dir" "$isolated_sessions_dir" 2>/dev/null
-  return 0
-}
-
-# --- Model alias mapping（Parent #2154 アーキテクチャ決定 E 準拠、Issue #2772 で
-#     GPT-6 Sol/Luna へ更新） ---
-# main / sonnet / opus -> gpt-6-sol（既定 allocation policy） / haiku -> gpt-6-luna
-#
-# Issue #2772 Model Policy 節（OWNER レビュー 2026-09-27 反映）: upstream
-# `raine/claude-code-proxy` v0.1.42 が追加した GPT-6 Sol/Luna
-#（https://github.com/raine/claude-code-proxy/pull/165）へ、この repository-owned
-# default allocation policy を更新する。これは「OpenAI が 5.6 Terra を 6 Sol に
-# 改名した」という主張ではなく、用途ベースの repo policy 決定である（公式発表の
-# 対応は 5.6 Sol→6 Sol、5.6 Luna→6 Luna）。main/sonnet/opus はすべて `gpt-6-sol`
-# に揃え、旧 `gpt-5.6-terra`（Issue #2654 で導入した中間の main 既定）は使わない。
-# `gpt-6-astra` は default opus alias にしない（下記 astra escalation 節参照。
-# 根拠は #2577 の 54 live run 実測で opus は `KEEP_CURRENT` 判定済みであり、GPT-6
-# 互換更新の名目でこの実測結果を上書きしない）。
-#
-# `[1m]` suffix は upstream raine/claude-code-proxy が公式に案内する起動形式
-# （https://claude-code-proxy.raine.dev/using/configure-claude-code/）で、Claude Code
-# 本体側の local context window policy を拡張する hint。proxy は upstream（ChatGPT
-# backend）へ転送する前にこの suffix を除去するため、実際に ChatGPT 側へ送られる
-# model ID は suffix なしの base 名のまま変わらない。suffix を付けずに起動すると
-# Claude Code が未知 model として扱い、実際の context 上限（272k）より小さい既定値
-# （200k）で誤って compaction を早期発動させ、summarization 失敗を引き起こす
-# （Issue #2158/PR #2162 実機再検証, 2026-08-15）。この rationale は base model ID の
-# 変更（5.6→6 系）とは独立であり、Issue #2772 でも変更しない。
+# `[1m]` suffix は upstream が案内する起動形式で、Claude Code 本体の local context
+# window policy を拡張する hint である。proxy は upstream（ChatGPT backend）へ転送する
+# 前にこの suffix を除去するため、実際に backend へ送られる model ID は base 名のまま。
 CLAUDE_GPT_MODEL_MAIN="gpt-6-sol[1m]"
+CLAUDE_GPT_MODEL_SMALL_FAST="gpt-6-luna[1m]"
+
+# role-based model routing。現行 launcher の値を維持する（配分変更は別 Issue の
+# explicit specification change であり、launcher 縮退と同時に比較しない。Issue #2925）。
 CLAUDE_GPT_MODEL_OPUS="gpt-6-sol[1m]"
 CLAUDE_GPT_MODEL_SONNET="gpt-6-sol[1m]"
 CLAUDE_GPT_MODEL_HAIKU="gpt-6-luna[1m]"
 
-# --- Astra の on-demand escalation（Issue #2772 Model Policy 2節。startup-critical
-#     にしない） ---
-#
-# `gpt-6-astra` は上記の通常既定（MAIN/OPUS/SONNET/HAIKU）に一切含めない。
-# 明示的な model 選択（`launch.sh -- --model gpt-6-astra[1m]` 等）で到達する
-# on-demand capability としてのみ残す。`launch.sh` の起動 preflight
-# （MAIN/OPUS/HAIKU の `/v1/models` availability 一括確認ループ）は、この定数を
-# 一切参照しない -- Astra entitlement/registration の有無だけで通常 Sol session の
-# launcher 全体が起動不能になることを避けるため（下記 model alias resolution
-# ループ、および明示 escalation 検証ブロック参照）。
-CLAUDE_GPT_MODEL_ASTRA="gpt-6-astra[1m]"
+# ChatGPT backend の実 context 上限（272k）に合わせた compaction window（upstream 案内値）。
+CLAUDE_GPT_AUTO_COMPACT_WINDOW="272000"
 
-# --- auto mode classifier request の routing 先（Issue #2654 で導入、Issue #2772
-#     で Luna へ復帰） ---
-#
-# upstream raine/claude-code-proxy は non-streaming・tool-free な auto mode
-# classifier request（`apply_auto_review_model()`）を `CCP_AUTO_REVIEW_MODEL`
-# 未設定時、provider が codex なら無条件で `gpt-5.6-luna` 相当（`CODEX_AUTO_REVIEW_MODEL`
-# 定数）へ固定 fallback する。この未設定時デフォルトを避けるため、claude-gpt
-# launcher 側で classifier 専用のモデル選択を明示する。
-#
-# Issue #2654 の bounded comparison（proxy log 実測で classifier request
-# 1030/1030件が変更前は gpt-5.6-luna へ固定到達していたことの確認）を受け、
-# 当時は候補として `gpt-5.6-terra` を採用した。native Claude Code の auto mode
-# classifier は `/model` で選択した session model とは独立に既定で Claude Sonnet 5
-# 上で動作する（`code.claude.com/docs/en/permission-modes`）ため、session model と
-# 揃えることが native 相当になるという根拠はない。`gpt-5.6-terra` の採用は launcher
-# が明示的に選んだ候補という位置づけであり、native classifier（Sonnet 5）との性能
-# 同等性、および `gpt-5.6-luna` 比での過剰拒否率・latency の改善は Issue #2654
-# 時点では未実証のまま残った（#2709 も拒否率改善の因果実証を outcome にしていない）。
-#
-# Issue #2772（ユーザーの明示指示、OWNER レビュー 2026-09-27）により、classifier
-# routing を Luna へ復帰する。「Luna が原因だった／Terra で改善した／問題は完全
-# 解消済み」という主張ではなく、明示的な `CCP_AUTO_REVIEW_MODEL` policy を維持し
-# つつ、対象モデルを世代更新後の base ID（`gpt-6-luna`）へ揃える決定である。
-CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY="gpt-6-luna"
-
-# --- Issue #2801: proxy model catalog compatibility preflight / repair ---------
-#
-# repository が要求する model set の live catalog に対する compatibility check の
-# authority は version number ではなく実際の `/v1/models` capability である
-# （Design 4節）。この定数はあくまで repair helper（repair_proxy.sh）が既定で
-# pin する upstream `raine/claude-code-proxy` の version 補助情報であり、単独では
-# 起動可否を決めない。
+# repair helper（repair_proxy.sh）が既定で pin する upstream proxy の version 補助情報。
+# 単独では起動可否を決めない（可否の authority は接続先 server の `/v1/models`）。
 CLAUDE_GPT_MIN_KNOWN_COMPATIBLE_PROXY_VERSION="0.1.42"
 
-# `CLAUDE_GPT_LAUNCH_RESULT_V1` の additive field `repair_command` に載せる、
-# operator がその場で実行できる repository-supported one-command repair path
-# （Outcome 5節）。
 CLAUDE_GPT_REPAIR_COMMAND="scripts/claude-gpt/repair_proxy.sh"
+
+# CLAUDE_GPT_HOME は repair_proxy.sh が補助 binary を導入する先、および smoke の
+# 一時証跡の置き場としてのみ使う。Claude 子プロセスの HOME / config root には
+# 一切影響しない（export しない）。
+: "${CLAUDE_GPT_HOME:=${HOME}/.claude-gpt}"
+
+# claude_gpt_evidence_dir: スクリプト自身の場所からリポジトリ内の
+# scripts/claude-gpt/.evidence を解決する。
+claude_gpt_evidence_dir() {
+  script_dir=$(CDPATH= cd -- "$(dirname -- "$1")" && pwd -P)
+  printf '%s/.evidence\n' "$script_dir"
+}
 
 # claude_gpt_strip_context_hint: model alias 末尾の `[1m]` 等 context-window hint suffix
 # を取り除き、proxy `/v1/models` が返す base model 名と比較できる形にする。
-# 引数1: model alias 文字列（例: "gpt-5.6-terra[1m]"）
+# 引数1: model alias 文字列（例: "gpt-6-sol[1m]"）
 claude_gpt_strip_context_hint() {
   printf '%s' "$1" | sed 's/\[[^]]*\]$//'
 }
 
 # claude_gpt_required_model_set: effective runtime consumer（main / opus / sonnet /
-# haiku・small-fast / Auto review classifier）から実際に使用される model alias を
-# `claude_gpt_strip_context_hint()` 後の base model ID へ変換し、重複を除いた一意な
-# ID を改行区切りで返す（一方向 derivation。Issue #2801 AC8）。固定
-# `MAIN`/`OPUS`/`HAIKU` サブセットの手書き列挙はしない -- `SONNET` や Auto review
-# classifier だけが将来別 model に変更されても、この derivation を経由する限り
-# 自動的に required set へ反映される。`gpt-6-astra` 等 on-demand escalation model は
-# 通常の effective runtime consumer に含まれないため、ここでは対象にしない
-# （#2772 の方針を維持）。
+# haiku / small-fast）から実際に使用される model alias を base model ID へ変換し、
+# 重複を除いた一意な ID を改行区切りで返す（一方向 derivation）。固定の手書き列挙は
+# せず、role alias が将来変わっても自動的に required set へ反映される。
+# `gpt-6-astra` 等の on-demand model は通常 consumer に含まれないため対象外。
 claude_gpt_required_model_set() {
   _cgt_req_seen=""
   for _cgt_req_alias in \
     "$CLAUDE_GPT_MODEL_MAIN" \
+    "$CLAUDE_GPT_MODEL_SMALL_FAST" \
     "$CLAUDE_GPT_MODEL_OPUS" \
     "$CLAUDE_GPT_MODEL_SONNET" \
-    "$CLAUDE_GPT_MODEL_HAIKU" \
-    "$CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY"; do
+    "$CLAUDE_GPT_MODEL_HAIKU"; do
     _cgt_req_base=$(claude_gpt_strip_context_hint "$_cgt_req_alias")
     case " $_cgt_req_seen " in
       *" $_cgt_req_base "*) : ;;
@@ -425,9 +91,10 @@ claude_gpt_required_model_set() {
   done
 }
 
-# claude_gpt_missing_models: 引数1 に proxy `/v1/models` の生 JSON 文字列、
-# 引数2 以降に required base model ID 群を受け取り、生 JSON 中に存在しない
-# model ID だけを改行区切りで返す（1件も欠落が無ければ何も出力しない）。
+# claude_gpt_missing_models: 引数1 に `/v1/models` の生 JSON 文字列、引数2 以降に
+# required base model ID 群を受け取り、生 JSON 中に存在しない model ID だけを改行区切りで
+# 返す（欠落が無ければ何も出力しない）。1 つでも欠ければ catalog は不完全であり、
+# 一方だけ揃っている状態を PASS にしない。
 claude_gpt_missing_models() {
   _cgt_miss_json="$1"
   shift
@@ -439,11 +106,10 @@ claude_gpt_missing_models() {
   done
 }
 
-# --- claude 実行バイナリの解決（P1-1） ---
+# --- claude 実行バイナリの解決 ---
 #
 # CLAUDE_GPT_CLAUDE_BIN が明示されていればそれを使う。未指定なら command -v claude を
-# 一度だけ解決する。呼び出し側は解決結果を変数に保存し、以降そのまま使い回すこと
-# （固定文字列 "claude" を都度再検索しない）。
+# 一度だけ解決する。
 claude_gpt_resolve_claude_bin() {
   if [ -n "${CLAUDE_GPT_CLAUDE_BIN:-}" ]; then
     printf '%s\n' "$CLAUDE_GPT_CLAUDE_BIN"
@@ -452,70 +118,338 @@ claude_gpt_resolve_claude_bin() {
   command -v claude 2>/dev/null
 }
 
-# --- proxy 実行バイナリの解決（P2: identity/version pinning） ---
+# --- PATH 上の claude-code-proxy（補助 evidence） ---
 #
-# `command -v claude-code-proxy` を一度だけ解決し、以降 preflight / 起動 / 証跡すべてで
-# 同一の absolute path を使い回す。CLAUDE_GPT_PROXY_BIN が明示されていれば（launch.sh が
-# 一度解決した値を子プロセス preflight.sh へ export する場合など）それを優先し、
-# 再解決による差異（PATH mutation 等）を排除する。
-#
-# --- 互換 proxy の isolated 導入手順（Issue #2772 In Scope、PR #2800 OWNER
-#     REQUEST_CHANGES P1）: ---
-#
-# `command -v claude-code-proxy`（グローバル PATH 上のバイナリ）が GPT-6
-# Sol/Luna/Astra を提供する upstream release（v0.1.42 以上）より古い場合、
-# 通常起動は preflight で `model_alias_not_resolved`（exit 7）になる。この
-# ケースでは、グローバル PATH のインストールを上書きせず、以下の手順で
-# 互換 proxy を隔離した場所へ追加導入し、`CLAUDE_GPT_PROXY_BIN` で明示選択する
-# （upstream 公式 installer の contract をそのまま使い、独自 downloader/package
-# manager は新設しない）。
-#
-#   CLAUDE_CODE_PROXY_VERSION=v0.1.42 \
-#   CLAUDE_CODE_PROXY_INSTALL_DIR=<isolated-dir, 例: ~/.local/share/claude-gpt-compat-proxy> \
-#     bash <(curl -fsSL https://raw.githubusercontent.com/raine/claude-code-proxy/main/scripts/install.sh)
-#
-#   export CLAUDE_GPT_PROXY_BIN=<isolated-dir>/claude-code-proxy
-#
-# 導入後は、選択した isolated バイナリで実際に認証する（Native Claude の
-# credential/config には触れない、proxy 専用の別アカウント認証）。
-#
-#   "$CLAUDE_GPT_PROXY_BIN" codex auth login
-#
-# 最後に、同じ選択バイナリで `scripts/claude-gpt/launch.sh --check-only` を
-# 実行し、`model_alias_ok: true` になることを確認する。`claude-code-proxy
-# models` への表示や local registry 一致は account entitlement の証明では
-# ない（AC7）。実際の ChatGPT subscription request 成功は Issue #2772 の
-# Runtime Verification（AC10）で別途確認する。
-#
-# 稼働中の proxy/session を kill・hot-swap する運用や、`CLAUDE_GPT_PROXY_BIN`
-# を明示している運用者の意図を無断で別バイナリへ差し替える運用はしない。
+# この binary は「接続先 server」ではない。launcher は proxy を起動しないため、ここで
+# 解決する path / version は診断の補助 evidence としてのみ記録する（接続先 server が
+# どの binary で動いているかは、この値からは分からない）。CLAUDE_GPT_PROXY_BIN が
+# 明示されていればそれを優先する。
 claude_gpt_resolve_proxy_bin() {
   if [ -n "${CLAUDE_GPT_PROXY_BIN:-}" ]; then
     printf '%s\n' "$CLAUDE_GPT_PROXY_BIN"
     return 0
   fi
-  # Issue #2801 fix_delta F3: binary precedence 第2候補 -- Claude-GPT-owned
-  # managed install location（`repair_proxy.sh` が compatible proxy を
-  # 導入する先）。これを PATH より先に確認しないと、repair 実行後の通常
-  # 起動が再び PATH 上の古い binary を選び直してしまう。
-  _cgt_home_bin="$(claude_gpt_home_bin_dir)/claude-code-proxy"
-  if [ -x "$_cgt_home_bin" ]; then
-    printf '%s\n' "$_cgt_home_bin"
-    return 0
-  fi
   command -v claude-code-proxy 2>/dev/null
 }
 
-# claude_gpt_home_bin_dir: Claude-GPT-owned managed binary の isolated install
-# directory（binary precedence の第2候補。Issue #2801 Design 3節）。
+# claude_gpt_home_bin_dir: repair_proxy.sh が補助 binary を導入する isolated directory。
 claude_gpt_home_bin_dir() {
   printf '%s/bin\n' "$CLAUDE_GPT_HOME"
 }
 
-# claude_gpt_find_free_port: OS に ephemeral port を割り当てさせ、bind 可能な
-# loopback port 番号を1つ返す。python3 が使えない環境では固定 fallback port を
-# 返す（VC preflight allowlist 外コマンドへ依存しない。claude_gpt_sha256_file と
-# 同型のフォールバック方針）。
+# claude_gpt_proxy_version: proxy バイナリの version 識別子を取得する。`--version` が
+# 使えない場合は sha256、それも取れなければ "unknown" を返す。
+# 引数1: proxy バイナリの絶対パス
+claude_gpt_proxy_version() {
+  proxy_bin="$1"
+  if [ -z "$proxy_bin" ]; then
+    printf 'unknown\n'
+    return 0
+  fi
+  version_output=$("$proxy_bin" --version 2>/dev/null | head -n1)
+  if [ -n "$version_output" ]; then
+    printf '%s\n' "$version_output"
+    return 0
+  fi
+  claude_gpt_sha256_file "$proxy_bin"
+}
+
+# claude_gpt_sha256_file: 任意ファイルの sha256。sha256sum / shasum いずれも無ければ "unknown"。
+claude_gpt_sha256_file() {
+  file="$1"
+  if [ -z "$file" ] || [ ! -f "$file" ]; then
+    printf 'unknown\n'
+    return 0
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" 2>/dev/null | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" 2>/dev/null | cut -d' ' -f1
+  else
+    printf 'unknown\n'
+  fi
+}
+
+# claude_gpt_git_head: repo_root の現行 HEAD SHA（取得不可なら "unknown"）。
+claude_gpt_git_head() {
+  repo_root="$1"
+  head_sha=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null)
+  if [ -n "$head_sha" ]; then
+    printf '%s\n' "$head_sha"
+  else
+    printf 'unknown\n'
+  fi
+}
+
+# claude_gpt_git_dirty: repo_root が dirty かどうかを "true"/"false"/"unknown" で返す。
+claude_gpt_git_dirty() {
+  repo_root="$1"
+  if ! git -C "$repo_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    printf 'unknown\n'
+    return 0
+  fi
+  if [ -n "$(git -C "$repo_root" status --porcelain 2>/dev/null)" ]; then
+    printf 'true\n'
+  else
+    printf 'false\n'
+  fi
+}
+
+# claude_gpt_json_escape: 任意文字列を JSON 文字列リテラル（引用符込み）へ変換する。
+# python3 が使えない環境では簡易 fallback（改行・制御文字は非対応）を使う。
+claude_gpt_json_escape() {
+  value="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json, sys; sys.stdout.write(json.dumps(sys.argv[1], ensure_ascii=False))' "$value"
+  else
+    esc=$(printf '%s' "$value" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    printf '"%s"' "$esc"
+  fi
+}
+
+# claude_gpt_json_array_from_lines: 改行区切り文字列を JSON string array へ変換する。
+# 空文字列なら `[]` を返す。
+claude_gpt_json_array_from_lines() {
+  _cgt_arr_lines="$1"
+  if [ -z "$_cgt_arr_lines" ]; then
+    printf '[]'
+    return 0
+  fi
+  _cgt_arr_out="["
+  _cgt_arr_first=true
+  _cgt_arr_old_ifs=$IFS
+  IFS='
+'
+  for _cgt_arr_line in $_cgt_arr_lines; do
+    [ -z "$_cgt_arr_line" ] && continue
+    if [ "$_cgt_arr_first" = "true" ]; then
+      _cgt_arr_first=false
+    else
+      _cgt_arr_out="${_cgt_arr_out},"
+    fi
+    _cgt_arr_out="${_cgt_arr_out}$(claude_gpt_json_escape "$_cgt_arr_line")"
+  done
+  IFS=$_cgt_arr_old_ifs
+  _cgt_arr_out="${_cgt_arr_out}]"
+  printf '%s' "$_cgt_arr_out"
+}
+
+# --- 接続先 server の診断（Issue #2925 AC3） ---
+#
+# 診断の authority は、実際に `ANTHROPIC_BASE_URL` が接続する running server である。
+# 同じ URL に対して到達性と `/v1/models` を判定し、required model set（`gpt-6-sol` および
+# `gpt-6-luna`）が両方揃っていることを PASS 条件とする。launcher はこの診断のために
+# proxy を起動せず、停止もしない。
+
+# claude_gpt_parse_base_url: `scheme://host[:port]` 形式の URL を分解する。
+# 結果は CGD_SCHEME / CGD_HOST / CGD_PORT に設定する（path / query / userinfo を含む URL は
+# 不正として戻り値 1）。port 省略時は scheme の既定値（http=80 / https=443）。
+# 引数1: base URL
+claude_gpt_parse_base_url() {
+  _cgt_url="$1"
+  CGD_SCHEME=""
+  CGD_HOST=""
+  CGD_PORT=""
+  case "$_cgt_url" in
+    http://*) CGD_SCHEME="http"; _cgt_rest="${_cgt_url#http://}" ;;
+    https://*) CGD_SCHEME="https"; _cgt_rest="${_cgt_url#https://}" ;;
+    *) return 1 ;;
+  esac
+  _cgt_rest="${_cgt_rest%/}"
+  case "$_cgt_rest" in
+    ""|*/*|*\?*|*\#*|*@*) return 1 ;;
+  esac
+  case "$_cgt_rest" in
+    \[*\]:*)
+      CGD_HOST="${_cgt_rest%%\]*}]"
+      CGD_PORT="${_cgt_rest##*\]:}"
+      ;;
+    \[*\])
+      CGD_HOST="$_cgt_rest"
+      ;;
+    *:*)
+      CGD_HOST="${_cgt_rest%%:*}"
+      CGD_PORT="${_cgt_rest#*:}"
+      ;;
+    *)
+      CGD_HOST="$_cgt_rest"
+      ;;
+  esac
+  if [ -z "$CGD_PORT" ]; then
+    if [ "$CGD_SCHEME" = "https" ]; then CGD_PORT="443"; else CGD_PORT="80"; fi
+  fi
+  case "$CGD_PORT" in
+    *[!0-9]*) return 1 ;;
+  esac
+  [ -n "$CGD_HOST" ]
+}
+
+# claude_gpt_is_loopback_host: loopback host（127.0.0.0/8 / localhost / ::1）のみ 0 を返す。
+# 引数1: host（IPv6 は角括弧付きでよい）
+claude_gpt_is_loopback_host() {
+  case "$1" in
+    localhost|127.*|"[::1]"|"::1") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# claude_gpt_probe_models: 引数1 の base URL の `/v1/models` を bounded（接続 2 秒・全体 3 秒）で
+# 1 回だけ取得する。結果は CGD_MODELS_HTTP_STATUS（curl 失敗時は 000）と CGD_MODELS_JSON に
+# 設定する。
+claude_gpt_probe_models() {
+  _cgt_pm_base="${1%/}"
+  CGD_MODELS_JSON=""
+  CGD_MODELS_HTTP_STATUS="000"
+  if ! command -v curl >/dev/null 2>&1; then
+    CGD_MODELS_HTTP_STATUS="curl_unavailable"
+    return 1
+  fi
+  _cgt_pm_tmp=$(mktemp 2>/dev/null) || return 1
+  CGD_MODELS_HTTP_STATUS=$(curl -s --connect-timeout 2 -m 3 -o "$_cgt_pm_tmp" -w '%{http_code}' "${_cgt_pm_base}/v1/models" 2>/dev/null) || CGD_MODELS_HTTP_STATUS="000"
+  [ -n "$CGD_MODELS_HTTP_STATUS" ] || CGD_MODELS_HTTP_STATUS="000"
+  if [ "$CGD_MODELS_HTTP_STATUS" = "200" ]; then
+    CGD_MODELS_JSON=$(cat "$_cgt_pm_tmp" 2>/dev/null)
+  fi
+  rm -f "$_cgt_pm_tmp" 2>/dev/null
+  [ "$CGD_MODELS_HTTP_STATUS" = "200" ]
+}
+
+# claude_gpt_run_connected_server_diagnostics: 接続先 server の診断を実行し、結果の JSON
+# object（`connected_server` の値）を CGD_JSON に、分類を CGD_CLASS に設定する。
+# command substitution の subshell で変数が失われないよう、stdout ではなく変数で返す。
+#   CGD_CLASS = ok | invalid_base_url | non_loopback | unreachable | models_http_error |
+#               required_models_missing
+# server version は公開 endpoint から取得できない（`/healthz` は `{"ok":true}` のみで
+# version を返さない）ため、常に「未確認」と記録する。PATH 上の binary の version を
+# server version として代用しない。
+# 引数1: base URL
+claude_gpt_run_connected_server_diagnostics() {
+  _cgt_ds_base="$1"
+  CGD_CLASS="ok"
+  _cgt_ds_reachable=false
+  _cgt_ds_catalog_ok=false
+  _cgt_ds_http="null"
+  _cgt_ds_required_nl=$(claude_gpt_required_model_set)
+  _cgt_ds_missing_nl="$_cgt_ds_required_nl"
+  _cgt_ds_host=""
+  _cgt_ds_port=""
+  if ! claude_gpt_parse_base_url "$_cgt_ds_base"; then
+    CGD_CLASS="invalid_base_url"
+  else
+    _cgt_ds_host="$CGD_HOST"
+    _cgt_ds_port="$CGD_PORT"
+    if ! claude_gpt_is_loopback_host "$CGD_HOST"; then
+      CGD_CLASS="non_loopback"
+    elif claude_gpt_probe_models "$_cgt_ds_base"; then
+      _cgt_ds_reachable=true
+      _cgt_ds_http=200
+      # shellcheck disable=SC2086 # 意図的な word-splitting: 改行区切りの model ID 一覧を反復する
+      _cgt_ds_missing_nl=$(claude_gpt_missing_models "$CGD_MODELS_JSON" $_cgt_ds_required_nl)
+      if [ -z "$_cgt_ds_missing_nl" ]; then
+        _cgt_ds_catalog_ok=true
+      else
+        CGD_CLASS="required_models_missing"
+      fi
+    elif [ "$CGD_MODELS_HTTP_STATUS" = "000" ] || [ "$CGD_MODELS_HTTP_STATUS" = "curl_unavailable" ]; then
+      CGD_CLASS="unreachable"
+    else
+      # server は応答したが `/v1/models` が 200 ではない。到達はしている。
+      _cgt_ds_reachable=true
+      _cgt_ds_http="$CGD_MODELS_HTTP_STATUS"
+      CGD_CLASS="models_http_error"
+    fi
+  fi
+  CGD_JSON=$(printf '{"base_url":%s,"host":%s,"port":%s,"reachable":%s,"models_http_status":%s,"required_models":%s,"missing_models":%s,"model_catalog_ok":%s,"classification":%s,"version":"未確認","version_note":%s}' \
+    "$(claude_gpt_json_escape "$_cgt_ds_base")" \
+    "$(claude_gpt_json_escape "$_cgt_ds_host")" \
+    "${_cgt_ds_port:-null}" \
+    "$_cgt_ds_reachable" \
+    "$_cgt_ds_http" \
+    "$(claude_gpt_json_array_from_lines "$_cgt_ds_required_nl")" \
+    "$(claude_gpt_json_array_from_lines "$_cgt_ds_missing_nl")" \
+    "$_cgt_ds_catalog_ok" \
+    "$(claude_gpt_json_escape "$CGD_CLASS")" \
+    "$(claude_gpt_json_escape "server version is not exposed by public endpoints (/healthz returns {\"ok\":true} only); local binary version is auxiliary evidence and is not the connected server version")")
+}
+
+# claude_gpt_local_proxy_auxiliary_json: PATH 上の claude-code-proxy の path / version を
+# 補助 evidence として JSON object で返す。binary が無い場合は path / version を null にする。
+# 接続先 server とは別項目であり、server の version や設定を証明しない。
+claude_gpt_local_proxy_auxiliary_json() {
+  _cgt_aux_bin=$(claude_gpt_resolve_proxy_bin)
+  if [ -z "$_cgt_aux_bin" ]; then
+    printf '{"path":null,"version":null,"note":%s}' \
+      "$(claude_gpt_json_escape "auxiliary evidence only: no claude-code-proxy found on PATH")"
+    return 0
+  fi
+  _cgt_aux_version=$(claude_gpt_proxy_version "$_cgt_aux_bin")
+  printf '{"path":%s,"version":%s,"note":%s}' \
+    "$(claude_gpt_json_escape "$_cgt_aux_bin")" \
+    "$(claude_gpt_json_escape "$_cgt_aux_version")" \
+    "$(claude_gpt_json_escape "auxiliary evidence only: the PATH binary is not necessarily the binary the connected server runs")"
+}
+
+# claude_gpt_launch_env_json: launcher が claude 子プロセスへ追加する env（key と値）を
+# JSON object で返す。値は全て非 secret（`ANTHROPIC_AUTH_TOKEN` は placeholder）。
+# 引数1: base URL
+# 引数2: 解決済みの claude 実行ファイル path（未解決なら空文字列 -> null）
+claude_gpt_launch_env_json() {
+  printf '{"ANTHROPIC_BASE_URL":%s,"ANTHROPIC_AUTH_TOKEN":%s,"ANTHROPIC_MODEL":%s,"ANTHROPIC_SMALL_FAST_MODEL":%s,"ANTHROPIC_DEFAULT_OPUS_MODEL":%s,"ANTHROPIC_DEFAULT_SONNET_MODEL":%s,"ANTHROPIC_DEFAULT_HAIKU_MODEL":%s,"CLAUDE_CODE_AUTO_MODE_SERVER":"0","CLAUDE_CODE_AUTO_COMPACT_WINDOW":%s,"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":"1","CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK":"1","LOOP_TASK_CONTEXT_RUNTIME_VARIANT":"claude_gpt","CLAUDE_GPT_CLAUDE_BIN":%s}' \
+    "$(claude_gpt_json_escape "$1")" \
+    "$(claude_gpt_json_escape "$CLAUDE_GPT_AUTH_TOKEN_PLACEHOLDER")" \
+    "$(claude_gpt_json_escape "$CLAUDE_GPT_MODEL_MAIN")" \
+    "$(claude_gpt_json_escape "$CLAUDE_GPT_MODEL_SMALL_FAST")" \
+    "$(claude_gpt_json_escape "$CLAUDE_GPT_MODEL_OPUS")" \
+    "$(claude_gpt_json_escape "$CLAUDE_GPT_MODEL_SONNET")" \
+    "$(claude_gpt_json_escape "$CLAUDE_GPT_MODEL_HAIKU")" \
+    "$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_COMPACT_WINDOW")" \
+    "$(if [ -n "$2" ]; then claude_gpt_json_escape "$2"; else printf null; fi)"
+}
+
+# claude_gpt_server_failure_json: 診断が失敗した場合の構造化 failure（stdout 用 JSON）を返す。
+# model catalog の不足は account entitlement や推論能力の failure とは分類しない
+# （`cause` は catalog 不整合のみを示す）。
+# 引数1: 診断 JSON（claude_gpt_run_connected_server_diagnostics が設定した CGD_JSON）
+claude_gpt_server_failure_json() {
+  case "$CGD_CLASS" in
+    required_models_missing)
+      _cgt_sf_reason="model_alias_not_resolved"
+      _cgt_sf_cause="connected_server_model_catalog_incomplete"
+      _cgt_sf_hint="the running server at ANTHROPIC_BASE_URL does not list every required model; update or restart the SERVER OWNER's process with a compatible claude-code-proxy (the launcher never starts, stops or restarts a proxy)"
+      ;;
+    models_http_error)
+      _cgt_sf_reason="connected_server_models_unavailable"
+      _cgt_sf_cause="connected_server_models_endpoint_not_ok"
+      _cgt_sf_hint="the server at ANTHROPIC_BASE_URL answered but /v1/models was not HTTP 200; confirm that the endpoint is a claude-code-proxy"
+      ;;
+    non_loopback)
+      _cgt_sf_reason="connected_server_not_loopback"
+      _cgt_sf_cause="base_url_host_is_not_loopback"
+      _cgt_sf_hint="ANTHROPIC_BASE_URL must point at a loopback claude-code-proxy (127.0.0.1 / localhost / ::1)"
+      ;;
+    invalid_base_url)
+      _cgt_sf_reason="invalid_anthropic_base_url"
+      _cgt_sf_cause="base_url_not_scheme_host_port"
+      _cgt_sf_hint="ANTHROPIC_BASE_URL must look like http://127.0.0.1:18765 (no path, query or userinfo)"
+      ;;
+    *)
+      _cgt_sf_reason="connected_server_unreachable"
+      _cgt_sf_cause="no_server_listening_or_not_responding"
+      _cgt_sf_hint="no claude-code-proxy answered at ANTHROPIC_BASE_URL; start one yourself, for example: claude-code-proxy serve --port 18765 (see https://claude-code-proxy.raine.dev/using/configure-claude-code/)"
+      ;;
+  esac
+  printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"failed","reason":%s,"cause":%s,"connected_server":%s,"local_proxy_binary_auxiliary":%s,"start_hint":%s,"repair_command":%s,"repair_scope":%s}\n' \
+    "$(claude_gpt_json_escape "$_cgt_sf_reason")" \
+    "$(claude_gpt_json_escape "$_cgt_sf_cause")" \
+    "$1" \
+    "$(claude_gpt_local_proxy_auxiliary_json)" \
+    "$(claude_gpt_json_escape "$_cgt_sf_hint")" \
+    "$(claude_gpt_json_escape "$CLAUDE_GPT_REPAIR_COMMAND")" \
+    "$(claude_gpt_json_escape "repair_proxy.sh installs a compatible BINARY under CLAUDE_GPT_HOME/bin only; it does not touch the running server, whose owner must restart it with that binary")"
+}
+
+# claude_gpt_find_free_port: OS に ephemeral port を割り当てさせ、bind 可能な loopback port
+# 番号を 1 つ返す（repair_proxy.sh の再検証 probe 専用）。
 claude_gpt_find_free_port() {
   if command -v python3 >/dev/null 2>&1; then
     python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
@@ -524,13 +458,10 @@ claude_gpt_find_free_port() {
   fi
 }
 
-# claude_gpt_probe_live_catalog: repair_proxy.sh の再検証専用の軽量プローブ
-# （Issue #2801 AC5）。指定した proxy バイナリを ephemeral port で起動し、
-# `/v1/models` の live catalog 生 JSON を取得してから kill する。launch.sh 本体の
-# 起動シーケンス（port TOCTOU retry・loopback bind 厳密確認等）とは独立した
-# 単純化済みの一度きりプローブであり、launch.sh の起動ロジックを置き換えない。
-# 取得できなければ空文字列を返す（呼び出し側は required set 全件を missing 扱いに
-# できる）。running な既存 proxy/session には一切触れない。
+# claude_gpt_probe_live_catalog: repair_proxy.sh の再検証専用の軽量 probe。指定した proxy
+# バイナリを使い捨て ephemeral port・使い捨て HOME で起動し、`/v1/models` の生 JSON を
+# 取得してから、**この関数自身が起動した** process だけを kill する。running な既存
+# proxy / session には一切触れない。取得できなければ空文字列を返す。
 # 引数1: proxy バイナリの絶対パス
 # 引数2: probe に使う loopback port
 claude_gpt_probe_live_catalog() {
@@ -574,766 +505,4 @@ claude_gpt_probe_live_catalog() {
   wait "$_cgt_probe_pid" 2>/dev/null
   rm -rf "$_cgt_probe_home" 2>/dev/null
   printf '%s' "$_cgt_probe_models"
-}
-
-# claude_gpt_proxy_version: 起動対象 proxy バイナリの version 識別子を取得する。
-# `--version` 相当が使えない/失敗する場合は sha256（存在すれば）、それも取れなければ
-# "unknown" を返す（証跡には常に何らかの identity 値を残す）。
-# 引数1: proxy バイナリの絶対パス
-claude_gpt_proxy_version() {
-  proxy_bin="$1"
-  if [ -z "$proxy_bin" ]; then
-    printf 'unknown\n'
-    return 0
-  fi
-  version_output=$("$proxy_bin" --version 2>/dev/null | head -n1)
-  if [ -n "$version_output" ]; then
-    printf '%s\n' "$version_output"
-    return 0
-  fi
-  claude_gpt_sha256_file "$proxy_bin"
-}
-
-# claude_gpt_sha256_file: 任意ファイルの sha256 を計算する。sha256sum / shasum いずれも
-# 使えない環境では "unknown" を返す（VC preflight allowlist 外コマンドへ依存しない）。
-claude_gpt_sha256_file() {
-  file="$1"
-  if [ -z "$file" ] || [ ! -f "$file" ]; then
-    printf 'unknown\n'
-    return 0
-  fi
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$file" 2>/dev/null | cut -d' ' -f1
-  elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$file" 2>/dev/null | cut -d' ' -f1
-  else
-    printf 'unknown\n'
-  fi
-}
-
-# claude_gpt_git_head: repo_root の現行 HEAD SHA を取得する（取得不可なら "unknown"）。
-claude_gpt_git_head() {
-  repo_root="$1"
-  head_sha=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null)
-  if [ -n "$head_sha" ]; then
-    printf '%s\n' "$head_sha"
-  else
-    printf 'unknown\n'
-  fi
-}
-
-# claude_gpt_git_dirty: repo_root が dirty（untracked/modified あり）かどうかを
-# "true"/"false"/"unknown"（git repo でない等）で返す。
-claude_gpt_git_dirty() {
-  repo_root="$1"
-  if ! git -C "$repo_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    printf 'unknown\n'
-    return 0
-  fi
-  if [ -n "$(git -C "$repo_root" status --porcelain 2>/dev/null)" ]; then
-    printf 'true\n'
-  else
-    printf 'false\n'
-  fi
-}
-
-# launcher が内部で必ず自前設定する policy flag。呼び出し側（drop-in 先の
-# runtime smoke harness 等）が `--` の後ろに同名 flag を渡して弱体化させることを拒否する
-# ためのチェック対象一覧（P1-1）。
-#
-# `--strict-mcp-config` はここに含めない（Issue #2189）。値を取らない純粋な boolean
-# flag であり、Herdr が常時付与する exact 一致トークンは launcher 自身が最終的に付与
-# する既定値と idempotent であるため、launch.sh の forbidden-flag 拒否ループの直前で
-# exact-match の pre-filter により安全に取り除く。値付き variant
-# （`--strict-mcp-config=...`）は本リストに依存せず、launch.sh 内の専用 exact-prefix
-# チェック（`--permission-mode=bypassPermissions` と同型のパターン）で個別に拒否する
-# （このリストに残すと exact トークンの pre-filter 後に到達する `=*` variant 判定と
-# 混在してしまうため、責務を分離した）。
-#
-# `--permission-mode` は Issue #2203（2026-08-16 OWNER adversarial review 反映）で
-# 追加した。launcher 自身が exactly one の `--permission-mode auto` を注入する契約の
-# ため、caller が明示する `--permission-mode VALUE` / `--permission-mode=VALUE` は
-# 値の種類（bypassPermissions を含む）を問わず一律拒否する。この一覧は
-# launcher-level `--` 以降の全トークンを走査する forbidden-flag ループでチェックされる
-# ため、duplicate 指定・`--` 後方の literal を含め、出現位置によらず拒否される
-# （区別して全面拒否。Outcome 節参照）。
-CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS="--settings --mcp-config --dangerously-skip-permissions --allow-dangerously-skip-permissions --permission-mode --agents"
-
-# --- Issue #2203: launcher-owned autoMode policy（second-gate の判断補助）--------
-#
-# `autoMode` は permissions.deny / PreToolUse hook / GitHub mutation transaction
-# broker の後段にある classifier ベースの判断補助であり、決定論的な authority では
-# ない（Configure auto mode ドキュメント準拠）。ここで生成する narrow 文字列は
-# launcher-owned `--settings` にのみ注入し、project `.claude/settings*.json` には
-# 追加しない。
-CLAUDE_GPT_TRUSTED_REPO="squne121/loop-protocol"
-
-CLAUDE_GPT_AUTO_MODE_ENVIRONMENT_NARROW_LABEL="claude-gpt launcher narrow environment（second-gate 判断補助。authority ではない）: このセッションが日常的に扱う対象は GitHub host github.com 上の ${CLAUDE_GPT_TRUSTED_REPO} リポジトリ（Issue/PR の read/create/edit/comment/review/close/reopen、および同一 repository への non-force task-branch push）と、repository-owned canonical codebase-investigator -> gemini-cli-headless-delegation -> provider=agy の read-only isolated delegation route のみである。Claude child の GitHub auth（GitHub CLI 経由）は、authentication token（GH_TOKEN/GITHUB_TOKEN）・host selector（GH_HOST）・repository context（GH_REPO）を native 同等に ambient 値のまま利用可能であり、GH_CONFIG_DIR は、親環境で非空値が明示的に設定されている場合はその値を isolation 後もそのまま保持し、未指定または空の場合は isolation 前の HOME/.config/gh を使用する（非標準の XDG_CONFIG_HOME を GitHub CLI と同じ優先順位で自動解決するところまでの native-equivalent は保証しない。HOME/XDG_CONFIG_HOME/XDG_CACHE_HOME は隔離値に置換され、SSH_AUTH_SOCK/GIT_ASKPASS/SSH_ASKPASS/GIT_CREDENTIAL_HELPER は unset される）。一方 AGY delegation の github_research route は既存の read-only broker が authentication token と gh invocation を専有し、AGY process 自身には渡さない。他 repository・他 host・broad gh api・arbitrary provider・force push・branch/tag/release 削除・repository settings/IAM/secret 変更はこの環境記述の対象外である。"
-
-CLAUDE_GPT_AUTO_MODE_ALLOW_NARROW_LABEL="claude-gpt launcher narrow allow（second-gate 判断補助。authority ではない）: ${CLAUDE_GPT_TRUSTED_REPO} に repository 固定した native GitHub client（\`gh\` 相当）による Issue の read/create/edit/comment/close と、同一 repository の PR の read/create/edit/comment/review、および同一 repository への non-force task-branch push（force push・branch/tag/release 削除・repository settings/IAM/secret 変更は含まない）。これら通常操作の correctness は mutation 前後の authoritative live readback で確認する。加えて controlled canonical Issue-edit transaction は \`uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file <repo-relative-safe-operand>\` の正確な token/argv identity に限定し、shell operator、追加引数、absolute/unsafe operand、generic uv/Python/raw gh は含まない（この token/argv 制限は本 controlled canonical Issue-edit transaction にのみ適用する transaction-local restriction であり、前段で許可した repository-scoped native GitHub client（\`gh\` 相当）による通常操作を一律に禁止するものではない）。repository-owned canonical codebase-investigator -> gemini-cli-headless-delegation -> provider=agy の read-only isolated delegation（direct arbitrary agy 起動・provider!=agy・canonical builder/wrapper bypass・AGY からの GitHub mutation は対象外。github_research route は既存の read-only broker が credential を専有する）。push/ref/merge の authority は repository permissions・GitHub Rulesets/branch protection・required CI が持ち、Issue/PR object mutation の authority は GitHub API authorization（repository permissions）と mutation 前後の authoritative live readback が持つ。この allow rule はいずれの authority でもない second-gate 判断補助に過ぎない。"
-
-# --- Issue #2843: canonical workflow delegation context（追加的な説明）-------------
-#
-# 上記 ENVIRONMENT/ALLOW narrow label は一切変更せず、その後ろに独立した entry として
-# 追加する（既存 label は autoMode.environment/allow の index 1 のまま。新 entry は
-# index 2）。これは classifier が読む自然言語の判断材料であり、決定論的 authorization
-# ではない（permissions.allow / hook / settings / permission mode は増やさない）。
-# 対象は「ユーザーが current issue-refinement-loop / impl-review-loop の自律実行を
-# 明示した session」の canonical SubAgent delegation に限る。
-#   - #2223 / #2658 / PR #2666 の Owner Decision（repository-scoped native GitHub
-#     操作の許可、raw gh / git push を遮断する新規 enforcing hook を追加しない）は
-#     狭めない。wrapper 必須条件は actor・mode・operation 単位でのみ記述する。
-#   - #2839（independent `claude -p` runtime VC への operator approval context）、
-#     #2456 / #2471（secret-free diagnostic false-positive）、raw CI rerun
-#     （`gh run rerun`。Interfere With Workloads）はそれぞれ別 ownership であり、
-#     この context に吸収しない。
-CLAUDE_GPT_AUTO_MODE_ENVIRONMENT_DELEGATION_LABEL="claude-gpt launcher canonical workflow delegation context（second-gate 判断補助。authority ではない）: ユーザーが current issue-refinement-loop または impl-review-loop の自律実行を明示した interactive session では、その loop の documented terminal boundary（ユーザーが指定した停止点。例: merge 判断直前）までの完走がユーザー自身の依頼に含まれる。対象は ${CLAUDE_GPT_TRUSTED_REPO} の current task / current linked Issue・PR / current repo に限る。親 Agent がユーザーの依頼文脈（依頼文や同 session の指定）で示された current linked Issue・PR と canonical Skill/Agent contract に基づいて組み立てた SubAgent 呼び出しは、ユーザー依頼の実行であり、transcript の中にしか現れない別の依頼として扱わない。ユーザーの依頼文脈に無い PR・Issue・repository が対象の場合はこの限りではない。この文脈は上記 narrow environment の記述を狭めない追加説明である。"
-
-CLAUDE_GPT_AUTO_MODE_ALLOW_DELEGATION_LABEL="claude-gpt launcher canonical workflow delegation allow（second-gate 判断補助。authority ではない）: ユーザーが明示的に起動した current issue-refinement-loop / impl-review-loop を完了するために current Skill/Agent contract が定める canonical SubAgent（issue-editor / implementation-worker / test-runner / pr-reviewer）への routine delegation（例: implementation-worker への update_pr_body_hygiene mode の IMPLEMENTATION_WORKER_REQUEST_V2 委譲）は、追加の個別承認を必要とする別の依頼として扱わない。loop の documented terminal boundary までを対象とし、mutation は current task / current linked Issue・PR / current repo に限る。親 Agent がユーザーの依頼文脈で示された current linked PR・Issue の番号・mode・body file などを引き継いで組み立てた IMPLEMENTATION_WORKER_REQUEST_V2 は、transcript の中にしか現れない別の依頼ではなくユーザー依頼の実行である。この文脈は前段の allow で許可した repository-scoped native GitHub client（\`gh\` 相当）による通常操作の許可を狭めず、controlled Issue-edit transaction の exact argv 制限が transaction-local restriction である旨も変更せず、各 Agent の役割や read-only 制約も変えない。wrapper 必須条件は current Agent/Skill contract がその条件を明示している actor・mode・operation（例: implementation-worker の update_pr_body_hygiene mode は .claude/skills/open-pr/scripts/update_pr.py 経由）にだけ適用し、全 session 共通の raw gh 禁止ではない。実 merge / auto-merge・force push・default branch direct push・remote ref deletion・secret や credential の read-egress・repository settings/IAM の変更・stale や current-head evidence の偽造（実行していない結果を current-head の成功証拠として作ること）はこの文脈に含まれない。ユーザーが指定した停止点・禁止事項は常に優先する。"
-
-# hard_deny への追加分（P0-2, PR #2214 OWNER adversarial review 反映）。$defaults の
-# hard_deny を置換・削除せず、default branch push・force push・remote ref
-# deletion を明示的に追加する。以下の hard_deny は classifier に対する追加
-# ルールであり、GitHub server-side authorization の代替ではない。通常の
-# GitHub 操作は native client（GitHub CLI 等）と mutation 前後の
-# authoritative live readback を用いる。#2223 Owner Decision により、
-# generic GitHub mutation production broker や、raw `gh` / `git push` を
-# 遮断する新規 enforcing PreToolUse hook は追加しない。既存の narrow
-# transaction executor（`controlled_skill_mutation_exec.py` 等）は CAS /
-# object identity / transaction semantics 等の固有の理由を持つ用途に限って
-# 維持する。
-CLAUDE_GPT_AUTO_MODE_HARD_DENY_DEFAULT_BRANCH_PUSH_LABEL="claude-gpt launcher hard_deny 追加分（second-gate 補助・defense-in-depth）: ${CLAUDE_GPT_TRUSTED_REPO} の default branch（main）への直接 push は絶対拒否する。task-branch 以外への push は行わない。"
-CLAUDE_GPT_AUTO_MODE_HARD_DENY_FORCE_PUSH_LABEL="claude-gpt launcher hard_deny 追加分（second-gate 補助・defense-in-depth）: force push（--force / --force-with-lease / +refspec）は絶対拒否する。"
-CLAUDE_GPT_AUTO_MODE_HARD_DENY_REF_DELETION_LABEL="claude-gpt launcher hard_deny 追加分（second-gate 補助・defense-in-depth）: remote ref（branch/tag/release）の削除は絶対拒否する。"
-
-# `autoMode.classifyAllShell` setting のサポート開始バージョン（support floor）を
-# 示す non-blocking capability 情報（Issue #2709 AC6。PR #2717 owner review P2-2
-# 反映）。v2.1.193 が意味するのは「`autoMode.classifyAllShell` という setting 自体を
-# vendor CLI がサポートし始めた境界」であり、`claude auto-mode config` の direct
-# boolean readback が利用可能かどうかとは別物である（現行 vendor CLI は
-# `auto-mode defaults`/`auto-mode config` で 4 rule lists のみを公開し、この version
-# floor を満たしていても `classifyAllShell` key の direct readback は依然
-# unavailable — 実機検証 Claude Code 2.1.278 で確認済み）。以前は launcher 起動
-# そのものを拒否する hard fail-closed version gate だったが、launcher-generated
-# settings が `classifyAllShell` を無条件注入・必須視しなくなったため
-# （Issue #2709 AC1）、この version floor の役割は「setting support floor を
-# 満たしているかどうかのメタデータ」に縮小した。この version floor を必要とする
-# 他の独立機能は現時点で存在しない（investigation 済み、Issue #2709 Background 参照）。
-CLAUDE_GPT_MIN_SUPPORTED_CLAUDE_VERSION="2.1.193"
-
-# claude_gpt_json_escape: 任意文字列を JSON 文字列リテラル（引用符込み）へ変換する。
-# python3 が使えない環境では簡易 fallback（改行・制御文字は非対応）を使う。
-# 引数1: エスケープしたい生文字列
-claude_gpt_json_escape() {
-  value="$1"
-  if command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import json, sys; sys.stdout.write(json.dumps(sys.argv[1]))' "$value"
-  else
-    esc=$(printf '%s' "$value" | sed 's/\\/\\\\/g; s/"/\\"/g')
-    printf '"%s"' "$esc"
-  fi
-}
-
-# claude_gpt_json_array_from_lines: 改行区切り文字列を JSON string array（例:
-# `["a","b"]`）へ変換する。空文字列なら `[]` を返す（Issue #2801）。
-# 引数1: 改行区切りの生文字列（各行が1要素）
-claude_gpt_json_array_from_lines() {
-  _cgt_arr_lines="$1"
-  if [ -z "$_cgt_arr_lines" ]; then
-    printf '[]'
-    return 0
-  fi
-  _cgt_arr_out="["
-  _cgt_arr_first=true
-  _cgt_arr_old_ifs=$IFS
-  IFS='
-'
-  for _cgt_arr_line in $_cgt_arr_lines; do
-    [ -z "$_cgt_arr_line" ] && continue
-    if [ "$_cgt_arr_first" = "true" ]; then
-      _cgt_arr_first=false
-    else
-      _cgt_arr_out="${_cgt_arr_out},"
-    fi
-    _cgt_arr_out="${_cgt_arr_out}$(claude_gpt_json_escape "$_cgt_arr_line")"
-  done
-  IFS=$_cgt_arr_old_ifs
-  _cgt_arr_out="${_cgt_arr_out}]"
-  printf '%s' "$_cgt_arr_out"
-}
-
-# claude_gpt_build_model_incompatibility_json: `CLAUDE_GPT_LAUNCH_RESULT_V1` の
-# 既存 top-level キー（schema/status/reason/model_alias_ok）はそのまま維持し、
-# additive fields（cause/required_models/missing_models/proxy/
-# minimum_known_compatible_version/repair_command）を追加した failure JSON を
-# 組み立てる（Issue #2801 AC1/AC3/AC6/AC9）。`cause` は本 helper が生成する限り
-# 常に `proxy_model_catalog_incompatible` であり、account entitlement 系の
-# 分類とは混同しない（AC3。通常起動での entitlement probe は追加しない）。
-# 引数1: proxy port
-# 引数2: 選択した proxy バイナリの絶対パス
-# 引数3: 選択した proxy バイナリの version 識別子
-# 引数4: required base model ID（改行区切り）
-# 引数5: missing model ID（改行区切り）
-claude_gpt_build_model_incompatibility_json() {
-  _cgt_bmi_port="$1"
-  _cgt_bmi_proxy_path="$2"
-  _cgt_bmi_proxy_version="$3"
-  _cgt_bmi_required_nl="$4"
-  _cgt_bmi_missing_nl="$5"
-
-  printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"failed","reason":"model_alias_not_resolved","model_alias_ok":false,"port":%s,"cause":"proxy_model_catalog_incompatible","required_models":%s,"missing_models":%s,"proxy":{"path":%s,"version":%s},"minimum_known_compatible_version":%s,"repair_command":%s}\n' \
-    "$_cgt_bmi_port" \
-    "$(claude_gpt_json_array_from_lines "$_cgt_bmi_required_nl")" \
-    "$(claude_gpt_json_array_from_lines "$_cgt_bmi_missing_nl")" \
-    "$(claude_gpt_json_escape "$_cgt_bmi_proxy_path")" \
-    "$(claude_gpt_json_escape "$_cgt_bmi_proxy_version")" \
-    "$(claude_gpt_json_escape "$CLAUDE_GPT_MIN_KNOWN_COMPATIBLE_PROXY_VERSION")" \
-    "$(claude_gpt_json_escape "$CLAUDE_GPT_REPAIR_COMMAND")"
-}
-
-# claude_gpt_auto_mode_json_fragment: settings JSON の `"autoMode": {...}` フィールド
-# 本体（キー名を含む）を1行の文字列として返す。`"$defaults"` を各配列の先頭に必ず
-# 含める。`classifyAllShell` キーは意図的に省略する（Issue #2709 AC1）: native
-# Claude Code の既定は narrow な Bash/PowerShell allow が classifier より先に
-# 解決される key-omission 相当であり、launcher が `classifyAllShell: true` を
-# 無条件注入することは native full parity の主張ではなく Claude-GPT 固有の
-# classifier coverage 拡張だった。この無条件注入を除去し、native default と
-# 同様にキー自体を省略する。hard_deny への narrow 追加分（default branch push /
-# force push / remote ref deletion）は本変更と独立に維持する。
-claude_gpt_auto_mode_json_fragment() {
-  env_label_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_ENVIRONMENT_NARROW_LABEL")
-  allow_label_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_ALLOW_NARROW_LABEL")
-  env_delegation_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_ENVIRONMENT_DELEGATION_LABEL")
-  allow_delegation_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_ALLOW_DELEGATION_LABEL")
-  hard_deny_default_branch_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_DEFAULT_BRANCH_PUSH_LABEL")
-  hard_deny_force_push_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_FORCE_PUSH_LABEL")
-  hard_deny_ref_deletion_json=$(claude_gpt_json_escape "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_REF_DELETION_LABEL")
-  # Issue #2843: 既存 narrow label（index 1）は変更せず、canonical workflow delegation
-  # context を index 2 に追加的に置く（classifyAllShell は引き続き省略する）。
-  printf '"autoMode": {"environment": ["$defaults", %s, %s], "allow": ["$defaults", %s, %s], "hard_deny": ["$defaults", %s, %s, %s]}' \
-    "$env_label_json" "$env_delegation_json" "$allow_label_json" "$allow_delegation_json" \
-    "$hard_deny_default_branch_json" "$hard_deny_force_push_json" "$hard_deny_ref_deletion_json"
-}
-
-# claude_gpt_auto_mode_standalone_json: 上記フラグメントを単独の JSON オブジェクトとして
-# 返す（hermetic test 用。生成された settings ファイル全体を経由せず、フラグメント単体の
-# JSON 妥当性・$defaults 存在・narrow scope を検証できるようにする）。
-claude_gpt_auto_mode_standalone_json() {
-  printf '{%s}\n' "$(claude_gpt_auto_mode_json_fragment)"
-}
-
-# claude_gpt_auto_mode_readback: `claude auto-mode defaults` / `claude auto-mode config`
-# の実 readback で、launcher-generated settings の autoMode が effective config に
-# 正しく反映されていること（narrow environment/allow label 反映・hard_deny 追加分
-# 保持・soft_deny 不変）を検証する（Issue #2203 AC1 / Issue #2709 で classifyAllShell
-# 関連の fail-closed 契約を tri-state/availability evidence へ更新）。python3 必須
-# （未対応環境は fail-closed）。呼び出し元プロセスの env を継承せず、`env -i` で
-# 最小限のみ渡す（FAKE_CLAUDE_ARGV_FILE 等、他コンポーネントの hermetic test 観測用
-# env の汚染防止も兼ねる）。
-#
-# 引数1: claude 実行バイナリの絶対パス
-# 引数2: 検証対象の settings.local.json 絶対パス
-# 戻り値: 0 = readback 成功（PASS）、8 = fail-closed（narrow label 未反映・
-#         hard_deny/soft_deny 不整合・classifyAllShell の direct readback が
-#         generated key 省略と矛盾する値を返した・classifyAllShell の direct
-#         readback が exact bool でない値を返した（schema/capability drift。
-#         PR #2717 owner review P2-1）、のいずれか。version floor は
-#         non-blocking capability 情報であり、単独では fail-closed の理由にならない
-#         — Issue #2709 AC6）
-claude_gpt_auto_mode_readback() {
-  claude_bin="$1"
-  settings_path="$2"
-
-  if ! command -v python3 >/dev/null 2>&1; then
-    printf '{"schema":"CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V2","status":"blocked","reason":"python3_unavailable"}\n'
-    return 8
-  fi
-
-  claude_config_dir=$(CDPATH= cd -- "$(dirname -- "$settings_path")" 2>/dev/null && pwd -P)
-  if [ -z "$claude_config_dir" ]; then
-    claude_config_dir="${HOME:-/tmp}"
-  fi
-
-  version_tmp=$(mktemp)
-  defaults_tmp=$(mktemp)
-  config_tmp=$(mktemp)
-
-  # `env -i` は呼び出し元の環境を明示指定分のみへリセットする（ambient env の
-  # readback invocation への意図しない漏洩を防ぐ）。hermetic test 用の fake
-  # claude binary 観測 channel（`FAKE_CLAUDE_*`）だけは、実 production では
-  # 一切設定されない前提のため、明示的に forward する（未設定時は空文字列の
-  # まま渡り、fake binary 側の `os.environ.get()` が falsy として扱う）。
-  env -i PATH="$PATH" HOME="${HOME:-/tmp}" CLAUDE_CONFIG_DIR="$claude_config_dir" \
-    FAKE_CLAUDE_ARGV_LOG="${FAKE_CLAUDE_ARGV_LOG:-}" FAKE_CLAUDE_ARGV_FILE="${FAKE_CLAUDE_ARGV_FILE:-}" \
-    FAKE_CLAUDE_VERSION="${FAKE_CLAUDE_VERSION:-}" \
-    FAKE_CLAUDE_AUTO_MODE_READBACK_FAIL="${FAKE_CLAUDE_AUTO_MODE_READBACK_FAIL:-}" \
-    "$claude_bin" --version >"$version_tmp" 2>&1
-  version_rc=$?
-
-  env -i PATH="$PATH" HOME="${HOME:-/tmp}" CLAUDE_CONFIG_DIR="$claude_config_dir" \
-    FAKE_CLAUDE_ARGV_LOG="${FAKE_CLAUDE_ARGV_LOG:-}" FAKE_CLAUDE_ARGV_FILE="${FAKE_CLAUDE_ARGV_FILE:-}" \
-    FAKE_CLAUDE_VERSION="${FAKE_CLAUDE_VERSION:-}" \
-    FAKE_CLAUDE_AUTO_MODE_READBACK_FAIL="${FAKE_CLAUDE_AUTO_MODE_READBACK_FAIL:-}" \
-    "$claude_bin" auto-mode defaults >"$defaults_tmp" 2>&1
-  defaults_rc=$?
-
-  env -i PATH="$PATH" HOME="${HOME:-/tmp}" CLAUDE_CONFIG_DIR="$claude_config_dir" \
-    FAKE_CLAUDE_ARGV_LOG="${FAKE_CLAUDE_ARGV_LOG:-}" FAKE_CLAUDE_ARGV_FILE="${FAKE_CLAUDE_ARGV_FILE:-}" \
-    FAKE_CLAUDE_VERSION="${FAKE_CLAUDE_VERSION:-}" \
-    FAKE_CLAUDE_AUTO_MODE_READBACK_FAIL="${FAKE_CLAUDE_AUTO_MODE_READBACK_FAIL:-}" \
-    "$claude_bin" --settings "$settings_path" auto-mode config >"$config_tmp" 2>&1
-  config_rc=$?
-
-  python3 - "$version_tmp" "$version_rc" "$defaults_tmp" "$defaults_rc" "$config_tmp" "$config_rc" "$settings_path" \
-    "$CLAUDE_GPT_AUTO_MODE_ENVIRONMENT_NARROW_LABEL" "$CLAUDE_GPT_AUTO_MODE_ALLOW_NARROW_LABEL" \
-    "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_DEFAULT_BRANCH_PUSH_LABEL" "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_FORCE_PUSH_LABEL" \
-    "$CLAUDE_GPT_AUTO_MODE_HARD_DENY_REF_DELETION_LABEL" "$CLAUDE_GPT_MIN_SUPPORTED_CLAUDE_VERSION" <<'PYEOF'
-import hashlib
-import json
-import re
-import sys
-
-(
-    version_path,
-    version_rc,
-    defaults_path,
-    defaults_rc,
-    config_path,
-    config_rc,
-    settings_path,
-    env_label,
-    allow_label,
-    hard_deny_default_branch_label,
-    hard_deny_force_push_label,
-    hard_deny_ref_deletion_label,
-    min_supported_version,
-) = sys.argv[1:14]
-version_rc = int(version_rc)
-defaults_rc = int(defaults_rc)
-config_rc = int(config_rc)
-
-
-def _digest(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def _parse_version(text: str) -> tuple[int, ...] | None:
-    match = re.search(r"(\d+)\.(\d+)\.(\d+)", text)
-    if not match:
-        return None
-    return tuple(int(part) for part in match.groups())
-
-
-reasons: list[str] = []
-
-with open(version_path, encoding="utf-8") as fh:
-    version_text = fh.read()
-with open(defaults_path, encoding="utf-8") as fh:
-    defaults_text = fh.read()
-with open(config_path, encoding="utf-8") as fh:
-    config_text = fh.read()
-
-# --- version capability info（non-blocking, Issue #2709 AC6。PR #2717 owner
-#     review P2-2 反映）。以前は classifyAllShell readback を検証する version
-#     未満を無条件 fail-closed にしていたが、launcher が classifyAllShell を
-#     無条件注入しなくなったため（AC1）、この version floor は
-#     「`autoMode.classifyAllShell` setting のサポート開始バージョン
-#     （support floor）を満たしているかどうか」を示す capability メタデータへ
-#     縮小した。これは vendor CLI の `auto-mode config` が classifyAllShell の
-#     direct boolean readback を公開しているかどうかとは別の意味であり
-#     （現行 vendor CLI は version floor を満たしていても direct readback は
-#     unavailable — 実機検証済み）、両者を混同する名称・説明にはしない。
-#     launcher 起動そのものはこの判定では拒否しない（reasons へは追加しない）。 ---
-parsed_version = _parse_version(version_text) if version_rc == 0 else None
-min_version = _parse_version(min_supported_version)
-if version_rc != 0 or parsed_version is None:
-    classify_all_shell_setting_version_floor_met = False
-elif min_version is not None and parsed_version < min_version:
-    classify_all_shell_setting_version_floor_met = False
-else:
-    classify_all_shell_setting_version_floor_met = True
-
-defaults = None
-config = None
-
-if defaults_rc != 0:
-    reasons.append("auto_mode_defaults_command_failed")
-else:
-    try:
-        defaults = json.loads(defaults_text)
-    except ValueError:
-        reasons.append("auto_mode_defaults_unparsable")
-
-if config_rc != 0:
-    reasons.append("auto_mode_config_command_failed")
-else:
-    try:
-        config = json.loads(config_text)
-    except ValueError:
-        reasons.append("auto_mode_config_unparsable")
-
-env_label_present = False
-allow_label_present = False
-hard_deny_superset_ok = None
-soft_deny_unmodified = None
-
-if defaults is not None and config is not None:
-    for key in ("environment", "allow", "hard_deny", "soft_deny"):
-        if key not in defaults or key not in config:
-            reasons.append(f"missing_key_{key}")
-
-    env_label_present = env_label in config.get("environment", [])
-    allow_label_present = allow_label in config.get("allow", [])
-    if not env_label_present:
-        reasons.append("environment_narrow_label_not_reflected")
-    if not allow_label_present:
-        reasons.append("allow_narrow_label_not_reflected")
-
-    # hard_deny は $defaults を置換・削除せず、narrow な追加分（default branch
-    # push / force push / ref deletion）だけを加える契約（P0-2）。defaults の
-    # 全 entry を含み、かつ3件の追加 deny 文言を含むことを確認する（任意の
-    # 超集合を許容する緩い検査にはしない）。
-    config_hard_deny = config.get("hard_deny", [])
-    defaults_hard_deny = defaults.get("hard_deny", [])
-    hard_deny_contains_defaults = all(entry in config_hard_deny for entry in defaults_hard_deny)
-    hard_deny_contains_additions = (
-        hard_deny_default_branch_label in config_hard_deny
-        and hard_deny_force_push_label in config_hard_deny
-        and hard_deny_ref_deletion_label in config_hard_deny
-    )
-    hard_deny_superset_ok = hard_deny_contains_defaults and hard_deny_contains_additions
-    if not hard_deny_superset_ok:
-        reasons.append("hard_deny_defaults_or_additions_missing")
-
-    soft_deny_unmodified = config.get("soft_deny") == defaults.get("soft_deny")
-    if not soft_deny_unmodified:
-        reasons.append("soft_deny_modified")
-
-# classifyAllShell tri-state/availability evidence (Issue #2709 AC1/AC2/AC5).
-# The launcher no longer injects `classifyAllShell` into generated settings
-# (AC1), so a boolean "enabled" readback is no longer the right question.
-# Real-machine verification (Claude Code 2.1.233, 2026-08-16) showed the
-# current vendor CLI does not expose this key in `auto-mode defaults` /
-# `auto-mode config` effective config output at all. This evidence
-# distinguishes (a) whether the launcher-generated settings literally
-# contain the key, from (b) whether the native CLI's direct boolean
-# readback surface is available -- and never infers/reports an unread
-# boolean as enabled, native-parity, or denial-rate-improving (AC2). This
-# computation is independent of the defaults/config success branch above
-# so that `generated_key_present` is always evaluated from the actual
-# generated settings file on disk (needed for the AC5 contradiction guard
-# below even if the `auto-mode defaults`/`auto-mode config` commands
-# themselves failed).
-try:
-    with open(settings_path, encoding="utf-8") as fh:
-        settings_text = fh.read()
-except OSError:
-    settings_text = ""
-generated_key_present = '"classifyAllShell"' in settings_text
-
-direct_readback_available = False
-effective_value = None
-if config is not None and "classifyAllShell" in config:
-    # PR #2717 owner review P2-1: `is True` は truthiness 相当の緩い判定であり、
-    # vendor CLI が将来 non-boolean 値（文字列 "false" / null / 数値等）を
-    # 返した場合に genuine な false へ黙って正規化してしまう。exact bool 型で
-    # ない場合は effective_value を確定させず、schema/capability drift として
-    # 明示的な reason を出す（新しい generic validator framework は作らない）。
-    raw_classify_all_shell_value = config["classifyAllShell"]
-    if type(raw_classify_all_shell_value) is bool:
-        direct_readback_available = True
-        effective_value = raw_classify_all_shell_value
-    else:
-        reasons.append("classify_all_shell_readback_non_boolean")
-
-# AC5 block condition (b): if direct readback becomes available in the
-# future and reports the projection enabled despite the launcher never
-# having generated the key, that contradicts the generated/default
-# projection and must fail-closed rather than be silently accepted as a
-# denial-rate improvement or native parity claim.
-if direct_readback_available and not generated_key_present and effective_value is True:
-    reasons.append("classify_all_shell_effective_value_contradicts_omitted_key")
-
-classify_all_shell_evidence = {
-    "generated_key_present": generated_key_present,
-    "direct_readback_available": direct_readback_available,
-    "effective_value": effective_value,
-    "native_parity_claimed": False,
-}
-
-defaults_digest = _digest(defaults_text) if defaults is not None else "unknown"
-config_digest = _digest(config_text) if config is not None else "unknown"
-
-# version floor is non-blocking capability info only (AC6); it does not
-# participate in `ok`.
-ok = not reasons
-
-result = {
-    "schema": "CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V2",
-    "status": "ok" if ok else "blocked",
-    "ok": ok,
-    "claude_version": {
-        "raw": version_text.strip(),
-        "parsed": list(parsed_version) if parsed_version else None,
-        "min_supported": list(min_version) if min_version else None,
-        # PR #2717 owner review P2-2: この field は「`autoMode.classifyAllShell`
-        # setting のサポート開始バージョンを満たしているか」のみを表す。
-        # classifyAllShell の direct boolean readback availability とは独立
-        # （それは下記 `classify_all_shell.direct_readback_available` を見る）。
-        "classify_all_shell_setting_version_floor_met": classify_all_shell_setting_version_floor_met,
-    },
-    "checks": {
-        "environment_narrow_label_present": env_label_present,
-        "allow_narrow_label_present": allow_label_present,
-        "hard_deny_defaults_and_additions_present": bool(hard_deny_superset_ok),
-        "soft_deny_unmodified": bool(soft_deny_unmodified),
-    },
-    "classify_all_shell": classify_all_shell_evidence,
-    "digests": {
-        "auto_mode_defaults_digest": defaults_digest,
-        "effective_config_digest": config_digest,
-    },
-    "fail_closed_reasons": reasons,
-}
-print(json.dumps(result))
-sys.exit(0 if ok else 8)
-PYEOF
-  rc=$?
-  rm -f "$version_tmp" "$defaults_tmp" "$config_tmp"
-  return "$rc"
-}
-
-# --- Canonical path safety check ---
-#
-# repository root / worktree 配下でないことを canonical path（symlink 解決後）で拒否する。
-# 戻り値: 0 = 安全（repo/worktree 配下でない）、1 = 危険（repo/worktree 配下）
-#
-# 引数1: 検証したいディレクトリ（存在しなくてもよい。親ディレクトリまで遡って canonical 化する）
-# 引数2: このスクリプトファイルへのパス（呼び出し元の $0 相当。repo root 推定に使う）
-claude_gpt_reject_if_under_repo() {
-  target_dir="$1"
-  self_path="$2"
-
-  # target_dir の canonical path を計算する（存在しない場合は既存の親まで遡る）
-  probe="$target_dir"
-  while [ ! -d "$probe" ]; do
-    parent=$(dirname -- "$probe")
-    if [ "$parent" = "$probe" ]; then
-      break
-    fi
-    probe="$parent"
-  done
-  canonical_target=$(CDPATH= cd -- "$probe" 2>/dev/null && pwd -P) || canonical_target="$probe"
-  # probe が target_dir の祖先である場合、差分サフィックスを付け戻す
-  if [ "$probe" != "$target_dir" ]; then
-    suffix=$(printf '%s' "$target_dir" | sed "s#^$(printf '%s' "$probe" | sed 's/[.[\*^$/]/\\&/g')##")
-    canonical_target="${canonical_target}${suffix}"
-  fi
-
-  script_dir=$(CDPATH= cd -- "$(dirname -- "$self_path")" && pwd -P)
-  # scripts/claude-gpt から見た repo root（worktree の場合は worktree root、main の場合は main repo root）
-  repo_root=$(CDPATH= cd -- "$script_dir/../.." && pwd -P)
-
-  case "$canonical_target" in
-    "$repo_root"|"$repo_root"/*)
-      return 1
-      ;;
-  esac
-
-  # 既知の worktree 配置規約（.claude/worktrees/issue-*）配下も明示的に拒否する
-  case "$canonical_target" in
-    */.claude/worktrees/*)
-      return 1
-      ;;
-  esac
-
-  return 0
-}
-
-# --- GPT-5.3-Codex-Spark delegation route: retired（Issue #2651）---
-#
-# The former Spark custom SubAgent definition (Issue #2186, Parent #2154
-# Gate1/Gate2), its system prompt, its `--agents` JSON fragment generator,
-# its explicit-only authorization gate, and its nonce/session_id sidecar
-# auth directory have all been removed from this launcher. Repository-owned
-# Claude-GPT / Claude Code invocation no longer selects, injects, or
-# dispatches the retired non-Anthropic Spark model in any form. Ordinary
-# SubAgent smoke canary generation
-# (`claude_gpt_smoke_canary_agents_json_fragment`, below) does not depend
-# on any Spark constant or function removed here.
-
-# --- Codex transport policy（Issue #2204, Parent #2154）---
-#
-# isolated proxy child が Codex backend への接続に使う transport を、親 shell の
-# CCP_CODEX_TRANSPORT pass-through や isolated proxy config.json の transport 指定
-# よりも優先して repository-owned に固定する無条件定数。auto ではなく http 固定を
-# 採る理由は Issue #2204 Outcome 直下の設計判断（decision block）を参照。
-# 親環境で上書き可能な `: "${VAR:=http}"` ではなく、無条件代入にすることで
-# 親 shell の値を一切参照しない（親 env は launch.sh の `env -i` により proxy
-# 子プロセスへそもそも継承されないが、本定数は isolated config.json 由来の
-# transport 指定にも優先する必要があるため、明示 env として常に渡す）。
-CLAUDE_GPT_CODEX_TRANSPORT_POLICY=http
-
-# --- proxy 子プロセス起動用 env allowlist ---
-#
-# 親 shell から継承した CCP_* / HTTP_PROXY / HTTPS_PROXY / ALL_PROXY 等を
-# そのまま proxy へ引き渡さず、launcher が明示的に組み立てた allowlist のみへ限定する。
-# HOME は proxy 専用 HOME（claude_gpt_proxy_home_dir）を渡すこと（P0-2。実 HOME をそのまま
-# 渡すと legacy credential へフォールバックし credential 分離が成立しない）。
-# CCP_CODEX_TRANSPORT は CLAUDE_GPT_CODEX_TRANSPORT_POLICY を単一の source of truth
-# として参照する（Issue #2204。isolated config.json や upstream built-in default の
-# websocket を明示 env で上書きする）。
-# 呼び出し側は `env -i $(claude_gpt_build_proxy_env "$config_dir" "$state_dir" "$proxy_home" "$port") claude-code-proxy serve ...`
-# のように使う。
-claude_gpt_build_proxy_env() {
-  proxy_config_dir="$1"
-  proxy_state_dir="$2"
-  proxy_home="$3"
-  bind_address="${4:-127.0.0.1}"
-
-  printf 'PATH=%s\n' "$PATH"
-  printf 'HOME=%s\n' "$proxy_home"
-  printf 'CCP_CONFIG_DIR=%s\n' "$proxy_config_dir"
-  printf 'XDG_STATE_HOME=%s\n' "$proxy_state_dir"
-  printf 'CCP_BIND_ADDRESS=%s\n' "$bind_address"
-  printf 'CCP_LOG_STDERR=1\n'
-  printf 'CCP_CODEX_TRANSPORT=%s\n' "$CLAUDE_GPT_CODEX_TRANSPORT_POLICY"
-  printf 'CCP_AUTO_REVIEW_MODEL=%s\n' "$CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY"
-}
-
-# --- Smoke harness canary agent fixture（Issue #2274 AC14/AC15）---
-#
-# claude_gpt_agents_json_merge_validate: 複数の `--agents` JSON fragment 文字列
-# （それぞれ単一 top-level key を持つ有効な JSON object であることを要求する）を
-# python3 の JSON serializer/parser だけを使って安全にマージし、生成後に
-# parse/readback して以下を fail-closed で拒否する:
-#   - 引数のいずれかが有効な JSON object としてパースできない場合（malformed JSON）
-#   - マージ後の top-level key 数が入力 fragment の合計 key 数と一致しない場合
-#     （＝ 複数 fragment 間で agent name が衝突し、後勝ちで上書きされた場合。
-#       duplicate agent name の検出）
-#   - readback したマージ結果が serialize 直後の値と一致しない場合
-# 成功時のみマージ結果 JSON を stdout へ書き、exit 0 を返す。失敗時は何も出力せず
-# 非 0 を返す（呼び出し元は戻り値を必ず検査すること）。python3 未対応環境は
-# fail-closed（何も出力せず exit 1）。
-claude_gpt_agents_json_merge_validate() {
-  if ! command -v python3 >/dev/null 2>&1; then
-    return 1
-  fi
-  python3 - "$@" <<'CLAUDE_GPT_AGENTS_MERGE_VALIDATE_PY'
-import json
-import sys
-
-fragments = sys.argv[1:]
-if not fragments:
-    sys.exit(1)
-
-merged = {}
-expected_key_count = 0
-for raw in fragments:
-    try:
-        parsed = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        sys.exit(1)
-    if not isinstance(parsed, dict) or not parsed:
-        sys.exit(1)
-    expected_key_count += len(parsed)
-    merged.update(parsed)
-
-if len(merged) != expected_key_count:
-    sys.exit(1)
-
-serialized = json.dumps(merged)
-try:
-    readback = json.loads(serialized)
-except (json.JSONDecodeError, ValueError):
-    sys.exit(1)
-if readback != merged:
-    sys.exit(1)
-
-sys.stdout.write(serialized)
-CLAUDE_GPT_AGENTS_MERGE_VALIDATE_PY
-}
-
-# claude_gpt_smoke_canary_agents_json_fragment: `runtime_smoke_test.sh` 専用の
-# launcher-owned/session-owned canary SubAgent fixture を内部合成する（Issue #2274
-# AC14/AC15）。smoke mode 以外からの呼び出しは想定しない。呼び出し元から
-# name/prompt/model/tools を一切受け取らない（この関数のシグネチャ自体が受け取れる
-# のは expected marker と smoke run 固有 nonce の 2 つだけ -- caller override は
-# 構造的に不可能）。生成した agent name は smoke run 固有 nonce（呼び出し元が
-# 生成する高エントロピー値。推測困難な値であること）を組み込み、他 run との
-# 衝突を避ける。tools は常に空配列、prompt は固定の canary prompt に expected
-# marker を埋め込んだもの。
-#
-# Issue #2651: 旧 Spark 定義名との衝突検査（$3 予約名引数）は撤去した。
-# Spark custom agent 定義自体が repository から撤去されたため、この関数は
-# spark 定数へ一切依存しない（衝突対象が存在しない）。
-#
-# JSON serializer（python3 の `json.dumps`）で一括生成した直後に自身で
-# parse/readback し、以下のいずれかを検出したら stdout へ何も書かず exit 1 する
-# （fail-closed。malformed JSON をそのまま `--agents` へ渡さない）:
-#   - marker/nonce が空
-#   - readback した object の top-level key が 1 個でない
-#   - readback した prompt/tools が固定 spec と一致しない（tools が空配列でない・
-#     model key が存在する等）
-#
-# 引数: $1=expected marker文字列  $2=smoke run 固有 nonce
-claude_gpt_smoke_canary_agents_json_fragment() {
-  marker="$1"
-  nonce="$2"
-  if [ -z "$marker" ] || [ -z "$nonce" ]; then
-    return 1
-  fi
-  if ! command -v python3 >/dev/null 2>&1; then
-    return 1
-  fi
-  prompt_text="You are a launcher-owned canary SubAgent used only for claude-gpt runtime smoke test positive control (Issue #2274 AC14/AC15). You have no tools. When invoked, respond with exactly: ${marker} and nothing else."
-  python3 - "$nonce" "$prompt_text" "$marker" <<'CLAUDE_GPT_CANARY_FIXTURE_PY'
-import hashlib
-import json
-import sys
-
-nonce, prompt_text, marker = sys.argv[1:4]
-
-if not nonce or not prompt_text or not marker:
-    sys.exit(1)
-
-agent_name = "canary-smoke-" + hashlib.sha256(nonce.encode("utf-8")).hexdigest()[:32]
-
-fixture = {
-    agent_name: {
-        "description": "Launcher-owned canary SubAgent for claude-gpt runtime smoke test positive control only (Issue #2274).",
-        "prompt": prompt_text,
-        "tools": [],
-    }
-}
-serialized = json.dumps(fixture)
-
-try:
-    readback = json.loads(serialized)
-except (json.JSONDecodeError, ValueError):
-    sys.exit(1)
-if not isinstance(readback, dict) or len(readback) != 1:
-    sys.exit(1)
-only_key = next(iter(readback))
-if only_key != agent_name:
-    sys.exit(1)
-entry = readback[only_key]
-if not isinstance(entry, dict):
-    sys.exit(1)
-# Issue #2274 PR #2285 OWNER fix-delta P0-1: defense-in-depth exact key-set
-# check. The fixture dict literal above already structurally cannot contain
-# any other key, but this explicit check makes "no extra fields, ever" a
-# tested invariant of the readback rather than an implicit property of the
-# literal, and fails closed if a future edit to the literal ever widens it.
-if set(entry.keys()) != {"description", "prompt", "tools"}:
-    sys.exit(1)
-if entry.get("tools") != []:
-    sys.exit(1)
-if "model" in entry:
-    sys.exit(1)
-if entry.get("prompt") != prompt_text:
-    sys.exit(1)
-
-sys.stdout.write(serialized)
-CLAUDE_GPT_CANARY_FIXTURE_PY
 }
