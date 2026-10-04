@@ -4,12 +4,23 @@ against Issue #2584.
 
 This is explicitly NOT a standing CI live-mutation gate (Out of Scope /
 Runtime Verification Applicability skip_conditions). It never runs unless
-the caller EXPLICITLY sets `LOOP_CANARY_STEP2_LIVE_ENABLE=1` -- absent
-that, this test SKIPs via `pytest.exit(..., returncode=77)` per
-`docs/dev/runtime-verification-policy.md`'s SKIP convention (exit code 77,
-`SKIP:` stdout prefix; SKIP != PASS). When disabled (the default for any
-routine `pytest` run of this file, including CI), collecting/running it is
-a no-op SKIP, never a live GitHub call.
+the caller EXPLICITLY sets `LOOP_CANARY_STEP2_LIVE_ENABLE=1`. Absent
+that (or when `gh` / `gh auth status` is unavailable), behaviour depends on
+how pytest was invoked (Issue #2903), decided from pytest's resolved target
+arguments (`config.args`), never from collected-item counts, failure counts
+or raw command-line substrings:
+
+- explicit STANDALONE runtime invocation (serial, resolved target is exactly
+  this file or exactly this test's node-id): a line-start `SKIP:` stdout line
+  (emitted through the public `capsys.disabled()` context so default output
+  capture does not swallow it) followed by `pytest.exit(returncode=77)` per
+  `docs/dev/runtime-verification-policy.md`'s SKIP convention (SKIP != PASS).
+- every other shape (directory target, mixed targets, directory narrowed by
+  `-k`, no target args, xdist worker): `pytest.skip()` on this item only, with
+  no extra stdout, so a broad regression collection keeps running the other
+  tests and still reports their independent failures.
+
+Neither path ever makes a live GitHub call.
 
 `root_review_pipeline.produce` is declared `mutation: False` in
 `command_registry.py` -- it fetches the live Issue body (read-only), runs
@@ -115,25 +126,58 @@ _SUBPROCESS_TIMEOUT_SECONDS = 1200
 _TERMINATE_GRACE_SECONDS = 3
 
 
-def _skip_or_exit(message: str, returncode: int) -> None:
-    """SKIP this test without crashing an xdist worker.
+_CANARY_TEST_NAME = "test_ac9_producer_smoke_canary_against_issue_2584"
 
-    ``pytest.exit()`` terminates the whole test *session* (fine for the
-    Issue #2610 AC9 standalone invocation, where it yields the documented
-    exit code 77 -- docs/dev/runtime-verification-policy.md's SKIP
-    convention), but inside a pytest-xdist worker process it is fatal:
-    the controller detects the worker's session-abort as a crashed item
-    (``INTERNALERROR> AssertionError`` in ``xdist/dsession.py``), failing
-    the entire parallel run this file is now collected into. Detect the
-    xdist worker via ``PYTEST_XDIST_WORKER`` (set by pytest-xdist in each
-    worker process, unset otherwise) and use a normal ``pytest.skip()``
-    there instead -- functionally equivalent for this always-opt-in test,
-    and safe under xdist.
+
+def _resolve_target_path(raw_target: str, base_dir: Path) -> Path:
+    path = Path(raw_target)
+    if not path.is_absolute():
+        path = base_dir / path
+    return path.resolve()
+
+
+def _is_explicit_standalone_runtime(config: pytest.Config) -> bool:
+    """True only for an explicit, serial, standalone runtime invocation.
+
+    Decided from pytest-resolved target arguments (``config.args``, which
+    already reflects ``PYTEST_ADDOPTS`` / ini ``addopts``), NOT from
+    ``testscollected`` (indistinguishable from a ``-k`` narrowing), failure
+    counts, raw command substrings or ``config.invocation_params.args``.
+    Standalone = serial (no xdist worker) and the single resolved target is
+    exactly this file or exactly this test's node-id. Path identity is
+    compared on resolved paths.
     """
     if os.environ.get("PYTEST_XDIST_WORKER"):
-        pytest.skip(message)
-    else:
-        pytest.exit(message, returncode=returncode)
+        return False
+    targets = list(config.args)
+    if len(targets) != 1:
+        return False
+    file_part, sep, node_part = targets[0].partition("::")
+    if sep and node_part != _CANARY_TEST_NAME:
+        return False
+    base_dir = Path(config.invocation_params.dir)
+    return _resolve_target_path(file_part, base_dir) == Path(__file__).resolve()
+
+
+def _skip_or_exit(config: pytest.Config, capsys: pytest.CaptureFixture[str], stdout_line: str, message: str) -> None:
+    """SKIP this test; only an explicit standalone invocation ends the session.
+
+    Standalone runtime (see ``_is_explicit_standalone_runtime``): print
+    ``stdout_line`` (starts with ``SKIP:``) as a line-start stdout line
+    inside ``capsys.disabled()`` and ``pytest.exit(returncode=77)`` --
+    docs/dev/runtime-verification-policy.md's SKIP convention.
+
+    Every other shape (directory / mixed targets / no targets / xdist worker):
+    ``pytest.skip()`` on this item only and print nothing, so a broad
+    collection keeps running the remaining nodes. ``pytest.exit()`` inside an
+    xdist worker is fatal (``INTERNALERROR`` in ``xdist/dsession.py``), so the
+    worker case is always an item skip.
+    """
+    if _is_explicit_standalone_runtime(config):
+        with capsys.disabled():
+            print(stdout_line, flush=True)
+        pytest.exit(message, returncode=77)
+    pytest.skip(message)
 
 
 def _write_evidence_log(*, verdict: str, exit_code: int, reason: str, extra: dict) -> Path:
@@ -192,29 +236,49 @@ def _terminate_process_group_and_reap(process: subprocess.Popen) -> None:
         pass
 
 
-def test_ac9_producer_smoke_canary_against_issue_2584() -> None:
+def test_ac9_producer_smoke_canary_against_issue_2584(
+    request: pytest.FixtureRequest, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = request.config
     if os.environ.get(_ENABLE_ENV_VAR) != "1":
-        print(
+        _skip_or_exit(
+            config,
+            capsys,
             f"SKIP: {_ENABLE_ENV_VAR}=1 not set. AC9 is an explicit opt-in, "
             "one-time read-only producer smoke canary against Issue #2584 -- "
             "it is never run automatically (Out of Scope: standing CI "
-            "live-mutation gate)."
+            "live-mutation gate).",
+            f"SKIP: {_ENABLE_ENV_VAR} not enabled",
         )
-        _skip_or_exit(f"SKIP: {_ENABLE_ENV_VAR} not enabled", 77)
 
     gh = shutil.which("gh")
     if gh is None:
-        print("SKIP: gh CLI unavailable in PATH; cannot fetch the live Issue #2584 body")
-        _skip_or_exit("SKIP: producer smoke canary unavailable (gh not found)", 77)
+        _skip_or_exit(
+            config,
+            capsys,
+            "SKIP: gh CLI unavailable in PATH; cannot fetch the live Issue #2584 body",
+            "SKIP: producer smoke canary unavailable (gh not found)",
+        )
 
+    # Only the pre-launch availability check may be converted to a SKIP, and
+    # only for these explicit types. Failures after the producer starts (below)
+    # are never converted.
     try:
         auth = subprocess.run([gh, "auth", "status"], capture_output=True, text=True, timeout=15)
-    except OSError as exc:
-        print(f"SKIP: gh auth status could not be executed ({exc})")
-        _skip_or_exit("SKIP: producer smoke canary unavailable (gh auth exec failed)", 77)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _skip_or_exit(
+            config,
+            capsys,
+            f"SKIP: gh auth status could not be executed ({type(exc).__name__}: {exc})",
+            "SKIP: producer smoke canary unavailable (gh auth exec failed)",
+        )
     if auth.returncode != 0:
-        print("SKIP: gh is not authenticated in this runtime; cannot read Issue #2584 live")
-        _skip_or_exit("SKIP: producer smoke canary unavailable (gh auth unavailable)", 77)
+        _skip_or_exit(
+            config,
+            capsys,
+            "SKIP: gh is not authenticated in this runtime; cannot read Issue #2584 live",
+            "SKIP: producer smoke canary unavailable (gh auth unavailable)",
+        )
 
     assert _PRODUCE_SCRIPT.is_file(), f"canonical Step 2 producer script missing: {_PRODUCE_SCRIPT}"
 
