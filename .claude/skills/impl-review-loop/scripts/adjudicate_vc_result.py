@@ -705,8 +705,119 @@ def _runtime_only_current_head_binding_error(
     expected_issue_number: Any = None,
     expected_pr_number: Any = None,
 ) -> str | None:
-    """Return a fail-closed reason unless runtime_only current-head
-    independent binding (Issue / PR / current head / reviewed head / diff
+    """runtime_only current-head independent binding (Issue #2467)."""
+    return _current_head_binding_error(
+        reason_prefix="runtime_only",
+        contract_snapshot=contract_snapshot,
+        current_vc_result=current_vc_result,
+        diff_summary=diff_summary,
+        changed_paths=changed_paths,
+        changed_paths_present=changed_paths_present,
+        allowed_paths=allowed_paths,
+        expected_issue_number=expected_issue_number,
+        expected_pr_number=expected_pr_number,
+    )
+
+
+# Issue #2912: the pr_review_only INDEPENDENT route binds current-head evidence
+# exactly like runtime_only does (the same helper, so the two cannot drift),
+# but every reason code carries the `pr_review_only_` prefix and the report's
+# own PR number is bound as well. It never requires a GitHub workflow / check /
+# artifact identifier: it is selected only by
+# _pr_review_only_uses_independent_route() below.
+def _pr_review_only_current_head_binding_error(
+    *,
+    contract_snapshot: Any,
+    current_vc_result: Any,
+    diff_summary: Any,
+    changed_paths: list[str],
+    changed_paths_present: bool,
+    allowed_paths: list[str],
+    expected_issue_number: Any = None,
+    expected_pr_number: Any = None,
+) -> str | None:
+    return _current_head_binding_error(
+        reason_prefix="pr_review_only",
+        contract_snapshot=contract_snapshot,
+        current_vc_result=current_vc_result,
+        diff_summary=diff_summary,
+        changed_paths=changed_paths,
+        changed_paths_present=changed_paths_present,
+        allowed_paths=allowed_paths,
+        expected_issue_number=expected_issue_number,
+        expected_pr_number=expected_pr_number,
+        bind_report_pr_number=True,
+    )
+
+
+# Issue #2912: GitHub-specific trust markers. The mere PRESENCE of any of these
+# keys in the test_verdict (even with a null / empty / placeholder value) means
+# the report claims GitHub-derived provenance, so it must be validated by the
+# legacy _test_verdict_binding_error() and can never be independent evidence.
+# producer_kind / repository / run_id / run_url are descriptive only: allowed,
+# never required, never a trust root.
+_PR_REVIEW_ONLY_TRUST_MARKER_KEYS = (
+    "workflow_run_id",
+    "workflow_run_attempt",
+    "check_run_id",
+    "artifact",
+    "artifact_payload",
+    "artifact_payload_sha256",
+    "producer_receipt",
+    "receipt_sha256",
+)
+
+
+def _pr_review_only_uses_independent_route(test_verdict: Any, *, require_producer_receipt: bool) -> bool:
+    """Decide ONCE, before any per-item validation, which route a pr_review_only
+    adjudication takes (Issue #2912). Legacy (False) when any of:
+
+    1. --require-producer-receipt was requested,
+    2. test_verdict is not a dict (missing / None),
+    3. any GitHub trust marker KEY is present (regardless of its value), or
+    4. the dict is not a TEST_VERDICT_MACHINE/v2 report (a ``{"TEST_VERDICT": ...}``
+       wrapper, a different schema, or ``{}``): these must keep failing closed
+       through the legacy ``test_verdict_schema_mismatch`` validation.
+    """
+    if require_producer_receipt:
+        return False
+    if not isinstance(test_verdict, dict):
+        return False
+    if test_verdict.get("schema") != TEST_VERDICT_SCHEMA:
+        return False
+    return not any(key in test_verdict for key in _PR_REVIEW_ONLY_TRUST_MARKER_KEYS)
+
+
+def _is_pr_review_only_current_execution_pass(item: dict[str, Any]) -> bool:
+    """An adapter-derived current item that is an ACTUAL executed PASS (the
+    same per-command facts runtime_only requires)."""
+    return _is_runtime_only_current_execution_pass(item)
+
+
+def _is_pr_review_only_skip_echo(item: dict[str, Any]) -> bool:
+    """A current item that merely echoes a skip declaration (no execution)."""
+    return (
+        _is_producer_authorized_pr_review_only_skip(item)
+        or item.get("runner") == "skipped"
+        or item.get("classification") == "skipped"
+    )
+
+
+def _current_head_binding_error(
+    *,
+    reason_prefix: str,
+    contract_snapshot: Any,
+    current_vc_result: Any,
+    diff_summary: Any,
+    changed_paths: list[str],
+    changed_paths_present: bool,
+    allowed_paths: list[str],
+    expected_issue_number: Any = None,
+    expected_pr_number: Any = None,
+    bind_report_pr_number: bool = False,
+) -> str | None:
+    """Return a fail-closed reason unless an independent current-head
+    binding (Issue / PR / current head / reviewed head / diff
     head / Issue body digest / source integrity) is fully satisfied.
 
     Issue #2467 P1 review fix (PR #2483 REQUEST_CHANGES): the Issue / PR
@@ -715,28 +826,28 @@ def _runtime_only_current_head_binding_error(
     independently retrieved from the live Issue and current PR -- not merely
     positive-integer presence in the evidence payload itself."""
     if not isinstance(contract_snapshot, dict) or not isinstance(current_vc_result, dict):
-        return "runtime_only_binding_context_invalid"
+        return f"{reason_prefix}_binding_context_invalid"
     if not isinstance(diff_summary, dict):
-        return "runtime_only_diff_context_invalid"
+        return f"{reason_prefix}_diff_context_invalid"
 
     if contract_snapshot.get("status") != "go":
-        return "runtime_only_contract_not_go"
+        return f"{reason_prefix}_contract_not_go"
     contract_sha = contract_snapshot.get("body_sha256")
     if not _is_nonempty_string(contract_sha):
-        return "runtime_only_contract_body_sha256_missing"
+        return f"{reason_prefix}_contract_body_sha256_missing"
 
     if not _is_nonempty_string(current_vc_result.get("generated_at")):
-        return "runtime_only_generated_at_missing"
+        return f"{reason_prefix}_generated_at_missing"
     if current_vc_result.get("status") != "pass":
-        return "runtime_only_current_vc_result_not_pass"
+        return f"{reason_prefix}_current_vc_result_not_pass"
     if current_vc_result.get("errors") != []:
-        return "runtime_only_current_vc_result_errors_present"
+        return f"{reason_prefix}_current_vc_result_errors_present"
     if current_vc_result.get("fallback_detected") is not False:
-        return "runtime_only_fallback_detected"
+        return f"{reason_prefix}_fallback_detected"
     if current_vc_result.get("human_review_required") is not False:
-        return "runtime_only_human_review_required"
+        return f"{reason_prefix}_human_review_required"
     if current_vc_result.get("stop_condition_triggered") is not False:
-        return "runtime_only_stop_condition_triggered"
+        return f"{reason_prefix}_stop_condition_triggered"
 
     current_head = current_vc_result.get("head_sha")
     reviewed_head = current_vc_result.get("reviewed_head_sha")
@@ -746,40 +857,44 @@ def _runtime_only_current_head_binding_error(
         or current_head != reviewed_head
         or current_head != diff_head
     ):
-        return "runtime_only_head_binding_mismatch"
+        return f"{reason_prefix}_head_binding_mismatch"
 
     source = current_vc_result.get("source")
     if not isinstance(source, dict) or source.get("body_sha256") != contract_sha:
-        return "runtime_only_source_body_sha256_mismatch"
+        return f"{reason_prefix}_source_body_sha256_mismatch"
 
     issue_number = current_vc_result.get("issue")
     if isinstance(issue_number, bool) or not isinstance(issue_number, int) or issue_number <= 0:
-        return "runtime_only_issue_number_missing"
+        return f"{reason_prefix}_issue_number_missing"
     if (
         isinstance(expected_issue_number, bool)
         or not isinstance(expected_issue_number, int)
         or expected_issue_number <= 0
     ):
-        return "runtime_only_expected_issue_number_missing"
+        return f"{reason_prefix}_expected_issue_number_missing"
     if issue_number != expected_issue_number:
-        return "runtime_only_issue_number_mismatch"
+        return f"{reason_prefix}_issue_number_mismatch"
 
     pr_number = diff_summary.get("pr_number")
     if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0:
-        return "runtime_only_pr_number_missing"
+        return f"{reason_prefix}_pr_number_missing"
     if (
         isinstance(expected_pr_number, bool)
         or not isinstance(expected_pr_number, int)
         or expected_pr_number <= 0
     ):
-        return "runtime_only_expected_pr_number_missing"
+        return f"{reason_prefix}_expected_pr_number_missing"
     if pr_number != expected_pr_number:
-        return "runtime_only_pr_number_mismatch"
+        return f"{reason_prefix}_pr_number_mismatch"
+    if bind_report_pr_number and current_vc_result.get("pr_number") != expected_pr_number:
+        # Issue #2912: the independent pr_review_only route also binds the PR
+        # number the report itself claims, not only the diff summary's.
+        return f"{reason_prefix}_pr_number_mismatch"
 
     if changed_paths_present is not True:
-        return "runtime_only_changed_paths_missing"
+        return f"{reason_prefix}_changed_paths_missing"
     if not _all_changed_paths_allowed(changed_paths, allowed_paths):
-        return "runtime_only_changed_paths_not_certified"
+        return f"{reason_prefix}_changed_paths_not_certified"
 
     return None
 
@@ -1204,6 +1319,14 @@ def adjudicate_vc_result(
         )
         baseline_failure_index.update((entry["kind"], entry["key"]) for entry in norm["failure_keys"])
 
+    # Issue #2912: decide the pr_review_only route (independent current-head
+    # evidence vs legacy GitHub-artifact provenance) ONCE, before any per-item
+    # validation, so the per-item check, the binding check and the per_ac
+    # assembly below can never disagree about which route applies.
+    independent_pr_review_only = bool(excluded_pr_review_only_keys) and _pr_review_only_uses_independent_route(
+        test_verdict, require_producer_receipt=effective_require_producer_receipt
+    )
+
     # Issue #2467 P0-2 review fix: `current_order` records every current item
     # in its ORIGINAL (Issue declaration) order together with its kind
     # ("normal" / "pr_review_only" / "runtime_only") so per_ac can later be
@@ -1236,6 +1359,28 @@ def adjudicate_vc_result(
                 errors=[f"duplicate_current_ac_command_hash:{norm['ac']}"],
             )
         seen_current_keys.add(mapping_key)
+        if mapping_key in excluded_pr_review_only_keys and independent_pr_review_only:
+            # Issue #2912 independent route: the baseline envelope is scope
+            # authorization only. The CURRENT side must carry an ACTUAL
+            # executed PASS for this (ac, command_hash); a skip-envelope echo
+            # is not execution evidence and a non-PASS execution is never
+            # rewritten into PASS or covered by skip metadata.
+            if _is_pr_review_only_skip_echo(norm):
+                return _result(
+                    overall_status="indeterminate", per_ac=[], rerun_required=True,
+                    source_integrity=source_integrity, evidence_refs=evidence_refs,
+                    errors=[f"pr_review_only_independent_requires_executed_item:{norm['ac']}"],
+                )
+            if not _is_pr_review_only_current_execution_pass(norm):
+                return _result(
+                    overall_status="indeterminate", per_ac=[], rerun_required=True,
+                    source_integrity=source_integrity, evidence_refs=evidence_refs,
+                    errors=[f"pr_review_only_current_execution_not_pass:{norm['ac']}"],
+                )
+            excluded_current_count += 1
+            excluded_current_keys.add(mapping_key)
+            current_order.append({"kind": "pr_review_only", "norm": norm})
+            continue
         if mapping_key in excluded_pr_review_only_keys:
             if not _is_producer_authorized_pr_review_only_skip(norm):
                 return _result(
@@ -1283,14 +1428,26 @@ def adjudicate_vc_result(
         )
 
     if excluded_pr_review_only_keys:
-        binding_error = _test_verdict_binding_error(
-            test_verdict,
-            contract_snapshot=contract_snapshot,
-            current_vc_result=current_vc_result,
-            diff_summary=diff_summary,
-            expected_keys=set(baseline_by_key) | excluded_pr_review_only_keys,
-            require_producer_receipt=effective_require_producer_receipt,
-        )
+        if independent_pr_review_only:
+            binding_error = _pr_review_only_current_head_binding_error(
+                contract_snapshot=contract_snapshot,
+                current_vc_result=current_vc_result,
+                diff_summary=diff_summary,
+                changed_paths=changed_paths,
+                changed_paths_present=changed_paths_present,
+                allowed_paths=normalized_allowed,
+                expected_issue_number=expected_issue_number,
+                expected_pr_number=expected_pr_number,
+            )
+        else:
+            binding_error = _test_verdict_binding_error(
+                test_verdict,
+                contract_snapshot=contract_snapshot,
+                current_vc_result=current_vc_result,
+                diff_summary=diff_summary,
+                expected_keys=set(baseline_by_key) | excluded_pr_review_only_keys,
+                require_producer_receipt=effective_require_producer_receipt,
+            )
         if binding_error is not None:
             return _result(
                 overall_status="indeterminate", per_ac=[], rerun_required=True,
@@ -1367,6 +1524,23 @@ def adjudicate_vc_result(
     for entry in current_order:
         norm = entry["norm"]
         if entry["kind"] == "pr_review_only":
+            if independent_pr_review_only:
+                # Issue #2912: the independent route ALWAYS keeps the resolved
+                # entry at its Issue declaration position (like runtime_only),
+                # so per_ac matches --expected-command-hashes-file in order
+                # even for ordinary + pr_review_only + runtime_only scopes.
+                per_ac.append(
+                    {
+                        "ac": norm["ac"],
+                        "status": "pass",
+                        "blocking": False,
+                        "command_hash": norm["command_hash"],
+                        "failure_keys": [],
+                        "reason_code": "pr_review_only_runtime_evidence_pass",
+                        "summary": "pr_review_only scope is covered by independent current-head executed PASS evidence",
+                    }
+                )
+                continue
             if has_normal_current:
                 continue
             per_ac.append(
