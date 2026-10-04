@@ -52,6 +52,7 @@ Issue #2843 追加 mode:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -59,9 +60,11 @@ import re
 import secrets
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -82,6 +85,8 @@ EXIT_OK = 0
 EXIT_FAIL = 1
 EXIT_INVALID_INVOCATION = 2
 EXIT_SKIP = 77
+# Issue #2906: explicit GC が一部の candidate を hold / 失敗 / 打ち切りにした (= 完全成功ではない) 場合の exit code。
+EXIT_GC_PARTIAL = 3
 
 TRUSTED_REPO = "squne121/loop-protocol"
 
@@ -2504,6 +2509,485 @@ def _git(args: list[str], *, cwd: Path, timeout: float = 60.0) -> subprocess.Com
     return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, timeout=timeout, check=False)
 
 
+# ---------------------------------------------------------------------------
+# Issue #2906: 使い捨て worktree の owner 保護 / 回収 (orphan GC)
+#
+# 設計の要点 (daemon / registry / lease / 新 schema は導入しない):
+#   - owner 情報 = holder 直下の `.canary-owner` marker。`git worktree add` より前に作り、その open file
+#     description に `flock` を掛ける。lock は launcher (子プロセス) へ `pass_fds` で継承されるため、親が
+#     SIGKILL されても子が生きている間は lock が残り、GC は「使用中」と判定できる。親 PID の生死や mtime は
+#     使わない。
+#   - GC は holder / 対応 branch / 現在の Git state を一体で判定し、保護対象なら holder も branch も触らない。
+#   - 回収は確定した完全 path への `git worktree remove` と対応 branch の削除だけ。repository 全域の
+#     `git worktree prune` は使わず、Git が拒否した対象を Python の再帰削除で迂回しない。
+# ---------------------------------------------------------------------------
+DISPOSABLE_OWNER_MARKER_NAME = ".canary-owner"
+DISPOSABLE_OWNER_MARKER_VERSION = 1
+_DISPOSABLE_HOLDER_NAME_RE = re.compile(
+    rf"{re.escape(CANONICAL_WORKFLOW_DISPOSABLE_HOLDER_PREFIX)}([A-Za-z0-9_]{{8}})"
+)
+_DISPOSABLE_BRANCH_NAME_RE = re.compile(
+    rf"{re.escape(CANONICAL_WORKFLOW_DISPOSABLE_BRANCH_PREFIX)}([A-Za-z0-9_]{{8}})"
+)
+# owner 情報のない既存 holder (legacy) の「作られて間もないので猶予する」期間。回収の十分条件ではない。
+DISPOSABLE_LEGACY_GRACE_SECONDS = 24 * 3600.0
+# 自動 GC (canary 準備前に best-effort で呼ぶ) の上限。回収を試みた candidate 数と総実行時間で bounded。
+DISPOSABLE_AUTO_GC_MAX_CANDIDATES = 3
+DISPOSABLE_AUTO_GC_TIME_BUDGET_SECONDS = 60.0
+DISPOSABLE_GIT_REMOVE_TIMEOUT_SECONDS = 120.0
+DISPOSABLE_GIT_QUERY_TIMEOUT_SECONDS = 30.0
+_DISPOSABLE_OWNER_LOCK_ATTEMPTS = 20
+_DISPOSABLE_OWNER_LOCK_RETRY_SECONDS = 0.1
+
+# holder (str) -> marker に flock を掛けた fd。launcher へ pass_fds で継承させ、cleanup で閉じる。
+_OWNER_LOCK_FDS: dict[str, int] = {}
+
+
+def _git_try(args: list[str], *, cwd: Path, timeout: float) -> tuple[int, str, str]:
+    """`_git` を例外なしで呼ぶ。timeout / 起動失敗は returncode=-1 (stderr に理由) として返す。"""
+    try:
+        result = _git(args, cwd=cwd, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return -1, "", "timeout"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return -1, "", type(exc).__name__
+    return result.returncode, result.stdout, result.stderr
+
+
+def _remaining_seconds(deadline: float | None, default: float) -> float:
+    if deadline is None:
+        return default
+    return max(1.0, min(default, deadline - time.monotonic()))
+
+
+def _proc_start_ticks() -> int | None:
+    """marker に残す最小限のプロセス識別情報 (Linux の自プロセス start time)。取得できなければ None。"""
+    try:
+        stat_text = Path("/proc/self/stat").read_text(encoding="utf-8")
+        return int(stat_text.rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _establish_owner(holder: Path, suffix: str) -> int:
+    """`git worktree add` より前に owner 情報を確立する。marker を作って flock を掛け、fd を返す。
+    lock fd は `_OWNER_LOCK_FDS` に登録され、launcher 起動時に `pass_fds` で継承させる。"""
+    marker = holder / DISPOSABLE_OWNER_MARKER_NAME
+    fd = os.open(str(marker), os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        # GC が作成直後の marker を一瞬 probe している場合に備え、待たずに短く再試行するだけ。
+        for attempt in range(_DISPOSABLE_OWNER_LOCK_ATTEMPTS):
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if attempt == _DISPOSABLE_OWNER_LOCK_ATTEMPTS - 1:
+                    raise
+                time.sleep(_DISPOSABLE_OWNER_LOCK_RETRY_SECONDS)
+        payload = {
+            "marker_version": DISPOSABLE_OWNER_MARKER_VERSION,
+            "suffix": suffix,
+            "pid": os.getpid(),
+            "created_at": _now_iso(),
+            "proc_start_ticks": _proc_start_ticks(),
+        }
+        os.write(fd, json.dumps(payload, sort_keys=True).encode("utf-8"))
+    except BaseException:
+        os.close(fd)
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+        raise
+    _OWNER_LOCK_FDS[str(holder)] = fd
+    return fd
+
+
+def _owner_lock_pass_fds(worktree: Path | None) -> tuple[int, ...]:
+    """launcher (子プロセス) へ継承させる owner lock fd。親が死んでも子が生きている間は lock が残る。
+    owner 情報を持たない worktree (テストの差し替え等) では空。"""
+    if worktree is None:
+        return ()
+    fd = _OWNER_LOCK_FDS.get(str(worktree.parent))
+    return (fd,) if fd is not None else ()
+
+
+def _release_owner_lock(holder: Path) -> None:
+    fd = _OWNER_LOCK_FDS.pop(str(holder), None)
+    if fd is not None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _probe_owner(holder: Path, suffix: str) -> tuple[str, int | None]:
+    """holder の owner 状態を非待機で判定する。返り値 (state, fd)。
+    state: live (lock 保持者あり) / dead (lock を取得でき marker が正当) / indeterminate / legacy (marker なし)。
+    dead のときだけ fd を返す (呼び出し側が回収完了まで lock を保持し、最後に閉じる)。"""
+    marker = holder / DISPOSABLE_OWNER_MARKER_NAME
+    try:
+        marker_stat = os.lstat(marker)
+    except FileNotFoundError:
+        return "legacy", None
+    except OSError:
+        return "indeterminate", None
+    if not stat.S_ISREG(marker_stat.st_mode):
+        return "indeterminate", None
+    try:
+        fd = os.open(str(marker), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return "indeterminate", None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return "live", None
+    except OSError:
+        os.close(fd)
+        return "indeterminate", None
+    try:
+        payload = json.loads(os.read(fd, 4096).decode("utf-8"))
+    except (OSError, ValueError):
+        payload = None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("marker_version") != DISPOSABLE_OWNER_MARKER_VERSION
+        or payload.get("suffix") != suffix
+        or not isinstance(payload.get("pid"), int)
+    ):
+        os.close(fd)
+        return "indeterminate", None
+    return "dead", fd
+
+
+def _list_worktree_registrations(canonical_worktree: Path, *, timeout: float) -> dict[str, dict] | None:
+    """`git worktree list --porcelain` を path (realpath) -> 状態 dict にする。読めなければ None。"""
+    rc, out, _err = _git_try(["worktree", "list", "--porcelain"], cwd=canonical_worktree, timeout=timeout)
+    if rc != 0:
+        return None
+    entries: dict[str, dict] = {}
+    for block in out.split("\n\n"):
+        fields: dict[str, str] = {}
+        for line in block.splitlines():
+            key, _sep, value = line.partition(" ")
+            fields[key] = value
+        raw_path = fields.get("worktree")
+        if not raw_path:
+            continue
+        branch = fields.get("branch")
+        if branch is not None and branch.startswith("refs/heads/"):
+            branch = branch[len("refs/heads/"):]
+        entries[os.path.realpath(raw_path)] = {
+            "path": raw_path,
+            "branch": branch,
+            "locked": "locked" in fields,
+            "prunable": "prunable" in fields,
+            "detached": "detached" in fields,
+            "bare": "bare" in fields,
+        }
+    return entries
+
+
+def _branch_exists(canonical_worktree: Path, branch: str, *, timeout: float) -> bool | None:
+    rc, _out, _err = _git_try(
+        ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], cwd=canonical_worktree, timeout=timeout
+    )
+    if rc == 0:
+        return True
+    return False if rc == 1 else None
+
+
+def _unexpected_working_state(target: Path, branch: str, *, timeout: float) -> str | None:
+    """worktree の想定外の working state。None = 想定どおり (clean、または canary 自身の fixture file だけ)。
+    `--no-optional-locks` で index を更新しない (dry-run を無変更に保つ)。"""
+    if _disposable_worktree_identity(target)[0] != branch:
+        return "head_not_expected_branch"
+    rc, out, _err = _git_try(
+        ["--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        cwd=target,
+        timeout=timeout,
+    )
+    if rc != 0:
+        return "working_state_unreadable"
+    allowed_dir = CLASSIFIER_SEMANTICS_FIXTURE_DIR + "/"
+    for entry in out.split("\0"):
+        if not entry:
+            continue
+        status_code, path = entry[:2], entry[3:]
+        if status_code == "??" and (path == CANONICAL_WORKFLOW_FIXTURE_BODY_RELPATH or path.startswith(allowed_dir)):
+            continue
+        return "unexpected_working_state"
+    return None
+
+
+def _reclaim_disposable_resources(
+    canonical_worktree: Path,
+    *,
+    holder: Path,
+    target: Path,
+    branch: str,
+    registration: dict | None,
+    deadline: float | None,
+) -> tuple[str, str | None]:
+    """確定した candidate の資源を安全な順序で回収する (GC と `finally` の共通手順)。
+    順序: 対象 path への `git worktree remove` -> 対応 branch 削除 -> marker 除去 + 空 holder の `rmdir`。
+    owner 情報 (marker) は branch 削除完了まで残すため、途中で中断しても次回に続きから回収できる。
+    返り値 (action, reason): action は reclaimed / hold。Git が拒否した対象を再帰削除で迂回しない。"""
+    query_timeout = _remaining_seconds(deadline, DISPOSABLE_GIT_QUERY_TIMEOUT_SECONDS)
+    if registration is not None:
+        rc, _out, err = _git_try(
+            ["worktree", "remove", "--force", registration["path"]],
+            cwd=canonical_worktree,
+            timeout=_remaining_seconds(deadline, DISPOSABLE_GIT_REMOVE_TIMEOUT_SECONDS),
+        )
+        regs = _list_worktree_registrations(canonical_worktree, timeout=query_timeout)
+        if regs is None:
+            return "hold", "worktree_state_unreadable_after_remove"
+        if os.path.realpath(registration["path"]) in regs:
+            return "hold", "worktree_remove_timeout" if err == "timeout" else "worktree_remove_rejected"
+        if os.path.lexists(target):
+            return "hold", "worktree_dir_remains_after_remove"
+    else:
+        regs = _list_worktree_registrations(canonical_worktree, timeout=query_timeout)
+        if regs is None:
+            return "hold", "worktree_state_unreadable"
+        if os.path.lexists(target):
+            return "hold", "worktree_unregistered_present"
+
+    exists = _branch_exists(canonical_worktree, branch, timeout=query_timeout)
+    if exists is None:
+        return "hold", "branch_state_unreadable"
+    if exists:
+        if any(entry["branch"] == branch for entry in regs.values()):
+            return "hold", "branch_checked_out_elsewhere"
+        rc, _out, _err = _git_try(["branch", "-D", "--", branch], cwd=canonical_worktree, timeout=query_timeout)
+        if rc != 0 and _branch_exists(canonical_worktree, branch, timeout=query_timeout) is not False:
+            return "hold", "branch_delete_failed"
+
+    try:
+        holder_stat = os.lstat(holder)
+    except FileNotFoundError:
+        return "reclaimed", None
+    except OSError:
+        return "hold", "holder_unreadable"
+    if not stat.S_ISDIR(holder_stat.st_mode):
+        return "hold", "holder_not_directory"
+    try:
+        extras = set(os.listdir(holder)) - {DISPOSABLE_OWNER_MARKER_NAME}
+        if extras:
+            return "hold", "unexpected_holder_entries"
+        marker = holder / DISPOSABLE_OWNER_MARKER_NAME
+        if os.path.lexists(marker):
+            marker.unlink()
+        holder.rmdir()
+    except OSError:
+        return "hold", "holder_cleanup_failed"
+    return "reclaimed", None
+
+
+def _disposable_worktrees_root(canonical_worktree: Path) -> Path | None:
+    rc, out, _err = _git_try(
+        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        cwd=canonical_worktree,
+        timeout=DISPOSABLE_GIT_QUERY_TIMEOUT_SECONDS,
+    )
+    if rc != 0 or not out.strip():
+        return None
+    return Path(os.path.realpath(Path(out.strip()).parent / ".claude" / "worktrees"))
+
+
+def _discover_disposable_candidates(root: Path, regs: dict[str, dict]) -> dict[str, dict]:
+    """filesystem 上の holder と Git の worktree 登録を突き合わせる。holder の存在を前提にしない。
+    suffix -> {"holder": bool, "registration": dict | None}。厳密な名前一致のものだけを candidate にする。"""
+    candidates: dict[str, dict] = {}
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        names = []
+    for name in names:
+        match = _DISPOSABLE_HOLDER_NAME_RE.fullmatch(name)
+        if match:
+            candidates.setdefault(match.group(1), {"holder": False, "registration": None})["holder"] = True
+    for key, registration in regs.items():
+        path = Path(key)
+        match = _DISPOSABLE_HOLDER_NAME_RE.fullmatch(path.parent.name)
+        if path.name == "wt" and match and path.parent.parent == root:
+            candidates.setdefault(match.group(1), {"holder": False, "registration": None})["registration"] = (
+                registration
+            )
+    return candidates
+
+
+def _evaluate_disposable_candidate(
+    root: Path,
+    suffix: str,
+    info: dict,
+    regs: dict[str, dict],
+    *,
+    allow_legacy: bool,
+    legacy_grace_seconds: float,
+    deadline: float | None,
+) -> tuple[str, str | None, int | None]:
+    """candidate 1 件を holder / branch / Git state 一体で判定する。返り値 (verdict, reason, lock_fd)。
+    verdict: reclaim (回収してよい) / hold (理由付き保護)。lock_fd は reclaim かつ owner が dead のときだけ
+    非 None (呼び出し側が回収完了まで保持して閉じる)。保護を弱める方向の判定は置かない。"""
+    holder = root / (CANONICAL_WORKFLOW_DISPOSABLE_HOLDER_PREFIX + suffix)
+    target = holder / "wt"
+    branch = CANONICAL_WORKFLOW_DISPOSABLE_BRANCH_PREFIX + suffix
+    registration = info.get("registration")
+    query_timeout = _remaining_seconds(deadline, DISPOSABLE_GIT_QUERY_TIMEOUT_SECONDS)
+    lock_fd: int | None = None
+    try:
+        if info.get("holder"):
+            try:
+                holder_stat = os.lstat(holder)
+            except OSError:
+                return "hold", "holder_unreadable", None
+            if stat.S_ISLNK(holder_stat.st_mode):
+                return "hold", "holder_is_symlink", None
+            if not stat.S_ISDIR(holder_stat.st_mode):
+                return "hold", "holder_not_directory", None
+            owner, lock_fd = _probe_owner(holder, suffix)
+            if owner == "live":
+                return "hold", "owner_live", None
+            if owner == "indeterminate":
+                return "hold", "owner_indeterminate", None
+            if owner == "legacy":
+                # TTL / mtime は「最近作られたので猶予する」判定にだけ使い、回収の十分条件にしない。
+                if time.time() - holder_stat.st_mtime < legacy_grace_seconds:
+                    return "hold", "legacy_within_grace", None
+                if not allow_legacy:
+                    return "hold", "legacy_owner_unknown", None
+                if registration is None:
+                    return "hold", "legacy_without_registration", None
+            try:
+                extras = set(os.listdir(holder)) - {"wt", DISPOSABLE_OWNER_MARKER_NAME}
+            except OSError:
+                return "hold", "holder_unreadable", None
+            if extras:
+                return "hold", "unexpected_holder_entries", None
+            if registration is None and os.path.lexists(target):
+                return "hold", "worktree_unregistered_present", None
+        else:
+            # holder は消えたが Git 登録だけ残る状態。path と branch 名が一致して初めて所有を確定できる。
+            if registration is None or registration["branch"] != branch:
+                return "hold", "ambiguous_registration", None
+
+        if registration is not None:
+            if registration["bare"]:
+                return "hold", "ambiguous_registration", None
+            if registration["locked"]:
+                return "hold", "worktree_locked", None
+            if registration["branch"] != branch:
+                return "hold", (
+                    "foreign_branch_checked_out" if registration["branch"] else "head_not_expected_branch"
+                ), None
+            if info.get("holder") and not registration["prunable"] and os.path.lexists(target):
+                unexpected = _unexpected_working_state(target, branch, timeout=query_timeout)
+                if unexpected is not None:
+                    return "hold", unexpected, None
+        for key, entry in regs.items():
+            if entry["branch"] == branch and key != os.path.realpath(target):
+                return "hold", "branch_checked_out_elsewhere", None
+        verdict_fd, lock_fd = lock_fd, None
+        return "reclaim", None, verdict_fd
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
+def gc_disposable_worktrees(
+    canonical_worktree: Path,
+    *,
+    dry_run: bool = False,
+    allow_legacy: bool = False,
+    max_candidates: int | None = None,
+    time_budget_seconds: float | None = None,
+    legacy_grace_seconds: float = DISPOSABLE_LEGACY_GRACE_SECONDS,
+) -> dict:
+    """canary 自身が作った使い捨て worktree の残骸だけを回収する orphan GC。
+    candidate ごとに失敗を局所化し (1 件の失敗 / timeout / 例外が他 candidate を止めない)、non-waiting
+    (lock 競合は待たず hold)。dry_run は何も変更せず候補と hold 理由だけを返す。
+    `max_candidates` は回収を試みる件数の上限、`time_budget_seconds` は総実行時間の上限。"""
+    report: dict = {"dry_run": dry_run, "candidates": [], "outcome": "complete", "truncated": False}
+    deadline = time.monotonic() + time_budget_seconds if time_budget_seconds is not None else None
+    root = _disposable_worktrees_root(canonical_worktree)
+    if root is None:
+        report.update(outcome="failed", error="git_common_dir_unresolved")
+        return report
+    regs = _list_worktree_registrations(
+        canonical_worktree, timeout=_remaining_seconds(deadline, DISPOSABLE_GIT_QUERY_TIMEOUT_SECONDS)
+    )
+    if regs is None:
+        report.update(outcome="failed", error="worktree_state_unreadable")
+        return report
+    attempted = 0
+    candidates = _discover_disposable_candidates(root, regs)
+    for suffix in sorted(candidates):
+        entry = {"holder": CANONICAL_WORKFLOW_DISPOSABLE_HOLDER_PREFIX + suffix, "action": "hold", "reason": None}
+        report["candidates"].append(entry)
+        if (deadline is not None and time.monotonic() >= deadline) or (
+            max_candidates is not None and attempted >= max_candidates
+        ):
+            entry.update(action="deferred", reason="gc_budget_exhausted")
+            report["truncated"] = True
+            continue
+        lock_fd: int | None = None
+        try:
+            verdict, reason, lock_fd = _evaluate_disposable_candidate(
+                root,
+                suffix,
+                candidates[suffix],
+                regs,
+                allow_legacy=allow_legacy,
+                legacy_grace_seconds=legacy_grace_seconds,
+                deadline=deadline,
+            )
+            if verdict == "hold":
+                entry.update(action="hold", reason=reason)
+            elif dry_run:
+                entry.update(action="would_reclaim", reason=None)
+            else:
+                attempted += 1
+                holder = root / entry["holder"]
+                action, reason = _reclaim_disposable_resources(
+                    canonical_worktree,
+                    holder=holder,
+                    target=holder / "wt",
+                    branch=CANONICAL_WORKFLOW_DISPOSABLE_BRANCH_PREFIX + suffix,
+                    registration=candidates[suffix].get("registration"),
+                    deadline=deadline,
+                )
+                entry.update(action=action, reason=reason)
+        except Exception as exc:  # noqa: BLE001 - candidate 1 件の例外で他 candidate / canary を止めない
+            entry.update(action="failed", reason=f"exception:{type(exc).__name__}")
+        finally:
+            if lock_fd is not None:
+                try:
+                    os.close(lock_fd)
+                except OSError:
+                    pass
+        if entry["action"] not in ("reclaimed", "would_reclaim"):
+            report["outcome"] = "partial"
+    if report["truncated"]:
+        report["outcome"] = "partial"
+    return report
+
+
+def _auto_gc_disposable_worktrees(canonical_worktree: Path) -> None:
+    """canary の準備前に呼ぶ best-effort / bounded / non-waiting の自動 GC。失敗しても通常 canary を止めない。
+    legacy holder は自動 GC では回収しない (explicit GC の opt-in のみ)。"""
+    try:
+        gc_disposable_worktrees(
+            canonical_worktree,
+            max_candidates=DISPOSABLE_AUTO_GC_MAX_CANDIDATES,
+            time_budget_seconds=DISPOSABLE_AUTO_GC_TIME_BUDGET_SECONDS,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _prepare_disposable_worktree(canonical_worktree: Path) -> tuple[Path | None, str | None]:
     """current HEAD の使い捨て linked worktree を `.claude/worktrees/` 配下に作る。
     `origin` は trusted repo、`main` ref が存在することを確認する（update_pr.py が使う
@@ -2527,27 +3011,45 @@ def _prepare_disposable_worktree(canonical_worktree: Path) -> tuple[Path | None,
     target = holder / "wt"
     branch = _disposable_branch_name(target)
     if branch is None:
-        shutil.rmtree(holder, ignore_errors=True)
+        try:
+            holder.rmdir()
+        except OSError:
+            pass
         return None, "disposable_worktree_branch_name_unresolved"
+    # owner 情報は `git worktree add` より前に確立する (作成中の holder / branch を GC が回収しないため)。
+    try:
+        _establish_owner(holder, branch[len(CANONICAL_WORKFLOW_DISPOSABLE_BRANCH_PREFIX):])
+    except OSError:
+        try:
+            holder.rmdir()
+        except OSError:
+            pass
+        return None, "disposable_worktree_owner_unavailable"
     # detached にしない: impl-review-loop preparation は detached HEAD を停止条件にする。canary 自身が
     # 作る一意名の使い捨て branch で作成し、cleanup ではこの branch だけを消す。
-    added = _git(["worktree", "add", "-b", branch, str(target), "HEAD"], cwd=canonical_worktree, timeout=120.0)
-    if added.returncode != 0:
-        shutil.rmtree(holder, ignore_errors=True)
+    added_ok = False
+    try:
+        added_ok = _git(
+            ["worktree", "add", "-b", branch, str(target), "HEAD"], cwd=canonical_worktree, timeout=120.0
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        added_ok = False
+    if not added_ok:
+        # post-checkout hook の失敗等で、登録 / branch だけが残りうる。残っていれば同じ安全な削除手順で回収する
+        # (無条件 rmtree で Git の保護を迂回しない)。回収できなければ marker が残り、次回 GC が続きから回収する。
+        _cleanup_disposable_worktree_safely(canonical_worktree, target)
         return None, "disposable_worktree_add_failed"
     return target, None
 
 
 def _disposable_branch_name(target: Path) -> str | None:
     """disposable worktree (`<holder>/wt`) に対応する canary 自作 branch 名。holder 名 (mkdtemp 由来の一意
-    suffix) から決定的に導く。holder 名が canary の prefix 形でなければ None (= branch を作らない / 消さない)。"""
-    holder_name = target.parent.name
-    if not holder_name.startswith(CANONICAL_WORKFLOW_DISPOSABLE_HOLDER_PREFIX):
+    suffix) から決定的に導く。holder 名が canary の prefix 形 (厳密一致) でなければ None
+    (= branch を作らない / 消さない)。"""
+    match = _DISPOSABLE_HOLDER_NAME_RE.fullmatch(target.parent.name)
+    if match is None:
         return None
-    suffix = holder_name[len(CANONICAL_WORKFLOW_DISPOSABLE_HOLDER_PREFIX):]
-    if not re.fullmatch(r"[A-Za-z0-9_]{1,32}", suffix):
-        return None
-    return f"{CANONICAL_WORKFLOW_DISPOSABLE_BRANCH_PREFIX}{suffix}"
+    return f"{CANONICAL_WORKFLOW_DISPOSABLE_BRANCH_PREFIX}{match.group(1)}"
 
 
 def _disposable_worktree_identity(target: Path) -> tuple[str | None, str | None]:
@@ -2569,13 +3071,46 @@ def _disposable_worktree_identity(target: Path) -> tuple[str | None, str | None]
 
 
 def _remove_disposable_worktree(canonical_worktree: Path, target: Path) -> None:
+    """自分が作った使い捨て worktree を安全な手順で回収する (`finally` 用)。repository 全域の
+    `git worktree prune` や無条件の `rmtree` は行わない。Git が remove を拒否 / timeout した場合は
+    作業ディレクトリを残し、marker を残して次回 GC に委ねる。"""
+    holder = target.parent
     branch = _disposable_branch_name(target)
-    _git(["worktree", "remove", "--force", str(target)], cwd=canonical_worktree, timeout=120.0)
-    shutil.rmtree(target.parent, ignore_errors=True)
-    _git(["worktree", "prune"], cwd=canonical_worktree)
-    # canary 自身が作った branch (prefix 厳密一致) だけを削除する。他の branch には触れない。
-    if branch is not None and branch.startswith(CANONICAL_WORKFLOW_DISPOSABLE_BRANCH_PREFIX):
-        _git(["branch", "-D", "--", branch], cwd=canonical_worktree)
+    try:
+        if branch is None:
+            return
+        try:
+            holder_stat = os.lstat(holder)
+        except FileNotFoundError:
+            holder_stat = None
+        if holder_stat is not None and not stat.S_ISDIR(holder_stat.st_mode):
+            return  # symlink / 想定外の型の holder には触れない
+        regs = _list_worktree_registrations(canonical_worktree, timeout=DISPOSABLE_GIT_QUERY_TIMEOUT_SECONDS)
+        if regs is None:
+            return
+        registration = regs.get(os.path.realpath(target))
+        if registration is not None and registration["branch"] not in (None, branch):
+            return  # canary 名の holder 内で foreign branch が checkout されている: 作業を失わせない
+        _reclaim_disposable_resources(
+            canonical_worktree,
+            holder=holder,
+            target=target,
+            branch=branch,
+            registration=registration,
+            deadline=None,
+        )
+    finally:
+        _release_owner_lock(holder)
+
+
+def _cleanup_disposable_worktree_safely(canonical_worktree: Path, target: Path | None) -> None:
+    """cleanup の失敗・例外で canary 本来の結果を覆さない (`finally` 呼び出し側 / prepare 失敗経路)。"""
+    if target is None:
+        return
+    try:
+        _remove_disposable_worktree(canonical_worktree, target)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _lib_sh_policy_sha256(lib_sh: Path) -> str:
@@ -2694,6 +3229,7 @@ def _run_canonical_workflow_side(
     """1 side（1 標本）を actual launcher / actual Auto parent で実行する。fake `gh` だけを
     canary 所有の PATH shim として差し込み、real `gh` には決してフォールバックしない。
     返り値は (side detail, unavailable_reason)。"""
+    _auto_gc_disposable_worktrees(canonical_worktree)  # best-effort / bounded / non-waiting。失敗しても続行
     worktree, reason = _prepare_disposable_worktree(canonical_worktree)
     if worktree is None:
         return {}, reason
@@ -2737,6 +3273,7 @@ def _run_canonical_workflow_side(
                 text=True,
                 timeout=timeout,
                 check=False,
+                pass_fds=_owner_lock_pass_fds(worktree),  # 親が死んでも子が生きている間は owner lock が残る
             )
             launcher_exit, stdout, stderr = result.returncode, result.stdout, result.stderr
         except subprocess.TimeoutExpired as exc:
@@ -2764,7 +3301,7 @@ def _run_canonical_workflow_side(
         return detail, None
     finally:
         shutil.rmtree(shim_dir, ignore_errors=True)
-        _remove_disposable_worktree(canonical_worktree, worktree)
+        _cleanup_disposable_worktree_safely(canonical_worktree, worktree)
 
 
 def _canonical_worktree_precondition(worktree: Path | None) -> str | None:
@@ -3195,6 +3732,7 @@ def decide_classifier_semantics(positive: str, negative: str) -> tuple[int, str]
 def _run_classifier_semantics_case(
     canonical_worktree: Path, case: str, *, timeout: float = 360.0
 ) -> tuple[dict, str | None]:
+    _auto_gc_disposable_worktrees(canonical_worktree)  # best-effort / bounded / non-waiting。失敗しても続行
     worktree, reason = _prepare_disposable_worktree(canonical_worktree)
     if worktree is None:
         return {}, reason
@@ -3216,6 +3754,7 @@ def _run_classifier_semantics_case(
                 text=True,
                 timeout=timeout,
                 check=False,
+                pass_fds=_owner_lock_pass_fds(worktree),  # 親が死んでも子が生きている間は owner lock が残る
             )
         except subprocess.TimeoutExpired:
             return {"case": case, "classification": "unverified", "reason": "runtime_timeout", "sample_count": 1}, None
@@ -3236,7 +3775,7 @@ def _run_classifier_semantics_case(
         detail["transcript_digest"] = _sha256_text(result.stdout + "\n" + result.stderr)
         return detail, None
     finally:
-        _remove_disposable_worktree(canonical_worktree, worktree)
+        _cleanup_disposable_worktree_safely(canonical_worktree, worktree)
 
 
 def run_classifier_semantics_canary(worktree: Path | None) -> tuple[int, dict]:
@@ -3542,7 +4081,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mode",
-        required=True,
+        default=None,
         choices=(
             "agy",
             "github",
@@ -3562,7 +4101,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--canonical-workflow-worktree",
         type=Path,
         default=None,
-        help="Issue #2843 の canonical-workflow-delegation / classifier-semantics が使う明示 linked worktree path",
+        help="Issue #2843 の canonical-workflow-delegation / classifier-semantics が使う明示 linked worktree path"
+        "（--gc-disposable-worktrees では GC 対象 repository の worktree path。省略時はこの script の repository）",
+    )
+    parser.add_argument(
+        "--gc-disposable-worktrees",
+        action="store_true",
+        help="Issue #2906: canary が作った使い捨て worktree / branch の残骸だけを回収する explicit GC。"
+        "--mode を要求せず、Claude / GitHub / policy / evidence には入らない。"
+        "完全成功は exit 0、hold / 失敗 / 打ち切りがあれば exit 3（候補と理由は stdout の JSON）",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="--gc-disposable-worktrees 用: refs・worktree 登録・filesystem を一切変更せず候補と hold 理由だけを返す",
+    )
+    parser.add_argument(
+        "--gc-include-legacy",
+        action="store_true",
+        help="--gc-disposable-worktrees 用の明示 opt-in: owner 情報のない legacy holder を、Git state が"
+        "安全（unlocked・想定 branch・clean）で猶予期間を過ぎている場合に限り回収する",
     )
     parser.add_argument(
         "--baseline-policy-commit",
@@ -3619,6 +4177,22 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def run_explicit_disposable_gc(args: argparse.Namespace) -> int:
+    """`--gc-disposable-worktrees` の独立した早期 dispatch。git 以外は起動しない
+    （Claude / gh / proxy / policy 取得 / evidence 出力には入らない）。"""
+    if args.mode is not None:
+        print("invalid invocation: --gc-disposable-worktrees does not take --mode", file=sys.stderr)
+        return EXIT_INVALID_INVOCATION
+    target = args.canonical_workflow_worktree if args.canonical_workflow_worktree is not None else REPO_ROOT
+    report = gc_disposable_worktrees(
+        target, dry_run=args.dry_run, allow_legacy=args.gc_include_legacy
+    )
+    print(json.dumps({"gc_disposable_worktrees": report}, sort_keys=True))
+    if report["outcome"] == "complete":
+        return EXIT_OK
+    return EXIT_FAIL if report["outcome"] == "failed" else EXIT_GC_PARTIAL
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     try:
@@ -3627,6 +4201,19 @@ def main(argv: list[str] | None = None) -> int:
         code = exc.code
         if code in (0, None):
             return EXIT_OK
+        return EXIT_INVALID_INVOCATION
+
+    if args.gc_disposable_worktrees:
+        return run_explicit_disposable_gc(args)
+    if args.dry_run or args.gc_include_legacy:
+        print(
+            "invalid invocation: --dry-run / --gc-include-legacy require --gc-disposable-worktrees",
+            file=sys.stderr,
+        )
+        return EXIT_INVALID_INVOCATION
+    if args.mode is None:
+        parser.print_usage(sys.stderr)
+        print("auto_mode_canary.py: error: the following arguments are required: --mode", file=sys.stderr)
         return EXIT_INVALID_INVOCATION
 
     if args.baseline_policy_commit is not None and args.mode != "canonical-workflow-delegation":
