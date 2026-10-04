@@ -143,17 +143,37 @@ def evaluate_role_subagent(
     }
 
 
-_INCONCLUSIVE_RE = re.compile(r"status[\"']?\s*[:=]\s*[\"']?inconclusive\b", re.IGNORECASE)
+def _status_re(value: str) -> "re.Pattern[str]":
+    return re.compile(rf"status[\"']?\s*[:=]\s*[\"']?{value}\b", re.IGNORECASE)
+
+
+_STATUS_OK_RE = _status_re("ok")
+_STATUS_REJECTED_RES = (_status_re("inconclusive"), _status_re("failed"))
+_NOT_DEFINED_RE = re.compile(
+    r"\bnot\s+defined\b|\bundefined\b|\bnot\s+found\b|未定義|定義(?:は|が)?(?:され)?(?:て)?(?:い)?(?:ま)?(?:せ)?(?:ん|ない)",
+    re.IGNORECASE,
+)
+_DEFINED_RE = re.compile(r"\bdefined\b|定義(?:され|あり|済)", re.IGNORECASE)
+HAIKU_TARGET_RELATIVE_PATH = "scripts/agent-ops/tests/_claude_gpt_role_subagent_smoke.py"
+HAIKU_TARGET_SYMBOL = "validate_haiku_handback"
 
 
 def validate_haiku_handback(text: str) -> bool:
-    """`codebase-investigator` に頼んだ調査結果（docs の `CLAUDE_CODE_AUTO_COMPACT_WINDOW` の値）を含むこと。
+    """`codebase-investigator` の実 result（`status: ok`）が `validate_haiku_handback` の「定義あり」を報告すること。
 
-    `status: inconclusive` の hand-back は、たまたま値の文字列を含んでいても PASS にしない
-    （値を特定できなかったという SubAgent 自身の報告を、要求結果の取得とは扱わない）。"""
-    if _INCONCLUSIVE_RE.search(text):
+    次はいずれも PASS にしない: `status: inconclusive` / `status: failed` / `INSUFFICIENT_CONTEXT`、
+    `not defined` / 未定義、symbol 名を含まない report、`status: ok` を持たない text（prompt の echo 等）。"""
+    if any(marker in text for marker in CONTEXT_STARVED_MARKERS):
         return False
-    return "272000" in text
+    if any(rx.search(text) for rx in _STATUS_REJECTED_RES):
+        return False
+    if not _STATUS_OK_RE.search(text):
+        return False
+    if HAIKU_TARGET_SYMBOL not in text:
+        return False
+    if _NOT_DEFINED_RE.search(text):
+        return False
+    return bool(_DEFINED_RE.search(text))
 
 
 def validate_sonnet_handback(text: str) -> bool:
@@ -161,22 +181,19 @@ def validate_sonnet_handback(text: str) -> bool:
     return bool(re.search(r"assessment[\"']?\s*[:=]\s*[\"']?(clear|findings)\b", text))
 
 
-HAIKU_TARGET_RELATIVE_PATH = "scripts/claude-gpt/tests/test_minimal_default_contract.py"
-HAIKU_TARGET_SYMBOL = "EXPECTED_ADDED_ENV"
-
-
 def haiku_prompt(repo_root: str) -> str:
-    # 調査対象は literal が明示的に書かれた Python の module-level 定数にする。AGY 委譲側
-    # （local_asset_research / Serena）は、shell script 内の変数代入（旧: lib.sh）や Markdown では
-    # symbol を抽出できず `inconclusive` になることが live で観測された。Python の named symbol なら抽出できる。
+    # 要求を「Python の regular file 内の関数が定義されているかの存在確認」に絞っている。
+    # 当初は値（`CLAUDE_*_COMPACT_WINDOW` の 272000）や行番号を要求したが、AGY/Serena の
+    # `local_asset_research` 経路は .sh / .md / .py のいずれでも値抽出で `status: inconclusive` を返し、
+    # 行番号を誤って報告した（実際の 149 を 170 と報告）。どちらも role routing の検証対象ではなく、
+    # AGY が信頼して返せないため、値・行番号の要求は取り下げた。directory の target_path は
+    # context_file_missing で拒否され、Serena は Python のみ対応する。
     return (
         "You are running inside an automated runtime smoke test. Use the Agent tool exactly once with "
         f"subagent_type \"{HAIKU_AGENT}\". Give the SubAgent exactly this task: "
         f"target_path: {repo_root}/{HAIKU_TARGET_RELATIVE_PATH} ; target_symbol: {HAIKU_TARGET_SYMBOL} ; "
-        f"purpose: {HAIKU_TARGET_SYMBOL} is a module-level dict constant in that Python file; report the "
-        "string value mapped to the key CLAUDE_CODE_AUTO_COMPACT_WINDOW and the line number of that entry ; "
-        "context_file: pass that same Python file itself as the single --context-file of the delegation "
-        "request so the delegate receives its full text (do not substitute a summary or a different file) ; "
+        f"purpose: confirm whether the Python function {HAIKU_TARGET_SYMBOL} is defined in that file "
+        "(answer defined or not defined; no line number needed) ; "
         "agy_advisory_native_fallback_allowed: true. Wait for the SubAgent to finish, then reply with the "
         "SubAgent's report verbatim."
     )

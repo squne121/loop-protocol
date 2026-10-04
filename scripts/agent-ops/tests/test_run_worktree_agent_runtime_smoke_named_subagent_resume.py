@@ -698,9 +698,41 @@ def _real_shape_role_stream(
     return stream.text()
 
 
+# live で観測された `codebase-investigator` の `status: ok` shape（存在確認）。
+_HAIKU_OK_HANDBACK = (
+    "CODEBASE_INVESTIGATION_RESULT_V1\n"
+    '{"schema_version": 1, "status": "ok", "investigation_route": "local_asset_research", '
+    '"discovery_summary": "The Python function validate_haiku_handback is defined in '
+    '_claude_gpt_role_subagent_smoke.py.", "failure_reason": null}'
+)
+_HAIKU_NEGATIVES = {
+    "not_defined": 'CODEBASE_INVESTIGATION_RESULT_V1\n{"status": "ok", "discovery_summary": '
+                   '"validate_haiku_handback is not defined in the file."}',
+    "status_inconclusive": 'CODEBASE_INVESTIGATION_RESULT_V1\n{"status": "inconclusive", '
+                           '"discovery_summary": "validate_haiku_handback is defined but unverified"}',
+    "status_failed": 'CODEBASE_INVESTIGATION_RESULT_V1\n{"status": "failed", '
+                     '"failure_reason": "validate_haiku_handback is defined? wrapper failed"}',
+    "insufficient_context": "INSUFFICIENT_CONTEXT: validate_haiku_handback is defined\nstatus: ok",
+    "empty": "",
+    "echoed_prompt": ROLE.haiku_prompt("/repo"),
+    "status_ok_without_symbol": '{"status": "ok", "discovery_summary": "the function is defined"}',
+    "status_ok_japanese_undefined": '{"status": "ok", "discovery_summary": "validate_haiku_handback は未定義"}',
+}
+
+
+@pytest.mark.parametrize("label", sorted(_HAIKU_NEGATIVES))
+def test_validate_haiku_handback_rejects_non_confirming_reports(label):
+    assert ROLE.validate_haiku_handback(_HAIKU_NEGATIVES[label]) is False, label
+
+
+def test_validate_haiku_handback_accepts_the_live_ok_defined_shape_and_japanese_variant():
+    assert ROLE.validate_haiku_handback(_HAIKU_OK_HANDBACK) is True
+    assert ROLE.validate_haiku_handback("status: ok\nvalidate_haiku_handback は定義されています") is True
+
+
 def test_role_subagent_real_shape_handback_is_taken_from_subagent_handback_tool_use():
     haiku = _evaluate_role(
-        _real_shape_role_stream(ROLE.HAIKU_AGENT, handback="CLAUDE_GPT_AUTO_COMPACT_WINDOW=272000 (lib.sh)"),
+        _real_shape_role_stream(ROLE.HAIKU_AGENT, handback=_HAIKU_OK_HANDBACK),
         ROLE.HAIKU_AGENT, ROLE.validate_haiku_handback)
     assert haiku["ok"] is True and haiku["parent_handback"] is True, haiku
     sonnet = _evaluate_role(
@@ -713,19 +745,18 @@ def test_role_subagent_real_shape_handback_is_taken_from_subagent_handback_tool_
     "label, kwargs",
     [
         ("subagent_handback_absent", dict(handback=None)),
-        ("agent_tool_result_missing", dict(handback="272000", agent_result=False)),
-        ("agent_tool_result_is_error", dict(handback="272000", agent_is_error=True)),
-        ("handback_tool_result_failed", dict(handback="272000", handback_success=False)),
-        ("handback_belongs_to_another_agent_call", dict(handback="272000", handback_parent="toolu_other")),
+        ("agent_tool_result_missing", dict(handback=_HAIKU_OK_HANDBACK, agent_result=False)),
+        ("agent_tool_result_is_error", dict(handback=_HAIKU_OK_HANDBACK, agent_is_error=True)),
+        ("handback_tool_result_failed", dict(handback=_HAIKU_OK_HANDBACK, handback_success=False)),
+        ("handback_belongs_to_another_agent_call", dict(handback=_HAIKU_OK_HANDBACK, handback_parent="toolu_other")),
         ("context_starved_handback", dict(handback="INSUFFICIENT_CONTEXT")),
         ("requested_result_missing", dict(handback="I could not find the value.")),
-        # 値を特定できなかった `status: inconclusive` の report は、値の文字列を含んでいても PASS にしない。
-        ("inconclusive_without_value",
-         dict(handback="status: inconclusive\nfailure_reason: shell symbol extraction failed")),
-        ("inconclusive_even_if_value_string_echoed",
-         dict(handback="status: inconclusive\nfailure_reason: could not confirm 272000")),
+        ("not_defined", dict(handback=_HAIKU_NEGATIVES["not_defined"])),
+        ("status_inconclusive", dict(handback=_HAIKU_NEGATIVES["status_inconclusive"])),
+        ("status_failed", dict(handback=_HAIKU_NEGATIVES["status_failed"])),
+        ("echoed_prompt_without_result", dict(handback=_HAIKU_NEGATIVES["echoed_prompt"])),
         # prompt (Agent tool_use input) carries the requested value, but nothing was handed back.
-        ("value_only_in_dispatch_prompt", dict(handback=None, prompt_text="the value is 272000")),
+        ("value_only_in_dispatch_prompt", dict(handback=None, prompt_text="validate_haiku_handback is defined")),
     ],
 )
 def test_role_subagent_real_shape_negative_controls_are_never_a_pass(label, kwargs):
@@ -741,7 +772,7 @@ def _evaluate_role(stdout: str, agent_type: str, validator) -> dict:
 
 def test_role_subagent_handback_normal_controls_pass():
     haiku = _evaluate_role(
-        _role_stream(ROLE.HAIKU_AGENT, handback="CLAUDE_GPT_AUTO_COMPACT_WINDOW is 272000 (lib.sh)"),
+        _role_stream(ROLE.HAIKU_AGENT, handback=_HAIKU_OK_HANDBACK),
         ROLE.HAIKU_AGENT, ROLE.validate_haiku_handback)
     assert haiku["ok"] is True, haiku
     sonnet = _evaluate_role(
@@ -757,10 +788,11 @@ def test_role_subagent_handback_normal_controls_pass():
         ("no_parent_handback", dict(handback=None)),
         ("context_starved_stop", dict(handback="INSUFFICIENT_CONTEXT")),
         ("requested_result_missing", dict(handback="I could not find the value.")),
-        ("inconclusive_without_value", dict(handback="status: inconclusive\nfailure_reason: no value found")),
-        ("spawn_never_started", dict(handback="272000", start=False)),
-        ("stop_precedes_start", dict(handback="272000", stop_before_start=True)),
-        ("different_subagent_type_requested", dict(handback="272000", call_type="general-purpose")),
+        ("status_inconclusive", dict(handback=_HAIKU_NEGATIVES["status_inconclusive"])),
+        ("not_defined", dict(handback=_HAIKU_NEGATIVES["not_defined"])),
+        ("spawn_never_started", dict(handback=_HAIKU_OK_HANDBACK, start=False)),
+        ("stop_precedes_start", dict(handback=_HAIKU_OK_HANDBACK, stop_before_start=True)),
+        ("different_subagent_type_requested", dict(handback=_HAIKU_OK_HANDBACK, call_type="general-purpose")),
     ],
 )
 def test_role_subagent_handback_negative_controls_are_never_a_pass(label, kwargs):
@@ -1677,12 +1709,16 @@ def test_freshness_rejects_recorded_evidence_of_a_failed_run():
     assert MODULE.freshness_record_from_evidence(evidence)["runner_exit_code"] == 1
 
 
-def test_haiku_prompt_targets_a_python_literal_not_a_shell_variable():
+def test_haiku_prompt_requests_an_existence_check_of_a_python_function_in_a_regular_file():
     prompt = ROLE.haiku_prompt("/repo")
-    assert f"/repo/{ROLE.HAIKU_TARGET_RELATIVE_PATH}" in prompt and ROLE.HAIKU_TARGET_RELATIVE_PATH.endswith(".py")
+    assert f"target_path: /repo/{ROLE.HAIKU_TARGET_RELATIVE_PATH}" in prompt
+    assert ROLE.HAIKU_TARGET_RELATIVE_PATH == "scripts/agent-ops/tests/_claude_gpt_role_subagent_smoke.py"
     assert f"target_symbol: {ROLE.HAIKU_TARGET_SYMBOL}" in prompt
-    assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" in prompt and "lib.sh" not in prompt
-    # 調査対象 file が実際に symbol と literal を持つ（prompt と対象の乖離を static に固定する）。
-    target = (REPO_ROOT / ROLE.HAIKU_TARGET_RELATIVE_PATH).read_text(encoding="utf-8")
-    assert f"{ROLE.HAIKU_TARGET_SYMBOL} = {{" in target
-    assert any("CLAUDE_CODE_AUTO_COMPACT_WINDOW" in line and "272000" in line for line in target.splitlines())
+    assert ROLE.HAIKU_TARGET_SYMBOL == "validate_haiku_handback"
+    assert "defined or not defined" in prompt and "agy_advisory_native_fallback_allowed: true" in prompt
+    # 値 / 行番号 / shell 変数 / directory は要求しない。
+    assert "272000" not in prompt and "lib.sh" not in prompt and "COMPACT_WINDOW" not in prompt
+    # 調査対象は regular Python file で、symbol が実際に def されている。
+    target = REPO_ROOT / ROLE.HAIKU_TARGET_RELATIVE_PATH
+    assert target.is_file() and target.suffix == ".py"
+    assert f"def {ROLE.HAIKU_TARGET_SYMBOL}(" in target.read_text(encoding="utf-8")
