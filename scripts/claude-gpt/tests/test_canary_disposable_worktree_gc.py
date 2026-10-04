@@ -162,9 +162,9 @@ def _wrap_git(monkeypatch, hook):
     """canary._git の差し込み。hook(args, cwd, timeout, real) が None 以外を返せばそれを結果にする。"""
     real = canary._git
 
-    def wrapper(args, *, cwd, timeout=60.0):
+    def wrapper(args, *, cwd, timeout=60.0, **kwargs):
         injected = hook(list(args), cwd, timeout, real)
-        return injected if injected is not None else real(args, cwd=cwd, timeout=timeout)
+        return injected if injected is not None else real(args, cwd=cwd, timeout=timeout, **kwargs)
 
     monkeypatch.setattr(canary, "_git", wrapper)
 
@@ -392,6 +392,19 @@ def test_gc_remove_rejected_never_falls_back_to_rmtree(tmp_path, monkeypatch):
     assert (target2 / "x.txt").read_text(encoding="utf-8") == "x\n"
     assert str(Path(os.path.realpath(target2))) in _porcelain(repo) and _branch_of(target2) in _branches(repo)
     assert (target2.parent / canary.DISPOSABLE_OWNER_MARKER_NAME).is_file()
+
+    # (f) 保護判定を通った (想定内の fixture file だけの) worktree でも、remove が timeout すれば迂回削除せず hold。
+    target3 = _prepare_in_dead_child(repo)
+    fixture3 = target3 / canary.CANONICAL_WORKFLOW_FIXTURE_BODY_RELPATH
+    fixture3.parent.mkdir(parents=True)
+    fixture3.write_text("fixture\n", encoding="utf-8")
+    with monkeypatch.context() as patch:
+        _wrap_git(patch, timeout_on_remove)
+        _no_rmtree(patch)
+        canary._remove_disposable_worktree(repo, target3)
+    assert fixture3.read_text(encoding="utf-8") == "fixture\n"
+    assert str(Path(os.path.realpath(target3))) in _porcelain(repo) and _branch_of(target3) in _branches(repo)
+    assert (target3.parent / canary.DISPOSABLE_OWNER_MARKER_NAME).is_file()
 
 
 # ---------------------------------------------------------------------------
@@ -864,8 +877,14 @@ def test_gc_candidate_failure_does_not_stop_others_or_canary(tmp_path, monkeypat
     assert [c["action"] for c in report["candidates"]].count("reclaimed") == 1
     assert [c["action"] for c in report["candidates"]].count("deferred") == 2
     assert report["truncated"] and report["outcome"] == "partial"
+    # 総時間 budget が最初から尽きている場合は、deadline 後に新しい git query を 1 本も始めない
+    # (#2906 P2-2: 1 秒の最小 timeout を復活させない)。候補の列挙にも git query が要るため、candidate は
+    # 列挙されず、truncated / partial で何も回収せず次回に持ち越す。
     report = canary.gc_disposable_worktrees(repo, time_budget_seconds=0.0)
-    assert {c["action"] for c in report["candidates"]} == {"deferred"} and report["truncated"]
+    assert report["truncated"] and report["outcome"] == "partial" and report["error"] == "gc_budget_exhausted"
+    assert not [c for c in report["candidates"] if c["action"] == "reclaimed"]
+    assert all(_branch_of(t) in _branches(repo) for t in dead if t.parent.exists())
+    assert sum(1 for t in dead if t.parent.exists()) == 2  # max_candidates=1 の回収で 1 件だけが消えている
     assert canary.gc_disposable_worktrees(repo)["outcome"] == "complete"
     assert not any(t.parent.exists() for t in dead)
 
@@ -909,3 +928,391 @@ def test_gc_candidate_failure_does_not_stop_others_or_canary(tmp_path, monkeypat
     assert side_reason3 is None and side3["side_outcome"] == "unavailable"
     assert not stale.parent.exists() and _branch_of(stale) not in _branches(repo)
     canary._release_owner_lock(contended)
+
+
+# ---------------------------------------------------------------------------
+# fix_delta iteration 1 (OWNER REQUEST_CHANGES): 追加の回帰 test
+# ---------------------------------------------------------------------------
+def _holder_names(repo: Path) -> list[str]:
+    root = repo / ".claude" / "worktrees"
+    return sorted(p.name for p in root.iterdir() if p.name.startswith(HOLDER_PREFIX)) if root.exists() else []
+
+
+def _make_dead_marker_holder(repo: Path, suffix: str) -> Path:
+    """owner が終了済み (marker は有効だが lock 保持者なし) の holder + 対応 branch。worktree 登録は持たない。"""
+    root = repo / ".claude" / "worktrees"
+    root.mkdir(parents=True, exist_ok=True)
+    holder = root / f"{HOLDER_PREFIX}{suffix}"
+    holder.mkdir()
+    canary._establish_owner(holder, suffix)
+    canary._release_owner_lock(holder)
+    _git_ok("branch", f"{BRANCH_PREFIX}{suffix}", cwd=repo)
+    return holder
+
+
+_DESCENDANT_LAUNCHER = """
+import os, sys, time
+if os.fork() == 0:
+    # 子孫 (launcher timeout 後も生き残る): 継承した owner lock fd を保持したまま release file を待つ。
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for stdio in (0, 1, 2):
+        os.dup2(devnull, stdio)
+    open({pid_file!r}, "w").write(str(os.getpid()))
+    stop = time.time() + 90
+    while not os.path.exists({release!r}) and time.time() < stop:
+        time.sleep(0.05)
+    os._exit(0)
+{extra}
+time.sleep(120)
+"""
+
+
+def _drive_side(mode: str, repo: Path, launcher: Path, monkeypatch, *, timeout: float):
+    """canary の実 call site を駆動する。canonical-workflow は `_run_canonical_workflow_side`、
+    classifier-semantics は `_run_classifier_semantics_case` (launcher は module 定数を差し替える)。
+    どちらも `_owner_lock_pass_fds` の実 launcher 経路と `finally` の `_cleanup_disposable_worktree_safely` を通る。"""
+    if mode == "canonical":
+        return canary._run_canonical_workflow_side(
+            launcher, repo, canary.canonical_workflow_prompt(), timeout=timeout
+        )
+    with monkeypatch.context() as patch:
+        patch.setattr(canary, "CLAUDE_GPT_LAUNCHER", launcher)
+        return canary._run_classifier_semantics_case(repo, "positive", timeout=timeout)
+
+
+@pytest.mark.parametrize("mode", ["canonical", "classifier"])
+def test_finally_cleanup_holds_while_descendant_owns_lock_after_launcher_timeout(tmp_path, monkeypatch, mode):
+    """GIVEN launcher が子孫 (owner lock fd を継承) を残したまま timeout で kill される
+    WHEN canary の両 mode の実 call site (`finally` の `_cleanup_disposable_worktree_safely`) が走る
+    THEN 子孫が生きている間は holder / worktree / marker / branch が残る (timeout は owner 終了ではない)。
+         子孫が終了すれば次の GC が回収する。通常の (git 管理外の) dirty file は self-cleanup で消えない。
+    mutation 対象: `_remove_disposable_worktree` が保護判定なしで `git worktree remove --force` に進む退行
+    """
+    repo = _make_repo(tmp_path)
+    pid_file, release = tmp_path / "descendant.pid", tmp_path / "descendant.release"
+    launcher = _fake_launcher(
+        tmp_path / "launcher-descendant.py",
+        _DESCENDANT_LAUNCHER.format(pid_file=str(pid_file), release=str(release), extra=""),
+    )
+    descendant_pid = None
+    try:
+        detail, reason = _drive_side(mode, repo, launcher, monkeypatch, timeout=3.0)
+        assert reason is None
+        if mode == "canonical":
+            assert detail["timed_out"] is True  # launcher timeout が実際に発火した
+        else:
+            assert detail["reason"] == "runtime_timeout"
+        assert _wait_for(lambda: pid_file.exists() and pid_file.read_text(encoding="utf-8").strip() != "")
+        descendant_pid = int(pid_file.read_text(encoding="utf-8"))
+        os.kill(descendant_pid, 0)  # launcher は kill されたが子孫は生存している
+
+        holders = _holder_names(repo)
+        assert len(holders) == 1, holders
+        holder = repo / ".claude" / "worktrees" / holders[0]
+        branch = BRANCH_PREFIX + holders[0][len(HOLDER_PREFIX):]
+        assert (holder / "wt").is_dir() and (holder / canary.DISPOSABLE_OWNER_MARKER_NAME).is_file()
+        assert branch in _branches(repo) and str(Path(os.path.realpath(holder / "wt"))) in _porcelain(repo)
+        report = canary.gc_disposable_worktrees(repo, dry_run=True)
+        assert _entry(report, holders[0])["reason"] == "owner_live"
+    finally:
+        release.write_text("go", encoding="utf-8")
+        if descendant_pid is not None:
+            assert _wait_for(
+                lambda: _entry(canary.gc_disposable_worktrees(repo, dry_run=True), holders[0])["reason"] != "owner_live"
+            )
+    # 子孫の終了後に、次の GC が回収する
+    assert _entry(canary.gc_disposable_worktrees(repo), holders[0])["action"] == "reclaimed"
+    assert not holder.exists() and branch not in _branches(repo)
+
+    # 通常の dirty file (git 管理外・fixture 以外) は launcher 正常終了後の self-cleanup でも消えない。
+    notes_launcher = _fake_launcher(
+        tmp_path / "launcher-notes.py",
+        "import sys\nopen('notes.txt', 'w').write('precious\\n')\nsys.exit(0)\n",
+    )
+    detail, reason = _drive_side(mode, repo, notes_launcher, monkeypatch, timeout=60.0)
+    assert reason is None
+    holders = _holder_names(repo)
+    assert len(holders) == 1, holders
+    holder = repo / ".claude" / "worktrees" / holders[0]
+    branch = BRANCH_PREFIX + holders[0][len(HOLDER_PREFIX):]
+    assert (holder / "wt" / "notes.txt").read_text(encoding="utf-8") == "precious\n"
+    assert branch in _branches(repo) and (holder / canary.DISPOSABLE_OWNER_MARKER_NAME).is_file()
+    held = _entry(canary.gc_disposable_worktrees(repo), holders[0])
+    assert (held["action"], held["reason"]) == ("hold", "unexpected_working_state")
+    (holder / "wt" / "notes.txt").unlink()
+    assert _entry(canary.gc_disposable_worktrees(repo), holders[0])["action"] == "reclaimed"
+
+
+def test_worktree_add_hook_inherits_owner_fd_when_parent_is_sigkilled(tmp_path):
+    """GIVEN `git worktree add` の post-checkout hook が進行中 (実 hook が block)
+    WHEN `_prepare_disposable_worktree` を実行している Python 親だけを SIGKILL する
+    THEN git / hook が owner lock fd を継承しているため GC は owner_live で hold し、holder / branch は残る。
+         hook が終われば owner は終了済みになり GC が回収できる
+    mutation 対象: `git worktree add` へ owner fd を `pass_fds` で渡さない退行
+    """
+    repo = _make_repo(tmp_path)
+    started, release, hook_pid_file = tmp_path / "hook-started", tmp_path / "hook-release", tmp_path / "hook.pid"
+    hook = repo / ".git" / "hooks" / "post-checkout"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f"echo $$ > {hook_pid_file}\n"
+        f"touch {started}\n"
+        "i=0\n"
+        f"while [ ! -e {release} ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    root = repo / ".claude" / "worktrees"
+    parent = subprocess.Popen(
+        [sys.executable, "-c", _CHILD_PREPARE, str(CANARY_PY), str(repo)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert _wait_for(started.exists), "post-checkout hook did not start"
+        hook_pid = int(hook_pid_file.read_text(encoding="utf-8").strip())
+        parent.send_signal(signal.SIGKILL)  # Python 親だけを kill (git / hook は生存)
+        parent.wait(timeout=30)
+        os.kill(hook_pid, 0)
+        holders = [p for p in root.iterdir() if p.name.startswith(HOLDER_PREFIX)]
+        assert len(holders) == 1
+        holder = holders[0]
+        branch = BRANCH_PREFIX + holder.name[len(HOLDER_PREFIX):]
+        assert branch in _branches(repo)
+        before = _snapshot(repo)
+        report = canary.gc_disposable_worktrees(repo, allow_legacy=True, legacy_grace_seconds=0.0)
+        entry = _entry(report, holder.name)
+        assert (entry["action"], entry["reason"]) == ("hold", "owner_live")
+        assert _snapshot(repo) == before and holder.is_dir() and branch in _branches(repo)
+    finally:
+        release.write_text("go", encoding="utf-8")
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait(timeout=30)
+    assert _wait_for(
+        lambda: _entry(canary.gc_disposable_worktrees(repo, dry_run=True), holder.name)["reason"] != "owner_live"
+    )
+    hook.unlink()
+    assert _entry(canary.gc_disposable_worktrees(repo), holder.name)["action"] == "reclaimed"
+    assert not holder.exists() and branch not in _branches(repo)
+
+
+def _patch_root_listdir_permission_error(monkeypatch, root: Path):
+    real_listdir = os.listdir
+
+    def listdir(path="."):
+        if os.path.realpath(path) == str(root):
+            raise PermissionError(13, "injected", str(path))
+        return real_listdir(path)
+
+    monkeypatch.setattr(os, "listdir", listdir)
+
+
+def test_gc_candidate_discovery_permission_error_never_reclaims(tmp_path, monkeypatch):
+    """GIVEN worktrees root の列挙だけが PermissionError になる (live owner の worktree + dead owner の残骸がある)
+    WHEN explicit / dry-run / 自動 GC / canary call site を実行する
+    THEN holder 不在とは見なさず何も回収しない (outcome は complete にならず理由が残る)。
+         自動 GC / canary は raise しない。
+         root 不在 (FileNotFoundError) だけが「holder 確認済みで不在」。registration-only の判定でも
+         holder の再出現・判定不能は保護側に倒す
+    mutation 対象: `_discover_disposable_candidates` が `except OSError: names = []` に戻る退行
+    """
+    repo = _make_repo(tmp_path)
+    live_target, reason = canary._prepare_disposable_worktree(repo)  # この process が owner lock を保持 (live)
+    assert live_target is not None and reason is None
+    dead_target = _prepare_in_dead_child(repo)
+    root = _root(repo)
+    before = _snapshot(repo)
+    try:
+        with monkeypatch.context() as patch:
+            _patch_root_listdir_permission_error(patch, root)
+            for kwargs in ({}, {"dry_run": True}, {"allow_legacy": True, "legacy_grace_seconds": 0.0}):
+                report = canary.gc_disposable_worktrees(repo, **kwargs)
+                assert report["outcome"] == "failed" and report["candidates"] == [], report
+                assert report["error"] == "candidate_discovery_indeterminate:PermissionError"
+            canary._auto_gc_disposable_worktrees(repo)  # raise しない
+            launcher = _fake_launcher(tmp_path / "ok-launcher.py", "import sys\nsys.exit(0)\n")
+            side, side_reason = canary._run_canonical_workflow_side(
+                launcher, repo, canary.canonical_workflow_prompt(), timeout=60.0
+            )
+            assert side_reason is None and side["launcher_exit_code"] == 0
+        assert _snapshot(repo) == before  # live / dead どちらの holder・登録・branch も不変
+        assert live_target.is_dir() and dead_target.is_dir()
+
+        # root 不在 (FileNotFoundError) は「holder 確認済みで不在」: 列挙失敗とは区別される。
+        ghost_regs: dict = {}
+        assert canary._discover_disposable_candidates(root / "does-not-exist", ghost_regs) == {}
+
+        # registration-only 判定: 判定時点で holder が存在する (再出現) なら回収しない。
+        regs = canary._list_worktree_registrations(repo)
+        registration = regs[os.path.realpath(live_target)]
+        verdict, why, fd = canary._evaluate_disposable_candidate(
+            root, _suffix(live_target), {"holder": False, "registration": registration}, regs,
+            allow_legacy=False, legacy_grace_seconds=0.0, deadline=None,
+        )
+        assert (verdict, why, fd) == ("hold", "holder_reappeared", None)
+    finally:
+        canary._remove_disposable_worktree(repo, live_target)
+    assert not live_target.parent.exists()
+
+
+def test_auto_gc_persistent_failures_do_not_starve_healthy_candidates(tmp_path):
+    """GIVEN 回収が永続的に失敗する candidate (branch ref の `.lock` で `git branch -D` が失敗) が試行上限より多く、
+            その後ろに健全な candidate がある
+    WHEN 自動 GC を繰り返し呼ぶ (件数 / 試行数 / 時間は bounded)
+    THEN 失敗が先頭の枠を占有し続けず、健全な candidate がいずれ回収される。`.lock` file は触られない
+    mutation 対象: 走査開始位置の回転を外す / 失敗した試行を成功件数として数えない上限を外す退行
+    """
+    repo = _make_repo(tmp_path)
+    failing = []
+    locks: dict[Path, int] = {}
+    for index in range(8):
+        suffix = f"fail000{index}"
+        holder = _make_dead_marker_holder(repo, suffix)
+        lock = repo / ".git" / "refs" / "heads" / f"{BRANCH_PREFIX}{suffix}.lock"
+        lock.write_text("", encoding="utf-8")
+        locks[lock] = lock.stat().st_mtime_ns
+        failing.append(holder)
+    healthy = _make_dead_marker_holder(repo, "zzzzzzzz")
+
+    # 先頭固定 (旧挙動相当) では、失敗が試行枠を使い切り後続の健全な candidate は永久に deferred になる。
+    for _ in range(3):
+        report = canary.gc_disposable_worktrees(
+            repo, max_candidates=3, max_attempts=6, time_budget_seconds=60.0, start_offset=0
+        )
+        reasons = [c["reason"] for c in report["candidates"]]
+        assert reasons.count("branch_delete_failed") == 6  # 総試行数は max_attempts で bounded
+        assert _entry(report, healthy.name)["action"] == "deferred" and report["truncated"]
+    assert healthy.is_dir()
+
+    # 自動 GC (開始位置が回転する) を繰り返せば、健全な candidate はいずれ回収される。
+    for _ in range(80):
+        canary._auto_gc_disposable_worktrees(repo)
+        if not healthy.exists():
+            break
+    assert not healthy.exists() and f"{BRANCH_PREFIX}zzzzzzzz" not in _branches(repo)
+    for holder in failing:  # 失敗した candidate は marker / branch を残し、`.lock` は一切触らない
+        assert (holder / canary.DISPOSABLE_OWNER_MARKER_NAME).is_file()
+        assert f"{BRANCH_PREFIX}{holder.name[len(HOLDER_PREFIX):]}" in _branches(repo)
+    for lock, mtime_ns in locks.items():
+        assert lock.is_file() and lock.stat().st_mtime_ns == mtime_ns
+
+
+def _install_git_shim(tmp_path: Path, monkeypatch, rules: list[dict]) -> tuple[Path, Path]:
+    """PATH 先頭に置く `git` shim。rules に一致する subcommand は sleep してから実 git を exec する。
+    全 invocation を (開始時刻, args) として log に残す。返り値は (log, rules file)。"""
+    shim_dir = tmp_path / "git-shim"
+    shim_dir.mkdir()
+    log, rules_file = tmp_path / "git-shim.log", tmp_path / "git-shim-rules.json"
+    rules_file.write_text(json.dumps(rules), encoding="utf-8")
+    real_git = shutil.which("git")
+    assert real_git
+    shim = shim_dir / "git"
+    shim.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys, time\n"
+        "args = sys.argv[1:]\n"
+        f"open({str(log)!r}, 'a').write(json.dumps({{'t': time.time(), 'args': args}}) + '\\n')\n"
+        f"for rule in json.load(open({str(rules_file)!r})):\n"
+        "    if all(token in args for token in rule['match']):\n"
+        "        time.sleep(rule['seconds'])\n"
+        "        break\n"
+        f"os.execv({real_git!r}, [{real_git!r}] + args)\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    return log, rules_file
+
+
+def _shim_calls(log: Path) -> list[dict]:
+    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()] if log.exists() else []
+
+
+def test_gc_time_budget_is_enforced_per_git_call_and_exhaustion_defers(tmp_path, monkeypatch):
+    """GIVEN 総時間 budget が短く、実 git (shim 経由) が特定の subcommand で遅延する
+    WHEN GC を実行する (identity query 中 / `git worktree remove` 後の branch 検証中に deadline を超える)
+    THEN deadline 後に新しい git query / branch 削除を始めず、各 git 呼び出しの timeout は残り時間で bounded
+         (identity query も 60 秒ではない)。中断した candidate は marker / branch を残して deferred、
+         report は truncated / partial。自動 GC は raise せず、次回の通常 GC が持ち越した分を回収する
+    mutation 対象: `_remaining_seconds` が deadline 後に 1 秒の最小値を返す / identity query が既定 60 秒を使う退行
+    """
+    repo = _make_repo(tmp_path)
+    targets = sorted((_prepare_in_dead_child(repo) for _ in range(2)), key=lambda t: t.parent.name)
+    first, second = targets
+    log, rules_file = _install_git_shim(
+        tmp_path, monkeypatch, [{"match": ["rev-parse", "--show-toplevel"], "seconds": 20.0}]
+    )
+    seen_timeouts: list[tuple[list[str], float]] = []
+    after_remove_delay = {"seconds": 0.0}
+    real_git = canary._git
+
+    def recording_git(args, *, cwd, timeout=60.0, **kwargs):
+        seen_timeouts.append((list(args), timeout))
+        result = real_git(args, cwd=cwd, timeout=timeout, **kwargs)
+        if list(args)[:2] == ["worktree", "remove"]:
+            time.sleep(after_remove_delay["seconds"])  # remove 完了後、次の呼び出しまでに deadline を跨がせる
+        return result
+
+    monkeypatch.setattr(canary, "_git", recording_git)
+
+    # --- (1) identity query (`rev-parse --show-toplevel`) が 20 秒止まる。budget 2 秒で打ち切る。
+    budget = 2.0
+    started = time.time()
+    report = canary.gc_disposable_worktrees(
+        repo, max_candidates=3, time_budget_seconds=budget, start_offset=0
+    )
+    elapsed = time.time() - started
+    assert elapsed < budget + 4.0, elapsed  # 旧実装は identity query が 60 秒 timeout で 20 秒待つ
+    identity_timeouts = [t for args, t in seen_timeouts if args[:2] == ["rev-parse", "--show-toplevel"]]
+    assert identity_timeouts and max(identity_timeouts) <= budget + 0.01, identity_timeouts
+    assert all(t <= budget + 0.01 for _args, t in seen_timeouts), seen_timeouts
+    assert report["truncated"] and report["outcome"] == "partial"
+    assert _entry(report, first.parent.name) == {
+        "holder": first.parent.name, "action": "deferred", "reason": "gc_budget_exhausted",
+    }
+    assert _entry(report, second.parent.name)["action"] == "deferred"
+    assert all(call["t"] <= started + budget + 0.5 for call in _shim_calls(log))  # deadline 後に新規 git なし
+    for target in targets:
+        assert target.is_dir() and _branch_of(target) in _branches(repo)
+        assert (target.parent / canary.DISPOSABLE_OWNER_MARKER_NAME).is_file()
+
+    # --- (2) `git worktree remove` は deadline 内に完了するが、その後に deadline を超える (operation 開始後の枯渇)。
+    #         以降の worktree list / branch 検証 / branch 削除は 1 本も始めてはならない。
+    rules_file.write_text(json.dumps([{"match": ["worktree", "remove"], "seconds": 1.0}]), encoding="utf-8")
+    after_remove_delay["seconds"] = 3.0
+    log.unlink()
+    budget = 3.0
+    started = time.time()
+    report = canary.gc_disposable_worktrees(
+        repo, max_candidates=3, time_budget_seconds=budget, start_offset=0
+    )
+    assert time.time() - started < budget + 4.0
+    calls = _shim_calls(log)
+    assert all(call["t"] <= started + budget + 0.5 for call in calls)  # deadline 後に新規 git を始めない
+    assert [c["args"][:2] for c in calls if c["args"][:2] == ["worktree", "remove"]] == [["worktree", "remove"]]
+    assert not [c for c in calls if c["args"][:2] == ["branch", "-D"]]  # branch 削除は始まっていない
+    assert _entry(report, first.parent.name)["action"] == "deferred"
+    assert _entry(report, second.parent.name)["action"] == "deferred"
+    assert report["truncated"] and report["outcome"] == "partial"
+    assert (first.parent / canary.DISPOSABLE_OWNER_MARKER_NAME).is_file() and _branch_of(first) in _branches(repo)
+    assert not os.path.lexists(first)  # remove は完了済み。残りの資源は次回に持ち越される
+    assert second.is_dir() and _branch_of(second) in _branches(repo)
+
+    after_remove_delay["seconds"] = 0.0
+
+    # --- (3) canary-facing の自動 GC は budget 超過でも raise せず、bounded な時間で戻る。
+    rules_file.write_text(json.dumps([{"match": ["worktree", "list"], "seconds": 20.0}]), encoding="utf-8")
+    monkeypatch.setattr(canary, "DISPOSABLE_AUTO_GC_TIME_BUDGET_SECONDS", 1.5)
+    started = time.time()
+    canary._auto_gc_disposable_worktrees(repo)
+    assert time.time() - started < 1.5 + 4.0
+    assert second.is_dir()
+
+    # --- (4) 遅延が解消されれば、持ち越された資源は次回の GC が回収する。
+    rules_file.write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(canary, "_git", real_git)
+    report = canary.gc_disposable_worktrees(repo)
+    assert report["outcome"] == "complete"
+    for target in targets:
+        assert not target.parent.exists() and _branch_of(target) not in _branches(repo)
