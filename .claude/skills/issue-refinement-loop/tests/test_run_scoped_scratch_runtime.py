@@ -19,7 +19,13 @@
 - runner の ``--output-schema-path`` で canonical ``refinement_preflight_result_v1.schema.json`` に対する
   jsonschema 検証を行い、さらにこの harness が独立に (a) workspace が canonical repo ``tmp/`` 配下に
   実在すること、(b) producer の stdout capture と on-disk artifact と consumer の readback が互いに一致すること、
-  (c) 固定 ``/tmp`` scratch が新規生成されていないこと、を実データで照合する。
+  (c) child/runtime evidence に attribution できる固定 ``/tmp`` scratch が新規生成されていないこと、
+  を実データで照合する。
+  provenance のない OS temp 全体の差分は diagnostic として log に残すだけで、verdict には使わない。
+- Auto mode: ``scripts/claude-gpt/launch.sh`` が自身で exactly one の ``--permission-mode auto`` を注入し、
+  caller 由来の ``--permission-mode`` は拒否される。よって caller は mode を渡さない。PASS 条件は
+  runner evidence から **実観測された main-session permission mode == "auto"** に束縛する。観測不能 (None/欠落) は
+  stdout ``SKIP:`` + exit 77、auto 以外は FAIL。declaration / launcher source / argv の静的文字列は観測の代替にしない。
 
 契約 (Issue #2860 AC5):
 - 実行不能 (CI / linked worktree 外 / 認証・CLI・launcher・ネットワーク不可 / runner SKIP) は
@@ -48,15 +54,19 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 EXIT_OK = 0
 EXIT_FAIL = 1
 EXIT_SKIP = 77
 
 CASE_NAME = "claude-gpt-auto-scratch"
+REQUIRED_MAIN_PERMISSION_MODE = "auto"
 ISSUE_NUMBER = 2860
 REPO_SLUG = "squne121/loop-protocol"
 WORKSPACE_NAME_RE = re.compile(r"^refinement-%d\.[A-Za-z0-9]{6}$" % ISSUE_NUMBER)
@@ -142,6 +152,77 @@ def build_runner_argv(
     return argv
 
 
+def observed_main_permission_mode(evidence: dict[str, Any] | None) -> str | None:
+    """runner evidence から **実観測された** main-session permission mode を返す。観測不能なら ``None``。
+
+    runner が claude の ``system/init`` event の ``permissionMode`` を載せる surface
+    (``permission_mode_observed``: top-level、または ``named_subagent_resume`` evidence 内) だけを読む。
+    SubagentStop hook payload 由来の ``observed_runtime_fields.permission_mode`` は SubAgent の event の値で
+    main session の mode ではないため採用しない。declaration・launcher source・argv は観測ではない。
+    複数 surface が食い違う場合は fail-closed で非 auto 扱い (``conflicting:...``) にする。"""
+    if not isinstance(evidence, dict):
+        return None
+    candidates: list[str] = []
+    top = evidence.get("permission_mode_observed")
+    if isinstance(top, str) and top:
+        candidates.append(top)
+    resume = evidence.get("named_subagent_resume")
+    if isinstance(resume, dict):
+        nested = resume.get("permission_mode_observed")
+        if isinstance(nested, str) and nested:
+            candidates.append(nested)
+    if not candidates:
+        return None
+    unique = sorted(set(candidates))
+    return unique[0] if len(unique) == 1 else "conflicting:" + ",".join(unique)
+
+
+def attribute_fixed_tmp_entries(
+    new_entries: list[str], *, attribution_corpus: str
+) -> tuple[list[str], list[str]]:
+    """OS temp の新規 entry を ``(attributed, unattributed)`` に分ける。
+
+    attributed = child / session / tool / runtime evidence の text (runner evidence・stdout・stderr) に
+    その名前が現れる entry のみ。それ以外は provenance が無く、無関係な並行 process の write と区別できないため
+    diagnostic に降格する (verdict には使わない)。"""
+    attributed: list[str] = []
+    unattributed: list[str] = []
+    for name in new_entries:
+        (attributed if name and name in attribution_corpus else unattributed).append(name)
+    return attributed, unattributed
+
+
+def cleanup_exact_artifact(artifact: Path, *, started_ns: int, parent_preexisting: bool) -> dict[str, Any]:
+    """test 自身が生成させた exact artifact だけを unlink する。recursive 削除はしない。
+
+    - exact file が regular file (symlink でない) かつ run 開始後に更新されている場合だけ unlink する。
+    - 親 directory は、run 開始前に存在せず (= この run が作成を確立)、かつ cleanup 時点で空の場合だけ ``rmdir`` する。
+      sibling artifact が 1 つでもあれば残す (foreign artifact を巻き込まない)。"""
+    result: dict[str, Any] = {"artifact_unlinked": False, "parent_removed": False, "parent_kept_reason": None}
+    try:
+        stat = artifact.lstat()
+    except FileNotFoundError:
+        stat = None
+    if stat is not None and artifact.is_file() and not artifact.is_symlink() and stat.st_mtime_ns >= started_ns:
+        try:
+            artifact.unlink()
+            result["artifact_unlinked"] = True
+        except OSError:
+            pass
+    parent = artifact.parent
+    if parent_preexisting:
+        result["parent_kept_reason"] = "parent_preexisted"
+    elif not parent.is_dir() or parent.is_symlink():
+        result["parent_kept_reason"] = "parent_absent"
+    else:
+        try:
+            parent.rmdir()  # 空でなければ OSError: sibling を巻き込まない
+            result["parent_removed"] = True
+        except OSError:
+            result["parent_kept_reason"] = "parent_not_empty"
+    return result
+
+
 def adjudicate(
     *,
     runner_exit: int,
@@ -153,10 +234,13 @@ def adjudicate(
     schema_errors: list[str],
     new_fixed_tmp_entries: list[str],
     mtimes_ns: dict[str, int] | None = None,
+    observed_permission_mode: str | None = None,
 ) -> tuple[str, str, str]:
     """(verdict, classification, reason)。verdict は PASS / FAIL / SKIP。
 
-    fail-closed: 観測できなかったものを PASS にしない。"""
+    fail-closed: 観測できなかったものを PASS にしない。``new_fixed_tmp_entries`` は provenance のある
+    (child/runtime evidence に attribution できた) entry だけを渡す。``observed_permission_mode`` は runner が
+    実観測した main-session mode で、``"auto"`` 以外は PASS にならない (None は SKIP、他は FAIL)。"""
     if runner_exit == EXIT_SKIP:
         return "SKIP", "runner_skip", "runner exited 77 (runtime/auth/launcher/causal observation unavailable)"
     if runner_exit != EXIT_OK:
@@ -170,6 +254,13 @@ def adjudicate(
     proxy_observed = isinstance(sidechannel, dict) and sidechannel.get("proxy_port") is not None
     if not (proxy_observed or isinstance(receipt, dict)):
         return "FAIL", "fallback_only", "no claude-gpt launcher/proxy observation (launcher not actually exercised)"
+    if observed_permission_mode is not None and observed_permission_mode != REQUIRED_MAIN_PERMISSION_MODE:
+        return (
+            "FAIL",
+            "permission_mode_not_auto",
+            f"observed main-session permission mode {observed_permission_mode!r} is not "
+            f"{REQUIRED_MAIN_PERMISSION_MODE!r}; not Auto evidence",
+        )
     ordered = evidence.get("ordered_evidence_match")
     if not (isinstance(ordered, dict) and ordered.get("verified") is True):
         return "FAIL", "ordered_markers_unverified", f"ordered markers not verified: {ordered!r}"
@@ -215,17 +306,50 @@ def adjudicate(
     if any(order[a] > order[b] for a, b in zip(chain, chain[1:])):
         return "FAIL", "procedure_order_violated", f"filesystem order differs from declared order: {order!r}"
     if new_fixed_tmp_entries:
-        return "FAIL", "fixed_tmp_scratch_created", f"new fixed /tmp entries: {new_fixed_tmp_entries!r}"
-    return "PASS", "pass", "scratch producer->consumer observed in a real claude-gpt session"
+        return "FAIL", "fixed_tmp_scratch_created", f"attributed fixed /tmp entries: {new_fixed_tmp_entries!r}"
+    if observed_permission_mode is None:
+        # 全ての scratch 観測が揃っても、Auto で動いたと観測できていなければ AC5 は充足しない (Auto を推測しない)。
+        return (
+            "SKIP",
+            "permission_mode_unobserved",
+            "main-session permission mode was not observed in runner evidence "
+            "(runner structured evidence does not surface init permissionMode); Auto is not assumed",
+        )
+    return "PASS", "pass", "scratch producer->consumer observed in a real claude-gpt session under observed Auto mode"
 
 
 def summarize_permissions(evidence: dict[str, Any] | None) -> dict[str, Any]:
-    """実測できた permission 状態だけを記録する。未観測を Auto と推測しない。"""
+    """実測できた permission 状態だけを記録する。未観測を Auto と推測しない。
+
+    launcher route / 観測 mode / permission denial / approval carrier / 失敗層の区別を分けて残す。"""
     if not isinstance(evidence, dict):
-        return {"permission_mode": "unobserved", "permission_denials": "unobserved", "approval_carrier": "unobserved"}
+        return {
+            "observed_main_permission_mode": None,
+            "permission_mode_source": "unobserved (no runner evidence)",
+            "permission_denials": "unobserved",
+            "approval_carrier": "unobserved",
+        }
     denials = evidence.get("permission_denials")
+    sidechannel = evidence.get("claude_gpt_proxy_sidechannel")
+    mode = observed_main_permission_mode(evidence)
+    subagentstop = (evidence.get("observed_runtime_fields") or {}).get("permission_mode")
     return {
-        "permission_mode": "unobserved (runner does not report the child's permission mode; Auto is not assumed)",
+        "launcher_route": {
+            "claude_adapter": evidence.get("claude_adapter"),
+            "launcher_receipt_present": isinstance(evidence.get("claude_gpt_launcher_receipt"), dict),
+            "proxy_port_observed": isinstance(sidechannel, dict) and sidechannel.get("proxy_port") is not None,
+        },
+        "observed_main_permission_mode": mode,
+        "permission_mode_source": (
+            "runner evidence permission_mode_observed (claude system/init permissionMode)"
+            if mode is not None
+            else "unobserved: runner structured evidence has no main-session permissionMode surface; "
+            "launcher source / argv declarations are not observations"
+        ),
+        "main_permission_mode_is_auto": mode == REQUIRED_MAIN_PERMISSION_MODE,
+        "subagentstop_permission_mode_diagnostic_not_main_session": (
+            subagentstop.get("value") if isinstance(subagentstop, dict) else None
+        ),
         "permission_denials": denials if isinstance(denials, list) else "unobserved",
         "approval_carrier": evidence.get("approval_carrier", "none"),
         "extra_approval_for_routine_processing": (
@@ -373,7 +497,10 @@ def run_case() -> int:
     observations: dict[str, Any] = {}
     harness_dir: Path | None = None
     created_workspace: Path | None = None
-    artifact_preexisting = (REPO_ROOT / ARTIFACT_REL).exists()
+    artifact_path_abs = REPO_ROOT / ARTIFACT_REL
+    artifact_preexisting = artifact_path_abs.exists() or artifact_path_abs.is_symlink()
+    artifact_parent_preexisting = artifact_path_abs.parent.exists()
+    run_started_ns = time.time_ns()
     try:
         head = _preflight_environment()
         if artifact_preexisting:
@@ -439,9 +566,17 @@ def run_case() -> int:
                 schema_errors = _validate_schema(artifact_json)
             except json.JSONDecodeError:
                 schema_errors = ["artifact is not valid JSON"]
-        new_fixed = sorted(
+        candidate_fixed = sorted(
             name for name in _fixed_tmp_listing() - before_fixed
             if re.search(r"issue|readback|anchor|guard_result|body", name, re.IGNORECASE)
+        )
+        # OS temp 全体の差分は無関係な並行 process の write を含みうる。child/runtime evidence に
+        # attribution できる entry だけを dispositive にし、残りは diagnostic として log に残す。
+        attribution_corpus = "\n".join(
+            [json.dumps(evidence, ensure_ascii=False, default=str) if evidence else "", runner_stdout, runner_stderr]
+        )
+        new_fixed, unattributed_fixed = attribute_fixed_tmp_entries(
+            candidate_fixed, attribution_corpus=attribution_corpus
         )
         porcelain_changed = _porcelain() != before_porcelain
 
@@ -449,6 +584,7 @@ def run_case() -> int:
             runner_exit=proc.returncode, evidence=evidence, new_workspaces=new_workspaces,
             workspace_files=workspace_files, stdout_capture=stdout_capture, artifact_json=artifact_json,
             schema_errors=schema_errors, new_fixed_tmp_entries=new_fixed, mtimes_ns=mtimes_ns,
+            observed_permission_mode=observed_main_permission_mode(evidence),
         )
         if verdict == "PASS" and porcelain_changed:
             verdict, classification, reason = "FAIL", "tracked_tree_changed", "git status changed during the live run"
@@ -465,7 +601,9 @@ def run_case() -> int:
                 and artifact_json is not None
                 and _safe_json(workspace_files.get("consumer_readback.json")) == artifact_json
             ),
-            "new_fixed_tmp_entries": new_fixed,
+            "attributed_fixed_tmp_entries": new_fixed,
+            "unattributed_global_tmp_diff_diagnostic_only": unattributed_fixed,
+            "runner_evidence_keys": sorted(evidence) if isinstance(evidence, dict) else None,
             "mtime_order_ns_relative": (
                 {k: v - min(mtimes_ns.values()) for k, v in mtimes_ns.items()} if mtimes_ns else {}
             ),
@@ -475,6 +613,7 @@ def run_case() -> int:
             "classification_of_failure_layer": {
                 "launcher/adapter": "claude_adapter, claude_gpt_launcher_receipt, claude_gpt_proxy_sidechannel",
                 "classifier/hook denial": "permission_denials (runner-reported)",
+                "permission mode": "observed_main_permission_mode (runner evidence only; None -> SKIP)",
                 "harness limitation": (
                     "preflight.run executor needs canonical main root; offline fixture producer observed instead"
                 ),
@@ -489,8 +628,13 @@ def run_case() -> int:
         for owned in (created_workspace, harness_dir):
             if owned is not None and owned.is_dir() and owned.parent == REPO_ROOT / "tmp":
                 shutil.rmtree(owned, ignore_errors=True)
+        # canonical artifact directory は他 invocation の artifact と共存する。exact file だけを unlink し、
+        # 親は run 前に不在かつ cleanup 時点で空の場合に限り rmdir する (recursive 削除は禁止)。
         if not artifact_preexisting:
-            shutil.rmtree((REPO_ROOT / ARTIFACT_REL).parent, ignore_errors=True)
+            cleanup_report = cleanup_exact_artifact(
+                artifact_path_abs, started_ns=run_started_ns, parent_preexisting=artifact_parent_preexisting
+            )
+            observations["artifact_cleanup"] = cleanup_report
 
     log_path = _write_artifact_log(
         verdict=verdict, classification=classification, reason=reason, exit_code=exit_code, head=head,
@@ -560,6 +704,7 @@ def _good_inputs() -> dict[str, Any]:
         "schema_errors": [],
         "new_fixed_tmp_entries": [],
         "mtimes_ns": {"draft.md": 1, "artifact": 2, "preflight_stdout.txt": 3, "consumer_readback.json": 4},
+        "observed_permission_mode": "auto",
     }
 
 
@@ -607,6 +752,77 @@ def test_adjudicate_filesystem_order_violation_or_missing_order_is_fail() -> Non
     assert adjudicate(**inputs)[:2] == ("FAIL", "procedure_order_unobserved")
 
 
+def test_adjudicate_observed_auto_is_required_for_pass() -> None:
+    inputs = _good_inputs()
+    inputs["observed_permission_mode"] = "auto"
+    assert adjudicate(**inputs)[:2] == ("PASS", "pass")
+
+
+def test_adjudicate_unobserved_permission_mode_is_skip_never_pass() -> None:
+    inputs = _good_inputs()
+    inputs["observed_permission_mode"] = None
+    verdict, classification, _ = adjudicate(**inputs)
+    assert (verdict, classification) == ("SKIP", "permission_mode_unobserved")
+
+
+@pytest.mark.parametrize(
+    "mode", ["default", "acceptEdits", "plan", "bypassPermissions", "conflicting:auto,default", ""]
+)
+def test_adjudicate_non_auto_observed_mode_is_fail_not_auto_evidence(mode: str) -> None:
+    inputs = _good_inputs()
+    inputs["observed_permission_mode"] = mode
+    assert adjudicate(**inputs)[:2] == ("FAIL", "permission_mode_not_auto")
+
+
+def test_launcher_declaration_or_argv_string_is_not_a_permission_observation() -> None:
+    # launcher source が `--permission-mode auto` を注入する事実や、argv 文字列・自己申告 field は観測ではない。
+    declared = {
+        "claude_adapter": "claude-gpt",
+        "declared_permission_mode": "auto",
+        "claude_gpt_launcher_receipt": {"argv": ["--permission-mode", "auto"]},
+        "observed_runtime_fields": {"permission_mode": {"value": "auto", "source_hook_event": "SubagentStop"}},
+    }
+    assert observed_main_permission_mode(declared) is None
+    assert observed_main_permission_mode(None) is None
+    assert observed_main_permission_mode({"permission_mode_observed": None}) is None
+    assert observed_main_permission_mode({"permission_mode_observed": 7}) is None
+    inputs = _good_inputs()
+    inputs["observed_permission_mode"] = observed_main_permission_mode(declared)
+    assert adjudicate(**inputs)[0] == "SKIP"
+
+
+def test_observed_main_permission_mode_reads_only_runner_init_surfaces() -> None:
+    assert observed_main_permission_mode({"permission_mode_observed": "auto"}) == "auto"
+    nested = {"named_subagent_resume": {"permission_mode_observed": "default"}}
+    assert observed_main_permission_mode(nested) == "default"
+    both = {"permission_mode_observed": "auto", "named_subagent_resume": {"permission_mode_observed": "default"}}
+    assert observed_main_permission_mode(both) == "conflicting:auto,default"
+
+
+def test_runner_structured_evidence_has_no_main_permission_mode_surface_today() -> None:
+    """runner の根拠: init permissionMode は named-subagent-resume evidence builder にだけ載る。
+
+    structured evidence (schema_summary) の top-level には ``permission_mode_observed`` が書かれない。
+    将来 runner がこの surface を追加すれば本 test が検知し、SKIP 経路を PASS 経路へ切り替えられる。"""
+    source = RUNNER.read_text(encoding="utf-8")
+    assert 'obs["init"]["permission_mode"] = mode if isinstance(mode, str) else None' in source
+    assert '"permission_mode_observed": obs["init"]["permission_mode"]' in source
+    assert 'schema_summary["permission_mode_observed"]' not in source
+
+
+def test_summarize_permissions_records_observed_mode_and_layers_without_assuming_auto() -> None:
+    unobserved = summarize_permissions({"claude_adapter": "claude-gpt", "permission_denials": []})
+    assert unobserved["observed_main_permission_mode"] is None
+    assert unobserved["main_permission_mode_is_auto"] is False
+    assert "unobserved" in unobserved["permission_mode_source"]
+    assert unobserved["launcher_route"]["claude_adapter"] == "claude-gpt"
+    observed = summarize_permissions({"claude_adapter": "claude-gpt", "permission_mode_observed": "auto",
+                                      "permission_denials": []})
+    assert observed["observed_main_permission_mode"] == "auto"
+    assert observed["main_permission_mode_is_auto"] is True
+    assert summarize_permissions(None)["observed_main_permission_mode"] is None
+
+
 def test_adjudicate_fixed_tmp_scratch_or_missing_evidence_is_fail() -> None:
     inputs = _good_inputs()
     inputs["new_fixed_tmp_entries"] = ["issue2860_readback.json"]
@@ -614,6 +830,120 @@ def test_adjudicate_fixed_tmp_scratch_or_missing_evidence_is_fail() -> None:
     inputs = _good_inputs()
     inputs["evidence"] = None
     assert adjudicate(**inputs)[:2] == ("FAIL", "evidence_missing")
+
+
+def test_unrelated_concurrent_global_tmp_files_are_diagnostic_not_fail() -> None:
+    # 無関係な並行 process が OS temp に作った file は child/runtime evidence に attribution できない。
+    corpus = json.dumps({"claude_adapter": "claude-gpt", "errors": []}) + "runner stdout without tmp names"
+    attributed, unattributed = attribute_fixed_tmp_entries(
+        ["contract_review_once_body_ab12.md", "issue_snapshot_zz.json"], attribution_corpus=corpus
+    )
+    assert attributed == []
+    assert unattributed == ["contract_review_once_body_ab12.md", "issue_snapshot_zz.json"]
+    inputs = _good_inputs()
+    inputs["new_fixed_tmp_entries"] = attributed
+    assert adjudicate(**inputs)[0] == "PASS"
+
+
+def test_global_tmp_entry_attributable_to_child_evidence_is_dispositive_fail() -> None:
+    corpus = json.dumps({"permission_denials": [{"tool_input": {"command": "cat > /tmp/issue2860_readback.json"}}]})
+    attributed, unattributed = attribute_fixed_tmp_entries(
+        ["issue2860_readback.json", "unrelated_body_1.md"], attribution_corpus=corpus
+    )
+    assert attributed == ["issue2860_readback.json"]
+    assert unattributed == ["unrelated_body_1.md"]
+    inputs = _good_inputs()
+    inputs["new_fixed_tmp_entries"] = attributed
+    assert adjudicate(**inputs)[:2] == ("FAIL", "fixed_tmp_scratch_created")
+
+
+def _artifact_fixture(root: Path, *, parent_exists: bool) -> tuple[Path, Path]:
+    parent = root / ".claude" / "artifacts" / "issue-refinement-loop" / str(ISSUE_NUMBER)
+    if parent_exists:
+        parent.mkdir(parents=True)
+    return parent, parent / "refinement_preflight_result_v1.json"
+
+
+def test_cleanup_keeps_sibling_sentinel_byte_identical_and_unlinks_only_exact_artifact(tmp_path: Path) -> None:
+    parent, artifact = _artifact_fixture(tmp_path, parent_exists=True)
+    sentinels = {
+        parent / "raw_issue_snapshot.json": b'{"foreign": "snapshot"}\n',
+        parent / "planner_input.json": b"\x00\x01 binary sentinel",
+    }
+    for path, content in sentinels.items():
+        path.write_bytes(content)
+    nested = parent / "snapshots" / "archive.json"
+    nested.parent.mkdir()
+    nested.write_bytes(b"archived")
+    started = time.time_ns()
+    artifact.write_text("{}", encoding="utf-8")
+
+    report = cleanup_exact_artifact(artifact, started_ns=started, parent_preexisting=True)
+
+    assert report["artifact_unlinked"] is True and report["parent_removed"] is False
+    assert not artifact.exists()
+    for path, content in sentinels.items():
+        assert path.read_bytes() == content
+    assert nested.read_bytes() == b"archived"
+
+
+def test_cleanup_does_not_remove_a_foreign_sibling_even_when_this_run_created_the_parent(tmp_path: Path) -> None:
+    parent, artifact = _artifact_fixture(tmp_path, parent_exists=False)
+    started = time.time_ns()
+    parent.mkdir(parents=True)
+    artifact.write_text("{}", encoding="utf-8")
+    foreign = parent / "provenance.json"
+    foreign.write_bytes(b"foreign appeared during the run")
+
+    report = cleanup_exact_artifact(artifact, started_ns=started, parent_preexisting=False)
+
+    assert report["artifact_unlinked"] is True and report["parent_removed"] is False
+    assert report["parent_kept_reason"] == "parent_not_empty"
+    assert foreign.read_bytes() == b"foreign appeared during the run"
+
+
+def test_cleanup_rmdirs_the_parent_only_when_this_run_created_it_and_it_is_empty(tmp_path: Path) -> None:
+    parent, artifact = _artifact_fixture(tmp_path, parent_exists=False)
+    started = time.time_ns()
+    parent.mkdir(parents=True)
+    artifact.write_text("{}", encoding="utf-8")
+
+    report = cleanup_exact_artifact(artifact, started_ns=started, parent_preexisting=False)
+
+    assert report["artifact_unlinked"] is True and report["parent_removed"] is True
+    assert not parent.exists()
+    assert parent.parent.is_dir(), "親の親 (issue-refinement-loop/) は触らない"
+
+
+def test_cleanup_never_unlinks_a_stale_or_symlinked_artifact(tmp_path: Path) -> None:
+    parent, artifact = _artifact_fixture(tmp_path, parent_exists=True)
+    artifact.write_text("{}", encoding="utf-8")
+    stale = cleanup_exact_artifact(artifact, started_ns=time.time_ns() + 10**12, parent_preexisting=True)
+    assert stale["artifact_unlinked"] is False and artifact.exists()
+    artifact.unlink()
+    target = tmp_path / "foreign-target.json"
+    target.write_bytes(b"keep")
+    artifact.symlink_to(target)
+    linked = cleanup_exact_artifact(artifact, started_ns=0, parent_preexisting=True)
+    assert linked["artifact_unlinked"] is False
+    assert target.read_bytes() == b"keep"
+
+
+def test_harness_source_does_not_recursively_remove_the_canonical_artifact_directory() -> None:
+    import ast
+
+    source = _THIS_FILE.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    rmtree_args = [
+        ast.unparse(arg)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and (getattr(node.func, "attr", None) == "rmtree" or getattr(node.func, "id", None) == "rmtree")
+        for arg in node.args[:1]
+    ]
+    assert rmtree_args, "owned workspace cleanup の rmtree 呼び出しが見つからない (検査が空振りしていないこと)"
+    assert not any("ARTIFACT" in arg.upper() or "artifact" in arg for arg in rmtree_args), rmtree_args
+    assert "cleanup_exact_artifact(" in source
 
 
 def test_runner_argv_uses_claude_gpt_without_native_only_flags() -> None:
@@ -625,6 +955,8 @@ def test_runner_argv_uses_claude_gpt_without_native_only_flags() -> None:
     assert "--expect-skill-command" not in argv
     assert "--expect-marker-source" not in argv
     assert argv.count("--expect-ordered-marker") == len(ORDERED_MARKERS)
+    # launch.sh が exactly one の --permission-mode auto を注入し caller 由来を拒否するため、caller は渡さない。
+    assert "--permission-mode" not in argv
     assert argv[argv.index("--output-schema-path") + 1].endswith("refinement_preflight_result_v1.schema.json")
 
 

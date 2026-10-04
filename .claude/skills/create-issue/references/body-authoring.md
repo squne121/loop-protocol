@@ -568,18 +568,20 @@ print('\n'.join(required))
 
 AC の番号（`- [ ] AC<n>`）と VC の行末コメント（`# AC<n>`）が一致しているかを起票・更新前に照合する。
 
+以降のコマンドの `$WORKSPACE/body.md` は、`create-issue/SKILL.md` が確立する invocation-owned workspace 内の本文 draft（producer の具体 path）である。cwd 直下の裸の `issue_body.md` を読まず、Bash call ごとに具体 path をリテラルで再指定する。
+
 ### awk による AC 件数カウント
 
 ```
 # Acceptance Criteria セクションの AC 件数を数える（awk + wc -l の参照例）
-awk '/^## Acceptance Criteria/{flag=1; next} /^## /{flag=0} flag && /- \[ \] AC[0-9]/' issue_body.md | wc -l
+awk '/^## Acceptance Criteria/{flag=1; next} /^## /{flag=0} flag && /- \[ \] AC[0-9]/' "$WORKSPACE/body.md" | wc -l
 ```
 
 ### rg による VC の # AC<n> コメント件数カウント
 
 ```bash
 # VC セクション内の # AC<n> コメント件数を数える
-rg -c "# AC[0-9]" issue_body.md
+rg -c "# AC[0-9]" "$WORKSPACE/body.md"
 ```
 
 ### 照合の判定ルール
@@ -590,9 +592,9 @@ AC 件数と VC の `# AC<n>` 件数が一致しなければ起票・更新し�
 ```
 # 照合の参照例（各コマンドを個別に実行する）
 # AC 件数カウント
-AC_COUNT=$(awk '/^## Acceptance Criteria/{flag=1; next} /^## /{flag=0} flag && /- \[ \] AC[0-9]/' issue_body.md | wc -l)
+AC_COUNT=$(awk '/^## Acceptance Criteria/{flag=1; next} /^## /{flag=0} flag && /- \[ \] AC[0-9]/' "$WORKSPACE/body.md" | wc -l)
 # VC の # AC<n> コメント件数カウント
-VC_AC_COUNT=$(rg -c "# AC[0-9]" issue_body.md)
+VC_AC_COUNT=$(rg -c "# AC[0-9]" "$WORKSPACE/body.md")
 # 件数比較（個別に実行）
 [ "$AC_COUNT" -eq "$VC_AC_COUNT" ]
 ```

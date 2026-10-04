@@ -296,3 +296,50 @@ def test_bootstrap_is_idempotent_when_tmp_root_already_exists(tmp_path: Path) ->
     assert os.path.commonpath([workspace, tmp_path / "tmp"]) == str(tmp_path / "tmp")
     # shlex で解釈可能な単純な command だけであること (複合 shell operator に依存しない)。
     assert shlex.split(mkdir_line) == ["mkdir", "-p", "tmp"]
+
+
+# ---------------------------------------------------------------------------
+# AC2 (OWNER scope extension): 共通参照 references/body-authoring.md の実 consumer が
+# SKILL.md の producer と同じ concrete path (`$WORKSPACE/body.md`) を使う。
+# ---------------------------------------------------------------------------
+
+BODY_AUTHORING_MD = Path(__file__).resolve().parent.parent / "references" / "body-authoring.md"
+
+# 直前が `/` `$` `"` `'` `-` 英数字・`.` でない裸の `issue_body.md` (= cwd 直下の predictable な consumer path)。
+_BARE_ISSUE_BODY = re.compile(r"(?<![\w/.$\"'-])issue_body\.md\b")
+
+
+def find_bare_issue_body_consumers(text: str) -> list[str]:
+    """fence 内の実行例 (コメント行を除く) にある裸の `issue_body.md` consumer を返す。
+
+    fence 外の説明文 (禁止例を述べる prose) は走査しない。"""
+    found: list[str] = []
+    for block in _fenced_blocks(text):
+        for line in _logical_lines(block):
+            if _BARE_ISSUE_BODY.search(line):
+                found.append(line.strip())
+    return found
+
+
+def test_body_authoring_ac_vc_consumers_use_the_concrete_workspace_body_path() -> None:
+    text = BODY_AUTHORING_MD.read_text(encoding="utf-8")
+    assert find_bare_issue_body_consumers(text) == []
+    code = "\n".join(_logical_lines("\n".join(_fenced_blocks(text))))
+    # AC 件数 (awk) と VC の # AC<n> 件数 (rg) の 4 つの実 consumer が全て workspace body path を読む。
+    assert len(re.findall(r'awk .*"\$WORKSPACE/body\.md"', code)) == 2
+    assert len(re.findall(r'rg -c "# AC\[0-9\]" "\$WORKSPACE/body\.md"', code)) == 2
+    assert "AC_COUNT=$(awk" in code and "VC_AC_COUNT=$(rg -c" in code
+
+
+def test_reintroducing_bare_issue_body_consumer_in_body_authoring_fails() -> None:
+    text = BODY_AUTHORING_MD.read_text(encoding="utf-8")
+    assert '"$WORKSPACE/body.md"' in text
+    mutated = text.replace('"$WORKSPACE/body.md"', "issue_body.md")
+    assert find_bare_issue_body_consumers(mutated), "裸の issue_body.md consumer を検出できない"
+
+
+def test_bare_issue_body_detector_has_no_false_positive_on_prose_or_concrete_paths() -> None:
+    prose = "cwd 直下の裸の `issue_body.md` を読まず、`$WORKSPACE/body.md` を使う。\n"
+    assert find_bare_issue_body_consumers(prose) == []
+    concrete = '```bash\nrg -c "# AC[0-9]" "$WORKSPACE/body.md"\n# issue_body.md という旧名の説明コメント\n```\n'
+    assert find_bare_issue_body_consumers(concrete) == []
