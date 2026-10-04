@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -799,7 +800,7 @@ def _child_error(cp: subprocess.CompletedProcess[str], code: str) -> dict[str, s
 def _fetch_issue(issue_number: int, repo: str) -> tuple[dict[str, Any] | None, str]:
     gh = shutil.which("gh") or "gh"
     cp = _run_command(
-        [gh, "issue", "view", str(issue_number), "--repo", repo, "--json", "title,body,updatedAt"],
+        [gh, "issue", "view", str(issue_number), "--repo", repo, "--json", "title,body,updatedAt,state"],
         env=_sanitized_gh_env(),
     )
     if cp.returncode != 0:
@@ -808,6 +809,131 @@ def _fetch_issue(issue_number: int, repo: str) -> tuple[dict[str, Any] | None, s
         return json.loads(cp.stdout), ""
     except json.JSONDecodeError:
         return None, "gh_issue_view_non_json"
+
+
+# Issue #2922: pre-existing readiness defect compatibility lane.
+# A CLOSED historical Issue whose live body already carries blocking readiness
+# defects may still receive a note-only update (`## Notes for Reviewer` only)
+# as long as the readiness defect multiset is exactly unchanged. The lane never
+# bypasses guard / hygiene / sha / updatedAt / readback checks.
+NOTES_FOR_REVIEWER_HEADING = "## Notes for Reviewer"
+PREEXISTING_READINESS_CHECKER_EXIT_CODES = frozenset({0, 1})
+NATIVE_RELATIONSHIP_LIST_FIELDS = ("add_blocked_by", "remove_blocked_by", "add_blocking", "remove_blocking")
+
+
+def _native_relationships_is_noop(relationship_input: Any) -> bool:
+    if relationship_input is None:
+        return True
+    if not isinstance(relationship_input, dict):
+        return False
+    parent = relationship_input.get("parent") or {"action": "unchanged"}
+    if not isinstance(parent, dict) or parent.get("action", "unchanged") != "unchanged":
+        return False
+    return not any(relationship_input.get(field) for field in NATIVE_RELATIONSHIP_LIST_FIELDS)
+
+
+def _compat_lane_preconditions_met(
+    live_state: Any, title_update: dict[str, Any], relationship_input: Any
+) -> bool:
+    """Cheap preconditions that need no child process (live state, title, relationships)."""
+    return (
+        live_state == "CLOSED"
+        and not title_update.get("required")
+        and _native_relationships_is_noop(relationship_input)
+    )
+
+
+def _split_h2_sections(body: str) -> list[tuple[str | None, str]]:
+    """Split a body into (heading, raw_text) chunks at top-level `## ` lines.
+
+    The first chunk (heading None) is the preamble before the first H2. Lines
+    inside fenced code blocks never start a new section.
+    """
+    chunks: list[tuple[str | None, list[str]]] = [(None, [])]
+    fence: str | None = None
+    for line in body.splitlines(keepends=True):
+        marker = line.lstrip()[:3]
+        if marker in ("```", "~~~"):
+            if fence is None:
+                fence = marker
+            elif fence == marker:
+                fence = None
+        if fence is None and line.startswith("## "):
+            chunks.append((line.rstrip("\r\n").rstrip(), [line]))
+        else:
+            chunks[-1][1].append(line)
+    return [(heading, "".join(lines)) for heading, lines in chunks]
+
+
+def _non_note_sections(body: str) -> list[tuple[str | None, str]]:
+    # Trailing newlines are separator bytes between sections (appending a note
+    # section legitimately adds a blank line after the previous section), so
+    # they are not part of a section's compared content.
+    return [
+        (heading, text.rstrip("\r\n"))
+        for heading, text in _split_h2_sections(body)
+        if heading != NOTES_FOR_REVIEWER_HEADING
+    ]
+
+
+def _only_notes_section_differs(live_body: str, candidate_body: str) -> bool:
+    return _non_note_sections(live_body) == _non_note_sections(candidate_body)
+
+
+def _defect_multiset_from_checker_output(rc: int, stdout: str) -> Counter | None:
+    """Opaque (rule_id, category, section, minimal_context) multiset, or None (fail-closed)."""
+    if rc not in PREEXISTING_READINESS_CHECKER_EXIT_CODES:
+        return None
+    try:
+        data = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("errors"), list):
+        return None
+    counter: Counter = Counter()
+    for error in data["errors"]:
+        if not isinstance(error, dict):
+            return None
+        key = tuple(
+            json.dumps(error.get(field), sort_keys=True)
+            for field in ("rule_id", "category", "section", "minimal_context")
+        )
+        counter[key] += 1
+    return counter
+
+
+def _preexisting_readiness_defects_unchanged(
+    live_body: str, mutated_candidate: str, candidate_readiness_cp: subprocess.CompletedProcess[str]
+) -> bool:
+    """True only when the candidate changes nothing but the notes section and
+    the real static readiness checker reports an identical defect multiset for
+    the live body and the mutated candidate (fail-closed otherwise)."""
+    if not _only_notes_section_differs(live_body, mutated_candidate):
+        return False
+    candidate_defects = _defect_multiset_from_checker_output(
+        candidate_readiness_cp.returncode, candidate_readiness_cp.stdout
+    )
+    if candidate_defects is None:
+        return False
+    tmp_dir = REPO_ROOT / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    live_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".md", delete=False, dir=str(tmp_dir), encoding="utf-8"
+        ) as live_file:
+            live_file.write(live_body)
+            live_path = Path(live_file.name)
+        live_cp = _run_command(
+            [sys.executable, str(READINESS_SCRIPT), "--body-file", str(live_path), "--mode", "static"]
+        )
+    finally:
+        if live_path is not None:
+            live_path.unlink(missing_ok=True)
+    live_defects = _defect_multiset_from_checker_output(live_cp.returncode, live_cp.stdout)
+    if live_defects is None:
+        return False
+    return live_defects == candidate_defects
 
 
 def _render_result(
@@ -1034,7 +1160,14 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             errors=state.errors,
         )
 
-    if forwarded_status == "needs_fix" and not readiness_result.get("resolution_evidence"):
+    # Issue #2922: the forwarded needs_fix (no resolution_evidence) rejection is
+    # deferred until after the live readback so the pre-existing readiness
+    # compatibility lane can evaluate the live state. Any unmet lane condition
+    # reproduces the original immediate rejection (same code, no child
+    # process, no mutation).
+    deferred_needs_fix = forwarded_status == "needs_fix" and not readiness_result.get("resolution_evidence")
+
+    def _reject_needs_fix_without_resolution_evidence() -> dict[str, Any]:
         state.errors.append(
             {
                 "code": "readiness_needs_fix_without_resolution_evidence",
@@ -1062,6 +1195,14 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
         )
 
     issue_data, issue_error = _fetch_issue(state.issue_number, state.repo)
+    compat_lane_preconditions = bool(
+        issue_data is not None
+        and _compat_lane_preconditions_met(
+            issue_data.get("state"), title_update, input_data.get("native_relationships")
+        )
+    )
+    if deferred_needs_fix and not compat_lane_preconditions:
+        return _reject_needs_fix_without_resolution_evidence()
     if issue_data is None:
         state.errors.append({"code": "issue_readback_failed", "message": issue_error})
         return _render_result(
@@ -1221,8 +1362,25 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             readiness_cp = _run_command(
                 [sys.executable, str(READINESS_SCRIPT), "--body-file", str(candidate_path), "--mode", "static"]
             )
-            if readiness_cp.returncode != 0:
-                state.errors.append(_child_error(readiness_cp, "guard_or_readiness_failed_before_mutation"))
+            # Issue #2922: forwarded needs_fix, or a failing candidate static
+            # readiness, is only tolerated when the pre-existing readiness
+            # compatibility lane proves the defect multiset is unchanged.
+            if deferred_needs_fix or readiness_cp.returncode != 0:
+                compat_lane_ok = compat_lane_preconditions and _preexisting_readiness_defects_unchanged(
+                    current_body, mutated_candidate, readiness_cp
+                )
+                if not compat_lane_ok and deferred_needs_fix:
+                    state.errors.append(
+                        {
+                            "code": "readiness_needs_fix_without_resolution_evidence",
+                            "message": "forwarded readiness status=needs_fix without resolution_evidence",
+                        }
+                    )
+                elif not compat_lane_ok:
+                    state.errors.append(_child_error(readiness_cp, "guard_or_readiness_failed_before_mutation"))
+            else:
+                compat_lane_ok = True
+            if not compat_lane_ok:
                 return _render_result(
                     native_relationships=rel_result_for_output,
                     status="failed_no_mutation", issue_number=state.issue_number, repo=state.repo,
