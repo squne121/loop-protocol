@@ -3706,8 +3706,7 @@ def test_rg_long_boolean_flags_single_allowed_file_not_broad():
     with tempfile.TemporaryDirectory() as temp_dir:
         for command in commands:
             result = classify_static_command(command, Path(temp_dir), allowed_paths=allowed)
-            category = result[1] if result else None
-            assert category != "broad_search_path_unbounded", (command, result)
+            assert result is None, (command, result)
 
 
 @pytest.mark.parametrize(
