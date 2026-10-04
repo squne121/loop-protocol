@@ -803,6 +803,42 @@ def _is_pr_review_only_skip_echo(item: dict[str, Any]) -> bool:
     )
 
 
+_PR_REVIEW_ONLY_RAW_EXECUTION_FLAGS = ("fallback_detected", "human_review_required", "stop_condition_triggered")
+
+
+def _pr_review_only_raw_report_error(test_verdict: Any) -> str | None:
+    """Fail-closed validation of the RAW TEST_VERDICT_MACHINE/v2 report for the
+    independent pr_review_only route (Issue #2912 fix_delta, PR #2924 P2).
+
+    adapt_test_verdict_to_current_vc_result() coerces the execution flags with
+    bool() and back-fills reviewed_head_sha from head_sha, so a missing / null /
+    non-bool flag or a missing reviewed_head_sha is indistinguishable from an
+    explicit false / matching head once adapted. step-2 requires head_sha /
+    reviewed_head_sha / diff_head_sha bound to one head and per-command
+    execution flags, so they are verified here on the report as received."""
+    if not isinstance(test_verdict, dict):
+        return "pr_review_only_report_not_object"
+    head_sha = test_verdict.get("head_sha")
+    if (
+        not _is_nonempty_string(head_sha)
+        or test_verdict.get("reviewed_head_sha") != head_sha
+        or test_verdict.get("diff_head_sha") != head_sha
+    ):
+        return "pr_review_only_head_binding_mismatch"
+    if "human_review_required" in test_verdict and not isinstance(test_verdict["human_review_required"], bool):
+        return "pr_review_only_report_flag_not_boolean::human_review_required"
+    rows = test_verdict.get("runtime_ac_results")
+    if not isinstance(rows, list):
+        return None  # missing_runtime_ac_results is already reported by the adapter
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for flag in _PR_REVIEW_ONLY_RAW_EXECUTION_FLAGS:
+            if not isinstance(row.get(flag), bool):
+                return f"pr_review_only_report_flag_not_boolean:{row.get('ac')}:{flag}"
+    return None
+
+
 def _current_head_binding_error(
     *,
     reason_prefix: str,
@@ -1439,6 +1475,8 @@ def adjudicate_vc_result(
                 expected_issue_number=expected_issue_number,
                 expected_pr_number=expected_pr_number,
             )
+            if binding_error is None:
+                binding_error = _pr_review_only_raw_report_error(test_verdict)
         else:
             binding_error = _test_verdict_binding_error(
                 test_verdict,
@@ -1570,6 +1608,15 @@ def adjudicate_vc_result(
             continue
 
         baseline_item = baseline_by_key[(norm["ac"], norm["command_hash"])]
+        if independent_pr_review_only and norm["exit_code"] == 0 and norm["status"] != "pass":
+            # Issue #2912 fix_delta (PR #2924 REQUEST_CHANGES P1): on the independent
+            # route an ordinary row whose OWN status is not "pass" (skip / fail / ...)
+            # is never promoted to PASS merely because exit_code == 0.
+            return _result(
+                overall_status="indeterminate", per_ac=[], rerun_required=True,
+                source_integrity=source_integrity, evidence_refs=evidence_refs,
+                errors=[f"pr_review_only_ordinary_current_status_not_pass:{norm['ac']}"],
+            )
         if norm["exit_code"] == 0:
             if norm["failure_keys_present"]:
                 status, blocking, rerun_required, reason_code, summary = (

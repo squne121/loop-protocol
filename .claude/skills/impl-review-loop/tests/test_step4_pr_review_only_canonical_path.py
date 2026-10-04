@@ -1318,3 +1318,120 @@ def test_step_docs_state_canonical_entrance(tmp_path):
     # The retained, allowed texts are still present (they are outside the checked phrases).
     assert "route_loop_verdict_v2_resolve_semantic_ambiguity()" in docs["step-5"]
     assert "step-5-mergeability-handling.md" in docs["step-4"]
+
+
+# --- #2924 REQUEST_CHANGES fix_delta (A: ordinary status / B: raw report / C: Step 2 triplet) ---
+
+
+@pytest.mark.parametrize("status", ["skip", "fail"])
+def test_mixed_ordinary_non_pass_status_with_zero_exit_is_not_promoted_to_pass(tmp_path, mixed, status):
+    # Finding A (P1): an ordinary row whose own status is not "pass" must not be promoted
+    # to PASS merely because exit_code == 0 while the report-level result is PASS.
+    changed = ["implemented.txt", "implemented2.txt"]
+    for tag, index in zip(("first", "last"), (mixed.indices("ordinary")[0], mixed.indices("ordinary")[-1])):
+        ws = Workspace(tmp_path / tag, mixed)
+        ws.dir.mkdir()
+        report = _report(mixed, row_overrides={index: {"status": status, "exit_code": 0}})
+        assert report["result"] == "PASS"
+
+        rc, payload = ws.adjudicate(report, diff_summary=_diff_summary(mixed, changed_paths=changed))
+
+        assert rc == 1, (tag, payload)
+        assert payload["invoke_pr_reviewer"] is False, (tag, payload)
+        assert payload["seq"] is None
+        assert payload["adjudication"]["blocking"] is True
+        assert "dispatch" not in ws.state()
+        assert ws.state().get("vc_adjudication", {}) == {}
+
+
+@pytest.mark.parametrize("flag", ["fallback_detected", "human_review_required", "stop_condition_triggered"])
+@pytest.mark.parametrize("bad", ["missing", None, 0, "", "false"], ids=["missing", "null", "zero", "empty", "str"])
+def test_raw_report_execution_flags_must_be_explicit_booleans(tmp_path, single, flag, bad):
+    # Finding B-1 (P2): a missing / null / non-bool flag in the RAW report is not an explicit false.
+    ws = Workspace(tmp_path, single)
+    report = _report(single)
+    if bad == "missing":
+        del report["runtime_ac_results"][0][flag]
+    else:
+        report["runtime_ac_results"][0][flag] = bad
+
+    rc, payload = ws.adjudicate(report)
+
+    assert rc == 1, payload
+    assert payload["invoke_pr_reviewer"] is False and payload["seq"] is None
+    # A truthy non-bool ("false") is coerced to True by the adapter and already blocked as a
+    # non-pass execution; every other non-bool is rejected on the raw report. Both fail closed.
+    expected = (
+        ["pr_review_only_current_execution_not_pass:AC1"]
+        if bad == "false"
+        else [f"pr_review_only_report_flag_not_boolean:AC1:{flag}"]
+    )
+    assert payload["adjudication"]["errors"] == expected
+    assert "dispatch" not in ws.state()
+
+
+def test_raw_report_flags_are_checked_for_ordinary_rows_and_top_level(tmp_path, mixed):
+    changed = _diff_summary(mixed, changed_paths=["implemented.txt", "implemented2.txt"])
+    ordinary = mixed.indices("ordinary")[0]
+    ws = Workspace(tmp_path / "row", mixed)
+    ws.dir.mkdir()
+    report = _report(mixed)
+    del report["runtime_ac_results"][ordinary]["stop_condition_triggered"]
+    rc, payload = ws.adjudicate(report, diff_summary=changed)
+    assert rc == 1 and payload["invoke_pr_reviewer"] is False
+    assert payload["adjudication"]["errors"] == ["pr_review_only_report_flag_not_boolean:AC1:stop_condition_triggered"]
+
+    ws = Workspace(tmp_path / "top", mixed)
+    ws.dir.mkdir()
+    rc, payload = ws.adjudicate(_report(mixed, human_review_required=0), diff_summary=changed)
+    assert rc == 1 and payload["invoke_pr_reviewer"] is False
+    assert payload["adjudication"]["errors"] == ["pr_review_only_report_flag_not_boolean::human_review_required"]
+
+
+@pytest.mark.parametrize("field", ["reviewed_head_sha", "diff_head_sha"])
+@pytest.mark.parametrize("bad", ["missing", None, "", "d" * 40], ids=["missing", "null", "empty", "drift"])
+def test_raw_report_head_fields_are_required_and_must_agree(tmp_path, single, field, bad):
+    # Finding B-2 (P2): step-2 requires head_sha / reviewed_head_sha / diff_head_sha bound to one head.
+    # reviewed_head_sha must not be back-filled from head_sha, and a drifting diff_head_sha is not ignored.
+    ws = Workspace(tmp_path, single)
+    report = _report(single)
+    if bad == "missing":
+        del report[field]
+    else:
+        report[field] = bad
+
+    rc, payload = ws.adjudicate(report)
+
+    assert rc == 1, payload
+    assert payload["invoke_pr_reviewer"] is False and payload["seq"] is None
+    assert payload["adjudication"]["errors"] == ["pr_review_only_head_binding_mismatch"]
+    assert "dispatch" not in ws.state()
+
+
+def _step2_message_template() -> str:
+    text = STEP2_DOC.read_text(encoding="utf-8")
+    block = re.search(r"```yaml\n(spawn_agent:.*?)```", text, flags=re.DOTALL)
+    assert block is not None, "step-2 spawn_agent template not found"
+    return block.group(1)
+
+
+def test_step2_delegation_template_passes_ac_command_command_hash_triplets_verbatim():
+    # Finding C (P1): test-runner must echo command_hash, so root passes (ac, raw_command, command_hash)
+    # triplets from extract-vc-metadata verbatim; test-runner never guesses / recomputes / inherits it.
+    template = _step2_message_template()
+    squashed_template = _squash(template)
+    assert _squash("Per-command inputs") in squashed_template
+    assert _squash("echo these values exactly") in squashed_template
+    for key in ("- ac:", "command:", "command_hash:"):
+        assert _squash(key) in squashed_template, key
+    # The old pair-only (label => command) shape must be gone from the template.
+    assert "=>" not in template
+
+    doc = _squash(STEP2_DOC.read_text(encoding="utf-8"))
+    for phrase in (
+        "`(ac, raw_command, command_hash)` の triplet",
+        "`extract-vc-metadata` の `commands[]` から",
+        "test-runner は `command_hash` を推測・再計算してはならず、親 context の暗黙継承に依存してはならない",
+    ):
+        assert _squash(phrase) in doc, phrase
+    assert _squash("`(ac label, literal command)` の組") not in doc
