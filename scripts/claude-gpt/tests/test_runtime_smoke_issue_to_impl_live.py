@@ -99,6 +99,30 @@ def resolve_canonical_main_root(sut_root: Path) -> tuple[Path | None, str | None
     return root, None
 
 
+_PREFLIGHT_PATH = _REPO_ROOT / "scripts" / "claude-gpt" / "workflow_capability_preflight.py"
+_PROMPT_OPERATION_EXAMPLES = ("issue_edit", "issue_comment")
+
+
+def build_workflow_prompt(issue_number: str) -> str:
+    # issue-refinement-loop の skill docs は、preflight.run に渡す LOOP_PLANNED_OPERATIONS_JSON の
+    # operation 名の語彙（workflow_capability_preflight.py の _KNOWN_OPERATION_ROUTES）を記載していない。
+    # model が未登録の名前（例: controlled_issue_edit）を推測で作ると preflight が
+    # `operation_route_unavailable` で blocked になり、planner / SubAgent に到達しない。これは repository
+    # workflow 側の documentation gap であり launcher の欠陥ではない。この smoke は launcher 経路の通信・報告
+    # 到達を測るものなので、model の推測という交絡要因を下の一文で除く（docs gap は follow-up Issue で追跡する。
+    # Issue 番号は PR 本文に記載）。評価基準（planner_ran / SubAgent completion / terminal step）は緩めない。
+    return (
+        "Run the repository's issue-refinement-loop skill for Issue "
+        f"#{issue_number} in {_REPO} using the current canonical entry (max_iterations: 1). Follow the "
+        "skill's documented procedure autonomously up to its documented terminal boundary, including the "
+        "canonical termination publish. If the repository workflow itself stops with "
+        "human_judgment_required, report that terminal reason; do not work around the stop. "
+        "Note: when you build LOOP_PLANNED_OPERATIONS_JSON for preflight.run, each operation value must be a "
+        "name registered in _KNOWN_OPERATION_ROUTES of scripts/claude-gpt/workflow_capability_preflight.py "
+        f"(for example {', '.join(_PROMPT_OPERATION_EXAMPLES)}); do not invent other operation names."
+    )
+
+
 def _events(stdout: str):
     for line in (stdout or "").splitlines():
         line = line.strip()
@@ -227,6 +251,24 @@ def test_workflow_evaluator_accepts_completed_subagents():
     assert result["ok"] is True and result["subagents_completed"] == 1
 
 
+def test_workflow_prompt_pins_known_operation_vocabulary_to_the_registry():
+    prompt = build_workflow_prompt("2889")
+    assert "_KNOWN_OPERATION_ROUTES" in prompt and "LOOP_PLANNED_OPERATIONS_JSON" in prompt
+    spec = importlib.util.spec_from_file_location("workflow_capability_preflight_2925_ac5_prompt", _PREFLIGHT_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    known = module._KNOWN_OPERATION_ROUTES
+    assert isinstance(known, frozenset)
+    assert _PROMPT_OPERATION_EXAMPLES
+    for name in _PROMPT_OPERATION_EXAMPLES:
+        assert name in prompt and name in known, name
+    # 推測で作られた operation 名は registry に無い（hint が必要だった理由の固定）。
+    assert "controlled_issue_edit" not in known and "controlled_issue_comment_publish" not in known
+    assert "controlled_issue_edit" not in prompt
+
+
 def _init_repo(path: Path) -> None:
     path.mkdir(parents=True)
     for cmd in (
@@ -310,13 +352,7 @@ def test_live_issue_refinement_loop_through_minimal_claude_gpt():
         _skip(f"canonical main root checkout unavailable for the workflow ({root_problem})")
 
     runner = _load_runner()
-    prompt = (
-        "Run the repository's issue-refinement-loop skill for Issue "
-        f"#{issue_number} in {_REPO} using the current canonical entry (max_iterations: 1). Follow the "
-        "skill's documented procedure autonomously up to its documented terminal boundary, including the "
-        "canonical termination publish. If the repository workflow itself stops with "
-        "human_judgment_required, report that terminal reason; do not work around the stop."
-    )
+    prompt = build_workflow_prompt(issue_number)
     # claude の cwd は canonical main root（preflight.run が要求する場所）。launcher は SUT（PR worktree）の
     # launch.sh を絶対 path で指定する。
     rc, out, err, timed_out = runner.run_structured_claude(
