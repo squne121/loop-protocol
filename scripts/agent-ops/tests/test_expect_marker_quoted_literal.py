@@ -232,6 +232,9 @@ def test_quoted_prompt_only_rejected_as_provenance(tmp_path):
     causal = evidence["subagent_causal_evidence"]
     assert causal["marker_provenance_verified"] is False
     assert causal["causal_evidence_source"] != "hook_id_correlated"
+    # AC4 semantics: the literal is NOT in the child's body, so it must stay
+    # missing even though the Agent tool-input prompt carries it.
+    assert evidence["expected_markers_missing"] == [QUOTED_MARKER]
     assert code == 1
 
 
@@ -244,7 +247,28 @@ def test_quoted_prompt_only_rejected_when_parent_text_echoes_literal(tmp_path):
     )
     code, evidence = _run_runner(tmp_path, stream, [QUOTED_MARKER])
     assert evidence["subagent_causal_evidence"]["marker_provenance_verified"] is False
+    # The parent's assistant text is not child output: still missing.
+    assert evidence["expected_markers_missing"] == [QUOTED_MARKER]
     assert code == 1
+
+
+def test_quoted_positive_via_handback_report_when_stop_has_no_last_message(tmp_path):
+    """AC1 (handback path): when the correlated ``SubagentStop`` carries no
+    ``last_assistant_message``, the Agent tool ``handbackReport.text`` is the
+    child's delivered report; a quoted literal in it is neither missing nor
+    unverified, in the same evidence."""
+    stream = _stream(child_body="", parent_text="parent without the literal")
+    stream = [ln for ln in stream]
+    # drop last_assistant_message from the Stop and attach a handbackReport.
+    stop_idx = next(i for i, ln in enumerate(stream) if '"SubagentStop"' in ln and "hook_response" in ln)
+    stream[stop_idx] = _hook_event("SubagentStop")
+    result_idx = next(i for i, ln in enumerate(stream) if "tool_use_result" in ln)
+    result = json.loads(stream[result_idx])
+    result["tool_use_result"]["handbackReport"] = {"text": f"report ok\n{QUOTED_MARKER}"}
+    stream[result_idx] = _line(result)
+    code, evidence = _run_runner(tmp_path, stream, [QUOTED_MARKER])
+    assert evidence["expected_markers_missing"] == []
+    assert evidence["subagent_causal_evidence"]["marker_provenance_verified"] is True
 
 
 def test_quoted_absent_quoted_missing_stays_in_expected_markers_missing(tmp_path):
