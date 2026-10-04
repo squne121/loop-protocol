@@ -2997,6 +2997,14 @@ def _rg_extract_path_operands(argv: List[str]) -> List[str]:
         # NOTE: -l (--files-with-matches) is boolean, intentionally excluded here
     ])
 
+    # Issue #2900: explicit allow-list of argument-less long boolean flags.
+    _RG_LONG_BOOLEAN_FLAGS_FOR_PATH = frozenset([
+        "--files-without-match",
+        "--fixed-strings",
+        "--count",
+        "--no-line-number",
+    ])
+
     # Issue #1328 Blocker 3: -f/--file PATTERNFILE supplies the pattern from a
     # file, just like -e/--regexp supplies it inline. In both cases there is
     # no positional PATTERN argument to skip, so all remaining positionals
@@ -3064,6 +3072,14 @@ def _rg_extract_path_operands(argv: List[str]) -> List[str]:
                 skip_flag_value = True
                 break
         if skip_flag_value:
+            i += 1
+            continue
+
+        # Issue #2900: argument-less long boolean flags (exact match only).
+        # These take no value and are neither PATTERN nor PATH. Deliberately NOT
+        # a startswith("--") / --no-* generalisation, and `--files` is excluded
+        # (separate mode that takes no PATTERN, so positional meaning differs).
+        if arg in _RG_LONG_BOOLEAN_FLAGS_FOR_PATH:
             i += 1
             continue
 
