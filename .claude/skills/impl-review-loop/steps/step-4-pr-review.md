@@ -38,14 +38,18 @@ TEST_VERDICT comment/artifact（存在する場合）は diagnostics-only であ
 
 | 入力 | 必須 field | 取得元 |
 |---|---|---|
-| `--test-verdict-file` | `step-2-verification.md` の委譲契約どおりの `TEST_VERDICT_MACHINE/v2`（`generated_at` と per-command `command_hash` を含む） | Step 2 で取得した test-runner の final result（read-only report）。final result が不在なら存在しないファイルのまま渡してよい（失効して exit 1） |
+| `--test-verdict-file` | `step-2-verification.md` の委譲契約どおりの `TEST_VERDICT_MACHINE/v2`（`generated_at` と per-command `command_hash` を含む。`pr_review_only` の独立経路では GitHub 固有 trust marker のキーを含めない） | Step 2 で取得した test-runner の final result（read-only report）。final result が不在なら存在しないファイルのまま渡してよい（失効して exit 1） |
 | `--contract-snapshot-file` | `status: go`、`body_sha256`（`sha256:` 付き）、baseline の VC classification（`results[]` または `checks.vc_preflight.classifications[]`） | `ensure_contract_snapshot.py` が trusted source に保存した `CONTRACT_REVIEW_RESULT_V1`（または baseline producer の `baseline_vc_preflight/v1`）。`body_sha256` は live Issue 本文の digest と一致させる |
 | `--diff-summary-file` | `head_sha`（PR current head）、`pr_number`、changed paths（`changed_paths[]`） | `gh pr view <pr_number> --json headRefOid,number,files` による独立取得（`gh pr diff --name-only` でも可） |
 | `--allowed-paths-file` | live Issue の `## Allowed Paths` を並べた JSON 配列 | `gh issue view <issue_number> --json body` で取得した本文の Allowed Paths |
 | `--expected-head-sha` | PR current head SHA | `gh pr view <pr_number> --json headRefOid,mergeable,mergeStateStatus` の 1 回の応答の `headRefOid`。Step 5 の `--expected-head-sha` と live mergeability file も同じ応答から作る（`step-5-feedback-and-termination.md` 参照）。HEAD を別々に取得して混ぜない |
 | `--expected-contract-body-sha256` | live Issue 本文の SHA-256（`sha256:` 付き） | `gh issue view <issue_number> --json body \| jq -j .body \| sha256sum`（`ensure_contract_snapshot.py` の `sha256_of(body)` と同じ digest） |
 | `--expected-command-hashes-file` | literal Verification Command の SHA-256 を宣言順に並べた JSON 配列 | live Issue 本文を独立取得して保存したファイルから `adjudicate_vc_result.py extract-vc-metadata --body-file <live body>` で再導出した `command_hashes[]`（parse-only で VC を実行しない。`baseline_vc_preflight.py` は executor のため hash 取得に使わない。contract snapshot の値を使い回さない） |
-| `--expected-issue-number` / `--expected-pr-number` | runtime_only VC を含む場合は必須（未指定は拒否される） | 呼び出し元が `gh issue view` / `gh pr view` で独立取得した live 値 |
+| `--expected-issue-number` / `--expected-pr-number` | runtime_only または pr_review_only VC を含む場合は必須（未指定は拒否される。下記の単文を参照） | 呼び出し元が `gh issue view` / `gh pr view` で独立取得した live 値 |
+
+`--expected-issue-number` / `--expected-pr-number` は runtime_only または pr_review_only VC を含む場合は必須である（未指定は `runtime_only_expected_*_number_missing` / `pr_review_only_expected_*_number_missing` で拒否され、reviewer dispatch は開かない）。
+
+`step4-adjudicate` が current evidence として consume するのは `--test-verdict-file`（内部で adapter を通す）と `--contract-snapshot-file` / `--diff-summary-file` / `--allowed-paths-file` / `--expected-*` である。`--current-vc-result-file` は `adjudicate` / `step4-gate` 用であり、`step4-adjudicate` は読まない。
 
 手組みの入力（上記の取得元を経ない JSON）は正規経路ではなく、保存済み PASS の根拠として扱わない。
 
@@ -105,6 +109,12 @@ uv run python3 .claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py s
 - WAL・ledger・lock・追加の state file は導入しない。回復は canonical な adjudicate + persist のやり直しだけである。
 
 「reviewer dispatch 許可」とは `step4-adjudicate` が `invoke`（exit 0）を返したことである。reviewer の実起動は LLM 手順であり、dispatch 関数は存在しない。
+
+#### exit 0 の意味と terminal approval の入口（Issue #2912）
+
+`step4-adjudicate` の exit 0 は reviewer dispatch の許可であり、terminal approval ではない。AC 達成の証明でもなく、reviewer の意味判断（実行事実・AC・diff の照合）は pr-reviewer が行う。terminal approval（`termination_reason: approved` / `merge_ready: true`）の確定は `step5-terminal-gate` の exit 0 のみを根拠とする。`route_loop_verdict_v2()` を直接呼んだ結果から終端承認を確定してはならない（`step-5-feedback-and-termination.md` の terminal gate 節参照）。
+
+`pr_review_only` VC を含む場合、`step4-adjudicate` は baseline の scope 認可（producer skip envelope）と current-head の実行事実（test-runner の独立 report）を別の状態として扱う。経路の判定（独立経路 / legacy 経路）、独立経路が受理する executed PASS item、`pr_review_only_*` の reason code と fail-closed の扱いは `step-2-verification.md` の「`pr_review_only` AC の current-head 証跡の取得と経路判定」節を正本とする。独立経路は GitHub 固有 trust marker を省略した report を入力とし、`--require-producer-receipt` 指定時と marker のキーが 1 つでも存在する report は legacy 経路で検証される。`pr_review_only` AC の実行失敗（FAIL / SKIP / fallback / 非 0 exit）は `pr_review_only_current_execution_not_pass:<AC>` で fail-closed になり、reviewer を起動せず dispatch seq も記録しない（実行失敗を reviewer 判断へ委譲する route は follow-up #2916 の所有）。
 
 #### reviewer 起動前の `seq` の保存
 
@@ -322,7 +332,7 @@ Step 4 では verdict 判定前に `wait_ci_checks.sh` を使って required che
 
 ## 期待する出力
 
-pr-reviewer は判定結果（verdict 本文 + `verdict` / `reviewed_head_sha` / `blockers` / `warnings` の最小 convention、Issue #1873）を呼び出し元（control-plane）へ返す。`merge_ready` / `mergeability` / `required_auto_actions` / `allowed_paths_gate` は pr-reviewer の自己申告として受け取らない。mergeability（`mergeable` / `merge_state_status`）は control-plane が `gh pr view --json headRefOid,mergeable,mergeStateStatus` で都度直接取得し、`route_loop_verdict_v2()` の `live_mergeability` 引数として渡す（`step-5-mergeability-handling.md` 参照）。
+pr-reviewer は判定結果（verdict 本文 + `verdict` / `reviewed_head_sha` / `blockers` / `warnings` の最小 convention、Issue #1873）を呼び出し元（control-plane）へ返す。`merge_ready` / `mergeability` / `required_auto_actions` / `allowed_paths_gate` は pr-reviewer の自己申告として受け取らない。mergeability（`mergeable` / `merge_state_status`）は control-plane が `gh pr view --json headRefOid,mergeable,mergeStateStatus` で都度直接取得し、live mergeability file として `step5-terminal-gate` に渡す（`step-5-feedback-and-termination.md` の terminal gate 節と `step-5-mergeability-handling.md` 参照）。
 
 pr-reviewer は Write/Edit を持たないため、監査用の verdict コメント投稿は control-plane が通常の `gh pr comment --body-file` で行う（専用 semantic publisher は使用しない）。投稿する verdict コメント本文には人間可読の判定根拠（Mergeability / Evidence Check / Blockers / Non-blockers）を書き、以下の最小 YAML ブロックを併記する:
 
