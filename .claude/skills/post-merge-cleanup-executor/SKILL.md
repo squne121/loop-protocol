@@ -134,10 +134,25 @@ uv run --locked python3 scripts/agent-ops/guard_preflight.py --json
 ```bash
 uv run --locked python3 scripts/agent-ops/cleanup_exec.py \
   --pr-number <pr> --linked-issue-number <issue> \
-  --worktree-path <絶対 worktree path> --branch-name <branch> --json
+  --worktree-path <絶対 worktree path> --branch-name <branch> \
+  [--non-closing-authority-file <non_closing_authority_file>] --json
 ```
 `status: ok` で `actions_taken` に `worktree_remove` / `branch_delete` が入る。`status: refused` の場合は
 `reason_code`（`pr_not_merged` / `worktree_dirty` / `root_not_default_branch` 等）を `unresolved_cleanup_items` に記録する。
+
+`[--non-closing-authority-file <non_closing_authority_file>]` は任意引数（Issue #2891）。worker の入力として
+`non_closing_authority_file`（orchestrator が保存した 7 key の JSON object ファイルの path）が渡された場合に
+**限り**、その path を括弧なしでそのまま追記する。入力に無い場合は引数ごと省略する（従来どおりの呼び出し）。
+worker はこのファイルを作成・編集・再構築しない（Edit / Write を持たない）。ファイルが読めない・JSON object
+でない場合も `cleanup_exec` は「authority 未供給」と同じ扱いで従来どおり `LINKED_ISSUE_MISMATCH` を返すため、
+worker は `linked_issue_number` を省略して認可を迂回しない。`cleanup_exec` はこの authority を、`closingIssuesReferences`
+が空の PR に限り、既存の closing relation fast path と research fallback のどちらでも認可されなかった場合にだけ
+評価する（通常 lane・branch-only lane・同一 invocation 内の branch-only 再認可のすべてで再評価され、再取得した
+PR 本文の hash が変わっていれば拒否される）。
+
+**残る制限（Issue #2891 完了後も）**: discard レーン（`materialize_cleanup_contract.py`）は authority を使わず挙動が
+変わらない。`--phase recover` / `--phase local-only` の Task Context adapter は non-closing binding を引き続き
+受理しない（別 Outcome・#2910 が所有）。全 recovery path が解禁されたわけではない。
 
 cleanup の正本経路は `cleanup_exec` **のみ** とする（Issue #1137 Blocker 4）。`cleanup_exec` は worktree
 remove と branch delete を **単一トランザクション** として内部で行う。agent が bare `git worktree remove` →

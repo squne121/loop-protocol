@@ -8,6 +8,7 @@ selectable via ``pytest -k <marker>`` per the Issue's Verification Commands.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -790,8 +791,89 @@ def test_given_close_gate_matrix_when_compared_then_workflow_and_post_merge_skil
     assert "PR 本文の `Closes #N` 文字列そのものは authority にしない" in skill_text
     assert "non_closing_authority" in skill_text and "`--phase recover` / `--phase local-only` は non-closing binding を受理せず" in skill_text
 
-    # deletion-class cleanup for Refs-bound PRs stays safe-side stopped until #2891 (no linked_issue_number bypass)
-    assert "#2891" in skill_text
+    # Issue #2891 replaced the old "stopped until #2891" limitation: see
+    # test_issue_2891_* below for the delivery path and the remaining limitation.
     assert "LINKED_ISSUE_MISMATCH" in skill_text
     assert "`linked_issue_number` を省略して認可を迂回する運用は採らない" in skill_text
     assert "cleanup_exec.py::_verify_linked_issue" in skill_text
+
+
+# ---------------------------------------------------------------------------
+# Issue #2891: non_closing_authority delivery path (orchestrator -> worker -> executor Skill -> CLI)
+# ---------------------------------------------------------------------------
+
+CLEANUP_EXEC_SCRIPT = REPO_ROOT / "scripts" / "agent-ops" / "cleanup_exec.py"
+AUTHORITY_FLAG = "--non-closing-authority-file"
+
+
+def _executor_cleanup_exec_block() -> str:
+    text = EXECUTOR_SKILL.read_text(encoding="utf-8")
+    blocks = [
+        b
+        for b in re.findall(r"```bash\n(.*?)```", text, flags=re.DOTALL)
+        if "scripts/agent-ops/cleanup_exec.py" in b
+    ]
+    assert len(blocks) == 1, f"exactly one production cleanup_exec command block expected, got {len(blocks)}"
+    return blocks[0]
+
+
+def test_issue_2891_executor_command_block_flags_exist_in_production_cli():
+    """The executor Skill's production command block must not drift from the real argparse."""
+    block = _executor_cleanup_exec_block()
+    # flags of the script itself only (the `uv run --locked` prefix belongs to uv)
+    skill_flags = set(re.findall(r"--[a-z][a-z-]*", block.split("scripts/agent-ops/cleanup_exec.py", 1)[1]))
+    assert AUTHORITY_FLAG in skill_flags
+    help_text = subprocess.run(
+        [sys.executable, str(CLEANUP_EXEC_SCRIPT), "--help"], capture_output=True, text=True, check=True
+    ).stdout
+    cli_flags = set(re.findall(r"--[a-z][a-z-]*", help_text))
+    assert skill_flags <= cli_flags, f"Skill flags not accepted by the CLI: {sorted(skill_flags - cli_flags)}"
+    # The authority is optional: it is wrapped in brackets so a missing worker input drops the whole argument.
+    assert f"[{AUTHORITY_FLAG} <non_closing_authority_file>]" in block
+
+
+def test_issue_2891_orchestrator_passes_authority_file_path_only_when_body_verdict_valid():
+    text = ORCHESTRATOR_SKILL.read_text(encoding="utf-8")
+    assert "non_closing_authority_file" in text
+    assert AUTHORITY_FLAG in text
+    # conditional: only when the evaluator body_verdict is `valid`, never on `decision == nonclosing_required` alone
+    assert "`body_verdict` が `valid` の場合に限り" in text
+    assert "`decision == nonclosing_required` だけを根拠にしない" in text
+    # PATH ONLY via the Delegation message / Materialization rule; the orchestrator never assembles the argv
+    assert "**path のみ**" in text
+    assert "orchestrator が `cleanup_exec` の argv 全体を組み立てて worker に渡してはならない" in text
+    assert "ファイルの内容（7 key）を message に複製せず" in text
+    delegation = text[text.index("### Materialization rule"):]
+    assert "`non_closing_authority_file`" in delegation.split("完了の扱いは4 site 共通")[0]
+
+
+def test_issue_2891_worker_input_lists_authority_file_path_without_duplicating_procedure():
+    text = WORKER_MD.read_text(encoding="utf-8")
+    inputs = text.split("## 入力")[1].split("## 振る舞い")[0]
+    assert "`non_closing_authority_file`" in inputs
+    assert "path のみ" in inputs
+    # procedure body is not duplicated into the worker definition (DRY)
+    assert "uv run --locked python3 scripts/agent-ops/cleanup_exec.py" not in text
+
+
+def test_issue_2891_old_limitation_replaced_and_remaining_limitation_documented():
+    skill_text = ORCHESTRATOR_SKILL.read_text(encoding="utf-8")
+    workflow_text = WORKFLOW_DOC.read_text(encoding="utf-8")
+    executor_text = EXECUTOR_SKILL.read_text(encoding="utf-8")
+    for label, text in (("orchestrator", skill_text), ("workflow", workflow_text), ("executor", executor_text)):
+        # old limitation wording is gone
+        assert "#2891 まで" not in text, label
+        assert "follow-up #2891 が所有し" not in text, label
+        assert "別 Outcome（#2891）が所有" not in text, label
+        assert "それまで `Refs`-bound PR の削除系 cleanup は" not in text, label
+        # the delivery entry and the remaining (unfixed) limitation are documented consistently
+        assert AUTHORITY_FLAG in text, label
+        assert "#2910" in text, label
+        assert "recover" in text and "local-only" in text, label
+        # never claimed as fully unlocked
+        assert "全 recovery path が解禁された" in text or "全 recovery path が解禁されたわけではない" in text, label
+        assert "全 recovery path が解禁された。" not in text, label
+        assert "すべての recovery path が解禁" not in text, label
+    assert "全 recovery path が解禁されたとは扱わない" in skill_text
+    assert "全 recovery path が解禁されたわけではない" in workflow_text
+    assert "全 recovery path が解禁されたわけではない" in executor_text

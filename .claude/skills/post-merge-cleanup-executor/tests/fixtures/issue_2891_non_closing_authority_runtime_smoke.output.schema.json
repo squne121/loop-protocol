@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Issue #2891 runtime smoke output contract (existing POST_MERGE_CLEANUP_REPORT_V1 required fields only)",
+  "description": "Shape-only check of the synthetic dry-run output against the required keys of the closed-key POST_MERGE_CLEANUP_REPORT_V1 documented in post-merge-cleanup-executor SKILL.md and validated by scripts/check_post_merge_cleanup_boundary.py. It does not prove a formal Skill load, a worker run, or execution of the documented procedure. No field or enum below is newly defined.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "generated_at",
+    "generated_by",
+    "human_review_required",
+    "cleaned_branches",
+    "cleaned_worktrees",
+    "unresolved_cleanup_items",
+    "parent_issue_status",
+    "superseded_prs",
+    "follow_up_issue_requests",
+    "stash_restored",
+    "stash_entry_ref",
+    "warnings",
+    "errors"
+  ],
+  "properties": {
+    "status": {"enum": ["ok", "partial", "failed"]},
+    "generated_at": {"type": "string"},
+    "generated_by": {"type": "string"},
+    "human_review_required": {"type": "boolean"},
+    "cleaned_branches": {"type": "array"},
+    "cleaned_worktrees": {"type": "array"},
+    "unresolved_cleanup_items": {"type": "array"},
+    "parent_issue_status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["parent_issue_number", "all_children_closed", "recommended_action"],
+      "properties": {
+        "parent_issue_number": {"type": "integer"},
+        "all_children_closed": {"type": "boolean"},
+        "recommended_action": {"enum": ["close", "keep_open", "n/a"]}
+      }
+    },
+    "superseded_prs": {"type": "array"},
+    "follow_up_issue_requests": {"type": "array"},
+    "stash_restored": {"anyOf": [{"type": "boolean"}, {"const": "n/a"}]},
+    "stash_entry_ref": {"type": ["string", "null"]},
+    "warnings": {"type": "array"},
+    "errors": {"type": "array"}
+  }
+}

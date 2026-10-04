@@ -24,6 +24,7 @@ main thread から以下を受け取る:
 
 - `merged_pr_number`（ステップ 5-6 実行時は必須。未提供時は skip して `unresolved_cleanup_items` に記録）
 - `linked_issue_number`（任意）
+- `non_closing_authority_file`（任意。orchestrator が保存した `non_closing_authority`（7 key の JSON object）ファイルの **path のみ**。worker は内容を作成・編集せず、executor Skill の `cleanup_exec.py` コマンドの任意引数 `--non-closing-authority-file` にそのまま渡す。無ければ省略し、`linked_issue_number` の省略による認可迂回もしない）
 
 ## 振る舞い
 
