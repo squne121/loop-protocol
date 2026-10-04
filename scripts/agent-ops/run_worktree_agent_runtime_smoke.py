@@ -2084,6 +2084,49 @@ def _iter_claude_stream_events(stdout: str):
             yield payload
 
 
+_STREAM_DECODED_STRING_MAX_DEPTH = 4
+
+
+def _collect_decoded_json_strings(value: object, parts: list[str], depth: int = 0) -> None:
+    """Issue #2923: collect every JSON string VALUE reachable from ``value``
+    (already JSON-decoded, i.e. ``\\"`` is a plain ``"``).  A string value that
+    itself parses to a JSON object (a hook event echoes its own payload as a
+    JSON-encoded string, e.g. ``SubagentStop`` with ``last_assistant_message``)
+    is additionally descended into, bounded by ``_STREAM_DECODED_STRING_MAX_DEPTH``."""
+    if isinstance(value, str):
+        parts.append(value)
+        if depth < _STREAM_DECODED_STRING_MAX_DEPTH and value.lstrip().startswith("{"):
+            try:
+                nested = json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                return
+            if isinstance(nested, dict):
+                _collect_decoded_json_strings(nested, parts, depth + 1)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _collect_decoded_json_strings(item, parts, depth)
+    elif isinstance(value, list):
+        for item in value:
+            _collect_decoded_json_strings(item, parts, depth)
+
+
+def extract_claude_stream_decoded_text(stdout: str) -> str:
+    """Issue #2923: the JSON-UNESCAPED text of every string value in every
+    stream-json event of ``stdout`` (newline-joined).
+
+    In raw stream-json a ``"`` inside model text appears as ``\\"``, so a
+    ``--expect-marker`` literal containing a double quote never matches the raw
+    stdout even when the child produced it.  ``_marker_provenance_verified``
+    already matches against the child's unescaped text; this gives the
+    ``--expect-marker-source subagent`` missing-check the same representation.
+    It is used ONLY to widen that missing-check -- provenance still requires the
+    marker in the correlated child's own text, never merely anywhere in the stream."""
+    parts: list[str] = []
+    for payload in _iter_claude_stream_events(stdout):
+        _collect_decoded_json_strings(payload, parts)
+    return "\n".join(parts)
+
+
 def _parse_embedded_json_object(text: str) -> dict | None:
     """Best-effort parse of a JSON object embedded in hook stdout.
 
@@ -9362,7 +9405,16 @@ def main(argv: list[str] | None = None) -> int:
                 if args.expect_marker_source == "main":
                     marker_search_text = extract_claude_main_output_text(out)
                 else:
-                    marker_search_text = out + "\n" + err
+                    # Issue #2923: raw stdout/stderr (byte-identical to the
+                    # pre-#2923 search text) PLUS the JSON-unescaped stream
+                    # string values, so a marker containing a double quote is
+                    # observed in the same representation
+                    # ``_marker_provenance_verified`` uses.  Unquoted markers
+                    # are unaffected (a superset only ever adds matches that
+                    # the raw text could not express).
+                    marker_search_text = (
+                        out + "\n" + err + "\n" + extract_claude_stream_decoded_text(out)
+                    )
                 missing = [m for m in args.expect_marker if m not in marker_search_text]
                 schema_summary["expected_markers_missing"] = missing
                 if missing:
