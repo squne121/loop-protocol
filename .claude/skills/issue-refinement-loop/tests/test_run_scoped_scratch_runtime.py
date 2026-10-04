@@ -220,6 +220,11 @@ def cleanup_exact_artifact(artifact: Path, *, started_ns: int, parent_preexistin
             result["parent_removed"] = True
         except OSError:
             result["parent_kept_reason"] = "parent_not_empty"
+            # 残置理由の記録のみ (削除しない): producer が同 directory に書いた sibling や foreign artifact。
+            try:
+                result["leftover_entries"] = sorted(child.name for child in parent.iterdir())
+            except OSError:
+                result["leftover_entries"] = "unlistable"
     return result
 
 
@@ -899,6 +904,7 @@ def test_cleanup_does_not_remove_a_foreign_sibling_even_when_this_run_created_th
 
     assert report["artifact_unlinked"] is True and report["parent_removed"] is False
     assert report["parent_kept_reason"] == "parent_not_empty"
+    assert report["leftover_entries"] == ["provenance.json"]
     assert foreign.read_bytes() == b"foreign appeared during the run"
 
 
