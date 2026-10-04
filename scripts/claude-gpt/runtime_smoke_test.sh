@@ -159,6 +159,8 @@ permission_mode = None
 model = None
 tool_use_ids = {}
 tool_results = {}
+# SubAgent 側の hand-back: SubagentHandback tool_use の (parent_tool_use_id, tool_use id, input.message)。
+handback_uses = []
 final_text = ""
 result_is_error = None
 for event in events:
@@ -171,6 +173,10 @@ for event in events:
         for block in content:
             if isinstance(block, dict) and block.get("type") == "tool_use":
                 tool_use_ids[block.get("id")] = block.get("name")
+                if block.get("name") == "SubagentHandback":
+                    tool_input = block.get("input")
+                    message = tool_input.get("message") if isinstance(tool_input, dict) else None
+                    handback_uses.append((event.get("parent_tool_use_id"), block.get("id"), str(message or "")))
     elif etype == "user":
         content = (event.get("message") or {}).get("content") or []
         if isinstance(content, list):
@@ -187,10 +193,39 @@ for event in events:
 wanted = {expect_tool} if expect_tool != "Agent" else {"Agent", "Task"}
 matched_tool_use = [tid for tid, name in tool_use_ids.items() if name in wanted] if expect_tool != "-" else []
 tool_completed = False
+
+
+def _result_succeeded(tool_use_id):
+    """tool_result が存在し、is_error ではなく、body が明示的な success:false でないこと。"""
+    body, is_error = tool_results.get(tool_use_id, (None, True))
+    if body is None or is_error:
+        return False
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return True
+    return not (isinstance(parsed, dict) and parsed.get("success") is False)
+
+
 for tid in matched_tool_use:
     body, is_error = tool_results.get(tid, (None, True))
-    if body is not None and not is_error and tool_marker in body:
+    if body is None or is_error:
+        continue
+    if expect_tool != "Agent":
+        if tool_marker in body:
+            tool_completed = True
+        continue
+    # SubAgent の terminal completion: Claude Code 2.1.289 以降の stream-json では Agent tool_result は
+    # 「report は SubagentHandback で届いた」という定型文だけで marker を含まない。marker は
+    # SubAgent 側の SubagentHandback tool_use（parent_tool_use_id が当該 Agent tool_use）の input と、
+    # その成功 tool_result で観測する。harness が report を Agent tool_result へ直接載せる場合はそちらも許容。
+    # Agent tool_use の prompt や parent の自己申告 text だけでは成立させない。
+    if tool_marker in body:
         tool_completed = True
+        continue
+    for parent_id, handback_id, message in handback_uses:
+        if parent_id == tid and tool_marker in message and _result_succeeded(handback_id):
+            tool_completed = True
 
 summary = {
     "permission_mode": permission_mode,

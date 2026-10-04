@@ -7,7 +7,11 @@ helper。pytest は先頭 underscore のため collect しない。
 
 判定は stream-json の構造化 event だけで行う（自己申告 text だけでは PASS にしない）:
   - 対象 `agent_type` の SubagentStart と、同じ agent_id の SubagentStop（Start より後）
-  - parent の Agent tool_use（`subagent_type` 一致）に対応する tool_result の hand-back text
+  - parent の Agent tool_use（`subagent_type` 一致）に対応する tool_result が存在し is_error でないこと
+  - hand-back text: Claude Code 2.1.289 以降の stream-json では Agent tool_result は「report は
+    SubagentHandback で届いた」という定型文だけを持つため、SubAgent 側の `SubagentHandback` tool_use
+    （`parent_tool_use_id` が当該 Agent tool_use）の input.message と、その成功 tool_result から
+    hand-back を取る。harness が report を Agent tool_result へ直接載せる場合はそちらも許容する
   - hand-back が空でなく、`INSUFFICIENT_CONTEXT` 等の context 不足による停止を含まず、
     要求した調査結果（validator）を含むこと
 dispatch-only / fixture-only / mock-only は PASS にしない。
@@ -49,6 +53,19 @@ def _tool_result_text(block: dict) -> str:
     return str(body or "")
 
 
+HANDBACK_DELIVERY_NOTICE = "SubagentHandback call"
+
+
+def _handback_result_succeeded(result: tuple[str, bool] | None) -> bool:
+    if result is None or result[1]:
+        return False
+    try:
+        parsed = json.loads(result[0])
+    except ValueError:
+        return True
+    return not (isinstance(parsed, dict) and parsed.get("success") is False)
+
+
 def evaluate_role_subagent(
     stdout: str,
     agent_type: str,
@@ -72,10 +89,12 @@ def evaluate_role_subagent(
         )
     ]
 
-    # parent 側の hand-back: subagent_type が一致する Agent/Task tool_use の tool_result。
+    # parent 側の hand-back: subagent_type が一致する Agent/Task tool_use の tool_result（存在・非 error 必須）と、
+    # 同 tool_use を parent_tool_use_id とする SubAgent 側 SubagentHandback tool_use（成功 tool_result 付き）。
     wanted_ids: set[str] = set()
     handbacks: list[str] = []
-    results: dict[str, str] = {}
+    results: dict[str, tuple[str, bool]] = {}
+    sub_handbacks: list[tuple[str | None, str | None, str]] = []
     for event in _iter_events(stdout):
         content = (event.get("message") or {}).get("content") if isinstance(event.get("message"), dict) else None
         if not isinstance(content, list):
@@ -87,11 +106,22 @@ def evaluate_role_subagent(
                 tool_input = block.get("input") or {}
                 if isinstance(tool_input, dict) and tool_input.get("subagent_type") == agent_type and block.get("id"):
                     wanted_ids.add(block["id"])
+            elif block.get("type") == "tool_use" and block.get("name") == "SubagentHandback":
+                tool_input = block.get("input")
+                message = tool_input.get("message") if isinstance(tool_input, dict) else None
+                sub_handbacks.append((event.get("parent_tool_use_id"), block.get("id"), str(message or "")))
             elif block.get("type") == "tool_result" and block.get("tool_use_id"):
-                results[block["tool_use_id"]] = _tool_result_text(block)
+                results[block["tool_use_id"]] = (_tool_result_text(block), bool(block.get("is_error")))
     for tool_use_id in wanted_ids:
-        if results.get(tool_use_id):
-            handbacks.append(results[tool_use_id])
+        result = results.get(tool_use_id)
+        if result is None or result[1]:
+            continue  # tool_result 欠落 / is_error は hand-back 完了ではない
+        text = result[0]
+        if text and HANDBACK_DELIVERY_NOTICE not in text:
+            handbacks.append(text)  # report が Agent tool_result へ直接載る harness
+        for parent_id, handback_id, message in sub_handbacks:
+            if parent_id == tool_use_id and message and _handback_result_succeeded(results.get(handback_id)):
+                handbacks.append(message)
     child_final = [s.get("last_assistant_message") or "" for s in paired_stops]
 
     texts = [t for t in (*handbacks, *child_final) if t]

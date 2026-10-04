@@ -77,7 +77,33 @@ _SCRIPTED_CLAUDE = textwrap.dedent(
     elif "Use the Bash tool" in prompt:
         tool("Bash", marker)
     elif "Use the Agent tool" in prompt:
-        tool("Agent", marker)
+        # Claude Code 2.1.289 の実 stream shape: Agent tool_result は定型文だけで marker を含まず、
+        # marker は SubAgent 側の SubagentHandback tool_use（parent_tool_use_id = Agent tool_use id）にある。
+        shape = os.environ.get("FAKE_AGENT_SHAPE", "real")
+        notice = (
+            "This agent's report was delivered to you as a message from \\"a1b2c3\\" (its SubagentHandback "
+            "call). Read it there; it is not repeated here.\\nagentId: a1b2c3\\n<usage>tool_uses: 1</usage>"
+        )
+        agent_input = {{"subagent_type": "general-purpose", "description": "d", "prompt": prompt}}
+        emit({{"type": "assistant", "parent_tool_use_id": None, "message": {{"content": [
+            {{"type": "tool_use", "id": "toolu_agent", "name": "Agent", "input": agent_input}}]}}}})
+        if shape not in ("prompt_only", "no_handback", "inline"):
+            handback_message = marker if shape != "handback_failed" else "no marker here"
+            hb_body = json.dumps({{"success": shape != "handback_is_error", "message": "Report delivered."}})
+            hb_parent = "toolu_other" if shape == "handback_other_parent" else "toolu_agent"
+            emit({{"type": "assistant", "parent_tool_use_id": hb_parent,
+                  "message": {{"content": [{{"type": "tool_use", "id": "toolu_hb", "name": "SubagentHandback",
+                                           "input": {{"message": handback_message}}}}]}}}})
+            emit({{"type": "user", "parent_tool_use_id": "toolu_agent", "message": {{"content": [
+                {{"type": "tool_result", "tool_use_id": "toolu_hb", "is_error": shape == "handback_is_error",
+                  "content": [{{"type": "text", "text": hb_body}}]}}]}}}})
+        if shape != "no_agent_result":
+            body = marker if shape == "inline" else notice
+            emit({{"type": "user", "parent_tool_use_id": None, "message": {{"content": [
+                {{"type": "tool_result", "tool_use_id": "toolu_agent", "is_error": shape == "agent_is_error",
+                  "content": [{{"type": "text", "text": body}}]}}]}}}})
+        if shape == "final_text_missing":
+            final = "done"
     emit({{"type": "result", "is_error": os.environ.get("FAKE_RESULT_ERROR") == "1", "result": final}})
     '''
 )
@@ -135,6 +161,53 @@ def test_default_scenario_passes_only_on_completed_tool_uses(tmp_path, smoke_rep
     assert all(step["check"]["ok"] for step in payload["steps"])
     assert payload["auto_mode"]["effective"] is True
     assert payload["launch_check_only"]["connected_server"]["version"] == "未確認"
+
+
+def _subagent_check(tmp_path, smoke_repo, shape):
+    with H.FakeServer() as server:
+        proc, payload = _run_smoke(
+            tmp_path, smoke_repo, ["--scenario", "default"], server_url=server.url, FAKE_AGENT_SHAPE=shape
+        )
+    by_name = {step["name"]: step["check"] for step in payload["steps"]}
+    return proc, payload, by_name["subagent"]
+
+
+def test_subagent_step_passes_on_the_real_claude_code_handback_stream_shape(tmp_path, smoke_repo):
+    # Agent tool_result は定型文のみ（marker なし）。marker は SubagentHandback tool_use の input にある。
+    proc, payload, check = _subagent_check(tmp_path, smoke_repo, "real")
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert check["tool_use_observed"] is True and check["tool_completed_with_marker"] is True
+    assert check["final_text_marker"] is True and check["result_is_error"] is False and check["ok"] is True
+
+
+def test_subagent_step_still_accepts_a_report_delivered_inside_the_agent_tool_result(tmp_path, smoke_repo):
+    proc, _payload, check = _subagent_check(tmp_path, smoke_repo, "inline")
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert check["ok"] is True
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "prompt_only",  # marker は Agent tool_use の prompt にしかなく、SubagentHandback も無い（dispatch-only）
+        "no_handback",  # Agent tool_result は定型文だが SubagentHandback tool_use が無い
+        "no_agent_result",  # SubagentHandback はあるが Agent tool_result が無い
+        "agent_is_error",  # Agent tool_result が is_error
+        "handback_is_error",  # SubagentHandback の tool_result が失敗
+        "handback_failed",  # SubagentHandback の message に marker が無い
+        "handback_other_parent",  # 別の Agent tool_use に属する SubagentHandback
+        "final_text_missing",  # parent の最終 text に marker が無い
+    ],
+)
+def test_subagent_step_negative_controls_are_never_a_pass(tmp_path, smoke_repo, shape):
+    proc, payload, check = _subagent_check(tmp_path, smoke_repo, shape)
+    assert proc.returncode == 1, (shape, proc.stdout, proc.stderr)
+    assert check["ok"] is False and payload["status"] == "fail", (shape, check)
+    # 失敗理由が意図した因果欠落であること（別要因の偶発 fail で緑にならない）。
+    if shape == "final_text_missing":
+        assert check["tool_completed_with_marker"] is True and check["final_text_marker"] is False, check
+    else:
+        assert check["tool_use_observed"] is True and check["tool_completed_with_marker"] is False, (shape, check)
 
 
 def test_default_scenario_is_not_passed_by_a_text_claim_without_tool_completion(tmp_path, smoke_repo):

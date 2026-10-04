@@ -657,6 +657,78 @@ def _role_stream(agent_type: str, *, handback: str | None, start: bool = True, s
     return stream.text()
 
 
+_HANDBACK_NOTICE = (
+    "  This agent's report was delivered to you as a message from \"agent-R\" (its SubagentHandback call). "
+    "Read it there; it is not repeated here.\n  \nagentId: agent-R (use SendMessage with to: 'agent-R')\n"
+    "<usage>subagent_tokens: 27852\ntool_uses: 3\nduration_ms: 13535</usage>"
+)
+
+
+def _real_shape_role_stream(
+    agent_type: str, *, handback: str | None, agent_result: bool = True, agent_is_error: bool = False,
+    handback_success: bool = True, handback_parent: str = "toolu_role_1", prompt_text: str | None = None,
+) -> str:
+    """Claude Code 2.1.289 stream shape: the Agent tool_result is a fixed delivery notice and the
+    report itself is the SubAgent's own ``SubagentHandback`` tool_use input (+ a success tool_result)."""
+    stream = Stream()
+    extra = {"prompt": prompt_text} if prompt_text else {}
+    stream.agent_call("toolu_role_1", None, subagent_type=agent_type, **extra)
+    stream.start("agent-R", agent_type=agent_type)
+    if handback is not None:
+        stream.add({
+            "type": "assistant", "parent_tool_use_id": handback_parent, "session_id": stream.session,
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_hb_1", "name": "SubagentHandback", "input": {"message": handback}}]},
+        })
+        stream.add({
+            "type": "user", "parent_tool_use_id": handback_parent, "session_id": stream.session,
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_hb_1", "is_error": not handback_success,
+                 "content": [{"type": "text", "text": json.dumps({"success": handback_success})}]}]},
+        })
+    stream.stop("agent-R", agent_type=agent_type)
+    if agent_result:
+        stream.add({
+            "type": "user", "parent_tool_use_id": None, "session_id": stream.session,
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_role_1", "is_error": agent_is_error,
+                 "content": [{"type": "text", "text": _HANDBACK_NOTICE}]}]},
+        })
+    stream.result()
+    return stream.text()
+
+
+def test_role_subagent_real_shape_handback_is_taken_from_subagent_handback_tool_use():
+    haiku = _evaluate_role(
+        _real_shape_role_stream(ROLE.HAIKU_AGENT, handback="CLAUDE_GPT_AUTO_COMPACT_WINDOW=272000 (lib.sh)"),
+        ROLE.HAIKU_AGENT, ROLE.validate_haiku_handback)
+    assert haiku["ok"] is True and haiku["parent_handback"] is True, haiku
+    sonnet = _evaluate_role(
+        _real_shape_role_stream(ROLE.SONNET_AGENT, handback='{"assessment": "clear", "findings": []}'),
+        ROLE.SONNET_AGENT, ROLE.validate_sonnet_handback)
+    assert sonnet["ok"] is True, sonnet
+
+
+@pytest.mark.parametrize(
+    "label, kwargs",
+    [
+        ("subagent_handback_absent", dict(handback=None)),
+        ("agent_tool_result_missing", dict(handback="272000", agent_result=False)),
+        ("agent_tool_result_is_error", dict(handback="272000", agent_is_error=True)),
+        ("handback_tool_result_failed", dict(handback="272000", handback_success=False)),
+        ("handback_belongs_to_another_agent_call", dict(handback="272000", handback_parent="toolu_other")),
+        ("context_starved_handback", dict(handback="INSUFFICIENT_CONTEXT")),
+        ("requested_result_missing", dict(handback="I could not find the value.")),
+        # prompt (Agent tool_use input) carries the requested value, but nothing was handed back.
+        ("value_only_in_dispatch_prompt", dict(handback=None, prompt_text="the value is 272000")),
+    ],
+)
+def test_role_subagent_real_shape_negative_controls_are_never_a_pass(label, kwargs):
+    result = _evaluate_role(
+        _real_shape_role_stream(ROLE.HAIKU_AGENT, **kwargs), ROLE.HAIKU_AGENT, ROLE.validate_haiku_handback)
+    assert result["ok"] is False, (label, result)
+
+
 def _evaluate_role(stdout: str, agent_type: str, validator) -> dict:
     return ROLE.evaluate_role_subagent(
         stdout, agent_type, validator, hook_events=MODULE.extract_claude_hook_lifecycle_events(stdout))
