@@ -140,7 +140,9 @@ def _is_explicit_standalone_runtime(config: pytest.Config) -> bool:
     """True only for an explicit, serial, standalone runtime invocation.
 
     Decided from pytest-resolved target arguments (``config.args``, which
-    already reflects ``PYTEST_ADDOPTS`` / ini ``addopts``), NOT from
+    already reflects ``PYTEST_ADDOPTS`` / ini ``addopts``; only
+    ``config.args_source is ArgsSource.ARGS`` counts, so ``testpaths`` /
+    invocation-dir fallbacks are never standalone), NOT from
     ``testscollected`` (indistinguishable from a ``-k`` narrowing), failure
     counts, raw command substrings or ``config.invocation_params.args``.
     Standalone = serial (no xdist worker) and the single resolved target is
@@ -148,6 +150,11 @@ def _is_explicit_standalone_runtime(config: pytest.Config) -> bool:
     compared on resolved paths.
     """
     if os.environ.get("PYTEST_XDIST_WORKER"):
+        return False
+    # Targets that did not come from explicit command-line / PYTEST_ADDOPTS
+    # arguments (ini ``testpaths`` fallback, or the invocation directory) are
+    # never an explicit standalone request.
+    if config.args_source is not pytest.Config.ArgsSource.ARGS:
         return False
     targets = list(config.args)
     if len(targets) != 1:
@@ -175,7 +182,10 @@ def _skip_or_exit(config: pytest.Config, capsys: pytest.CaptureFixture[str], std
     """
     if _is_explicit_standalone_runtime(config):
         with capsys.disabled():
-            print(stdout_line, flush=True)
+            # Leading newline: pytest's progress output (file name without -q,
+            # node-id with -v) is already on the current line, and the SKIP
+            # line must start at column 0.
+            print(f"\n{stdout_line}", flush=True)
         pytest.exit(message, returncode=77)
     pytest.skip(message)
 

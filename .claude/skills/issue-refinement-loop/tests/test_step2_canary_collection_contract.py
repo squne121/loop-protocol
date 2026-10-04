@@ -78,6 +78,8 @@ _DOUBLES_PLUGIN_SOURCE = textwrap.dedent(
                 raise subprocess.TimeoutExpired(list(argv), 15)
             if _MODE == "auth_oserror":
                 raise OSError("fake: gh not executable")
+            if _MODE == "auth_runtime_error":
+                raise RuntimeError("fake: gh auth exploded")
             if _MODE == "auth_nonzero":
                 return subprocess.CompletedProcess(list(argv), 1, "", "not logged in")
             return subprocess.CompletedProcess(list(argv), 0, "ok", "")
@@ -194,6 +196,7 @@ def _run_child(
     xdist: bool = False,
     use_clean_env: bool = True,
     parent_env: dict[str, str] | None = None,
+    quiet: bool = True,
 ) -> ChildResult:
     root = layout.root
     junit = root / "junit.xml"
@@ -213,8 +216,9 @@ def _run_child(
         "-p",
         "no:cacheprovider",
         f"--junitxml={junit}",
-        "-q",
     ]
+    if quiet:
+        cmd.append("-q")
     if doubles:
         cmd += ["-p", _PLUGIN_NAME]
     if xdist:
@@ -327,6 +331,19 @@ def test_unavailable_standalone_is_77_and_never_reaches_producer(
     assert not child.events("popen"), "unavailable canary must never launch the producer"
 
 
+@pytest.mark.parametrize("quiet", [True, False], ids=["q", "no_q"])
+@pytest.mark.parametrize("verbosity", [[], ["-v"], ["-vv"]], ids=["default", "v", "vv"])
+def test_standalone_skip_line_is_line_start_for_every_verbosity(
+    layout: Layout, verbosity: list[str], quiet: bool
+) -> None:
+    # pytest's progress output (file name / node-id) precedes the SKIP line on the
+    # same terminal line unless the SKIP line begins with its own newline.
+    child = _run_child(layout, [*verbosity, str(_CANARY_FILE)], quiet=quiet)
+    assert child.returncode == 77, (child.stdout, child.stderr)
+    assert any(line.startswith("SKIP:") for line in child.stdout.splitlines()), child.stdout
+    assert not child.events("popen")
+
+
 def test_gh_auth_timeout_skip_happens_after_auth_check_only(layout: Layout) -> None:
     child = _run_child(
         layout,
@@ -339,6 +356,20 @@ def test_gh_auth_timeout_skip_happens_after_auth_check_only(layout: Layout) -> N
 
 
 # --- AC2 tail: only the pre-launch availability check is converted to SKIP -----------------------
+
+
+def test_unexpected_gh_auth_exception_is_not_converted_to_skip(layout: Layout) -> None:
+    # Only (OSError, subprocess.TimeoutExpired) mean "unavailable"; anything else is a real failure.
+    child = _run_child(
+        layout,
+        [str(_CANARY_FILE)],
+        env_extra={"CANARY_DOUBLE_MODE": "auth_runtime_error", _ENABLE_ENV_VAR: "1"},
+    )
+    assert child.returncode == 1, (child.stdout, child.stderr)
+    assert not child.has_skip_line(), child.stdout_lines
+    assert child.outcomes.get(_CANARY_NODE) == "failed", child.outcomes
+    assert len(child.events("gh_auth_status")) == 1
+    assert not child.events("popen")
 
 
 @pytest.mark.parametrize("mode", ["popen_runtime_error", "popen_timeout"])
@@ -439,6 +470,18 @@ def test_directory_narrowed_by_k_to_single_canary_is_not_standalone(layout: Layo
 def test_no_target_arguments_item_skip(layout: Layout) -> None:
     child = _run_child(layout, [], cwd=layout.suite)
     _assert_item_skip_session_continues(child)
+
+
+def test_testpaths_resolved_canary_is_item_skip_not_standalone(layout: Layout) -> None:
+    # ini ``testpaths`` fills config.args when no target is given; that is NOT an explicit
+    # standalone request, even though the resolved target is exactly the canary file.
+    (layout.root / "pytest.ini").write_text(f"[pytest]\ntestpaths = suite/{_CANARY_FILE.name}\n", encoding="utf-8")
+    child = _run_child(layout, ["-rs"], cwd=layout.root)
+    assert child.returncode == 0, (child.stdout, child.stderr)
+    assert child.outcomes == {_CANARY_NODE: "skipped"}, child.outcomes
+    assert not child.has_skip_line(), child.stdout_lines
+    assert "INTERNALERROR" not in child.stdout + child.stderr
+    assert not child.events("popen")
 
 
 # --- AC4: real xdist -------------------------------------------------------------------------
