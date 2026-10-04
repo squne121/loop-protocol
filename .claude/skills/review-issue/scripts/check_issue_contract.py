@@ -506,7 +506,22 @@ def readiness_error_to_structured_blocker(
 # advisory). `merge_readiness_into_review_result()` routes entries in this
 # category to `non_blocking_improvements` instead of `structured_blockers`/
 # `blocking_issues`/`failure_class` escalation.
-_NON_BLOCKING_READINESS_ERROR_CATEGORIES = {"extension_surface_candidate_advisory"}
+#
+# Issue #2852: `runtime_assertion_disposition_classification` (the readiness
+# `check_runtime_assertion_disposition_classification()` RUNTIMEASSERT003
+# carrier) is registered here too. Its readiness `category` and the
+# `non_blocking_improvements[].code` it is merged into are the SAME string
+# (`_READINESS_ADVISORY_CODE_BY_CATEGORY`), identical to the code
+# `run_checks()` emits directly, so a merged review result keeps ONE carrier
+# identity instead of a `RUNTIMEASSERT003` / category split.
+_RUNTIME_ASSERTION_DISPOSITION_CARRIER_CODE = "runtime_assertion_disposition_classification"
+_NON_BLOCKING_READINESS_ERROR_CATEGORIES = {
+    "extension_surface_candidate_advisory",
+    _RUNTIME_ASSERTION_DISPOSITION_CARRIER_CODE,
+}
+_READINESS_ADVISORY_CODE_BY_CATEGORY = {
+    _RUNTIME_ASSERTION_DISPOSITION_CARRIER_CODE: _RUNTIME_ASSERTION_DISPOSITION_CARRIER_CODE,
+}
 
 
 def readiness_errors_to_structured_blockers(
@@ -1008,11 +1023,14 @@ def merge_readiness_into_review_result(
         ]
 
         if advisory_readiness_errors:
-            merged["non_blocking_improvements"] = list(
-                merged.get("non_blocking_improvements") or []
-            ) + [
+            existing_improvements = list(merged.get("non_blocking_improvements") or [])
+            new_improvements = [
                 {
-                    "code": str(error.get("rule_id") or "READINESS_ADVISORY"),
+                    "code": str(
+                        _READINESS_ADVISORY_CODE_BY_CATEGORY.get(error.get("category"))
+                        or error.get("rule_id")
+                        or "READINESS_ADVISORY"
+                    ),
                     "severity": "advisory",
                     "evidence": error.get("minimal_context", []),
                     "suggested_action": str(
@@ -1021,6 +1039,28 @@ def merge_readiness_into_review_result(
                 }
                 for error in advisory_readiness_errors
             ]
+            # Issue #2852: `run_checks()` already emits the disposition
+            # carrier directly into the review result, and the readiness
+            # result carries the same classification (same shared evaluator,
+            # same evidence lines). A merged result must expose it ONCE:
+            # skip a readiness-side carrier whose code AND evidence are
+            # byte-identical to an entry already present. Deliberately
+            # narrow: carrier code only, exact equality only (a differing
+            # classification stays visible as two entries rather than being
+            # silently collapsed). Not a general advisory dedupe.
+            new_improvements = [
+                entry
+                for entry in new_improvements
+                if not (
+                    entry["code"] == _RUNTIME_ASSERTION_DISPOSITION_CARRIER_CODE
+                    and any(
+                        existing.get("code") == entry["code"]
+                        and existing.get("evidence") == entry["evidence"]
+                        for existing in existing_improvements
+                    )
+                )
+            ]
+            merged["non_blocking_improvements"] = existing_improvements + new_improvements
 
         new_blockers: list = []
         if blocking_readiness_errors:
@@ -2084,12 +2124,37 @@ def check_c15_runtime_assertion_binding_coverage(body: str, issue_kind: str) -> 
     risk_trigger`'s NA/WARN/FAIL shape so the two checks share the same
     call-site pattern.
     """
-    if issue_kind != "implementation":
+    verdict, policy_error = _evaluate_runtime_assertion_binding_coverage_for_body(body, issue_kind)
+    if policy_error is not None:
+        # Issue #2771 AC6: a policy integrity defect (dangling profile
+        # reference / duplicate assertion id within a profile) is not
+        # Issue-author-fixable -- WARN (not FAIL, not NA), mirroring C14's
+        # existing PolicyLoadError handling above.
+        return CheckResult.WARN, [f"runtime assertion binding coverage policy unavailable: {policy_error}"]
+    if verdict is None:
         return CheckResult.NA, []
+
+    if verdict["verdict"] == "needs_fix":
+        return CheckResult.FAIL, verdict["reasons"]
+    return CheckResult.PASS, []
+
+
+def _evaluate_runtime_assertion_binding_coverage_for_body(
+    body: str, issue_kind: str
+) -> tuple[Optional[dict], Optional[Exception]]:
+    """Run the shared evaluator for C15 and the Issue #2852 carrier.
+
+    Returns ``(verdict, policy_error)``: ``(None, None)`` when C15 is not
+    applicable (non-implementation Issue, no Allowed Paths, evaluator not
+    loadable); ``(None, exc)`` on a policy integrity failure
+    (``PolicyLoadError``); otherwise ``(verdict, None)``.
+    """
+    if issue_kind != "implementation":
+        return None, None
 
     allowed_path_entries = pc_extract_allowed_paths(body)
     if not allowed_path_entries:
-        return CheckResult.NA, []
+        return None, None
 
     rva_section = extract_section(body, "Runtime Verification Applicability")
     ac_section = extract_section(body, "Acceptance Criteria")
@@ -2103,7 +2168,7 @@ def check_c15_runtime_assertion_binding_coverage(body: str, issue_kind: str) -> 
 
     evaluator = _load_extension_surface_policy_matcher()
     if evaluator is None:
-        return CheckResult.NA, []
+        return None, None
 
     try:
         verdict = evaluator.evaluate_runtime_assertion_binding_coverage(
@@ -2113,15 +2178,30 @@ def check_c15_runtime_assertion_binding_coverage(body: str, issue_kind: str) -> 
             ac_vc_refs=ac_vc_refs,
         )
     except evaluator.PolicyLoadError as exc:
-        # Issue #2771 AC6: a policy integrity defect (dangling profile
-        # reference / duplicate assertion id within a profile) is not
-        # Issue-author-fixable -- WARN (not FAIL, not NA), mirroring C14's
-        # existing PolicyLoadError handling above.
-        return CheckResult.WARN, [f"runtime assertion binding coverage policy unavailable: {exc}"]
+        return None, exc
+    return verdict, None
 
-    if verdict["verdict"] == "needs_fix":
-        return CheckResult.FAIL, verdict["reasons"]
-    return CheckResult.PASS, []
+
+def get_runtime_assertion_disposition_carrier(body: str, issue_kind: str) -> list[str]:
+    """Issue #2852 AC9: non-blocking disposition classification carrier lines
+    (one line per binding) for ``non_blocking_improvements[].evidence``.
+
+    Companion to ``check_c15_runtime_assertion_binding_coverage`` (the
+    unchanged blocking gate): returns ``[]`` unless the structural evaluation
+    APPROVES, so the carrier never decorates a FAIL / policy-unavailable WARN
+    primary result, and only when at least one binding is explicit /
+    ``not_applicable`` / compat (a pure legacy 3-field input emits nothing).
+    The text is produced by the shared evaluator module's formatter, the same
+    one ``issue-contract-review`` uses. Classification only -- never runtime
+    PASS evidence.
+    """
+    verdict, policy_error = _evaluate_runtime_assertion_binding_coverage_for_body(body, issue_kind)
+    if policy_error is not None or verdict is None:
+        return []
+    evaluator = _load_extension_surface_policy_matcher()
+    if evaluator is None:
+        return []
+    return evaluator.format_runtime_assertion_disposition_carrier_lines(verdict)
 
 
 def get_extension_surface_candidate_advisories(body: str, issue_kind: str) -> list[str]:
@@ -3071,6 +3151,27 @@ def run_checks(
                     "evaluated for this Issue's runtime assertion binding coverage (policy "
                     "integrity failure, not an Issue-author-fixable defect). Escalate to a "
                     "human/owner to repair docs/dev/extension-surface-runtime-policy.yaml."
+                ),
+                emit_finding=False,
+            )
+
+    # C15b: disposition classification carrier (Issue #2852 AC9). Non-blocking:
+    # emitted only when C15 passed, `emit_finding=False` so the finding count /
+    # heuristic_concern_count do not grow, and it never touches checks.* /
+    # all_check_values / verdict.
+    if checks.C15_runtime_assertion_binding_coverage == CheckResult.PASS:
+        disposition_carrier_lines = get_runtime_assertion_disposition_carrier(body, issue_kind)
+        if disposition_carrier_lines:
+            _add_warning(
+                result,
+                code=_RUNTIME_ASSERTION_DISPOSITION_CARRIER_CODE,
+                severity="advisory",
+                evidence=disposition_carrier_lines,
+                suggested_action=(
+                    "Non-blocking: runtime_assertion_bindings carries an explicit disposition "
+                    "(dispositive / non_dispositive_readiness_compat / not_applicable). This is a "
+                    "structural classification only, not runtime verification PASS evidence; "
+                    "semantic sufficiency of each reason / demonstrated_by stays with semantic review."
                 ),
                 emit_finding=False,
             )

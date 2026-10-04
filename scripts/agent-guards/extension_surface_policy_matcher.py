@@ -1022,7 +1022,64 @@ def decision_level_runtime_verification_tag_consistent(
     return True
 
 
+# Issue #2852: assertion-level applicability (`disposition`).
+#
+# Closed enum of how a hard-required (profile, assertion) candidate is treated
+# by *this* Issue's change. This is a STRUCTURAL classification only -- it is
+# never runtime PASS evidence, and the evaluator result deliberately exposes no
+# field that could be read as one (structural_completeness_not_runtime_pass):
+#
+# - ``dispositive``: this Issue's own runtime AC verifies the assertion (the
+#   pre-#2852 behaviour; ``ac`` is required). A legacy 3-field entry that omits
+#   ``disposition`` is classified here with ``disposition_source:
+#   legacy_default`` -- an internal compatibility reading, not "verified".
+# - ``non_dispositive_readiness_compat``: another EXISTING AC owns the
+#   substantive verification (``demonstrated_by: AC<N>``, plus a non-empty
+#   ``reason``); never counted as runtime PASS and never given an ``ac``.
+# - ``not_applicable``: the change surface has no such behaviour (non-empty
+#   ``reason``; no ``ac`` / ``demonstrated_by`` so a fictional reference can
+#   never be written).
+#
+# Whether a ``reason`` / ``demonstrated_by`` is *semantically sufficient* is
+# not judged here (existing semantic review owns that); machine validation is
+# a non-empty ``reason`` and an existing AC with a canonical ``# AC<N>`` VC
+# reference only.
+DISPOSITION_DISPOSITIVE = "dispositive"
+DISPOSITION_NON_DISPOSITIVE_READINESS_COMPAT = "non_dispositive_readiness_compat"
+DISPOSITION_NOT_APPLICABLE = "not_applicable"
+RUNTIME_ASSERTION_DISPOSITIONS = (
+    DISPOSITION_DISPOSITIVE,
+    DISPOSITION_NON_DISPOSITIVE_READINESS_COMPAT,
+    DISPOSITION_NOT_APPLICABLE,
+)
+DISPOSITION_SOURCE_EXPLICIT = "explicit"
+DISPOSITION_SOURCE_LEGACY_DEFAULT = "legacy_default"
+
+# Legacy (disposition omitted) closed key set -- unchanged from #2771.
 _RUNTIME_ASSERTION_BINDING_ALLOWED_KEYS = frozenset({"profile", "assertion", "ac"})
+
+# Closed key set per explicit disposition (Issue #2852 contract shape).
+_RUNTIME_ASSERTION_BINDING_ALLOWED_KEYS_BY_DISPOSITION: dict[str, frozenset[str]] = {
+    DISPOSITION_DISPOSITIVE: frozenset({"profile", "assertion", "ac", "disposition"}),
+    DISPOSITION_NON_DISPOSITIVE_READINESS_COMPAT: frozenset(
+        {"profile", "assertion", "disposition", "demonstrated_by", "reason"}
+    ),
+    DISPOSITION_NOT_APPLICABLE: frozenset({"profile", "assertion", "disposition", "reason"}),
+}
+
+
+def _reason_problem(index: int, entry: dict[str, Any]) -> Optional[str]:
+    """Distinct malformed description for a missing / non-string / empty
+    ``reason`` (Issue #2852 AC2: the missing cause is reported distinctly)."""
+    prefix = f"runtime_assertion_bindings[{index}] (disposition {entry.get('disposition')!r})"
+    if "reason" not in entry:
+        return f"{prefix} is missing a non-empty 'reason'"
+    reason = entry["reason"]
+    if not isinstance(reason, str):
+        return f"{prefix} declares a non-string 'reason' ({type(reason).__name__}), expected a non-empty string"
+    if not reason.strip():
+        return f"{prefix} declares an empty 'reason', expected a non-empty string"
+    return None
 
 
 def parse_runtime_assertion_bindings(
@@ -1030,24 +1087,32 @@ def parse_runtime_assertion_bindings(
 ) -> tuple[list[dict[str, str]], list[str]]:
     """Parse the canonical ``runtime_assertion_bindings`` wire format list.
 
-    Canonical shape (Issue #2771 In Scope): a list of mappings, each with
-    exactly the three keys ``profile`` / ``assertion`` / ``ac`` -- never a
-    duplicated ``vc:``/command-text field (the binding only records *which*
-    AC owns the assertion; the VC command text itself lives in the existing
-    ``## Verification Commands`` section and is cross-checked separately by
-    ``derive_required_runtime_assertions``'s caller via the existing C5 /
-    ``parse_verification_commands_section`` parser).
+    Canonical shapes (Issue #2771 In Scope, extended by Issue #2852): a list of
+    mappings. The legacy form has exactly the three keys ``profile`` /
+    ``assertion`` / ``ac`` (``disposition`` omitted; classified ``dispositive``
+    with ``disposition_source: legacy_default``). An explicit ``disposition``
+    selects one of three closed key sets (see
+    ``_RUNTIME_ASSERTION_BINDING_ALLOWED_KEYS_BY_DISPOSITION``) -- never a
+    duplicated ``vc:``/command-text field (the binding only records *which* AC
+    owns or demonstrates the assertion; the VC command text itself lives in the
+    existing ``## Verification Commands`` section and is cross-checked
+    separately via the existing C5 / ``parse_verification_commands_section``
+    parser).
 
-    Returns ``(bindings, malformed_entry_descriptions)``. Each returned
-    binding dict has ``profile`` / ``assertion`` (verbatim strings) and
-    ``ac`` (digit-only, e.g. ``"3"`` for ``ac: AC3``). A raw
-    ``runtime_assertion_bindings`` value that is present but not a list, or
-    an individual entry that is not a mapping, declares an unexpected key,
-    or is missing/malformed ``profile``/``assertion``/``ac``, is reported as
-    a human-readable string in ``malformed_entry_descriptions`` rather than
-    silently skipped (an Issue-side declaration defect, Issue #2771 AC3/AC4)
-    -- never raised as a policy integrity failure, since a malformed
-    *declaration* is always something the Issue author can fix.
+    Returns ``(bindings, malformed_entry_descriptions)``. Each returned binding
+    dict has ``profile`` / ``assertion`` (verbatim strings), ``disposition``
+    (explicit entries only; its absence means the legacy 3-field form), and by
+    disposition: ``ac`` (digit-only, e.g. ``"3"`` for ``ac: AC3``;
+    dispositive), ``demonstrated_by`` (digit-only; compat) and ``reason``
+    (stripped original text; compat / not_applicable). A raw
+    ``runtime_assertion_bindings`` value that is present but not a list, or an
+    individual entry that is not a mapping, has an out-of-enum ``disposition``,
+    declares a key outside its disposition's closed set, or is
+    missing/malformed in a required field, is reported as a human-readable
+    string in ``malformed_entry_descriptions`` rather than silently skipped (an
+    Issue-side declaration defect) -- never raised as a policy integrity
+    failure, since a malformed *declaration* is always something the Issue
+    author can fix.
     """
     raw = _extract_rva_yaml_field(rva_section_text, "runtime_assertion_bindings")
     if raw is None:
@@ -1064,35 +1129,129 @@ def parse_runtime_assertion_bindings(
         if not isinstance(entry, dict):
             malformed.append(f"runtime_assertion_bindings[{index}] is not a mapping")
             continue
-        extra_keys = set(entry.keys()) - _RUNTIME_ASSERTION_BINDING_ALLOWED_KEYS
+
+        if "disposition" in entry:
+            disposition = entry["disposition"]
+            if not isinstance(disposition, str) or disposition not in RUNTIME_ASSERTION_DISPOSITIONS:
+                malformed.append(
+                    f"runtime_assertion_bindings[{index}] declares disposition {disposition!r}, "
+                    f"expected one of {list(RUNTIME_ASSERTION_DISPOSITIONS)}"
+                )
+                continue
+            disposition_source = DISPOSITION_SOURCE_EXPLICIT
+            allowed_keys = _RUNTIME_ASSERTION_BINDING_ALLOWED_KEYS_BY_DISPOSITION[disposition]
+        else:
+            disposition = DISPOSITION_DISPOSITIVE
+            disposition_source = DISPOSITION_SOURCE_LEGACY_DEFAULT
+            allowed_keys = _RUNTIME_ASSERTION_BINDING_ALLOWED_KEYS
+
+        extra_keys = set(entry.keys()) - allowed_keys
         if extra_keys:
             malformed.append(
                 f"runtime_assertion_bindings[{index}] declares unexpected key(s) "
-                f"{sorted(extra_keys)} (canonical shape is profile/assertion/ac only, Issue #2771)"
+                f"{sorted(extra_keys, key=str)} for disposition {disposition!r} "
+                f"(closed key set is {sorted(allowed_keys)}, Issue #2771 / #2852)"
             )
             continue
         profile = entry.get("profile")
         assertion = entry.get("assertion")
-        ac = entry.get("ac")
         if not isinstance(profile, str) or not profile.strip():
             malformed.append(f"runtime_assertion_bindings[{index}] is missing a non-empty 'profile'")
             continue
         if not isinstance(assertion, str) or not assertion.strip():
             malformed.append(f"runtime_assertion_bindings[{index}] is missing a non-empty 'assertion'")
             continue
-        if not isinstance(ac, str) or not _AC_TOKEN_RE.match(ac.strip()):
-            malformed.append(
-                f"runtime_assertion_bindings[{index}] declares 'ac' as {ac!r}, expected 'AC<N>' form"
-            )
-            continue
-        bindings.append(
-            {
-                "profile": profile.strip(),
-                "assertion": assertion.strip(),
-                "ac": _AC_TOKEN_RE.match(ac.strip()).group(1),
-            }
-        )
+
+        # A legacy 3-field entry keeps its pre-#2852 parsed shape (profile /
+        # assertion / ac only); an explicit entry additionally carries its
+        # `disposition`. `disposition_source` is derived from that presence
+        # (`_binding_disposition`), never stored twice.
+        binding: dict[str, str] = {
+            "profile": profile.strip(),
+            "assertion": assertion.strip(),
+        }
+        if disposition_source == DISPOSITION_SOURCE_EXPLICIT:
+            binding["disposition"] = disposition
+
+        if disposition == DISPOSITION_DISPOSITIVE:
+            ac = entry.get("ac")
+            if not isinstance(ac, str) or not _AC_TOKEN_RE.match(ac.strip()):
+                malformed.append(
+                    f"runtime_assertion_bindings[{index}] declares 'ac' as {ac!r}, expected 'AC<N>' form"
+                )
+                continue
+            binding["ac"] = _AC_TOKEN_RE.match(ac.strip()).group(1)
+        elif disposition == DISPOSITION_NON_DISPOSITIVE_READINESS_COMPAT:
+            demonstrated_by = entry.get("demonstrated_by")
+            if "demonstrated_by" not in entry:
+                malformed.append(
+                    f"runtime_assertion_bindings[{index}] (disposition {disposition!r}) is missing "
+                    "'demonstrated_by' (an existing 'AC<N>' reference)"
+                )
+                continue
+            if not isinstance(demonstrated_by, str) or not demonstrated_by.strip():
+                malformed.append(
+                    f"runtime_assertion_bindings[{index}] declares an empty or non-string "
+                    f"'demonstrated_by' ({demonstrated_by!r}), expected 'AC<N>' form"
+                )
+                continue
+            token = _AC_TOKEN_RE.match(demonstrated_by.strip())
+            if token is None:
+                malformed.append(
+                    f"runtime_assertion_bindings[{index}] declares 'demonstrated_by' as "
+                    f"{demonstrated_by!r}, expected 'AC<N>' form (test path / node-id references "
+                    "are not accepted)"
+                )
+                continue
+            problem = _reason_problem(index, entry)
+            if problem:
+                malformed.append(problem)
+                continue
+            binding["demonstrated_by"] = token.group(1)
+            binding["reason"] = entry["reason"].strip()
+        else:  # DISPOSITION_NOT_APPLICABLE
+            problem = _reason_problem(index, entry)
+            if problem:
+                malformed.append(problem)
+                continue
+            binding["reason"] = entry["reason"].strip()
+
+        bindings.append(binding)
     return bindings, malformed
+
+
+def _binding_disposition(binding: dict[str, str]) -> tuple[str, str]:
+    """``(disposition, disposition_source)`` of a parsed binding: an explicit
+    ``disposition`` key is ``explicit``; its absence is the legacy 3-field
+    form, read as ``dispositive`` with ``legacy_default`` (internal
+    compatibility only -- never "verified")."""
+    if "disposition" in binding:
+        return binding["disposition"], DISPOSITION_SOURCE_EXPLICIT
+    return DISPOSITION_DISPOSITIVE, DISPOSITION_SOURCE_LEGACY_DEFAULT
+
+
+def _classified_binding_view(binding: dict[str, str]) -> dict[str, Any]:
+    """Public, evidence-free view of one parsed binding (Issue #2852 AC1/AC6).
+
+    Only the classification and the author-declared references are exposed
+    (``ac`` for dispositive, ``demonstrated_by`` for compat, ``reason`` for
+    compat / not_applicable). No field here means "executed", "observed" or
+    "verified" -- the declaration is structural only.
+    """
+    disposition, disposition_source = _binding_disposition(binding)
+    view: dict[str, Any] = {
+        "profile": binding["profile"],
+        "assertion": binding["assertion"],
+        "disposition": disposition,
+        "disposition_source": disposition_source,
+    }
+    if "ac" in binding:
+        view["ac"] = f"AC{binding['ac']}"
+    if "demonstrated_by" in binding:
+        view["demonstrated_by"] = f"AC{binding['demonstrated_by']}"
+    if "reason" in binding:
+        view["reason"] = binding["reason"]
+    return view
 
 
 def evaluate_runtime_assertion_binding_coverage(
@@ -1114,6 +1273,17 @@ def evaluate_runtime_assertion_binding_coverage(
     the bound VC actually *proves* the assertion's semantic postcondition
     (that remains existing semantic review's responsibility, Issue #2771
     Outcome / AC9 / AC10).
+
+    Issue #2852: each binding carries a closed-enum ``disposition``
+    (``dispositive`` / ``non_dispositive_readiness_compat`` /
+    ``not_applicable``; legacy 3-field entries are ``dispositive`` with
+    ``disposition_source: legacy_default``). Every disposition declares its
+    own required key, but only that key: ``not_applicable`` / compat never
+    hide another required assertion's ``missing`` nor any unknown /
+    duplicate / malformed / invalid finding. The result exposes the
+    classification (``classified_bindings`` and per-disposition assertion
+    lists) and NO runtime-PASS-evidence field. ``evaluate_issue_risk_trigger``
+    is intentionally unaffected (Issue-level decision requirements stay).
 
     ``ac_vc_refs`` is the caller-supplied, digit-only set of AC numbers that
     the ``## Verification Commands`` section references via a canonical
@@ -1151,6 +1321,10 @@ def evaluate_runtime_assertion_binding_coverage(
     for binding in bindings:
         key = (binding["profile"], binding["assertion"])
         declared_key_counts[key] = declared_key_counts.get(key, 0) + 1
+    # Every disposition declares its (profile, assertion) key, but a
+    # not_applicable / compat declaration only covers THAT key: it can never
+    # hide another required assertion's `missing`, nor any
+    # unknown / duplicate / malformed / invalid finding (Issue #2852 AC4/AC7).
     declared_keys = set(declared_key_counts.keys())
 
     missing = sorted(required - declared_keys)
@@ -1158,26 +1332,50 @@ def evaluate_runtime_assertion_binding_coverage(
     duplicate = sorted(key for key, count in declared_key_counts.items() if count > 1)
 
     invalid_ac_bindings: list[dict[str, Any]] = []
+    invalid_demonstrated_by_bindings: list[dict[str, Any]] = []
     for binding in bindings:
-        ac_digit = binding["ac"]
-        reasons: list[str] = []
-        if ac_digit not in ac_numbers:
-            reasons.append("ac_not_found")
-        if ac_digit not in applicable_acs:
-            reasons.append("ac_not_in_applicable_acs")
-        if not tag_consistent:
-            reasons.append("runtime_verification_tag_inconsistent")
-        if ac_digit not in ac_vc_refs:
-            reasons.append("ac_missing_vc_reference")
-        if reasons:
-            invalid_ac_bindings.append(
-                {
-                    "profile": binding["profile"],
-                    "assertion": binding["assertion"],
-                    "ac": f"AC{ac_digit}",
-                    "reasons": reasons,
-                }
-            )
+        disposition, _source = _binding_disposition(binding)
+        if disposition == DISPOSITION_DISPOSITIVE:
+            ac_digit = binding["ac"]
+            reasons: list[str] = []
+            if ac_digit not in ac_numbers:
+                reasons.append("ac_not_found")
+            if ac_digit not in applicable_acs:
+                reasons.append("ac_not_in_applicable_acs")
+            if not tag_consistent:
+                reasons.append("runtime_verification_tag_inconsistent")
+            if ac_digit not in ac_vc_refs:
+                reasons.append("ac_missing_vc_reference")
+            if reasons:
+                invalid_ac_bindings.append(
+                    {
+                        "profile": binding["profile"],
+                        "assertion": binding["assertion"],
+                        "ac": f"AC{ac_digit}",
+                        "reasons": reasons,
+                    }
+                )
+        elif disposition == DISPOSITION_NON_DISPOSITIVE_READINESS_COMPAT:
+            # `demonstrated_by` must name an EXISTING AC that owns a canonical
+            # `# AC<N>` Verification Commands reference. It is deliberately NOT
+            # required to be in `applicable_acs` / carry the runtime tag (the
+            # other AC is an ordinary deterministic test, not a runtime AC),
+            # and no test-path / node-id resolver is involved.
+            demonstrated_digit = binding["demonstrated_by"]
+            reasons = []
+            if demonstrated_digit not in ac_numbers:
+                reasons.append("demonstrated_by_ac_not_found")
+            if demonstrated_digit not in ac_vc_refs:
+                reasons.append("demonstrated_by_ac_missing_vc_reference")
+            if reasons:
+                invalid_demonstrated_by_bindings.append(
+                    {
+                        "profile": binding["profile"],
+                        "assertion": binding["assertion"],
+                        "demonstrated_by": f"AC{demonstrated_digit}",
+                        "reasons": reasons,
+                    }
+                )
 
     reasons_out: list[str] = []
     if missing:
@@ -1193,8 +1391,8 @@ def evaluate_runtime_assertion_binding_coverage(
     if duplicate:
         reasons_out.append(
             "duplicate runtime_assertion_bindings declared for the same (profile, assertion) key "
-            "(1 key = 1 ac; declaring the same key more than once is invalid regardless of whether "
-            "the bound ac matches): " + ", ".join(f"{p}/{a}" for p, a in duplicate)
+            "(1 key = 1 binding; declaring the same key more than once is invalid regardless of "
+            "disposition or whether the bound ac matches): " + ", ".join(f"{p}/{a}" for p, a in duplicate)
         )
     reasons_out.extend(malformed_entries)
     for entry in invalid_ac_bindings:
@@ -1202,21 +1400,99 @@ def evaluate_runtime_assertion_binding_coverage(
             f"runtime_assertion_bindings entry {entry['profile']}/{entry['assertion']} -> "
             f"{entry['ac']} is invalid: {', '.join(entry['reasons'])}"
         )
+    for entry in invalid_demonstrated_by_bindings:
+        reasons_out.append(
+            f"runtime_assertion_bindings entry {entry['profile']}/{entry['assertion']} "
+            f"(disposition {DISPOSITION_NON_DISPOSITIVE_READINESS_COMPAT}) -> demonstrated_by "
+            f"{entry['demonstrated_by']} is invalid: {', '.join(entry['reasons'])}"
+        )
 
     verdict = "needs_fix" if reasons_out else "approve"
+
+    classified = [_classified_binding_view(b) for b in bindings]
+
+    def _assertions_for(disposition: str) -> list[str]:
+        return [
+            f"{c['profile']}/{c['assertion']}" for c in classified if c["disposition"] == disposition
+        ]
 
     return {
         "schema": SCHEMA_RUNTIME_ASSERTION_BINDING_COVERAGE,
         "verdict": verdict,
+        # STRUCTURAL completeness only: no field of this result is runtime
+        # PASS evidence (Issue #2852 AC1 / structural checker PASS != runtime
+        # verification PASS).
+        "structural_completeness_only": True,
         "required_assertions": sorted(f"{p}/{a}" for p, a in required),
         "declared_bindings": [
-            {"profile": b["profile"], "assertion": b["assertion"], "ac": f"AC{b['ac']}"}
-            for b in bindings
+            {k: v for k, v in c.items() if k in ("profile", "assertion", "ac")} for c in classified
         ],
+        "classified_bindings": classified,
+        "dispositive_assertions": _assertions_for(DISPOSITION_DISPOSITIVE),
+        "non_dispositive_readiness_compat_assertions": _assertions_for(
+            DISPOSITION_NON_DISPOSITIVE_READINESS_COMPAT
+        ),
+        "not_applicable_assertions": _assertions_for(DISPOSITION_NOT_APPLICABLE),
         "missing": [f"{p}/{a}" for p, a in missing],
         "unknown": [f"{p}/{a}" for p, a in unknown],
         "duplicate": [f"{p}/{a}" for p, a in duplicate],
         "malformed_binding_entries": malformed_entries,
         "invalid_ac_bindings": invalid_ac_bindings,
+        "invalid_demonstrated_by_bindings": invalid_demonstrated_by_bindings,
         "reasons": reasons_out,
     }
+
+
+# ---------------------------------------------------------------------------
+# Disposition classification carrier (Issue #2852 AC9 / AC10)
+# ---------------------------------------------------------------------------
+
+# One identity for the non-blocking carrier on BOTH sides: the readiness error
+# `category` and the review-issue `non_blocking_improvements[].code`.
+RUNTIME_ASSERTION_DISPOSITION_CARRIER_CODE = "runtime_assertion_disposition_classification"
+
+
+def _normalize_carrier_reason(reason: str) -> str:
+    """Collapse every whitespace run (including newlines) to one space so one
+    binding is always exactly one carrier line. ``;`` is left untouched:
+    ``reason`` is the LAST field of the line, so a ``;`` inside it cannot
+    shift any earlier field (the line parses with fixed-order leading tokens
+    and ``reason=(.*)$``)."""
+    return " ".join(reason.split())
+
+
+def format_runtime_assertion_disposition_carrier_lines(evaluation: dict[str, Any]) -> list[str]:
+    """Project one ``evaluate_runtime_assertion_binding_coverage()`` result
+    into the non-blocking carrier ``evidence`` lines (Issue #2852 AC9).
+
+    One line per classified binding::
+
+        <profile>/<assertion>: disposition=<v>; source=<explicit|legacy_default>;
+        demonstrated_by=<AC<N>|->; reason=<text|->
+
+    (a single physical line). Returns ``[]`` unless the structural evaluation
+    APPROVED -- the carrier never decorates a ``needs_fix`` result -- and at
+    least one binding is explicit / not_applicable / compat (a purely legacy
+    3-field input keeps its pre-#2852 output unchanged). Shared by both
+    checkers so the text cannot drift between them. Carries classification
+    only; it is not runtime PASS evidence.
+    """
+    if evaluation.get("verdict") != "approve":
+        return []
+    classified = evaluation.get("classified_bindings") or []
+    if not any(
+        c["disposition_source"] == DISPOSITION_SOURCE_EXPLICIT
+        or c["disposition"] != DISPOSITION_DISPOSITIVE
+        for c in classified
+    ):
+        return []
+    lines: list[str] = []
+    for c in classified:
+        reason = c.get("reason")
+        lines.append(
+            f"{c['profile']}/{c['assertion']}: disposition={c['disposition']}; "
+            f"source={c['disposition_source']}; "
+            f"demonstrated_by={c.get('demonstrated_by') or '-'}; "
+            f"reason={_normalize_carrier_reason(reason) if reason else '-'}"
+        )
+    return lines
