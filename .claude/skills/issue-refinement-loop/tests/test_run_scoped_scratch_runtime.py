@@ -869,6 +869,17 @@ def _artifact_fixture(root: Path, *, parent_exists: bool) -> tuple[Path, Path]:
     return parent, parent / "refinement_preflight_result_v1.json"
 
 
+def _write_artifact_during_run(artifact: Path, *, started_ns: int) -> None:
+    """run 開始後に producer が artifact を書いた状態を決定論的に作る。
+
+    kernel の mtime は coarse clock (CI runner の古い kernel では wall clock より数 ms 遅れうる) のため、
+    ``time.time_ns()`` で取った開始時刻の直後に write しただけだと ``mtime < started`` になり得る (flaky)。
+    mtime を開始時刻より後に明示固定し、filesystem timestamp 粒度に依存させない。"""
+    artifact.write_text("{}", encoding="utf-8")
+    later = started_ns + 1_000_000
+    os.utime(artifact, ns=(later, later))
+
+
 def test_cleanup_keeps_sibling_sentinel_byte_identical_and_unlinks_only_exact_artifact(tmp_path: Path) -> None:
     parent, artifact = _artifact_fixture(tmp_path, parent_exists=True)
     sentinels = {
@@ -881,7 +892,7 @@ def test_cleanup_keeps_sibling_sentinel_byte_identical_and_unlinks_only_exact_ar
     nested.parent.mkdir()
     nested.write_bytes(b"archived")
     started = time.time_ns()
-    artifact.write_text("{}", encoding="utf-8")
+    _write_artifact_during_run(artifact, started_ns=started)
 
     report = cleanup_exact_artifact(artifact, started_ns=started, parent_preexisting=True)
 
@@ -896,7 +907,7 @@ def test_cleanup_does_not_remove_a_foreign_sibling_even_when_this_run_created_th
     parent, artifact = _artifact_fixture(tmp_path, parent_exists=False)
     started = time.time_ns()
     parent.mkdir(parents=True)
-    artifact.write_text("{}", encoding="utf-8")
+    _write_artifact_during_run(artifact, started_ns=started)
     foreign = parent / "provenance.json"
     foreign.write_bytes(b"foreign appeared during the run")
 
@@ -912,7 +923,7 @@ def test_cleanup_rmdirs_the_parent_only_when_this_run_created_it_and_it_is_empty
     parent, artifact = _artifact_fixture(tmp_path, parent_exists=False)
     started = time.time_ns()
     parent.mkdir(parents=True)
-    artifact.write_text("{}", encoding="utf-8")
+    _write_artifact_during_run(artifact, started_ns=started)
 
     report = cleanup_exact_artifact(artifact, started_ns=started, parent_preexisting=False)
 
