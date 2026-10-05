@@ -309,12 +309,18 @@ AC に「特定の関数内」で何かを確認する VC を書く場合、`gre
 
 ### 削除確認パターン
 
-削除されたことを確認するには、パターンの count が 0 件であることを単一コマンドで確認する。
+削除されたことを確認するには、literal が file に存在しないことを `--files-without-match` で単一コマンドとして確認する。成功は exit 0 とする。
 
 ```bash
-# count が 0 であることを確認する（rg は 0 件の場合 exit 1 を返す）
-rg -c "削除対象の記述" <file>
+rg --files-without-match --fixed-strings -- "<literal>" <file>
 ```
+
+- `--` は option parsing の終端であり、`--settings` / `--foo` のように `-` で始まる literal を option ではなく pattern として扱うために必須とする。`--fixed-strings` を付けても `--` がなければ dash-leading literal は option と解釈されて rg が exit 2（option parse error）になる。
+- 成功は exit 0（literal が file に存在しない）。literal が存在する間は exit 1 になるため、削除前の baseline では fail、削除後は pass という遷移を VC で実証できる。
+- 1 command = 1 concrete file とする。複数 file を一度に渡すと、1 file でも literal を含まなければ exit 0 になり「全 file から消えた」と誤読できるため、file ごとに VC を分ける。
+- `-q` / `--quiet` を併用しない。ripgrep 14.1.0 には `--files-without-match` との併用で exit status が反転する upstream bug（#3108）があり、15.0.0 で修正された。バージョン依存を避けるため plain `rg` を使う。
+- rg の `-c` / `--count` は no-match で exit 1 を返す（`--include-zero` 付きでも同じ）ため、「0 件を成功」とする削除確認には使えない。存在確認や正の件数確認（count が 1 以上であることを成功とする用途）とは区別する。
+- 否定演算子 `!` を前置した rg / grep 検索は、repo の VC verifier が静的に分類して実行しないため、削除確認の canonical な例として使わない。
 
 > `A && echo PASS || echo FAIL` 形式の compound shell は使用しない。`VC_SINGLE_COMMAND_GUARDRAIL` セクションを参照。
 
