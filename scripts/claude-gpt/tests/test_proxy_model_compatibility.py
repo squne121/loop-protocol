@@ -1,19 +1,25 @@
 """scripts/claude-gpt/tests/test_proxy_model_compatibility.py
 
-Issue #2801: focused tests for the launcher's proxy model catalog
-compatibility preflight (AC1, AC2, AC3, AC6, AC8, AC9, AC10, AC11).
+Issue #2801 (updated by Issue #2925): focused tests for the launcher's proxy model catalog
+compatibility diagnostic (AC1, AC2, AC3, AC6, AC8, AC9, AC10, AC11 of Issue #2801).
 
 All catalog-compatibility checks in this file are fixture-based (a hermetic
-fake `claude-code-proxy` HTTP server started via `launch.sh --check-only`,
-mirroring the pattern already established in
-`scripts/claude-gpt/test_launch_transport_policy.py`, Issue #2204) and never
+fake `claude-code-proxy` HTTP server bound to a real loopback port, queried by
+`launch.sh --check-only`) and never
 depend on live network access or a real ChatGPT account/subscription
-(Runtime Verification Applicability: fixture-based catalog compatibility
-checks for AC1/AC2/AC5/AC6/AC7 do not depend on external auth -- see Issue
-#2801 body). Tests derive the "required model set" dynamically by sourcing
-`lib.sh` (`claude_gpt_required_model_set`) rather than hardcoding literal
-model IDs, so they remain correct across future model policy changes
-(Recurrence Prevention).
+(Runtime Verification Applicability: fixture-based
+catalog compatibility checks for AC1/AC2/AC5/AC6/AC7 do not depend on external
+auth -- see Issue #2801 body). Tests derive the "required model set"
+dynamically by sourcing `lib.sh` (`claude_gpt_required_model_set`) rather than
+hardcoding literal model IDs, so they remain correct across future model policy
+changes (Recurrence Prevention).
+
+Issue #2925 changed WHAT is diagnosed: the authority is the running server that
+`ANTHROPIC_BASE_URL` points at, not a proxy binary the launcher starts (the
+launcher no longer starts any proxy). `CLAUDE_GPT_PROXY_BIN` therefore only
+selects the AUXILIARY binary path/version evidence. The connected-server
+diagnostics themselves are covered in `test_connected_proxy_diagnostics.py`;
+this file keeps the Issue #2801 catalog-compatibility regressions.
 
 AC11's *real* ChatGPT subscription smoke (bounded real request against a
 live compatible proxy) is intentionally NOT exercised here -- per the
@@ -27,38 +33,30 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import os
 import re
-import shutil
 import stat
 import subprocess
 from pathlib import Path
 
 import pytest
 
-# Loaded via importlib.util.spec_from_file_location (not a bare `import`) with
-# a name unique to this test module, to avoid sys.modules collisions with
-# same-named sibling helper modules under the shared repo-wide pytest session
-# (see `scripts/claude-gpt/tests/_latitude_check_only_helper.py` consumers for
-# the established precedent).
-_HELPER_PATH = Path(__file__).resolve().parent / "_proxy_model_compat_fixture_helpers.py"
-_helper_spec = importlib.util.spec_from_file_location(
-    "claude_gpt_proxy_model_compat_fixture_helpers_2801_compat", _HELPER_PATH
-)
-_helper = importlib.util.module_from_spec(_helper_spec)
-assert _helper_spec.loader is not None
-_helper_spec.loader.exec_module(_helper)
-write_fake_proxy = _helper.write_fake_proxy
+# Loaded via importlib.util.spec_from_file_location (not a bare `import`) with a name unique to
+# this test module, to avoid sys.modules collisions with same-named sibling helper modules under
+# the shared repo-wide pytest session.
+_HARNESS_PATH = Path(__file__).resolve().parent / "_launcher_harness.py"
+_spec = importlib.util.spec_from_file_location("claude_gpt_launcher_harness_2925_compat", _HARNESS_PATH)
+assert _spec is not None and _spec.loader is not None
+H = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(H)
 
-SCRIPT_DIR = Path(__file__).resolve().parent.parent  # scripts/claude-gpt/
-LAUNCH_SH = SCRIPT_DIR / "launch.sh"
-LIB_SH = SCRIPT_DIR / "lib.sh"
+SCRIPT_DIR = H.SCRIPT_DIR
+LAUNCH_SH = H.LAUNCH_SH
+LIB_SH = H.LIB_SH
 
-# Mirrors scripts/agent-ops/run_worktree_agent_runtime_smoke.py:991's
-# `_CLAUDE_GPT_LAUNCH_RESULT_RE` / `extract_claude_gpt_launcher_receipt()`
-# WITHOUT importing that file (it is outside this Issue's Allowed Paths).
-# Kept byte-for-byte equivalent so a forward-compat regression there would
-# also be caught here (AC9).
+# Mirrors scripts/agent-ops/run_worktree_agent_runtime_smoke.py's
+# `_CLAUDE_GPT_LAUNCH_RESULT_RE` / `extract_claude_gpt_launcher_receipt()` WITHOUT importing that
+# file. Kept byte-for-byte equivalent so a forward-compat regression there would also be caught
+# here (AC9).
 _CLAUDE_GPT_LAUNCH_RESULT_RE = re.compile(r'\{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1"[^\n]*\}')
 
 
@@ -90,56 +88,31 @@ def _required_models() -> list[str]:
     return models
 
 
-def _run_check_only(
-    tmp_path: Path,
-    *,
-    proxy_models: list[str],
-    proxy_version: str,
-    extra_env: dict[str, str] | None = None,
-    timeout: float = 40.0,
-) -> tuple[subprocess.CompletedProcess, Path]:
-    claude_gpt_home = tmp_path / "claude-gpt-home"
-    env = dict(os.environ)
-    env["CLAUDE_GPT_HOME"] = str(claude_gpt_home)
+def _check_only(tmp_path: Path, server_url: str, **env_overrides) -> subprocess.CompletedProcess:
+    env = H.base_env(tmp_path, ANTHROPIC_BASE_URL=server_url, **env_overrides)
+    return H.run_launcher(["--check-only"], env)
 
-    fake_proxy = write_fake_proxy(
-        tmp_path / "fake-claude-code-proxy", models=proxy_models, version=proxy_version
-    )
-    env["CLAUDE_GPT_PROXY_BIN"] = str(fake_proxy)
-    env.pop("CLAUDE_GPT_CLAUDE_BIN", None)
 
-    if extra_env:
-        env.update(extra_env)
-
-    result = subprocess.run(
-        [str(LAUNCH_SH), "--check-only"],
-        cwd=str(SCRIPT_DIR),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    return result, fake_proxy
+def _write_labelled_proxy_bin(path: Path, version_line: str) -> Path:
+    path.write_text(f'#!/bin/sh\nif [ "$1" = "--version" ]; then echo "{version_line}"; fi\nexit 0\n', encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return path
 
 
 # --- AC1 --------------------------------------------------------------------
 
 
 def test_incompatible_catalog_returns_actionable_failure(tmp_path):
-    """GIVEN a fixture proxy whose live catalog is missing one required model
+    """GIVEN a fixture server whose live catalog is missing one required model
     (v0.1.36-equivalent incompatible catalog)
-    WHEN launch.sh --check-only runs
-    THEN it exits 7 with a structured, actionable failure that names the
-    missing model IDs and the selected proxy's identity -- not just a bare
-    `model_alias_not_resolved` string.
-    """
+    WHEN `launch.sh --check-only` runs
+    THEN it exits 7 with the existing top-level `reason: model_alias_not_resolved` plus the
+    additive fields: missing model, auxiliary binary path/version, repair command."""
     required = _required_models()
-    incompatible_catalog = required[:-1]  # drop the last required model
-    dropped = required[-1]
-
-    result, fake_proxy = _run_check_only(
-        tmp_path, proxy_models=incompatible_catalog, proxy_version="claude-code-proxy 0.1.36"
-    )
+    incompatible_catalog = required[:-1]
+    aux_bin = _write_labelled_proxy_bin(tmp_path / "aux-proxy", "claude-code-proxy 0.1.36")
+    with H.FakeServer(models=incompatible_catalog) as server:
+        result = _check_only(tmp_path, server.url, CLAUDE_GPT_PROXY_BIN=str(aux_bin))
     assert result.returncode == 7, result.stderr
 
     receipt = extract_claude_gpt_launcher_receipt(result.stdout)
@@ -147,333 +120,171 @@ def test_incompatible_catalog_returns_actionable_failure(tmp_path):
     assert receipt["schema"] == "CLAUDE_GPT_LAUNCH_RESULT_V1"
     assert receipt["status"] == "failed"
     assert receipt["reason"] == "model_alias_not_resolved"
-    assert receipt["model_alias_ok"] is False
-    assert receipt["cause"] == "proxy_model_catalog_incompatible"
-    assert dropped in receipt["missing_models"]
-    assert set(receipt["required_models"]) == set(required)
-    assert receipt["proxy"]["path"] == str(fake_proxy)
-    assert receipt["proxy"]["version"] == "claude-code-proxy 0.1.36"
-    assert receipt["minimum_known_compatible_version"] == "0.1.42"
+    assert receipt["connected_server"]["missing_models"] == [required[-1]]
+    assert sorted(receipt["connected_server"]["required_models"]) == sorted(required)
+    assert receipt["local_proxy_binary_auxiliary"]["path"] == str(aux_bin)
+    assert receipt["local_proxy_binary_auxiliary"]["version"] == "claude-code-proxy 0.1.36"
     assert receipt["repair_command"] == "scripts/claude-gpt/repair_proxy.sh"
 
 
-# --- AC2 --------------------------------------------------------------------
+# --- AC2 / AC3 ----------------------------------------------------------------
 
 
 def test_compatible_catalog_passes(tmp_path):
-    """GIVEN a fixture proxy whose live catalog has every required model
-    (v0.1.42+-equivalent compatible catalog)
-    WHEN launch.sh --check-only runs
-    THEN compatibility preflight PASSes and the normal launcher path
-    continues (exit 0, model_alias_ok true).
-    """
     required = _required_models()
-    result, _ = _run_check_only(
-        tmp_path, proxy_models=required, proxy_version="claude-code-proxy 0.1.42"
-    )
+    with H.FakeServer(models=required) as server:
+        result = _check_only(tmp_path, server.url)
     assert result.returncode == 0, result.stderr
-
-    # This success receipt embeds preflight.sh's own pretty-printed
-    # (multi-line) JSON verbatim under the `preflight` key, so it is not a
-    # single-line receipt like the failure path -- parse the whole stdout
-    # directly as JSON rather than via the single-line extraction regex
-    # (that regex is only exercised against the single-line failure receipt
-    # in the AC9 test below, matching real launcher/consumer behavior).
-    receipt = json.loads(result.stdout)
-    assert receipt["status"] == "ok"
-    assert receipt["mode"] == "check_only"
-    assert receipt["model_alias_ok"] is True
+    receipt = extract_claude_gpt_launcher_receipt(result.stdout)
+    assert receipt is not None and receipt["status"] == "ok"
+    assert receipt["connected_server"]["model_catalog_ok"] is True
 
 
 def test_compatible_catalog_passes_even_with_old_version_label(tmp_path):
-    """GIVEN a fixture proxy reporting an OLD version string but whose live
-    catalog nonetheless has every required model
-    WHEN launch.sh --check-only runs
-    THEN it still PASSes -- version number is auxiliary; live catalog
-    capability is the authority (Outcome section).
-    """
+    """Version number is NOT the authority (Issue #2801 Design 4): a server whose catalog is
+    compatible passes even if the auxiliary PATH binary claims an old version."""
     required = _required_models()
-    result, _ = _run_check_only(
-        tmp_path, proxy_models=required, proxy_version="claude-code-proxy 0.0.1-ancient"
-    )
+    aux_bin = _write_labelled_proxy_bin(tmp_path / "old-label-proxy", "claude-code-proxy 0.1.30")
+    with H.FakeServer(models=required) as server:
+        result = _check_only(tmp_path, server.url, CLAUDE_GPT_PROXY_BIN=str(aux_bin))
     assert result.returncode == 0, result.stderr
-
-
-# --- AC3 ---------------------------------------------------------------------
+    receipt = json.loads(result.stdout)
+    assert receipt["local_proxy_binary_auxiliary"]["version"] == "claude-code-proxy 0.1.30"
+    assert receipt["connected_server"]["version"] == "未確認"
 
 
 def test_catalog_incompatible_not_conflated_with_entitlement(tmp_path):
-    """GIVEN an incompatible catalog fixture
-    WHEN launch.sh --check-only runs
-    THEN the failure `cause` is exactly `proxy_model_catalog_incompatible`
-    and no entitlement/auth/quota-style classification leaks into the
-    receipt -- local catalog incompatibility must never be conflated with
-    ChatGPT account entitlement/runtime rejection (Design section 4).
-    """
+    """AC3: a catalog mismatch is reported as a local catalog incompatibility only -- never as an
+    account entitlement / inference failure."""
     required = _required_models()
-    result, _ = _run_check_only(
-        tmp_path, proxy_models=required[:-1], proxy_version="claude-code-proxy 0.1.36"
-    )
-    assert result.returncode == 7, result.stderr
-
-    receipt = extract_claude_gpt_launcher_receipt(result.stdout)
-    assert receipt is not None
-    assert receipt["cause"] == "proxy_model_catalog_incompatible"
-
-    forbidden_tokens = ["entitlement", "quota", "account_rejected", "auth_denied"]
-    raw = json.dumps(receipt).lower()
-    for token in forbidden_tokens:
-        assert token not in raw, f"unexpected entitlement-style token {token!r} in receipt"
+    with H.FakeServer(models=required[:-1]) as server:
+        result = _check_only(tmp_path, server.url)
+    receipt = json.loads(result.stdout)
+    assert receipt["cause"] == "connected_server_model_catalog_incomplete"
+    blob = json.dumps(receipt).lower()
+    for forbidden in ("entitlement", "subscription_not", "not_authenticated", "inference"):
+        assert forbidden not in blob, forbidden
 
 
-# --- AC6 ----------------------------------------------------------------------
-
-
-def test_explicit_proxy_bin_precedence_preserved(tmp_path):
-    """GIVEN an explicit CLAUDE_GPT_PROXY_BIN pointing at an INCOMPATIBLE
-    proxy, while PATH *and* the Claude-GPT-owned managed install location
-    (`$CLAUDE_GPT_HOME/bin`, fix_delta F3's second-precedence candidate) both
-    expose a different, COMPATIBLE `claude-code-proxy` binary
-    WHEN launch.sh --check-only runs
-    THEN the launcher does not silently fall back to either the managed
-    binary or the PATH binary -- it reports the explicit binary's own
-    path/version and its missing models (binary precedence: explicit
-    CLAUDE_GPT_PROXY_BIN always wins over every other candidate, even an
-    otherwise-compatible one; Design section 3). This also regression-guards
-    fix_delta F3 (home_bin_dir precedence) against silently overriding an
-    explicit operator override -- not just against the PATH candidate.
-    """
+def test_explicit_proxy_bin_selects_only_the_auxiliary_evidence(tmp_path):
+    """`CLAUDE_GPT_PROXY_BIN` (explicit override) is honored for the auxiliary path/version
+    evidence, and never changes which server is diagnosed (that is `ANTHROPIC_BASE_URL`)."""
     required = _required_models()
-
-    claude_gpt_home = tmp_path / "claude-gpt-home"
-
-    # PATH candidate: compatible, but must NOT be selected.
-    path_bin_dir = tmp_path / "path-bin"
-    path_bin_dir.mkdir()
-    path_proxy = write_fake_proxy(
-        path_bin_dir / "claude-code-proxy", models=required, version="claude-code-proxy 0.1.42"
-    )
-
-    # Managed (`$CLAUDE_GPT_HOME/bin`) candidate: also compatible, also must
-    # NOT be selected (fix_delta F3 regression guard).
-    managed_bin_dir = claude_gpt_home / "bin"
-    managed_bin_dir.mkdir(parents=True)
-    managed_proxy = write_fake_proxy(
-        managed_bin_dir / "claude-code-proxy", models=required, version="claude-code-proxy 0.1.42"
-    )
-
-    # Explicit candidate: incompatible, must be the one actually used.
-    explicit_proxy = write_fake_proxy(
-        tmp_path / "explicit-incompatible-proxy",
-        models=required[:-1],
-        version="claude-code-proxy 0.1.30",
-    )
-
-    env = dict(os.environ)
-    env["CLAUDE_GPT_HOME"] = str(claude_gpt_home)
-    env["CLAUDE_GPT_PROXY_BIN"] = str(explicit_proxy)
-    env["PATH"] = f"{path_bin_dir}{os.pathsep}{env['PATH']}"
-    env.pop("CLAUDE_GPT_CLAUDE_BIN", None)
-
-    result = subprocess.run(
-        [str(LAUNCH_SH), "--check-only"],
-        cwd=str(SCRIPT_DIR),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=40,
-    )
-    assert result.returncode == 7, result.stderr
-
-    receipt = extract_claude_gpt_launcher_receipt(result.stdout)
-    assert receipt is not None
-    assert receipt["proxy"]["path"] == str(explicit_proxy)
-    assert receipt["proxy"]["path"] != str(path_proxy)
-    assert receipt["proxy"]["path"] != str(managed_proxy)
-    assert receipt["proxy"]["version"] == "claude-code-proxy 0.1.30"
-    assert receipt["missing_models"]  # non-empty: explicit binary really is incompatible
+    explicit = _write_labelled_proxy_bin(tmp_path / "explicit-proxy", "claude-code-proxy 0.1.42")
+    with H.FakeServer(models=required) as good, H.FakeServer(models=required[:-1]) as bad:
+        ok = _check_only(tmp_path, good.url, CLAUDE_GPT_PROXY_BIN=str(explicit))
+        ng = _check_only(tmp_path, bad.url, CLAUDE_GPT_PROXY_BIN=str(explicit))
+    assert ok.returncode == 0 and ng.returncode == 7
+    for result in (ok, ng):
+        assert json.loads(result.stdout)["local_proxy_binary_auxiliary"]["path"] == str(explicit)
 
 
-# --- AC8 -----------------------------------------------------------------------
+# --- AC8 --------------------------------------------------------------------
 
 
 def test_required_set_derived_from_effective_runtime_consumers():
-    """GIVEN lib.sh's claude_gpt_required_model_set()
-    WHEN its body is inspected
-    THEN it derives from all five effective runtime consumers (main / opus /
-    sonnet / haiku / Auto review classifier) rather than a hand-picked
-    MAIN/OPUS/HAIKU subset (AC8).
-    """
-    content = LIB_SH.read_text(encoding="utf-8")
-    start = content.index("claude_gpt_required_model_set() {")
-    end = content.index("\n}", start)
-    body = content[start:end]
-    for consumer_const in (
-        "CLAUDE_GPT_MODEL_MAIN",
-        "CLAUDE_GPT_MODEL_OPUS",
-        "CLAUDE_GPT_MODEL_SONNET",
-        "CLAUDE_GPT_MODEL_HAIKU",
-        "CLAUDE_GPT_AUTO_REVIEW_MODEL_POLICY",
-    ):
-        assert consumer_const in body, f"{consumer_const} missing from required-set derivation"
+    """The required set is a one-way derivation from the effective runtime consumers (main /
+    small-fast / opus / sonnet / haiku), de-duplicated, with no `[1m]` context hint."""
+    required = _required_models()
+    assert len(required) == len(set(required))
+    assert all("[" not in model for model in required)
+    consumers = subprocess.run(
+        ["sh", "-c", '. ./lib.sh; printf "%s\\n" "$CLAUDE_GPT_MODEL_MAIN" "$CLAUDE_GPT_MODEL_SMALL_FAST" '
+                     '"$CLAUDE_GPT_MODEL_OPUS" "$CLAUDE_GPT_MODEL_SONNET" "$CLAUDE_GPT_MODEL_HAIKU"'],
+        cwd=str(SCRIPT_DIR), capture_output=True, text=True, timeout=10,
+    ).stdout.split()
+    assert set(required) == {re.sub(r"\[[^\]]*\]$", "", alias) for alias in consumers}
+    # on-demand escalation models are not startup-critical.
+    assert "gpt-6-astra" not in required
 
 
-def test_launch_sh_model_check_loop_uses_derived_required_set_not_hardcoded_subset():
-    """GIVEN launch.sh's live catalog compatibility loop
-    WHEN its content is inspected
-    THEN it iterates over `claude_gpt_required_model_set()` output, not a
-    hardcoded literal `MAIN`/`OPUS`/`HAIKU` enumeration (recurrence
-    prevention: a future SONNET-only or Auto-review-only model change must
-    still be checked).
-    """
-    content = LAUNCH_SH.read_text(encoding="utf-8")
-    assert "claude_gpt_required_model_set" in content
-    old_hardcoded_enum = (
-        'for m in "$CLAUDE_GPT_MODEL_MAIN" "$CLAUDE_GPT_MODEL_OPUS" "$CLAUDE_GPT_MODEL_HAIKU"'
-    )
-    assert old_hardcoded_enum not in content
+def test_diagnostics_use_the_derived_required_set_not_a_hardcoded_subset():
+    lib = LIB_SH.read_text(encoding="utf-8")
+    assert "claude_gpt_required_model_set" in lib
+    assert "claude_gpt_run_connected_server_diagnostics" in lib
+    body = lib.split("claude_gpt_run_connected_server_diagnostics() {", 1)[1].split("\n}\n", 1)[0]
+    assert "claude_gpt_required_model_set" in body
+    assert "gpt-6-sol" not in body and "gpt-6-luna" not in body
 
 
 def test_required_set_reflects_a_sonnet_only_drift(tmp_path):
-    """GIVEN a copy of lib.sh where ONLY CLAUDE_GPT_MODEL_SONNET is changed to
-    a distinct model ID (simulating a future policy change touching just the
-    Auto-review/Sonnet consumer)
-    WHEN claude_gpt_required_model_set() is sourced from the patched copy
-    THEN the new distinct model ID appears in the derived required set --
-    proving the one-directional derivation actually reacts to a
-    SONNET-only change instead of silently keeping a stale fixed subset
-    (AC8 recurrence prevention).
-    """
-    patched_dir = tmp_path / "patched-claude-gpt"
-    shutil.copytree(SCRIPT_DIR, patched_dir, ignore=shutil.ignore_patterns("tests", "__pycache__"))
-    patched_lib = patched_dir / "lib.sh"
-    original = patched_lib.read_text(encoding="utf-8")
+    """If only the sonnet role alias moves to another model, the derived required set (and thus
+    the diagnostic against the connected server) follows without editing any hardcoded list."""
+    required = _required_models()
+    drifted = "gpt-6-drift-probe"
+    out = subprocess.run(
+        ["sh", "-c", f'. ./lib.sh; CLAUDE_GPT_MODEL_SONNET="{drifted}[1m]"; claude_gpt_required_model_set'],
+        cwd=str(SCRIPT_DIR), capture_output=True, text=True, timeout=10,
+    ).stdout.split()
+    assert drifted in out and set(required) <= set(out)
 
-    # Extract the *current* `CLAUDE_GPT_MODEL_SONNET="..."` assignment line
-    # itself, rather than hardcoding a specific generation's baseline model
-    # name (that hardcoded literal breaks every time the shared model policy
-    # rotates -- e.g. Issue #2772/#2800 -- even though this test's actual
-    # subject, the one-directional derivation, is untouched by that rotation).
-    # If the assignment line can't be found at all, that is itself a policy
-    # drift this test must not silently swallow -- fail loudly instead of
-    # skipping.
-    sonnet_line_match = re.search(
-        r'^CLAUDE_GPT_MODEL_SONNET="[^"]*"$', original, flags=re.MULTILINE
+    drift_lib = tmp_path / "lib-drift.sh"
+    drift_lib.write_text(
+        LIB_SH.read_text(encoding="utf-8").replace(
+            'CLAUDE_GPT_MODEL_SONNET="gpt-6-sol[1m]"', f'CLAUDE_GPT_MODEL_SONNET="{drifted}[1m]"'
+        ),
+        encoding="utf-8",
     )
-    assert sonnet_line_match is not None, (
-        "CLAUDE_GPT_MODEL_SONNET assignment line not found in lib.sh -- "
-        "policy drift the recurrence test must not silently ignore"
-    )
-    original_sonnet_line = sonnet_line_match.group(0)
-    patched_sonnet_line = 'CLAUDE_GPT_MODEL_SONNET="gpt-9.9-drift-sentinel[1m]"'
-    assert patched_sonnet_line != original_sonnet_line
-
-    patched = original.replace(original_sonnet_line, patched_sonnet_line, 1)
-    assert patched != original
-    patched_lib.write_text(patched, encoding="utf-8")
-    patched_lib.chmod(patched_lib.stat().st_mode | stat.S_IEXEC)
-
-    result = subprocess.run(
-        ["sh", "-c", ". ./lib.sh; claude_gpt_required_model_set"],
-        cwd=str(patched_dir),
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    assert result.returncode == 0, result.stderr
-    assert "gpt-9.9-drift-sentinel" in result.stdout.splitlines()
+    script_copy = tmp_path / "scripts" / "claude-gpt"
+    script_copy.mkdir(parents=True)
+    (script_copy / "lib.sh").write_text(drift_lib.read_text(encoding="utf-8"), encoding="utf-8")
+    (script_copy / "launch.sh").write_text(LAUNCH_SH.read_text(encoding="utf-8"), encoding="utf-8")
+    with H.FakeServer(models=required) as server:  # does not list the drifted model
+        env = H.base_env(tmp_path, ANTHROPIC_BASE_URL=server.url)
+        result = subprocess.run(
+            ["sh", str(script_copy / "launch.sh"), "--check-only"], env=env, capture_output=True, text=True, timeout=60
+        )
+    assert result.returncode == 7
+    assert json.loads(result.stdout)["connected_server"]["missing_models"] == [drifted]
 
 
-# --- AC9 ------------------------------------------------------------------------
+# --- AC9 --------------------------------------------------------------------
 
 
 def test_launcher_receipt_extraction_regex_tolerates_additive_fields(tmp_path):
-    """GIVEN the launcher's own additive-field failure receipt (nested
-    `proxy` object, new `cause`/`required_models`/`missing_models`/
-    `minimum_known_compatible_version`/`repair_command` fields), embedded in
-    a larger multi-line stdout+stderr blob (simulating a real subprocess
-    capture with other lines around it)
-    WHEN the same extraction regex as
-    `scripts/agent-ops/run_worktree_agent_runtime_smoke.py`'s
-    `extract_claude_gpt_launcher_receipt()` is applied
-    THEN it still extracts the receipt and the existing `reason` /
-    `model_alias_ok` / `schema` semantics survive unbroken (AC9). The
-    Allowed-Paths-excluded consumer file itself is not imported or modified.
-    """
+    """The runner-side single-line receipt regex keeps extracting the failure receipt even though
+    additive fields were appended (forward compatibility)."""
     required = _required_models()
-    result, _ = _run_check_only(
-        tmp_path, proxy_models=required[:-1], proxy_version="claude-code-proxy 0.1.36"
-    )
-    assert result.returncode == 7, result.stderr
-
-    noisy_blob = (
-        "launcher=/some/path/launch.sh git=abc1234 dirty=false proxy=claude-code-proxy 0.1.36\n"
-        + result.stdout
-        + "\nCLAUDE_GPT_PROXY_PORT=12345\n"
-    )
-
-    receipt = extract_claude_gpt_launcher_receipt(noisy_blob)
-    assert receipt is not None, "regex failed to extract receipt from noisy multi-line blob"
-    assert receipt["schema"] == "CLAUDE_GPT_LAUNCH_RESULT_V1"
-    assert receipt["reason"] == "model_alias_not_resolved"
-    assert receipt["model_alias_ok"] is False
-    assert isinstance(receipt["proxy"], dict)
-    assert "path" in receipt["proxy"] and "version" in receipt["proxy"]
-    assert isinstance(receipt["required_models"], list)
-    assert isinstance(receipt["missing_models"], list)
-    assert receipt["minimum_known_compatible_version"] == "0.1.42"
-    assert receipt["repair_command"] == "scripts/claude-gpt/repair_proxy.sh"
+    with H.FakeServer(models=required[:-1]) as server:
+        result = _check_only(tmp_path, server.url)
+    receipt = extract_claude_gpt_launcher_receipt(result.stdout)
+    assert receipt is not None
+    for key in ("schema", "status", "reason", "cause", "connected_server", "local_proxy_binary_auxiliary",
+                "start_hint", "repair_command", "repair_scope"):
+        assert key in receipt, key
 
 
-# --- AC10 -----------------------------------------------------------------------
+# --- AC10 / AC11 ----------------------------------------------------------------
 
 
-def test_preflight_independent_of_notifier_availability(tmp_path):
-    """GIVEN lib.sh / launch.sh
-    WHEN their source is inspected for any coupling to the #2773
-    upstream-update notifier
-    THEN no reference exists -- and a compatible-catalog fixture run PASSes
-    regardless (AC10: preflight/repair guidance must function independently
-    of notifier availability/staleness/offline state).
-    """
-    lib_content = LIB_SH.read_text(encoding="utf-8")
-    launch_content = LAUNCH_SH.read_text(encoding="utf-8")
-    for forbidden in ("notifier", "notify_upstream", "2773"):
-        assert forbidden not in lib_content.lower()
-        assert forbidden not in launch_content.lower()
-
+def test_diagnostics_are_independent_of_notifier_and_other_ambient_tooling(tmp_path):
+    """Nothing but sh/curl is needed to diagnose; unrelated ambient tooling variables do not matter."""
     required = _required_models()
-    result, _ = _run_check_only(
-        tmp_path, proxy_models=required, proxy_version="claude-code-proxy 0.1.42"
-    )
+    with H.FakeServer(models=required) as server:
+        result = _check_only(tmp_path, server.url, HERDR_ENV="1", NOTIFY_COMMAND="/nonexistent/notifier")
     assert result.returncode == 0, result.stderr
 
 
-# --- AC11 (fixture-based check-only portion only; see module docstring) --------
-
-
-def test_check_only_passes_with_compatible_proxy(tmp_path):
-    """GIVEN a fixture proxy at the known-compatible version
-    (`CLAUDE_GPT_MIN_KNOWN_COMPATIBLE_PROXY_VERSION`) whose live catalog has
-    every current-head required model
-    WHEN launch.sh --check-only runs
-    THEN it PASSes without any live network/ChatGPT-auth dependency (AC11
-    fixture-based portion; the bounded real-subscription smoke is a separate,
-    optionally-SKIPped manual step per Runtime Verification Applicability).
-    """
+def test_check_only_passes_with_compatible_server(tmp_path):
+    """AC11 (fixture-based part): `launch.sh --check-only` PASSes against a compatible server and
+    reports the launch env it would use. Real ChatGPT subscription smoke is SKIP (exit 77) /
+    environment_blocked when unavailable and is exercised out-of-band."""
     required = _required_models()
-    result, _ = _run_check_only(
-        tmp_path, proxy_models=required, proxy_version="claude-code-proxy 0.1.42"
-    )
+    with H.FakeServer(models=required) as server:
+        result = _check_only(tmp_path, server.url)
     assert result.returncode == 0, result.stderr
-    # See test_compatible_catalog_passes() for why this parses the raw
-    # stdout directly instead of via the single-line extraction regex.
     receipt = json.loads(result.stdout)
-    assert receipt["status"] == "ok"
-    assert receipt["model_alias_ok"] is True
+    assert receipt["status"] == "ok" and receipt["mode"] == "check_only"
+    assert receipt["launch_env"]["ANTHROPIC_BASE_URL"] == server.url
+    assert receipt["launch_env"]["CLAUDE_CODE_AUTO_MODE_SERVER"] == "0"
+    assert "CCP_AUTO_REVIEW_MODEL" not in receipt["launch_env"]
 
 
-if __name__ == "__main__":
-    import sys
-
-    sys.exit(pytest.main([__file__, "-v"]))
+@pytest.mark.parametrize("flag", ["--check-only", "--dry-run"])
+def test_launcher_options_never_start_or_stop_a_server(tmp_path, flag):
+    required = _required_models()
+    with H.FakeServer(models=required) as server:
+        env = H.base_env(tmp_path, ANTHROPIC_BASE_URL=server.url)
+        result = H.run_launcher([flag], env)
+        assert result.returncode == 0, result.stderr
+        assert server.alive() and server.listening()

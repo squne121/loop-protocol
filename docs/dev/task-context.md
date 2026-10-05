@@ -297,7 +297,7 @@ Code 側にあり、Task Context は hook から観測できる identity だけ�
   team dir と照合できる、`members[]` 内で name が一意、の全てを満たす場合だけ
   PASS。それ以外（flag 無効・dir 無し・parse 不能・schema 不一致・別 session・
   removed・重複 name・独立 session 名との衝突）は ASK。config root は
-  `CLAUDE_CONFIG_DIR`（Claude-GPT の isolated root を含む）を優先し、未設定時
+  ambient な `CLAUDE_CONFIG_DIR`（Issue #2925 以降 Claude-GPT launcher は config root を隔離しない）を優先し、未設定時
   のみ Native 既定を使う。テスト用に `LOOP_TASK_CONTEXT_TEAMS_DIR` で上書き
   できる。team config は手編集せず、書き込みも行わない。
 - **通常 named SubAgent の name**: `Agent` tool を `name` 付きで呼ぶと、

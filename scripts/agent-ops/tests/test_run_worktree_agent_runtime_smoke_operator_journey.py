@@ -825,13 +825,13 @@ def _seed_fake_claude_transcript(
     (never the first), matching what ``_find_claude_interactive_transcript``'s
     ``_TRANSCRIPT_CWD_SCAN_LINES``-line scan window must actually handle.
 
-    ``claude_adapter="native"`` writes under
-    ``<fake_home>/.claude/projects/<any-slug>/<any-name>.jsonl`` (the
-    default adapter's projects root). ``claude_adapter="claude-gpt"`` writes
-    under ``<fake_home>/.claude-gpt/claude/projects/<any-slug>/<any-name>.jsonl``
-    instead, mirroring ``scripts/claude-gpt/lib.sh``'s own
-    ``CLAUDE_GPT_HOME``-default (``$HOME/.claude-gpt``) resolution exactly."""
-    if claude_adapter == "claude-gpt":
+    ``claude_adapter="native"`` and ``claude_adapter="claude-gpt"`` both write
+    under ``<fake_home>/.claude/projects/<any-slug>/<any-name>.jsonl`` -- since
+    Issue #2925 the minimal Claude-GPT launcher shares the ambient ``~/.claude``
+    root instead of isolating ``$CLAUDE_GPT_HOME/claude``.
+    ``claude_adapter="retired-isolated-root"`` seeds the former isolated root
+    (``<fake_home>/.claude-gpt/claude/projects``) for negative controls."""
+    if claude_adapter == "retired-isolated-root":
         projects_root = fake_home / ".claude-gpt" / "claude" / "projects"
     else:
         projects_root = fake_home / ".claude" / "projects"
@@ -1092,37 +1092,21 @@ def test_given_interactive_lane_no_transcript_found_when_require_min_turns_then_
 # ---------------------------------------------------------------------------
 
 
-def test_given_claude_gpt_adapter_when_resolving_projects_root_then_uses_isolated_config_dir():
-    """Pure-function unit test (Issue #2219 fix_delta iteration 2): the
-    claude-gpt adapter's projects root is $CLAUDE_GPT_HOME/claude/projects
-    (default $HOME/.claude-gpt/claude/projects when CLAUDE_GPT_HOME is
-    unset), never the native ~/.claude/projects."""
-    original = os.environ.pop("CLAUDE_GPT_HOME", None)
-    try:
-        native_root = MODULE._resolve_claude_projects_root("native")
-        gpt_root = MODULE._resolve_claude_projects_root("claude-gpt")
-        assert native_root == Path.home() / ".claude" / "projects"
-        assert gpt_root == Path.home() / ".claude-gpt" / "claude" / "projects"
-        assert native_root != gpt_root
-    finally:
-        if original is not None:
-            os.environ["CLAUDE_GPT_HOME"] = original
+def test_given_claude_gpt_adapter_when_resolving_projects_root_then_uses_the_shared_ambient_root():
+    """Pure-function unit test (Issue #2925, supersedes the Issue #2219 fix_delta
+    iteration 2 isolated-root rule): the minimal Claude-GPT launcher shares the
+    ambient Native config surface, so both adapters resolve to ~/.claude/projects."""
+    native_root = MODULE._resolve_claude_projects_root("native")
+    gpt_root = MODULE._resolve_claude_projects_root("claude-gpt")
+    assert native_root == Path.home() / ".claude" / "projects"
+    assert gpt_root == native_root
 
 
-def test_given_claude_gpt_home_override_when_resolving_projects_root_then_honored():
-    """A caller-set CLAUDE_GPT_HOME (matching scripts/claude-gpt/lib.sh's own
-    override mechanism) must be honored identically, not silently ignored
-    in favor of a re-derived default."""
-    original = os.environ.get("CLAUDE_GPT_HOME")
-    os.environ["CLAUDE_GPT_HOME"] = "/tmp/custom-claude-gpt-home"
-    try:
-        gpt_root = MODULE._resolve_claude_projects_root("claude-gpt")
-        assert gpt_root == Path("/tmp/custom-claude-gpt-home") / "claude" / "projects"
-    finally:
-        if original is None:
-            os.environ.pop("CLAUDE_GPT_HOME", None)
-        else:
-            os.environ["CLAUDE_GPT_HOME"] = original
+def test_given_claude_gpt_home_override_when_resolving_projects_root_then_it_has_no_effect(monkeypatch):
+    """CLAUDE_GPT_HOME only names the repair helper's install dir now; it must
+    never redirect where a session transcript is looked up."""
+    monkeypatch.setenv("CLAUDE_GPT_HOME", "/tmp/custom-claude-gpt-home")
+    assert MODULE._resolve_claude_projects_root("claude-gpt") == Path.home() / ".claude" / "projects"
 
 
 def test_given_claude_gpt_adapter_interactive_transcript_under_isolated_config_dir_when_wired_then_pass(
@@ -1188,14 +1172,13 @@ def test_given_claude_gpt_adapter_interactive_transcript_under_isolated_config_d
     assert "'verified': True" in summary
 
 
-def test_given_claude_gpt_transcript_only_under_native_root_when_adapter_is_claude_gpt_then_not_found(
+def test_given_claude_gpt_transcript_only_under_the_retired_isolated_root_then_not_found(
     repo_with_worktree, tmp_path
 ):
-    """Negative control proving root selection is genuinely adapter-aware
-    (not a change that makes every root match): a transcript seeded ONLY
-    under the NATIVE root while --claude-adapter claude-gpt is requested
-    must NOT be found -- the isolated adapter must never accidentally read
-    another adapter's (or another isolation boundary's) session data."""
+    """Negative control (Issue #2925): the isolated ``$CLAUDE_GPT_HOME/claude`` root
+    was retired together with the launcher's CLAUDE_CONFIG_DIR isolation, so a
+    transcript seeded ONLY under that former root must NOT be found for
+    --claude-adapter claude-gpt -- the scan reads the shared ambient root only."""
     repo, worktree = repo_with_worktree
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -1207,7 +1190,7 @@ def test_given_claude_gpt_transcript_only_under_native_root_when_adapter_is_clau
     _seed_fake_claude_transcript(
         fake_home, worktree,
         [{"type": "system", "subtype": "init", "session_id": "native-only-sess"}],
-        claude_adapter="native",
+        claude_adapter="retired-isolated-root",
     )
     prompt = _prompt_file(tmp_path, "OBSERVED_MARKER\n")
     out_dir = tmp_path / "out"
@@ -1377,24 +1360,13 @@ def test_given_hook_sink_record_with_non_digest_prompt_field_when_scanned_then_f
     assert "UserPromptSubmit" in result["violating_events"]
 
 
-def test_given_hook_sink_path_when_derived_then_built_only_from_launcher_owned_constant(monkeypatch):
-    """AC14: the claude-gpt sink path is built ONLY from
-    ``claude_gpt_proxy_state_dir_python()`` (mirrors ``lib.sh``'s
-    ``claude_gpt_proxy_state_dir()``) and the nonce -- never from a
-    caller-supplied worktree path or CLI argument. Setting a caller-
-    controlled env var that has NOTHING to do with the launcher-owned
-    ``CLAUDE_GPT_HOME`` constant must have zero effect on the resolved
-    path."""
-    monkeypatch.delenv("CLAUDE_GPT_HOME", raising=False)
-    home_default = MODULE.claude_gpt_proxy_state_dir_python()
-    path_a = MODULE.claude_gpt_hook_sink_path("nonce-x")
-    assert str(path_a).startswith(str(home_default))
-    assert "nonce-x" in path_a.name
-    # A caller-supplied value that is NOT the launcher-owned CLAUDE_GPT_HOME
-    # constant (e.g. a worktree path) must never influence the sink path.
-    monkeypatch.setenv("SOME_CALLER_SUPPLIED_WORKTREE_PATH", "/tmp/attacker-controlled")
-    path_b = MODULE.claude_gpt_hook_sink_path("nonce-x")
-    assert path_a == path_b
+def test_given_launcher_owned_hook_sink_constant_removed_then_no_helper_derives_a_launcher_path():
+    """Issue #2925: the launcher owns no hook-sink gate or state directory any more, so
+    the runner no longer mirrors a launcher-owned ``claude_gpt_proxy_state_dir()``
+    constant; the sink path is built only by the harness-owned temp dir (see the
+    hook-sink wiring in ``run_interactive_herdr_isolated``)."""
+    assert not hasattr(MODULE, "claude_gpt_proxy_state_dir_python")
+    assert not hasattr(MODULE, "claude_gpt_hook_sink_path")
 
 
 def test_given_hook_sink_concurrent_write_when_parsed_then_not_corrupted(tmp_path):
