@@ -1021,7 +1021,20 @@ class TestSourceEvidenceAdapterCliSmoke:
             },
         )
 
-    def test_operator_resolution_rejects_old_commit_or_wrong_c1_target_cli(self, tmp_path):
+    @pytest.mark.parametrize(
+        "scenario",
+        ["old_commit_wrong_target", "unverified_c1_ref", "head_only_false_main"],
+        ids=["old-commit-wrong-target", "unverified-c1-ref", "head-only-false-main"],
+    )
+    def test_operator_resolution_rejects_old_commit_or_wrong_c1_target_cli(self, tmp_path, scenario):
+        # This exact Issue VC node must execute all three independent subprocess
+        # cases. pytest gives each parameter its own tmp_path and real Git repo.
+        if scenario == "unverified_c1_ref":
+            self._assert_operator_resolution_rejects_unverified_c1_ref_cli(tmp_path)
+            return
+        if scenario == "head_only_false_main":
+            self._assert_operator_resolution_rejects_worktree_head_false_main_binding_cli(tmp_path)
+            return
         fixture = _C1Fixture(tmp_path)
         first = fixture.acquire()
         fixture.select_operator(first)
@@ -1147,6 +1160,9 @@ class TestSourceEvidenceAdapterCliSmoke:
         fixture.rejection_artifact("old-commit-wrong-target", negatives)
 
     def test_operator_resolution_rejects_unverified_c1_ref_cli(self, tmp_path):
+        self._assert_operator_resolution_rejects_unverified_c1_ref_cli(tmp_path)
+
+    def _assert_operator_resolution_rejects_unverified_c1_ref_cli(self, tmp_path):
         from copy import deepcopy
 
         fixture = _C1Fixture(tmp_path)
@@ -1185,6 +1201,9 @@ class TestSourceEvidenceAdapterCliSmoke:
         )
 
     def test_operator_resolution_rejects_worktree_head_false_main_binding_cli(self, tmp_path):
+        self._assert_operator_resolution_rejects_worktree_head_false_main_binding_cli(tmp_path)
+
+    def _assert_operator_resolution_rejects_worktree_head_false_main_binding_cli(self, tmp_path):
         from copy import deepcopy
 
         fixture = _C1Fixture(tmp_path)
