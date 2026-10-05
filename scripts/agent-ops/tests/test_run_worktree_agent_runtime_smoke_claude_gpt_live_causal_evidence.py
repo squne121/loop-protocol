@@ -87,10 +87,12 @@ def _interpret_claude_gpt_launch_result(exit_code: int, stdout: str) -> tuple[bo
     """
     try:
         payload = json.loads(stdout)
-    except (json.JSONDecodeError, ValueError, TypeError):
+    except (json.JSONDecodeError, ValueError, TypeError, RecursionError):
+        # Input-content-independent: never echo any part of the malformed stdout.
+        stdout_len = len(stdout) if isinstance(stdout, str) else -1
         return False, (
-            f"claude-gpt preflight exit_code={exit_code}: stdout is not valid JSON "
-            f"(head={str(stdout)[:80]!r})"
+            f"claude-gpt preflight exit_code={exit_code}: "
+            f"classification=invalid_json stdout_len={stdout_len}"
         )
     if not isinstance(payload, dict):
         return False, (
@@ -100,9 +102,9 @@ def _interpret_claude_gpt_launch_result(exit_code: int, stdout: str) -> tuple[bo
     schema = payload.get("schema")
     status = payload.get("status")
     if schema != _LAUNCH_RESULT_SCHEMA:
+        # Neither the received schema value nor its status is echoed.
         return False, (
-            f"claude-gpt preflight exit_code={exit_code} status={_safe_scalar(status)}: "
-            f"schema={_safe_scalar(schema)} != {_LAUNCH_RESULT_SCHEMA}"
+            f"claude-gpt preflight exit_code={exit_code}: classification=schema_mismatch"
         )
     detail = ""
     if status != "ok":
@@ -118,7 +120,7 @@ def _interpret_claude_gpt_launch_result(exit_code: int, stdout: str) -> tuple[bo
     mode = payload.get("mode")
     if mode != "check_only":
         return False, (
-            f"claude-gpt preflight exit_code={exit_code} status=ok: mode={_safe_scalar(mode)} != check_only"
+            f"claude-gpt preflight exit_code={exit_code} status=ok: mode is not check_only"
         )
     server = payload.get("connected_server")
     if not isinstance(server, dict):

@@ -5,8 +5,10 @@ current ``CLAUDE_GPT_LAUNCH_RESULT_V1`` receipt に exact に bind している�
 - AC5/AC6: 実 ``scripts/claude-gpt/preflight.sh`` を local loopback の ``FakeServer`` に対して
   実行する runtime test。preflight 自身の exit code と receipt を helper の返り値とは独立に
   assert してから helper を評価する（起動失敗 OSError / timeout を False に変換しただけの結果は
-  PASS 根拠にしない）。``sh`` または loopback が使えない環境では SKIP ではなく fail させる
-  （SKIP は PASS ではない）。
+  PASS 根拠にしない）。``sh`` が無い、または 127.0.0.1 の loopback socket を bind できない
+  runtime 環境不備の場合のみ ``pytest.skip()``（SKIP は PASS ではない。承認済み contract の
+  skip_conditions に一致）。``preflight.sh`` 自体の欠落や preflight / FakeServer の assertion
+  failure は repository の欠陥であり SKIP にせず FAIL とする。
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import shutil
+import socket
 import sys
 from pathlib import Path
 
@@ -120,6 +123,7 @@ def test_availability_legacy_shape_returns_false() -> None:
         ),
         pytest.param(0, _ok_receipt(mode="launch"), id="wrong-mode"),
         pytest.param(7, _ok_receipt(), id="status-ok-with-nonzero-exit"),
+        pytest.param(0, "[" * 100000 + "]" * 100000, id="deeply-nested-json"),
         pytest.param(0, _ok_receipt(status="failed"), id="status-failed-with-zero-exit"),
     ],
 )
@@ -129,10 +133,75 @@ def test_availability_invalid_receipt_shape_returns_false(exit_code: int, payloa
     assert isinstance(reason, str) and reason
 
 
-def _require_sh_and_loopback() -> None:
-    """Fail (not skip) when the runtime AC environment is missing: SKIP is not PASS."""
-    assert shutil.which("sh"), "AC5/AC6 require `sh` (SKIP is not PASS)"
+_SENTINEL = "SENTINEL_SECRET_sk-test-0000"
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "payload"),
+    [
+        pytest.param(0, f"not json {_SENTINEL}", id="non-json-with-sentinel"),
+        pytest.param(0, f"{{{_SENTINEL}", id="truncated-json-with-sentinel"),
+        pytest.param(0, _ok_receipt(schema=_SENTINEL), id="wrong-schema-with-sentinel"),
+        pytest.param(7, _ok_receipt(schema=_SENTINEL, status=_SENTINEL), id="wrong-schema-status-sentinel"),
+        pytest.param(0, _ok_receipt(mode=_SENTINEL), id="wrong-mode-with-sentinel"),
+    ],
+)
+def test_availability_malformed_input_reason_does_not_echo_secret_shaped_value(exit_code: int, payload) -> None:
+    available, reason = _interpret(exit_code, payload)
+    assert available is False
+    assert isinstance(reason, str) and reason
+    assert _SENTINEL not in reason
+    assert "sk-test" not in reason
+
+
+def _skip_if_runtime_environment_unavailable() -> None:
+    """SKIP only when `sh` or a loopback bind is unavailable (SKIP is not PASS).
+
+    A missing ``preflight.sh`` is a broken repository, not an unavailable environment,
+    so it stays a hard assertion failure.
+    """
+    if shutil.which("sh") is None:
+        pytest.skip("SKIP: runtime environment unavailable: `sh` not found on PATH (SKIP is not PASS)")
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+    except OSError:
+        pytest.skip("SKIP: runtime environment unavailable: cannot bind 127.0.0.1 loopback (SKIP is not PASS)")
     assert helper._PREFLIGHT_PATH.is_file(), f"missing {helper._PREFLIGHT_PATH}"
+
+
+def test_availability_runtime_environment_skip_branches(monkeypatch) -> None:
+    # Missing `sh` -> skip.
+    monkeypatch.setattr(shutil, "which", lambda *_a, **_k: None)
+    with pytest.raises(pytest.skip.Exception) as no_sh:
+        _skip_if_runtime_environment_unavailable()
+    assert "SKIP is not PASS" in str(no_sh.value)
+    monkeypatch.undo()
+
+    # Loopback bind failure -> skip.
+    class _NoBindSocket:
+        def __init__(self, *_a, **_k) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc) -> None:
+            return None
+
+        def bind(self, _addr) -> None:
+            raise OSError("bind denied")
+
+    monkeypatch.setattr(socket, "socket", _NoBindSocket)
+    with pytest.raises(pytest.skip.Exception) as no_bind:
+        _skip_if_runtime_environment_unavailable()
+    assert "SKIP is not PASS" in str(no_bind.value)
+    monkeypatch.undo()
+
+    # Missing preflight.sh is a repository defect: AssertionError, never a skip.
+    monkeypatch.setattr(helper, "_PREFLIGHT_PATH", Path("/nonexistent/preflight.sh"))
+    with pytest.raises(AssertionError):
+        _skip_if_runtime_environment_unavailable()
 
 
 def _run_real_preflight(env: dict) -> tuple[int, dict]:
@@ -147,7 +216,7 @@ def _run_real_preflight(env: dict) -> tuple[int, dict]:
 
 
 def test_availability_real_preflight_loopback_success_returns_true(tmp_path: Path) -> None:
-    _require_sh_and_loopback()
+    _skip_if_runtime_environment_unavailable()
     with harness.FakeServer(models=harness.REQUIRED_MODELS) as server:
         assert server.alive() and server.listening()
         env = harness.base_env(tmp_path, ANTHROPIC_BASE_URL=server.url)
@@ -164,7 +233,7 @@ def test_availability_real_preflight_loopback_success_returns_true(tmp_path: Pat
 
 
 def test_availability_real_preflight_failure_returns_false(tmp_path: Path) -> None:
-    _require_sh_and_loopback()
+    _skip_if_runtime_environment_unavailable()
 
     def _assert_failed_preflight(env: dict) -> None:
         exit_code, receipt = _run_real_preflight(env)
