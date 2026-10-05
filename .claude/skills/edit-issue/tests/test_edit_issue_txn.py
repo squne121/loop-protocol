@@ -782,6 +782,17 @@ def test_needs_fix_forwarding_does_not_mutate_without_resolution_evidence(
     def _run(*_args: object, **_kwargs: object) -> _CP:
         pytest.fail("child subprocess should not be invoked")
 
+    # Issue #2922: the rejection is deferred until after the live readback
+    # (`_fetch_issue`); an OPEN Issue is still rejected with no child process.
+    def _fetch(*_args: object, **_kwargs: object) -> tuple[dict | None, str]:
+        return {
+            "title": "old",
+            "body": "old issue body",
+            "updatedAt": "2026-07-03T10:40:51Z",
+            "state": "OPEN",
+        }, ""
+
+    monkeypatch.setattr(txn, "_fetch_issue", _fetch)
     monkeypatch.setattr(txn, "_run_command", _run)
 
     result = txn.run_transaction(payload)
@@ -789,6 +800,26 @@ def test_needs_fix_forwarding_does_not_mutate_without_resolution_evidence(
     assert result["mutation_started"] is False
     assert result["body_update"]["attempted"] is False
     assert result["errors"][0]["code"] == "readiness_needs_fix_without_resolution_evidence"
+
+
+def test_fetch_issue_argv_single_snapshot_includes_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Issue #2922: one `gh issue view` readback carries title / body /
+    # updatedAt / state; there is no separate state-only request helper.
+    seen: list[list[str]] = []
+
+    def _run(args: list[str], **_kwargs: object) -> _CP:
+        seen.append(args)
+        return _CP(0, stdout='{"title":"t","body":"b","updatedAt":"u","state":"CLOSED"}')
+
+    monkeypatch.setattr(txn, "_run_command", _run)
+    issue, err = txn._fetch_issue(1, "squne121/loop-protocol")
+    assert err == ""
+    assert issue == {"title": "t", "body": "b", "updatedAt": "u", "state": "CLOSED"}
+    assert len(seen) == 1
+    assert seen[0][1:] == [
+        "issue", "view", "1", "--repo", "squne121/loop-protocol", "--json", "title,body,updatedAt,state",
+    ]
+    assert not hasattr(txn, "_fetch_issue_state")
 
 
 def _assert_no_child_stdout_stderr_leak(
