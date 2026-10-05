@@ -403,6 +403,40 @@ def test_probe_ignores_default_curlrc_proxy_and_reaches_the_loopback_target(tmp_
     assert proxy.hits == [], f".curlrc proxy diverted the probe: {proxy.hits}"
 
 
+def test_probe_ignores_default_curlrc_connect_to_and_reaches_the_loopback_target(tmp_path):
+    """`proxy` 指令は `--noproxy '*'` でも無効化されるため、`-q` を固定できない。
+
+    `connect-to` は `--noproxy` では無効化されず `-q`（.curlrc を読まない）でのみ無効化される
+    routing 指令なので、これで lib.sh の `-q` を個別に固定する。"""
+    with _RecordingServer(("gpt-6-sol", "gpt-6-luna")) as target, _RecordingServer(("decoy-only",)) as decoy:
+        child_env = H.base_env(tmp_path, ANTHROPIC_BASE_URL=target.url)
+        rc_line = f'connect-to = "127.0.0.1:{target.port}:127.0.0.1:{decoy.port}"\n'
+        for directory in (Path(child_env["HOME"]), Path(child_env["XDG_CONFIG_HOME"])):
+            (directory / ".curlrc").write_text(rc_line, encoding="utf-8")
+        # control: 同じ子 env の素の curl は .curlrc の connect-to で decoy に流れる。
+        _plain_curl_get(child_env, target.url)
+        assert decoy.hits and not target.hits, "control failed: .curlrc connect-to was not honoured by plain curl"
+        # `--noproxy '*'` だけでは無効化されないことも確認（-q 固定の必要性の根拠）。
+        decoy.hits.clear()
+        subprocess.run(
+            ["curl", "--noproxy", "*", "-s", "-m", "3", "-o", "/dev/null", f"{target.url}/v1/models"],
+            env=child_env,
+            capture_output=True,
+            timeout=10,
+        )
+        assert decoy.hits and not target.hits, "control failed: --noproxy alone should not neutralise connect-to"
+        decoy.hits.clear()
+        target.hits.clear()
+
+        proc = H.run_launcher(["--check-only"], child_env)
+
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    connected = json.loads(proc.stdout)["connected_server"]
+    assert connected["model_catalog_ok"] is True and connected["missing_models"] == []
+    assert "/v1/models" in target.hits, "target never received /v1/models"
+    assert decoy.hits == [], f".curlrc connect-to diverted the probe to the decoy: {decoy.hits}"
+
+
 # ---------------------------------------------------------------------------
 # process ownership: a proxy the launcher did not start is never stopped
 # ---------------------------------------------------------------------------
