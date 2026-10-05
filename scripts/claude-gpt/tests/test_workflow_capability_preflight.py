@@ -372,17 +372,20 @@ def test_launch_check_only_contract_not_regressed():
     syntax_check = subprocess.run(["sh", "-n", str(PREFLIGHT_SH)], capture_output=True, text=True)
     assert syntax_check.returncode == 0, syntax_check.stderr
 
-    # The pre-existing full-mode / --env-only lanes (used by launch.sh
-    # --check-only via preflight.sh) must keep returning their own
-    # CLAUDE_GPT_PREFLIGHT_RESULT_V1 schema, untouched by the new
+    # Issue #2925: the default / --env-only lanes are now an alias of
+    # `launch.sh --check-only` (connected-server diagnostics). They return the
+    # launcher's own CLAUDE_GPT_LAUNCH_RESULT_V1 schema, untouched by the
     # --workflow-profile dispatch branch (schema separation, Issue #2273 In
-    # Scope).
+    # Scope). 0 = diagnostics PASS, 7 = connected server unavailable.
+    child_env = dict(os.environ)
+    child_env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:1"
     proc = subprocess.run(
-        ["sh", str(PREFLIGHT_SH), "--env-only"], capture_output=True, text=True, timeout=30
+        ["sh", str(PREFLIGHT_SH), "--env-only"], capture_output=True, text=True, timeout=30, env=child_env
     )
-    assert proc.returncode in (0, 3, 4, 5, 6)
+    assert proc.returncode in (0, 7)
     payload = json.loads(proc.stdout)
-    assert payload["schema"] == "CLAUDE_GPT_PREFLIGHT_RESULT_V1"
+    assert payload["schema"] == "CLAUDE_GPT_LAUNCH_RESULT_V1"
+    assert "connected_server" in payload
 
 
 # --- AC14 ------------------------------------------------------------------

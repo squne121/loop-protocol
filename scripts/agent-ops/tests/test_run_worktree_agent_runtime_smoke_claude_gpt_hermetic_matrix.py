@@ -1,15 +1,14 @@
 """Issue #2174 AC8 matrix test: --claude-bin combinations (PATH native /
 absolute native / claude-gpt / claude-gpt + --hermetic-agent-definition /
 arbitrary wrapper), including confirming that the claude-gpt adapter +
-hermetic --settings forwarding combination is DETECTABLY rejected by the
-launcher's own forbidden-flag policy (not silently swallowed).
+hermetic --settings forwarding combination.
 
-The fake ``launch.sh`` fixture below reproduces the two load-bearing
-behaviors of the real ``scripts/claude-gpt/launch.sh`` (Issue #2158/#2162)
-relevant to this matrix: (1) it only accepts its own launcher options
-before a literal ``--`` separator, and (2) it rejects a ``--settings`` flag
-forwarded after ``--`` as a policy-weakening extra flag, emitting its own
-``CLAUDE_GPT_LAUNCH_RESULT_V1`` JSON receipt to stderr and exiting 2.
+Issue #2925: the real ``scripts/claude-gpt/launch.sh`` is now a thin wrapper.
+The fake ``launch.sh`` fixture below reproduces its two load-bearing behaviors
+relevant to this matrix: (1) it only accepts its own launcher options before a
+literal ``--`` separator, and (2) it forwards everything after ``--`` to claude
+unchanged (``--settings`` is no longer rejected; only the permission-bypass
+flags are, which this runner never passes).
 """
 
 from __future__ import annotations
@@ -96,11 +95,11 @@ def _run(
     )
 
 
-# A minimal, behaviorally-faithful stand-in for scripts/claude-gpt/launch.sh:
-# accepts --claude-bin/--check-only/--dry-run before "--", rejects a
-# --settings token forwarded after "--" with the real launcher's own
-# CLAUDE_GPT_LAUNCH_RESULT_V1 JSON receipt shape, otherwise runs the
-# resolved claude-compatible binary transparently.
+# A minimal, behaviorally-faithful stand-in for scripts/claude-gpt/launch.sh
+# (Issue #2925 thin wrapper): accepts --claude-bin/--check-only/--dry-run before
+# "--", rejects only permission-bypass flags forwarded after "--" with the real
+# launcher's own CLAUDE_GPT_LAUNCH_RESULT_V1 JSON receipt shape, otherwise runs
+# the resolved claude-compatible binary transparently.
 _FAKE_CLAUDE_GPT_LAUNCHER = """
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -117,9 +116,9 @@ while [ $# -gt 0 ]; do
 done
 for arg in "$@"; do
   case "$arg" in
-    --settings|--settings=*)
+    --dangerously-skip-permissions|--allow-dangerously-skip-permissions)
       printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked",'\
-'"reason":"policy_weakening_flag_rejected","flag":"--settings"}\\n' 1>&2
+'"reason":"permission_bypass_flag_rejected","flag":"%s"}\\n' "$arg" 1>&2
       exit 2
       ;;
   esac
@@ -279,15 +278,15 @@ def test_claude_bin_matrix_non_hermetic_combinations_succeed(repo_with_worktree,
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_claude_gpt_adapter_plus_hermetic_settings_flag_causes_launcher_rejection(
+def test_claude_gpt_adapter_plus_hermetic_settings_flag_is_forwarded_not_rejected(
     repo_with_worktree, tmp_path
 ):
-    """AC8: the claude-gpt adapter + --hermetic-agent-definition combination
-    forwards a hermetic --settings flag after the launcher's own `--`
-    separator; the launcher's forbidden-flag policy structurally rejects
-    it. This must be independently DETECTABLE (recorded in evidence via
-    claude_gpt_launcher_receipt / a non-zero exit code), never silently
-    absorbed as a successful run."""
+    """AC8 (updated by Issue #2925): the claude-gpt adapter +
+    --hermetic-agent-definition combination forwards its hermetic --settings flag
+    after the launcher's own `--` separator. The thin launcher no longer treats
+    ``--settings`` as a policy-weakening flag, so the combination is no longer
+    structurally rejected; the run completes, and no launcher refusal receipt
+    is recorded."""
     repo, worktree = repo_with_worktree
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -305,7 +304,7 @@ def test_claude_gpt_adapter_plus_hermetic_settings_flag_causes_launcher_rejectio
 
     prompt = _prompt_file(tmp_path)
     out_dir = tmp_path / "out-claude-gpt-hermetic"
-    result = _run(
+    _run(
         repo, worktree,
         "--runtime", "claude", "--mode", "structured",
         "--prompt-file", str(prompt), "--output-dir", str(out_dir),
@@ -315,7 +314,6 @@ def test_claude_gpt_adapter_plus_hermetic_settings_flag_causes_launcher_rejectio
         "--hermetic-agent-definition",
         fake_bin_dir=fake_bin,
     )
-    assert result.returncode == 1, result.stdout + result.stderr
     summary = (out_dir / "summary.md").read_text(encoding="utf-8")
-    assert "policy_weakening_flag_rejected" in summary, summary
-    assert "claude_gpt_launcher_receipt" in summary
+    assert "policy_weakening_flag_rejected" not in summary, summary
+    assert "permission_bypass_flag_rejected" not in summary, summary

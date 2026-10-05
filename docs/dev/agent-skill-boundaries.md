@@ -75,7 +75,7 @@ human-gate 原則そのものの docs-only な追記を扱う。本節（#2740�
 |---|---|---|
 | Claude Code が読む実行宣言 | `.claude/agents/*.md` | claude-native / claude-gpt 共通の Claude Code 実行 authority |
 | repository 固有の分類・mutation/delegation/output policy | `tests/fixtures/agent-config/expected-runtime-contract.json` | `asset_classification` ブロックが SSOT |
-| alias から runtime model への mapping | `claude-gpt` launcher（`scripts/claude-gpt/**`） | model_alias（sonnet/haiku/opus）→ 具体 model ID の変換はここに一本化する |
+| alias から runtime model への mapping | `claude-gpt` launcher（`scripts/claude-gpt/**`） | model_alias（sonnet/haiku/opus）→ 具体 model ID の変換は、launcher が exec 前に設定する `ANTHROPIC_DEFAULT_*_MODEL` env に一本化する（Issue #2925。launcher はそれ以外の policy を持たない薄い wrapper） |
 | 実際に起動された runtime/model/SubAgent | 既存 runtime-smoke evidence（PR #2176 / #2220） | `run_worktree_agent_runtime_smoke.py` |
 | 人間向け説明 | 本節 | Authority 分離の正本 |
 
@@ -2782,54 +2782,44 @@ blind spot になる）。
   producer を特定した上で再度対応を検討する。証跡のない事前の blanket exemption は
   行わない。
 
-## claude-gpt launcher における auto mode の second-gate 境界（Issue #2203）
+## claude-gpt launcher における auto mode の境界（Issue #2203、Issue #2925 で縮退）
 
-`scripts/claude-gpt/launch.sh` が生成する launcher-owned `--settings` の
-`autoMode`（`environment` / `allow` / `hard_deny`）は、Claude Code の
-Auto mode 自然言語 classifier に対する判断補助（second gate）であり、決定論的な
-authority ではない（[Configure auto mode](https://code.claude.com/docs/en/auto-mode-config)、
-[Configure permissions](https://code.claude.com/docs/en/permissions) 準拠）。
-`classifyAllShell` キーは launcher-generated `autoMode` から intentionally
-omitted であり、生成しない（PR #2717 / Issue #2709）。
+Issue #2925 以降、`scripts/claude-gpt/launch.sh` は launcher 生成の `--settings`、custom `autoMode`
+prose（`environment` / `allow` / `hard_deny`）、`--permission-mode auto` の強制注入、`CCP_AUTO_REVIEW_MODEL`
+の注入を持たない。Auto mode は ambient な Native Claude Code の設定（user/project の
+`permissions.defaultMode` 等）をそのまま使う。launcher が残す Auto mode 関連の設定は、現行の Claude Code と
+proxy の組合せで classifier request を client 側から proxy 経由で routing する互換設定
+`CLAUDE_CODE_AUTO_MODE_SERVER=0` だけである（PR #2800 で実機確認済み。廃止は current な runtime evidence を
+添えた別 Issue の explicit specification change でのみ行う）。
 
-本 Issue（#2203）の Allowed Paths 内で実装したのは、launcher-local な
-defense-in-depth と canary Issue lifecycle 専用の narrow な transaction guard で
-あり、repository の server-side security authority ではない（後述「未達スコープ」の
-Issue #2223 Owner Decision 参照）。実装した層は次の三層である。ただし各層のスコープは
-限定的であり、raw `gh` / raw `git push` 全般に対する production-grade な
-deterministic deny ではない（下記「未達スコープ」参照）。
+Issue #2203 当時に実装した launcher-local な defense-in-depth（`autoMode` の判断補助）は、決定論的な authority
+ではなく、対象だった launcher-owned `--settings` 自体が撤去されたため撤去した（履歴は Git history）。
+canary Issue lifecycle 専用の `GitHubMutationBroker` を持つ `scripts/claude-gpt/auto_mode_canary.py` は、
+Allowed Paths 外の consumer（`.claude/agents/tests/test_issue_editor_runtime_smoke.py` が import する）が
+残るため削除せず残しており、撤去した層を前提とする mode は陳腐化している。整理は consumer を含む
+follow-up で扱う。
+`permissions.deny` と `PreToolUse` hook を含む repository の canonical guard、GitHub server-side protection、
+worktree ownership、destructive-operation prohibition は弱めない。Claude Code permission bypass は
+launcher 経由で導入しない（launcher は `--dangerously-skip-permissions` 系と
+`--permission-mode bypassPermissions` を引き続き拒否する）。
 
-1. `permissions.deny`（絶対拒否。autoMode では緩和しない）
-2. 引数・repository・object identity を検証する `PreToolUse` hook
-3. `squne121/loop-protocol` に repository 固定した **canary Issue lifecycle 専用**の
-   GitHub mutation transaction broker（`scripts/claude-gpt/auto_mode_canary.py` の
-   `GitHubMutationBroker`。`scripts/agent-guards/controlled_skill_mutation_exec.py`
-   と同型の repository binding / env scrub / shell=False / remote-state-is-authority
-   readback 設計を踏襲するが、対応する操作は canary Issue の create/edit/comment/close
-   に限定される）
-
-launcher は caller の `--permission-mode` 指定（値の種類を問わず一律）を forbidden
-flag として拒否し、launcher 自身が exactly one の `--permission-mode auto` を注入
-する（`scripts/claude-gpt/lib.sh` の `CLAUDE_GPT_FORBIDDEN_EXTRA_FLAGS`）。`autoMode`
-は project `.claude/settings.json` / `.claude/settings.local.json` には追加せず、
-launcher-owned `--settings` にのみ注入する。
+Auto mode の実 runtime 確認は `bash scripts/claude-gpt/runtime_smoke_test.sh --scenario auto_classifier`
+で行う。permission 許可済みルールに含まれず classifier を通る無害な操作（scratch directory 内のファイル作成）が
+Auto mode のまま完了することを確認し、接続先 proxy の構造化ログが観測できる場合に限り routing 先 model を
+記録する。観測できない場合は「未観測」と記録し、route 確認済みとは扱わない。
 
 ### 未達スコープ（generic production broker は作らない — Issue #2223 CLOSED / minimal-harness Owner Decision）
 
-上記 3 層目の `GitHubMutationBroker` は `squne121/loop-protocol` の canary Issue
-lifecycle（本 Issue の live 検証専用）にスコープが限定された broker であり、汎用の
-GitHub mutation authority（任意の `gh` / raw `git push` 全般）に対する決定論的な
-authorization boundary ではない。raw `gh` / raw `git push`（force push・default branch
-push・remote ref 削除・repository settings 変更等）に対する generic な production-grade
-broker / 新規 enforcing hook-level deny は、Issue #2223（CLOSED、implementation から
-research/Owner Decision へ reframe 済み）で「作らない」方針に確定している。同 Owner
-Decision では、server-side protection・repository permission・required CI を
-security authority の正本とし、mutation correctness の evidence は native/client
-operation とそれに続く authoritative live readback を基本とする（live readback は
-mutation correctness の evidence であり、security authority そのものではない）。
-独立した transaction semantics が必要な狭い範囲（本節の canary Issue lifecycle
-broker 等）にのみ narrow な transaction executor を限定して用いる。PR #2666 後の
-現行 `lib.sh` はこの方針へ同期済みである。
+raw `gh` / raw `git push`（force push・default branch push・remote ref 削除・repository settings 変更等）に
+対する generic な production-grade broker / 新規 enforcing hook-level deny は、Issue #2223（CLOSED、
+implementation から research/Owner Decision へ reframe 済み）で「作らない」方針に確定している。同 Owner
+Decision では、server-side protection・repository permission・required CI を security authority の正本とし、
+mutation correctness の evidence は native/client operation とそれに続く authoritative live readback を
+基本とする（live readback は mutation correctness の evidence であり、security authority そのものではない）。
+独立した transaction semantics が必要な狭い範囲にのみ narrow な transaction executor を限定して用いる
+（`scripts/agent-guards/controlled_skill_mutation_exec.py` 等）。Issue #2203 当時の canary 専用
+`GitHubMutationBroker` は launcher-owned `autoMode` 層の撤去（Issue #2925）後も generic な production
+broker にはならず、この方針は変わらない。
 
 ## agent-retrospective の run 境界 / source authority（情報源の権威） / mutation boundary（変更操作の境界）（ADR 0007、Issue #2234）
 
@@ -2933,51 +2923,20 @@ history を保持するため、この限定なしに「毎回 fresh」と一般
 
 「省略 = foreground」という単純な断定はしない。
 
-### claude-gpt launcher の background/foreground 実行契約（Issue #2652）
+### claude-gpt launcher の background/foreground 実行契約（Issue #2652、Issue #2925 で更新）
 
-`scripts/claude-gpt/launch.sh` はかつて（Issue #2274 AC13）、実 `claude` 子プロセスに対して
-session-global に `unset CLAUDE_CODE_FORK_SUBAGENT` と `export
-CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` の両方を production invariant として設定していた。
-この disable は GPT-5.3-Codex-Spark delegation（Issue #2186/#2274）の model/evidence causal
-chain を deterministic にする目的（`effective_env_override_reason()` PreToolUse(Agent) gate
-hook が同 invariant からの逸脱を fail-closed で deny していた）に限定して導入されたが、
-実際の影響範囲は Spark 呼び出しに限らず **Claude-GPT session 全体**の Bash tool schema から
-`run_in_background` を削除するという、Spark より広い blast radius を持っていた。
+`scripts/claude-gpt/launch.sh` はかつて（Issue #2274 AC13）、実 `claude` 子プロセスに対して session-global に
+`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` を設定していた。この disable は GPT-5.3-Codex-Spark delegation の
+causal chain を deterministic にする目的に限定して導入されたが、実際の影響範囲は Claude-GPT session 全体の
+Bash tool schema から `run_in_background` を削除するもので、`issue-refinement-loop` の canonical Step 2
+（`run_in_background: true` で起動し completion notification を待って mandatory join する契約、Issue #2610）を
+実行不能にしていた。Issue #2651/#2662 で Spark delegation が撤去され、Issue #2652 で当該 disable を撤去した。
 
-Issue #2651/#2662 で GPT-5.3-Codex-Spark delegation とその authorization gate
-（`SPARK_GATE_WRITER_PY_BEGIN`/`_END`）自体が撤去され、上記 disable の Spark 固有の存在理由は
-消滅した。しかし session-global disable の行自体は撤去されずに残っており、
-`issue-refinement-loop` の canonical Step 2（`root_review_pipeline.produce` を
-`run_in_background: true` で起動し completion notification を待って mandatory join する
-契約、Issue #2610）が Claude-GPT session では実行不能になる、という非互換が発生していた
-（Issue #2652 Background）。
-
-Issue #2652 でこの session-global disable を撤去した。現行の launcher は実 `claude` 子プロセス
-起動直前に以下の両方を明示的に `unset` する（`export ...=1` のような特定値への固定ではない）:
-
-```sh
-unset CLAUDE_CODE_FORK_SUBAGENT
-unset CLAUDE_CODE_DISABLE_BACKGROUND_TASKS
-```
-
-- `unset`（単なる absence 依存ではない）にしているのは、launch 元の親 shell からの ambient
-  export leak が子プロセス環境へ引き継がれることを防ぐため（`CLAUDE_CODE_FORK_SUBAGENT` 側で
-  既に採用していたのと同じ forgery-prevention の理由）。
-- これにより、親 shell の `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` が未設定・`0`・`1` のいずれで
-  あっても、launcher が所有する設定範囲では Claude Code 既定の background 有効状態に収束する。
-- `CLAUDE_CODE_FORK_SUBAGENT` の unset は独立した契約として維持し、`CLAUDE_CODE_DISABLE_
-  BACKGROUND_TASKS` の撤去と一括では扱わない（Issue #2652 Design Direction）。この launcher
-  自体は `CLAUDE_CODE_FORK_SUBAGENT` unset が引き続き必要かどうかを再評価しない。
-
-**launcher が保証できない範囲（阻害要因の明示）**: 上記 `unset` は、この launcher 自身が子
-プロセス環境へ注入する内容のみを制御する。launcher が所有しない設定層（enterprise
-`managed-settings.json`、または launcher 自身の isolated `CLAUDE_CONFIG_DIR`
-（`settings.local.json`。この launcher が毎回生成する内容にはこの変数を含めていない）の外側
-にある Claude Code `settings.json` の `env` block 等）がこの変数を再注入する場合、launcher は
-それを検出・上書きできない。本 Issue の修正時点で確認した限り、本リポジトリの project-scope
-`.claude/settings.json` / `.claude/settings.local.json` はこの変数を参照しておらず、環境上
-`managed-settings.json` も存在しないが、これは launcher が保証する不変条件ではなく、
-launcher の isolation scope 外の外部要因であることを明示しておく。
+Issue #2925 以降の launcher は、`CLAUDE_CODE_FORK_SUBAGENT` / `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` を
+設定も `unset` もしない。これらは Native Claude Code と同じく ambient な値がそのまま届き、Claude Code の既定
+（background task 有効）に従う。launcher は background/foreground 実行モードに一切介入しない。環境上
+（enterprise `managed-settings.json` や user の `settings.json` の `env` block 等）でこれらの変数が設定されて
+いる場合、その影響は Native と同一であり、launcher が補正・隠蔽することはない。
 
 ### isolation（worktree 分離の適用条件）
 
