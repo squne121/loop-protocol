@@ -29,8 +29,8 @@ diagnostic の successful readback または valid noop reconciliation の後に
 
 
 reviewer_verdict（`verdict`/`reviewed_head_sha`/`blockers`/`warnings`）と live_mergeability
-（`gh pr view` で取得した `mergeable`/`merge_state_status`）を `route_loop_verdict_v2()` に渡し、
-返る `route` で分岐する。詳細な `route` 一覧と判定条件は `step-5-mergeability-handling.md` を参照。
+（`gh pr view` で取得した `mergeable`/`merge_state_status`）を `step5-terminal-gate` に渡し、出力の `route` で分岐する。
+詳細な `route` 一覧と判定条件は `step-5-mergeability-handling.md` を参照。
 
 | `route` | アクション |
 |---|---|

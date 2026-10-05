@@ -623,10 +623,10 @@ issue-contract-review の deterministic gate に配線する）の責務であ�
 ### profile の assertion binding における完全性の確認（Issue #2771）
 
 `matched_rules[].enforcement == "hard"` のみから到達した各 `verification_profile`
-の `assertions[]` 全件は、Issue の `## Runtime Verification Applicability` に
-`runtime_assertion_bindings`（`profile` / `assertion` / `ac` の3フィールドのみの
-canonical shape）として、どの runtime AC がその assertion を担うかを明示しなければ
-ならない。`enforcement == "advisory"` のみから到達した profile / assertion は
+の `assertions[]` 全件は candidate assertion であり、Issue の
+`## Runtime Verification Applicability` に `runtime_assertion_bindings` として
+それぞれの扱い（`disposition`、後述）を明示しなければならない。
+`enforcement == "advisory"` のみから到達した profile / assertion は
 この required set に一切含まれない（PR #2370 の advisory non-blocking 方針を
 継続する）。
 
@@ -634,13 +634,13 @@ canonical shape）として、どの runtime AC がその assertion を担うか
 `derive_required_runtime_assertions()` / `evaluate_runtime_assertion_binding_
 coverage()` が、composite identity `(verification_profile_id, assertion_id)` を
 基準に required set と宣言された binding set の missing / unknown / duplicate
-（1 key = 1 ac。同一 key の複数回宣言は bind 先 `ac` の異同を問わず duplicate）を
-決定論的に検証し、各 binding の `ac` について実在確認・`applicable_acs` 包含・
-decision レベルの runtime-verification タグ整合・`## Verification Commands` の
-`# AC<N>` canonical reference 存在を確認する。`review-issue`
-（`check_issue_contract.py` の C15）と `issue-contract-review`
-（`contract_readiness_check.py`）は同一のこの shared evaluator を呼ぶため、両者は
-drift しない。
+（1 key = 1 binding。同一 key の複数回宣言は disposition の組合せ・bind 先 `ac` の
+異同を問わず duplicate）を決定論的に検証し、`dispositive` の各 binding の `ac` に
+ついて実在確認・`applicable_acs` 包含・decision レベルの runtime-verification
+タグ整合・`## Verification Commands` の `# AC<N>` canonical reference 存在を
+確認する。`review-issue`（`check_issue_contract.py` の C15）と
+`issue-contract-review`（`contract_readiness_check.py`）は同一のこの shared
+evaluator を呼ぶため、両者は drift しない。
 
 本 gate が保証するのは binding の **structural completeness**（宣言漏れ・未知
 宣言・重複宣言の不在、binding 先 AC の referential integrity）のみであり、binding
@@ -649,8 +649,56 @@ drift しない。
 （`structural_completeness_not_semantic_sufficiency`）。policy 自身の欠陥
 （dangling profile reference、同一 profile 内の assertion ID 重複）は Issue の
 `needs_fix` に偽装せず、policy integrity failure として区別する。author 向けの
-記法・生成規則・escape valve は `.claude/skills/create-issue/references/body-
+記法と生成規則は `.claude/skills/create-issue/references/body-
 authoring.md` の「実行時検証プロファイルの assertion binding 記法」を参照する。
+
+#### assertion 単位の適用可否の宣言（`disposition`、Issue #2852）
+
+各 `runtime_assertion_bindings` entry は閉じた enum の `disposition` で、policy が
+選んだ candidate assertion を今回の変更でどう扱うかを宣言する。disposition ごとの
+key 集合は閉じており、集合外の key を持つ entry は malformed として拒否される。
+
+| disposition | 意味 | key 集合 |
+|---|---|---|
+| `dispositive` | 今回の runtime AC が検証する | `profile` / `assertion` / `ac` / `disposition` |
+| `non_dispositive_readiness_compat` | 別の**既存** AC が substantive verification を所有する | `profile` / `assertion` / `disposition` / `demonstrated_by` / `reason`（`ac` は持たない） |
+| `not_applicable` | 今回の change surface に対象の振る舞い自体が存在しない | `profile` / `assertion` / `disposition` / `reason`（`ac` / `demonstrated_by` は持たない） |
+
+- `disposition` を省略した `profile` / `assertion` / `ac` の旧形式は読み取り互換として
+  受理され、`dispositive` 相当・`disposition_source: legacy_default` として扱う。
+  明示した場合は `disposition_source: explicit`。いずれも「実証済み」を意味しない。
+- `demonstrated_by` は実在する既存 AC の参照（`AC<N>`）のみ。当該 AC は Acceptance
+  Criteria に実在し、`## Verification Commands` の canonical `# AC<N>` 参照を持つ
+  必要がある。`applicable_acs` / runtime-verification タグへの追加は要求しない。
+  test path / pytest node-id の resolver は持たない。
+- `reason` の機械検証は非空文字列のみ（言語判定などの gate は追加しない）。
+- `not_applicable` / compat は自身の required key を「宣言済み」にするが、他の required
+  assertion の missing、および unknown / duplicate / malformed / invalid の判定を隠さない。
+  required set に無い key への `not_applicable` は unknown になる。
+- evaluator の結果は分類済み binding 一覧と disposition 別の assertion 一覧を返すが、
+  runtime PASS 根拠を表す field は一切持たない。分類は `review-issue` /
+  `issue-contract-review` の成功経路でも非 blocking の carrier
+  （`runtime_assertion_disposition_classification`）として公開され、
+  `merged_review_result` まで保持される。carrier は verdict / `overall_status` を変えない。
+- `evaluate_issue_risk_trigger()` は assertion 単位の宣言の影響を受けない。hard-required の
+  全 assertion が `not_applicable` / compat であっても、policy 由来の Issue-level の
+  `decision` 要求は緩まない（保守的な既知の limitation。rule-level の緩和設計は
+  policy 側の Issue #2775 の責務）。
+
+不変条件:
+
+- structural checker の PASS は runtime verification の PASS ではない。
+- `dispositive` の宣言は実行済み / 観測済みを意味しない。
+- `non_dispositive_readiness_compat` は runtime PASS ではない。
+- `not_applicable` は runtime PASS ではなく、成功ではなく対象外の宣言である。
+- applicability の分類は semantic sufficiency の証明ではない（`reason` / `demonstrated_by`
+  の妥当性は既存 semantic review の責務で、新しい judge / 言語判定 gate は追加しない）。
+- 対象の振る舞いが今回の変更に関係するのに未観測の assertion は unverified であり、
+  `not_applicable` でも PASS でもない。「runner が無い」「認証できない」「test が未実装」は
+  `not_applicable` の理由にならない。
+- skipped / 未実行の必須 scenario が aggregate pass になる問題は別 Issue（#2841）の
+  責務であり、本節は「正当な `not_applicable`」と「applicable だが未実行」を混同しない
+  分類境界のみを定める。
 
 ---
 
