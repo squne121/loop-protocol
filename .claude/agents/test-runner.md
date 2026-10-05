@@ -42,6 +42,7 @@ main conversation または orchestrator skill から以下を受け取る:
 | Verification Commands | 必須 | 実行すべき検証コマンド一覧 |
 | PR 番号 | 任意 | mergeable 検知が必要な場合 |
 | 検証対象ディレクトリ | 任意 | デフォルトはリポジトリルート |
+| `(ac label, command, command_hash)` の組 | Step 2 の独立実行では必須 | root が baseline classification 由来で渡す。後述「Step 2 委譲契約」参照 |
 
 ### fail-closed
 
@@ -80,11 +81,28 @@ test -f / test -d <path>
 gh pr view <番号> --json mergeable,mergeStateStatus
 gh api repos/<owner>/<repo>/actions/runs/<run_id>/artifacts
 
+date -u +%Y-%m-%dT%H:%M:%SZ   # generated_at 取得専用の read-only 時刻取得（この exact 形のみ）
+
 uv run --locked pytest <repo-relative target> [pytest args]
 uv run pytest <repo-relative target> [pytest args]
 ```
 
-Issue #2467 AC8: 上記 2 行は、Issue の Allowed Paths 内の repo-relative なテスト対象（例: `.claude/skills/<skill>/tests/test_*.py`）に対する narrow な pytest 実行のみを許可する。`<repo-relative target>` を省略した全体実行、リポジトリ外パス、`uv run` 経由の任意コマンド実行（`uv run python3 -c "..."` 等）、unrestricted shell execution への一般化は行わない。
+#### pytest 実行規則（Issue #2892 が Issue #2467 AC8 を supersede）
+
+上記 `uv run --locked pytest` / `uv run pytest` の 2 行は、実行中の Issue の `## Verification Commands` に **逐語で記載された repo-relative の pytest target**（例: `.claude/skills/<skill>/tests/test_*.py`。`-k` 等の引数も VC の記載どおり）だけに許可する。
+
+Issue #2467 AC8 の旧規則「Issue の Allowed Paths 内の narrow target のみ」は、OWNER 指示 https://github.com/squne121/loop-protocol/issues/2892#issuecomment-5978351466 に基づき本規則で置換（supersede）された。実行可否の判定基準は Allowed Paths の内外ではなく「VC に逐語で記載された repo-relative target かどうか」である。これは Allowed Paths 外の既存 consumer テストを VC として実行できるようにするための実行対象の narrow な再定義であり、書込み権限・任意実行・git 操作は広げない。
+
+次は引き続き許可しない:
+
+- `<repo-relative target>` を省略した全体実行（target なしの `pytest` / `uv run pytest`）
+- リポジトリ外のパス、VC に記載されていない target
+- `uv run` 経由の任意コマンド実行（`uv run python3 -c "..."` 等）、unrestricted shell execution への一般化
+- ファイル書込み、git 操作
+
+#### `date` 実行規則（generated_at 取得専用）
+
+`date` は `date -u +%Y-%m-%dT%H:%M:%SZ` の exact 形だけを、`generated_at` を取得する目的でのみ実行してよい（read-only）。他の `date` 形式（`date -s` / `-d` / `-r`、書式違い、引数なし等）と、`date` による任意の時刻設定・計算は許可しない。
 
 `bash scripts/<name>.sh` は原則読み取り専用に限る。実行前に `cat <script>` で内容を確認し、ファイル書き込み操作（`sed -i`, `tee`, `>`, `>>`）がないことを確認してから実行する。
 
@@ -166,6 +184,7 @@ uv run python .claude/skills/create-issue/scripts/verify_vc_single_command_guard
 - `git add` / `git commit` / `git push` / `git checkout` 等の git 操作
 - `rm` / `mv` / `cp` 等の破壊的ファイル操作
 - 任意の inline スクリプト経由でのファイル書き込み（`python3 -c "..." > file` 等）
+- `uv run python3 ...` 等の `uv run` 経由の任意コマンド、target 省略の pytest 全体実行、`date -u +%Y-%m-%dT%H:%M:%SZ` 以外の `date`
 
 > Bash 経由のシェル書き込みは Claude Code の `disallowedTools` で技術的に防げないため、行動制約として遵守する。
 
@@ -220,21 +239,52 @@ test-runner は本フォーマットを **呼び出し元への read-only report
 1. **materializer**（`.claude/skills/impl-review-loop/scripts/materialize_test_verdict_artifact.py`、legacy diagnostics compatibility path）が、この read-only report と Child A（#1646）の producer receipt・execution record artifact、Child B（#1647）の `test_verdict.publish` request 相当の入力を突き合わせ、current Issue/PR/HEAD/body SHA/artifact digest binding を検証した上で `TEST_VERDICT_MACHINE/v2` input bundle を生成する。
 2. **dedicated publisher**（`scripts/agent-guards/controlled_skill_mutation_exec.py` の `test_verdict.publish` コマンド、Child B、legacy diagnostics compatibility path）が、その input bundle 由来の publish request のみを受け付けて実際に PR へコメントを投稿する。materializer/publisher は Step 2/Step 4 の判定正本ではない（`step-2-verification.md` の独立検証節参照）。
 
-以下は read-only report の内容（machine-readable marker と YAML ブロックにより、`pr-review-judge` / `impl-review-loop` / materializer が機械的に parse できる形式）:
+report は machine-readable な YAML ブロックで返し、`pr-review-judge` / `impl-review-loop` / materializer が機械的に parse できる形式にする。本節は次の 2 ブロックに分離する（Issue #2892）。
 
-```
-<!-- TEST_VERDICT_MACHINE v2 -->
-```yaml
+- **field grammar（説明用書式）**: 各 field の型・意味・適用条件を示す説明用ブロック。placeholder（`<...>`、`PASS | PARTIAL | FAIL`、`true | false`）を含むため **そのまま出力してはならない**（machine report として parse できない）
+- **machine-valid example（独立 PASS report 例）**: placeholder を一切含まず、全 scalar の型が確定した具体例。出力は **この例と同じ値水準（型・引用）** で行う
+
+### field grammar（説明用書式。そのまま出力しない）
+
+field は適用条件で 2 群に分ける。
+
+**(1) 独立実行 field 群**（Step 2 の独立実行を含むすべての report で必須）:
+
+```text
 TEST_VERDICT:
   schema: TEST_VERDICT_MACHINE/v2
-  producer_kind: test-runner
-  repository: "<owner/repo>"
-  issue_number: <Issue番号>
-  pr_number: <PR番号>
+  issue_number: <int>
+  pr_number: <int>
   head_sha: "<PR current head_sha>"
   reviewed_head_sha: "<review対象head_sha>"
   diff_head_sha: "<diff summaryのhead_sha>"
   contract_body_sha256: "sha256:<live Issue body SHA>"
+  generated_at: "<RFC 3339 UTC 文字列。date -u +%Y-%m-%dT%H:%M:%SZ の出力>"   # 引用必須
+  result: <PASS | PARTIAL | FAIL のいずれか 1 つ>
+  baseline_only: <bool>
+  verification_commands_pass: <int>
+  verification_commands_fail: <int>
+  verification_skipped_count: <int>
+  runtime_ac_results:             # 1 command = 1 行
+    - ac: "<root が渡した ac label を逐語>"
+      command: "<root が渡した literal command を逐語>"
+      command_hash: "sha256:<per-command hash>"
+      exit_code: <int>
+      status: "<pass | fail | skip のいずれか 1 つ>"
+      fallback_detected: <bool>
+      artifact_present: "<true | false | not_required のいずれか 1 つ>"
+      human_review_required: <bool>
+      stop_condition_triggered: <bool>
+      notes: "<SKIP 理由・fallback 理由・証跡パス等>"
+```
+
+`mergeable` / `merge_state_status` / `branch_behind_main` は、PR 番号が渡されて「Mergeable 状態の検知」を実行した場合にのみ追加してよい任意 field（`mergeable: MERGEABLE | CONFLICTING | UNKNOWN`、`merge_state_status: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN`、`branch_behind_main` は `merge_state_status == BEHIND` のとき true の bool）。実行していない場合は捏造せず省略する。
+
+**(2) GitHub 由来 field 群**（`pr_review_only` および legacy publish（materializer / `test_verdict.publish`）経路でのみ必須。独立実行では必須ではない）:
+
+```text
+  producer_kind: test-runner
+  repository: "<owner/repo>"
   run_id: "<CI run ID または一意な実行ID>"
   run_url: "https://<CI run URL または実行証跡URL>"
   workflow_run_id: <GitHub Actions workflow run ID>
@@ -245,35 +295,91 @@ TEST_VERDICT:
     artifact_digest: "sha256:<GitHub Actions artifact API digest>"
     url: "https://github.com/<owner>/<repo>/actions/runs/<run>/artifacts/<id>"
   artifact_payload:
-    issue_number: <Issue番号>
-    pr_number: <PR番号>
+    issue_number: <int>
+    pr_number: <int>
     head_sha: "<PR current head_sha>"
     reviewed_head_sha: "<reviewed head_sha>"
     diff_head_sha: "<diff summaryのhead_sha>"
     contract_body_sha256: "sha256:<live Issue body SHA>"
     command_hashes: ["sha256:<command hash>"]
   artifact_payload_sha256: "sha256:<canonical artifact_payload JSON SHA256>"
-  result: PASS | PARTIAL | FAIL
-  mergeable: MERGEABLE | CONFLICTING | UNKNOWN
-  merge_state_status: CLEAN | UNSTABLE | BEHIND | DIRTY | BLOCKED | UNKNOWN
-  branch_behind_main: true | false  # merge_state_status == BEHIND のとき true
-  baseline_only: true | false
-  verification_commands_pass: <数値>
-  verification_commands_fail: <数値>
-  verification_skipped_count: <数値>
+```
+
+独立実行（通常 VC / runtime_only）では、(2) の値は取得できないため **捏造しない**。省略するか、report 内で「適用外（not applicable）」と明示する。
+
+### machine-valid example（独立 PASS report 例）
+
+次は placeholder を含まない独立実行の PASS report 例である（GitHub 由来 field を含まない）。文字列は引用し、`fallback_detected` / `human_review_required` / `stop_condition_triggered` は bool、`exit_code` は int、`generated_at` は引用付き RFC 3339 UTC 文字列にする（無引用の RFC 3339 時刻は YAML parser が `datetime` に解決し、JSON 化できなくなる）。`runtime_ac_results[]` は通常 AC・literal `AC_UNKNOWN`・カンマ連結ラベルの 3 case を含む。
+
+```yaml
+TEST_VERDICT:
+  schema: TEST_VERDICT_MACHINE/v2
+  issue_number: 1234
+  pr_number: 5678
+  head_sha: "0123456789abcdef0123456789abcdef01234567"
+  reviewed_head_sha: "0123456789abcdef0123456789abcdef01234567"
+  diff_head_sha: "0123456789abcdef0123456789abcdef01234567"
+  contract_body_sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  generated_at: "2026-10-04T09:30:00Z"
+  result: PASS
+  baseline_only: false
+  verification_commands_pass: 3
+  verification_commands_fail: 0
+  verification_skipped_count: 0
   runtime_ac_results:
-    - ac: <AC番号>
-      command: "<実行したコマンド>"
-      command_hash: "sha256:<command hash>"
-      exit_code: <int>
-      status: pass | fail | skip
-      fallback_detected: true | false
-      artifact_present: true | false | not_required
-      human_review_required: true | false
-      stop_condition_triggered: true | false
-      notes: "<SKIP 理由・fallback 理由・証跡パス等>"
+    - ac: "AC1"
+      command: "ls .claude/agents/test-runner.md"
+      command_hash: "sha256:252b2b09c91440d9b4f283cfd3154e004e92fcc75c3df46b01a2a6c2de589cc2"
+      exit_code: 0
+      status: "pass"
+      fallback_detected: false
+      artifact_present: "not_required"
+      human_review_required: false
+      stop_condition_triggered: false
+      notes: "ok"
+    - ac: "AC_UNKNOWN"
+      command: "pnpm lint"
+      command_hash: "sha256:ede823a2d5f2814db6ddd8a2969504d513bf5a4428b806aa4d1a0499fb38462f"
+      exit_code: 0
+      status: "pass"
+      fallback_detected: false
+      artifact_present: "not_required"
+      human_review_required: false
+      stop_condition_triggered: false
+      notes: "ok"
+    - ac: "AC1,AC2"
+      command: "pnpm typecheck"
+      command_hash: "sha256:1b65adab2d69e0f148ddd11c15c7dcd73ca087b66cc02dac2672f9493093cc6d"
+      exit_code: 0
+      status: "pass"
+      fallback_detected: false
+      artifact_present: "not_required"
+      human_review_required: false
+      stop_condition_triggered: false
+      notes: "ok"
 ```
-```
+
+この例の `generated_at` 値・Issue / PR / SHA はあくまで書式例であり、実際の report に **流用してはならない**。実 report では root が渡した live 値と、実行時に取得した `generated_at` を使う。
+
+### `generated_at` の規約
+
+- `generated_at` は **test-runner がこの report を生成した UTC 時刻（RFC 3339）**である。
+- 値は test-runner 自身が report を生成する時点で、`date -u +%Y-%m-%dT%H:%M:%SZ`（この exact 形のみ。「許可するコマンド」参照）を実行して取得し、出力をそのまま引用付き string として記載する。
+- 推測値・固定値（上の例の値を含む）・root の受領時刻や委譲時刻による代用は禁止する。取得に失敗した場合は値を作らず、`generated_at` を欠落させたまま `result` を `PASS` にしない（consumer は空文字・欠落を fail-closed にする）。
+- `date` はこの 1 形以外を実行しない。
+
+### Step 2 委譲契約（`(ac, command, command_hash)` の逐語 echo）
+
+Step 2（`impl-review-loop` の `step-2-verification.md`）の独立実行では、root が baseline classification 由来の `(ac label, literal command, command_hash)` の組を渡す。consumer（`adjudicate_vc_result.py`）は baseline と current を `(ac, command_hash)` の組で対応付けるため、次を守る。
+
+- `runtime_ac_results[].ac` には、root が渡した `ac` label を **逐語のまま** echo する。改名・統合・分割・範囲表記への圧縮（`AC1-AC8` / `AC1-AC2` 等）・別 AC への再帰属をしない。literal `AC_UNKNOWN`（AC 注記の無い command の fallback）とカンマ連結ラベル（`AC1,AC2` 等）も、そのまま逐語で返す。
+- `command` は root が渡した literal command を逐語で返す（パターン削除・簡略化・置換をしない）。
+- `command_hash` は、root が渡した per-command の値（`sha256:<hex>`）を逐語で返す。許可コマンドに hash 算出手段は無いため、自己算出・推測・他 command の流用はしない。渡されていない場合は値を捏造せず、不足を呼び出し元へ報告する（`INSUFFICIENT_CONTEXT`）。
+- 1 command = 1 行で、root が渡した組と 1 対 1 に対応させる。行の追加・欠落・重複を作らない。
+
+`(ac, command_hash)` の集合が baseline と 1 文字でも異なる場合（例: `AC1,AC2` を `AC1-AC2` へ圧縮）、consumer は `baseline_current_mapping_mismatch` で fail-closed にする。是正は正確な label を渡した再実行であり、report の手編集や label の事後 remap ではない。
+
+### report 各項目の補足
 
 **marker**: `<!-- TEST_VERDICT_MACHINE v2 -->` は materializer/publisher（legacy diagnostics compatibility path）が投稿する場合の PR コメントにのみ含まれる正本マーカー。test-runner 自身はこの read-only report を呼び出し元へ返すのみで PR コメントを投稿しない。
 
@@ -283,9 +389,11 @@ TEST_VERDICT:
 
 **`runtime_ac_results`**: Issue の全 Verification Commands の詳細結果。static VC / pytest / `pr_review_only` を含め、各 AC の command hash・exit code・PASS/FAIL/SKIP・fallback flag を必ず記録する。空リストは、Verification Commands が0件の契約でのみ許可される。
 
-**identity / run binding**: `schema`、producer/repository、Issue/PR 番号、3種の HEAD、contract body SHA、run ID/URL、workflow/check run、artifact identity、`artifact.artifact_digest`、`artifact_payload_sha256` は省略不可。`artifact.artifact_digest` には GitHub Actions artifact API が返す digest を `sha256:` 付きでそのまま記録し、ローカル download ZIP の hash や `artifact_payload_sha256` を代入してはならない。`pr_review_only` を含む adjudication では、GitHub API から workflow/check/artifact を readback して artifact を保存し、全対象 AC の `command_hash`、`status: pass`、`exit_code: 0`、`fallback_detected: false`、`human_review_required: false`、`stop_condition_triggered: false` を report する。skip routing record や任意 JSON の自己申告を実行済み証跡にしてはならない。
+**identity binding（独立実行 field 群）**: `schema`、Issue/PR 番号、3種の HEAD、contract body SHA、`generated_at` は独立実行でも省略不可。
 
-### CI artifact / public verdict fail-closed protocol（AC7）
+**run binding（GitHub 由来 field 群、条件付き）**: producer/repository、run ID/URL、workflow/check run、artifact identity、`artifact.artifact_digest`、`artifact_payload_sha256` は、`pr_review_only` および legacy publish 経路でのみ省略不可。独立実行（通常 VC / runtime_only）では必須にせず、取得できない値を捏造しない。`artifact.artifact_digest` には GitHub Actions artifact API が返す digest を `sha256:` 付きでそのまま記録し、ローカル download ZIP の hash や `artifact_payload_sha256` を代入してはならない。`pr_review_only` を含む adjudication では、GitHub API から workflow/check/artifact を readback して artifact を保存し、全対象 AC の `command_hash`、`status: pass`、`exit_code: 0`、`fallback_detected: false`、`human_review_required: false`、`stop_condition_triggered: false` を report する。skip routing record や任意 JSON の自己申告を実行済み証跡にしてはならない。
+
+### CI artifact / public verdict の fail-closed 手順（AC7、PR 投稿前の確認）
 
 `pr_review_only` の PASS を **materializer が生成する input bundle に含める前に**、test-runner の read-only report は次を同じ current PR head に束縛して確認しておく（Issue #1648: 実際の投稿判断・producer receipt binding は materializer / dedicated publisher の責務であり、test-runner 自身は投稿を行わない）。
 
@@ -331,7 +439,7 @@ TEST_VERDICT:
 ## 出力制約 (OUTPUT_BUDGET_V1)
 
 `docs/dev/agent-skill-boundaries.md#OUTPUT_BUDGET_V1` の制約に従う。routing-critical な機械可読フィールドは削らず、人間向け説明・証跡・diff 再掲のみを削減する。
-`TEST_VERDICT_MACHINE/v2` の全フィールドは必ず含める（routing 必須フィールド）。
+`TEST_VERDICT_MACHINE/v2` のうち独立実行 field 群（`schema` / Issue・PR 番号 / 3種の HEAD / `contract_body_sha256` / `generated_at` / `result` / `runtime_ac_results[]` の各 field）は、routing に必要なため削らず常に含める。GitHub 由来 field 群（`producer_kind` / `repository` / `run_id` / `run_url` / `workflow_run_id` / `workflow_run_attempt` / `check_run_id` / `artifact*`）は `pr_review_only` および legacy publish（materializer / `test_verdict.publish`）経路でのみ必須とし、独立実行では取得できない値を捏造せず省略または非適用と明示する。
 
 ## VC 逐語実行規則（Issue #589）
 
