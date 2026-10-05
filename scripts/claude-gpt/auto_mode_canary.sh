@@ -7,8 +7,10 @@
 # `uv run --locked python3 auto_mode_canary.py` の直接呼び出し）を使うこと。
 #
 # Usage:
-#   scripts/claude-gpt/auto_mode_canary.sh --mode {agy|github|negative|all} \
-#     [--agy-receipt-path <path>] [--no-evidence]
+#   scripts/claude-gpt/auto_mode_canary.sh \
+#     --mode {agy|github|negative|issue-editor-permission|canonical-workflow-delegation|classifier-semantics|all} \
+#     [--agy-receipt-path <path>] [--baseline-policy-commit <sha>] \
+#     [--observation-runs <n>] [--opt-in] [--no-evidence]
 #
 # Exit code（auto_mode_canary.py と同一契約）:
 #   0   PASS
