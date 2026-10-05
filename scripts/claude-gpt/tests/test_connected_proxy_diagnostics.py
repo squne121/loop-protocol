@@ -19,6 +19,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import stat
+import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -247,6 +250,46 @@ def test_non_loopback_base_url_is_refused_without_any_request(tmp_path, url):
     assert payload["connected_server"]["models_http_status"] is None
 
 
+def _run_check_only_with_bash(tmp_path, base_url):
+    """実 `bash scripts/claude-gpt/launch.sh --check-only` を local subprocess として起動する。"""
+    env = H.base_env(tmp_path, ANTHROPIC_BASE_URL=base_url)
+    return subprocess.run(
+        ["bash", str(H.LAUNCH_SH), "--check-only"],
+        env=env,
+        cwd=str(H.REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=60.0,
+    )
+
+
+@pytest.mark.parametrize("host", ["127.evil.example", "127.0.0.1.evil.example", "0127.0.0.1"])
+def test_loopback_reject_non_loopback_hosts(tmp_path, host):
+    """`127.` 始まりの host 名や先頭 0 付きの曖昧表記は loopback として受理しない（#2939 AC1）。
+
+    exit code と stdout/stderr の `non_loopback` 分類を観測する。network request は発生しない。"""
+    proc = _run_check_only_with_bash(tmp_path, f"http://{host}:18765")
+    assert proc.returncode == 7, (proc.stdout, proc.stderr)
+    assert "non_loopback" in proc.stdout + proc.stderr, (proc.stdout, proc.stderr)
+    connected = json.loads(proc.stdout)["connected_server"]
+    assert connected["classification"] == "non_loopback"
+    assert connected["reachable"] is False
+    assert connected["models_http_status"] is None
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "[::1]"])
+def test_loopback_accept_loopback_hosts(tmp_path, host):
+    """正当な loopback host は non_loopback として拒否されない（#2939 AC2）。
+
+    live proxy は不要。閉じた port へ向けるため結果は `unreachable` になるが、loopback 判定を
+    通過して probe 段階まで進んだこと（non_loopback / invalid_base_url でないこと）を確認する。"""
+    proc = _run_check_only_with_bash(tmp_path, f"http://{host}:{H.closed_port()}")
+    assert "non_loopback" not in proc.stdout + proc.stderr, (proc.stdout, proc.stderr)
+    payload = json.loads(proc.stdout)
+    assert payload["connected_server"]["classification"] == "unreachable", (proc.stdout, proc.stderr)
+    assert payload["reason"] == "connected_server_unreachable"
+
+
 @pytest.mark.parametrize("url", ["127.0.0.1:18765", "http://127.0.0.1:18765/v1", "http://user@127.0.0.1:1", "http://127.0.0.1:abc"])
 def test_malformed_base_url_is_refused(tmp_path, url):
     proc, payload = _check_only(tmp_path, url)
@@ -258,6 +301,140 @@ def test_default_base_url_is_the_upstream_loopback_endpoint(tmp_path):
     env = H.base_env(tmp_path, ANTHROPIC_BASE_URL=None)
     proc = H.run_launcher(["--dry-run"], env)
     assert json.loads(proc.stdout)["base_url"] == "http://127.0.0.1:18765"
+
+
+# ---------------------------------------------------------------------------
+# probe must reach the validated loopback target directly (#2939 P1: ambient proxy / .curlrc)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingServer:
+    """In-process loopback HTTP server that records every request path it receives.
+
+    `models` is the `/v1/models` catalog it serves. A fake *proxy* serves an incomplete catalog
+    so that a probe wrongly routed through it cannot be mistaken for the real target."""
+
+    def __init__(self, models):
+        self.hits: list[str] = []
+        hits = self.hits
+        body = json.dumps({"data": [{"id": m} for m in models]}).encode()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                hits.append(self.path)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, fmt, *args):
+                return
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def _plain_curl_get(child_env: dict, url: str) -> None:
+    """Control: a bare `curl` run with the very same child environment.
+
+    Used to prove the ambient proxy setting really reaches child processes in this test
+    (so a PASS cannot come from the setting being silently dropped)."""
+    subprocess.run(
+        ["curl", "-s", "--connect-timeout", "2", "-m", "3", "-o", "/dev/null", f"{url}/v1/models"],
+        env=child_env,
+        capture_output=True,
+        timeout=10,
+    )
+
+
+# 大文字 HTTP_PROXY は curl 自身が（CGI 対策で）無視するため対象外。curl が実際に参照する変数のみ。
+@pytest.mark.parametrize("proxy_var", ["http_proxy", "ALL_PROXY", "all_proxy"])
+def test_probe_bypasses_ambient_proxy_and_reaches_the_loopback_target(tmp_path, proxy_var):
+    with _RecordingServer(("gpt-6-sol", "gpt-6-luna")) as target, _RecordingServer(("not-the-target",)) as proxy:
+        child_env = H.base_env(tmp_path, ANTHROPIC_BASE_URL=target.url, **{proxy_var: proxy.url})
+        assert child_env[proxy_var] == proxy.url
+        # control: the ambient proxy setting really diverts a plain curl in this environment.
+        _plain_curl_get(child_env, target.url)
+        assert proxy.hits, "control failed: ambient proxy setting did not reach curl; test would be a false PASS"
+        proxy.hits.clear()
+        target.hits.clear()
+
+        proc = H.run_launcher(["--check-only"], child_env)
+
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    connected = json.loads(proc.stdout)["connected_server"]
+    assert connected["model_catalog_ok"] is True and connected["missing_models"] == []
+    assert "/v1/models" in target.hits, "target never received /v1/models"
+    assert proxy.hits == [], f"probe was diverted through the ambient proxy: {proxy.hits}"
+
+
+def test_probe_ignores_default_curlrc_proxy_and_reaches_the_loopback_target(tmp_path):
+    with _RecordingServer(("gpt-6-sol", "gpt-6-luna")) as target, _RecordingServer(("not-the-target",)) as proxy:
+        child_env = H.base_env(tmp_path, ANTHROPIC_BASE_URL=target.url)
+        # curl 8.5 searches $CURL_HOME, $XDG_CONFIG_HOME/.curlrc, then $HOME/.curlrc. Write the same
+        # .curlrc to every candidate so it is read whichever one this curl prefers.
+        for directory in (Path(child_env["HOME"]), Path(child_env["XDG_CONFIG_HOME"])):
+            (directory / ".curlrc").write_text(f'proxy = "{proxy.url}"\n', encoding="utf-8")
+        # control: the .curlrc really diverts a plain curl run with this environment.
+        _plain_curl_get(child_env, target.url)
+        assert proxy.hits, "control failed: .curlrc proxy was not honoured; test would be a false PASS"
+        proxy.hits.clear()
+        target.hits.clear()
+
+        proc = H.run_launcher(["--check-only"], child_env)
+
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert json.loads(proc.stdout)["connected_server"]["model_catalog_ok"] is True
+    assert "/v1/models" in target.hits, "target never received /v1/models"
+    assert proxy.hits == [], f".curlrc proxy diverted the probe: {proxy.hits}"
+
+
+def test_probe_ignores_default_curlrc_connect_to_and_reaches_the_loopback_target(tmp_path):
+    """`proxy` 指令は `--noproxy '*'` でも無効化されるため、`-q` を固定できない。
+
+    `connect-to` は `--noproxy` では無効化されず `-q`（.curlrc を読まない）でのみ無効化される
+    routing 指令なので、これで lib.sh の `-q` を個別に固定する。"""
+    with _RecordingServer(("gpt-6-sol", "gpt-6-luna")) as target, _RecordingServer(("decoy-only",)) as decoy:
+        child_env = H.base_env(tmp_path, ANTHROPIC_BASE_URL=target.url)
+        rc_line = f'connect-to = "127.0.0.1:{target.port}:127.0.0.1:{decoy.port}"\n'
+        for directory in (Path(child_env["HOME"]), Path(child_env["XDG_CONFIG_HOME"])):
+            (directory / ".curlrc").write_text(rc_line, encoding="utf-8")
+        # control: 同じ子 env の素の curl は .curlrc の connect-to で decoy に流れる。
+        _plain_curl_get(child_env, target.url)
+        assert decoy.hits and not target.hits, "control failed: .curlrc connect-to was not honoured by plain curl"
+        # `--noproxy '*'` だけでは無効化されないことも確認（-q 固定の必要性の根拠）。
+        decoy.hits.clear()
+        subprocess.run(
+            ["curl", "--noproxy", "*", "-s", "-m", "3", "-o", "/dev/null", f"{target.url}/v1/models"],
+            env=child_env,
+            capture_output=True,
+            timeout=10,
+        )
+        assert decoy.hits and not target.hits, "control failed: --noproxy alone should not neutralise connect-to"
+        decoy.hits.clear()
+        target.hits.clear()
+
+        proc = H.run_launcher(["--check-only"], child_env)
+
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    connected = json.loads(proc.stdout)["connected_server"]
+    assert connected["model_catalog_ok"] is True and connected["missing_models"] == []
+    assert "/v1/models" in target.hits, "target never received /v1/models"
+    assert decoy.hits == [], f".curlrc connect-to diverted the probe to the decoy: {decoy.hits}"
 
 
 # ---------------------------------------------------------------------------
