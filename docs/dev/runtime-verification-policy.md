@@ -706,18 +706,21 @@ key 集合は閉じており、集合外の key を持つ entry は malformed �
 
 ### `CLAUDE_GPT_HOME` は補助 binary の導入先であり credential namespace ではない
 
-Issue #2925 で `scripts/claude-gpt/launch.sh` は upstream の minimal client contract へ縮退した。現行 launcher は `HOME` / `XDG_*` / `CLAUDE_CONFIG_DIR` を隔離せず、Native Claude Code と同じ ambient な user / project config をそのまま使う。`scripts/claude-gpt/lib.sh` の `CLAUDE_GPT_HOME`（既定値: `${HOME}/.claude-gpt`）は、`repair_proxy.sh` が補助 binary を導入する先（`$CLAUDE_GPT_HOME/bin`）と、smoke の一時証跡の置き場としてだけ使われる。`CLAUDE_GPT_HOME` は認証済み credential を保持する namespace ではなく、Claude の子 process の `HOME` や config root にも影響しない（export されない）。したがって `CLAUDE_GPT_HOME` の値を launcher と揃えること、または別の値を指定することは、認証状態の検証対象を変える操作にならない。
+Issue #2925 で `scripts/claude-gpt/launch.sh` は upstream の minimal client contract へ縮退した。現行 launcher は `HOME` / `XDG_*` / `CLAUDE_CONFIG_DIR` を隔離せず、Native Claude Code と同じ ambient な user / project config をそのまま使う。`scripts/claude-gpt/lib.sh` の `CLAUDE_GPT_HOME`（既定値: `${HOME}/.claude-gpt`）は、`repair_proxy.sh` が補助 binary を導入する先（`$CLAUDE_GPT_HOME/bin`）としてだけ使われる。`runtime_smoke_test.sh` の作業 directory と証跡は `CLAUDE_GPT_HOME` とは無関係であり、作業 directory は `mktemp -d`、証跡は `scripts/claude-gpt/.evidence/` または `--evidence-out` が指す path に置かれる。`CLAUDE_GPT_HOME` は認証済み credential を保持する namespace ではなく、Claude の子 process の `HOME` や config root にも影響しない（export されない）。したがって `CLAUDE_GPT_HOME` の値を launcher と揃えること、または別の値を指定することは、認証状態の検証対象を変える操作にならない。
 
 ChatGPT subscription の認証は、接続先 proxy server の所有者の責務である。`scripts/claude-gpt/preflight.sh` も `launch.sh --check-only` も認証状態を判定せず、認証状態や認証不足を表す field も出力しない。
 
-### 2 種類の evidence を混同しない
+### 2 種類の evidence と attribution を混同しない
 
-次の 2 種類の evidence はそれぞれ独立した観測対象であり、いずれか単独を「runtime / entitlement PASS」と呼んではならない:
+次の evidence はそれぞれ独立した観測対象であり、いずれか単独を「runtime / entitlement PASS」と呼んではならない:
 
 1. **接続先 server の診断**（`launch.sh --check-only` の `CLAUDE_GPT_LAUNCH_RESULT_V1`、および `runtime_smoke_test.sh` の `CLAUDE_GPT_SMOKE_RESULT_V1.launch_check_only` が持つ `connected_server`）: `ANTHROPIC_BASE_URL` が実際に向く running server への到達性（`reachable`）、`/v1/models` の HTTP status、required model の欠落（`missing_models`）、`model_catalog_ok`、`classification` だけを示す。`model_catalog_ok` は `/v1/models` に required model が列挙されていることだけを意味し、実 ChatGPT subscription request が受理されたこと、認証が有効であること、request ごとの routing / provider fallback の不在のいずれも証明しない。接続先 server の version / hash は現行 interface から観測できないため「未確認」と記録する。PATH 上の binary の情報（`local_proxy_binary_auxiliary`）は接続先 server が動かしている binary とは限らない非 authority の補助診断である。
-2. **実 ChatGPT subscription request の受理**（先行 Issue #2772 の AC10 相当。実際に ChatGPT subscription へのリクエストが成功したかどうか）: 接続先 server の診断とは別に、実 request の結果（`runtime_smoke_test.sh` の各 step の完了など）で評価する。
+2. **configured connected-server への実 request の受理**（先行 Issue #2772 の AC10 相当）: 接続先 server の診断とは別に、`ANTHROPIC_BASE_URL` が向く server が実 request を受理したことを、`runtime_smoke_test.sh` の各 step の完了などで評価する。これは「接続先 server が request を受理した」ことだけを示す。`runtime_smoke_test.sh` の成功だけでは、ChatGPT subscription / Codex provider がその request を受理したという attribution は成立しない。generic / custom な `ANTHROPIC_BASE_URL` でも同じ smoke shape は成立しうるためであり、request ごとの routing は `CLAUDE_GPT_PROXY_LOG` を明示した場合にだけ観測され、通常は未観測である。
+3. **provider / subscription attribution**（別 evidence）: 実 ChatGPT subscription request が Codex provider に受理されたという attribution は、上記 2 とは別の evidence である。attribution への昇格は、canonical environment で server / provider の ownership が別 evidence により束縛された場合、または #2925 AC7 の operational trial などで provider / routing の evidence が得られた場合に限る。それ以外は「attribution 未確認」と記録する。
 
-`connected_server` の診断が `ok`（`model_catalog_ok: true`）でも、それだけで実 request の受理を主張してはならない。逆に診断が `failed`（例: `reason: model_alias_not_resolved` / `cause: connected_server_model_catalog_incomplete`、exit 7）の場合は接続先 server の catalog 不整合であり、ChatGPT アカウントの entitlement や再認証の要否を示すものではない。この区別を保ったまま 2 種類の evidence を個別に評価すること。
+upstream（raine/claude-code-proxy の公式 docs）の契約も踏まえる。`ANTHROPIC_AUTH_TOKEN=unused` は Claude Code の client credential 要件を満たすだけで、upstream の認証には使われない。provider credentials と routing は proxy server 側（`CCP_*` や `config.json`）の責務である。`/healthz` は provider credentials や upstream の可用性を検証せず、`/v1/models` は catalog discovery であり、`/v1/messages` の `model` が provider を選ぶ。proxy は Codex 以外の provider も route しうる。
+
+`connected_server` の診断が `ok`（`model_catalog_ok: true`）でも、それだけで実 request の受理や attribution を主張してはならない。逆に診断が `failed`（例: `reason: model_alias_not_resolved` / `cause: connected_server_model_catalog_incomplete`、exit 7）の場合は接続先 server の catalog 不整合であり、ChatGPT アカウントの entitlement や再認証の要否を示すものではない。この区別を保ったまま 3 種類の evidence を個別に評価すること。
 
 ---
 

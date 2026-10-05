@@ -326,7 +326,8 @@ owner_local_observation_supersession_v1:
     - native_claude_settings_not_full_config_authority_for_claude_gpt
     - issue_2375_pr_2392_schema_and_collection_budget_unchanged
   superseded_constraints:
-    - superseded_by: "#2925 / PR #2932"
+    - constraint: claude_gpt_home_config_mcp_plugin_isolation_not_relaxed
+      superseded_by: "#2925 / PR #2932"
       reason: >
         claude-gpt launcher の HOME / config / MCP / plugin 隔離層が #2925 / PR #2932 で
         撤去されたため、旧 retained constraint（隔離を緩和しない）は superseded。

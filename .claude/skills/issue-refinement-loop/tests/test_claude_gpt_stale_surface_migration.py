@@ -77,8 +77,7 @@ def test_ac3_passthrough_script_deleted():
     assert not PASSTHROUGH_SCRIPT.exists()
     text = _read(CAPABILITY_GAPS)
     assert (
-        "bash .claude/skills/agent-retrospective/scripts/tests/verify_claude_gpt_transport_passthrough.sh"
-        not in text
+        "bash .claude/skills/agent-retrospective/scripts/tests/verify_claude_gpt_transport_passthrough.sh" not in text
     )
 
 
@@ -126,15 +125,19 @@ def test_ac5_docs_stale_concepts_absent():
         ["home_source", "chatgpt_auth.available", "chatgpt_auth.detail", "not_authenticated"],
         RUNTIME_POLICY.name,
     )
-    _assert_absent(
-        _read(SECRET_POLICY),
-        [
-            "claude_gpt_home_config_mcp_plugin_isolation_not_relaxed",
-            "空の隔離ディレクトリ",
-            "引き続き scrub",
-        ],
-        SECRET_POLICY.name,
+    secret_policy = _read(SECRET_POLICY)
+    _assert_absent(secret_policy, ["空の隔離ディレクトリ", "引き続き scrub"], SECRET_POLICY.name)
+    # The retired isolation constraint ID must not remain as a live retained constraint. It is
+    # preserved only as the `constraint:` of a superseded entry (OWNER decision on PR #2952).
+    stale_id = "claude_gpt_home_config_mcp_plugin_isolation_not_relaxed"
+    retained_block = re.search(r"(?ms)^  retained_constraints:\n(.*?)(?=^  \w)", secret_policy)
+    assert retained_block is not None, "retained_constraints block not found"
+    assert stale_id not in retained_block.group(1), "stale constraint must not stay in retained_constraints"
+    assert not re.search(rf"(?m)^\s*-\s*{stale_id}\s*$", secret_policy), (
+        "stale constraint ID must not appear as a bare list item"
     )
+    assert secret_policy.count(stale_id) == 1
+    assert re.search(rf"(?m)^    - constraint: {stale_id}$", secret_policy)
     _assert_absent(
         _runtime_policy_section_12(runtime_policy),
         ["未認証の namespace", "必ず一致"],
@@ -156,16 +159,39 @@ def test_ac6_docs_current_concepts_present():
     assert re.search(r"(?s)CLAUDE_GPT_HOME.{0,300}補助 binary", section_12)
     # `CLAUDE_GPT_HOME` is explicitly not a credential namespace.
     assert re.search(r"(?s)CLAUDE_GPT_HOME.{0,600}credential namespace ではない", section_12)
+    # `CLAUDE_GPT_HOME` is not tied to the smoke's temporary evidence / work dir (OWNER Finding 3).
+    assert not re.search(r"smoke の一時証跡の置き場", section_12)
+    # any sentence linking CLAUDE_GPT_HOME with smoke evidence / work dir must deny the link.
+    for sentence in re.split(r"(?<=。)", section_12):
+        if "CLAUDE_GPT_HOME" in sentence and re.search(r"証跡|作業 directory", sentence):
+            assert "無関係" in sentence, sentence
+    assert re.search(r"(?s)runtime_smoke_test\.sh` の作業 directory と証跡は `CLAUDE_GPT_HOME` とは無関係", section_12)
+    # connected-server request acceptance and provider / subscription attribution are separate items
+    # (OWNER Finding 2); the latter is established only by additional evidence.
+    evidence_items = re.findall(r"(?m)^\d\. \*\*(.+?)\*\*", section_12)
+    assert any("configured connected-server" in item and "受理" in item for item in evidence_items)
+    assert any("attribution" in item for item in evidence_items)
+    assert not any("configured connected-server" in item and "attribution" in item for item in evidence_items)
+    assert re.search(r"(?s)runtime_smoke_test\.sh.{0,40}成功だけでは.{0,80}attribution は成立しない", section_12)
+    assert re.search(r"(?s)CLAUDE_GPT_PROXY_LOG.{0,80}明示.{0,80}観測", section_12)
+    assert re.search(r"(?s)attribution への昇格は.{0,200}別 evidence.{0,200}#2925 AC7.{0,200}(?:に限る)", section_12)
 
     secret_policy = _read(SECRET_POLICY)
     assert re.search(r"(?s)ambient.{0,600}ANTHROPIC_AUTH_TOKEN.{0,200}placeholder", secret_policy)
     # the launcher neither scrubs nor unsets these ambient values.
     assert re.search(r"(?s)SSH_AUTH_SOCK.{0,200}scrub も unset もせず", secret_policy)
     # the #2426 supersession record carries the #2925 superseded record.
-    assert re.search(
-        r"(?s)owner_local_observation_supersession_v1:.{0,1500}retained_constraints:.{0,800}2925",
+    entry = re.search(
+        r"(?ms)^  superseded_constraints:\n((?:    .*\n|\n)+?)(?=^\S|^  \w|^```)",
         secret_policy,
     )
+    assert entry is not None, "superseded_constraints block not found"
+    entries = re.split(r"(?m)^    - ", entry.group(1))[1:]
+    assert any(
+        e.startswith("constraint: claude_gpt_home_config_mcp_plugin_isolation_not_relaxed\n")
+        and re.search(r'(?m)^      superseded_by: "#2925 / PR #2932"$', e)
+        for e in entries
+    ), "original constraint ID must pair with superseded_by within the same superseded entry"
     # adjacent constraints and the #2426 authorization are unchanged.
     assert "native_claude_settings_not_full_config_authority_for_claude_gpt" in secret_policy
     assert 'authorized_by: "#2426 owner decision (2026-08-30)"' in secret_policy
