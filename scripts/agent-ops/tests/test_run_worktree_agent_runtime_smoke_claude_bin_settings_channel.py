@@ -280,3 +280,25 @@ def test_claude_bin_unspecified_keeps_settings_flag_and_no_env_channel(repo_with
         "CLAUDE_GPT_RUNTIME_SMOKE_HOOKS must not be injected for the "
         "native claude default lane"
     )
+
+
+def test_claude_adapter_help_describes_current_settings_overlay():
+    """Issue #2939 AC4: the ``--claude-adapter`` argparse help describes the
+    current behavior (same fixed ``--settings`` overlay as the native adapter,
+    passed after ``--``; the launcher injects no hooks) and no longer carries
+    the removed ``CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-start-stop`` channel."""
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--help"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    help_text = " ".join(result.stdout.split())
+    assert "CLAUDE_GPT_RUNTIME_SMOKE_HOOKS" not in help_text
+    assert "subagent-start-stop" not in help_text
+    assert (
+        "passes the same fixed --settings overlay as the native adapter, "
+        "after the `--` separator, to the underlying claude; "
+        "the launcher itself injects no hooks"
+    ) in help_text

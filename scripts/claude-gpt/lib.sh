@@ -308,13 +308,35 @@ claude_gpt_parse_base_url() {
   [ -n "$CGD_HOST" ]
 }
 
-# claude_gpt_is_loopback_host: loopback host（127.0.0.0/8 / localhost / ::1）のみ 0 を返す。
+# claude_gpt_is_loopback_host: loopback host のみ 0 を返す。受理するのは次だけ:
+#   - 127.0.0.0/8 の 4 octet 10 進 IPv4 リテラル（各 octet 0-255。先頭 0 付きの曖昧表記は拒否）
+#   - localhost
+#   - ::1 / [::1]
+# `127.evil.example` や `127.0.0.1.evil.example` のような 127. 始まりの host 名は拒否する。
 # 引数1: host（IPv6 は角括弧付きでよい）
 claude_gpt_is_loopback_host() {
   case "$1" in
-    localhost|127.*|"[::1]"|"::1") return 0 ;;
+    localhost|"[::1]"|"::1") return 0 ;;
+    127.*) ;;
     *) return 1 ;;
   esac
+  case "$1" in
+    *[!0-9.]*|*..*|*.) return 1 ;;
+  esac
+  _cgt_lh_old_ifs="$IFS"
+  IFS=.
+  # shellcheck disable=SC2086 # 意図的な word-splitting: `.` 区切りで octet を分解する
+  set -- $1
+  IFS="$_cgt_lh_old_ifs"
+  [ "$#" -eq 4 ] || return 1
+  for _cgt_lh_octet in "$@"; do
+    case "$_cgt_lh_octet" in
+      ""|0?*) return 1 ;;
+    esac
+    [ "${#_cgt_lh_octet}" -le 3 ] || return 1
+    [ "$_cgt_lh_octet" -le 255 ] || return 1
+  done
+  return 0
 }
 
 # claude_gpt_probe_models: 引数1 の base URL の `/v1/models` を bounded（接続 2 秒・全体 3 秒）で

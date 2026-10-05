@@ -19,6 +19,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -245,6 +246,46 @@ def test_non_loopback_base_url_is_refused_without_any_request(tmp_path, url):
     assert payload["reason"] == "connected_server_not_loopback"
     assert payload["connected_server"]["reachable"] is False
     assert payload["connected_server"]["models_http_status"] is None
+
+
+def _run_check_only_with_bash(tmp_path, base_url):
+    """実 `bash scripts/claude-gpt/launch.sh --check-only` を local subprocess として起動する。"""
+    env = H.base_env(tmp_path, ANTHROPIC_BASE_URL=base_url)
+    return subprocess.run(
+        ["bash", str(H.LAUNCH_SH), "--check-only"],
+        env=env,
+        cwd=str(H.REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=60.0,
+    )
+
+
+@pytest.mark.parametrize("host", ["127.evil.example", "127.0.0.1.evil.example", "0127.0.0.1"])
+def test_loopback_reject_non_loopback_hosts(tmp_path, host):
+    """`127.` 始まりの host 名や先頭 0 付きの曖昧表記は loopback として受理しない（#2939 AC1）。
+
+    exit code と stdout/stderr の `non_loopback` 分類を観測する。network request は発生しない。"""
+    proc = _run_check_only_with_bash(tmp_path, f"http://{host}:18765")
+    assert proc.returncode != 0, (proc.stdout, proc.stderr)
+    assert "non_loopback" in proc.stdout + proc.stderr, (proc.stdout, proc.stderr)
+    connected = json.loads(proc.stdout)["connected_server"]
+    assert connected["classification"] == "non_loopback"
+    assert connected["reachable"] is False
+    assert connected["models_http_status"] is None
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "[::1]"])
+def test_loopback_accept_loopback_hosts(tmp_path, host):
+    """正当な loopback host は non_loopback として拒否されない（#2939 AC2）。
+
+    live proxy は不要。閉じた port へ向けるため結果は `unreachable` になるが、loopback 判定を
+    通過して probe 段階まで進んだこと（non_loopback / invalid_base_url でないこと）を確認する。"""
+    proc = _run_check_only_with_bash(tmp_path, f"http://{host}:{H.closed_port()}")
+    assert "non_loopback" not in proc.stdout + proc.stderr, (proc.stdout, proc.stderr)
+    payload = json.loads(proc.stdout)
+    assert payload["connected_server"]["classification"] == "unreachable", (proc.stdout, proc.stderr)
+    assert payload["reason"] == "connected_server_unreachable"
 
 
 @pytest.mark.parametrize("url", ["127.0.0.1:18765", "http://127.0.0.1:18765/v1", "http://user@127.0.0.1:1", "http://127.0.0.1:abc"])
