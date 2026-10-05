@@ -21,10 +21,10 @@ Per-command (ac, command, command_hash) tuples. Echo each ac label, command and 
 2. ac: AC_UNKNOWN | command: echo test-runner-report-smoke-unlabeled | command_hash: sha256:8d5bee214d1668ff6e21acfb70679e60694d4c48b93c7975412a0549087bcb48
 3. ac: AC1,AC2 | command: test -f .claude/agents/test-runner.md | command_hash: sha256:a276395890eac0420d91408c11bc598301b8834dceba698c50527b7863427f5c
 Run each command verbatim exactly once. Right before you write the report, obtain generated_at by running exactly `date -u +%Y-%m-%dT%H:%M:%SZ` and put its output into generated_at as a quoted string. Never guess or reuse a fixed time.
-Return the report in the "machine-valid example" form of your agent definition: a single yaml block starting with TEST_VERDICT:, no placeholders, all strings quoted, booleans as true/false, exit_code as an integer, result PASS only if all three commands passed, and no GitHub-derived field (no producer_kind, repository, run_id, run_url, workflow_run_id, workflow_run_attempt, check_run_id, artifact).
+Return the report in the "machine-valid example" form of your agent definition: a single yaml block starting with TEST_VERDICT:, no placeholders, strings quoted EXCEPT `schema` and `result`, which must be bare (unquoted) scalars exactly as in the machine-valid example (`schema: TEST_VERDICT_MACHINE/v2`, `result: PASS`), booleans as true/false, exit_code as an integer, result PASS only if all three commands passed, and no GitHub-derived field (no producer_kind, repository, run_id, run_url, workflow_run_id, workflow_run_attempt, check_run_id, artifact).
 Do not run any other command, and do not modify any file.
 ```
-<!-- このコードブロックは子 test-runner SubAgent へ送る英語の指示文である。合成の binding 値、3 つの (ac, command, command_hash) の組（通常 AC・literal AC_UNKNOWN・カンマ連結ラベル）、date の exact 形による generated_at 取得、machine-valid example の形での report 返却、GitHub 由来 field を含めないことを指示する。 -->
+<!-- このコードブロックは子 test-runner SubAgent へ送る英語の指示文である。合成の binding 値、3 つの (ac, command, command_hash) の組（通常 AC・literal AC_UNKNOWN・カンマ連結ラベル）、date の exact 形による generated_at 取得、machine-valid example の形での report 返却（文字列は引用付きだが schema と result だけは example どおり引用なしの bare scalar とする）、GitHub 由来 field を含めないことを指示する。 -->
 
 After the SubAgent has completed and returned its final response, write your own final message as the SubAgent's full final response text copied verbatim, and nothing else.
 Do not summarize, paraphrase, reformat, or omit any line of the report, and do not add any text of your own.
