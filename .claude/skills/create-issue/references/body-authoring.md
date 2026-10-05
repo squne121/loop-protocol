@@ -312,9 +312,10 @@ AC に「特定の関数内」で何かを確認する VC を書く場合、`gre
 削除されたことを確認するには、literal が file に存在しないことを `--files-without-match` で単一コマンドとして確認する。成功は exit 0 とする。
 
 ```bash
-rg --files-without-match --fixed-strings "<literal>" <file>
+rg --files-without-match --fixed-strings -- "<literal>" <file>
 ```
 
+- `--` は option parsing の終端であり、`--settings` / `--foo` のように `-` で始まる literal を option ではなく pattern として扱うために必須とする。`--fixed-strings` を付けても `--` がなければ dash-leading literal は option と解釈されて rg が exit 2（option parse error）になる。
 - 成功は exit 0（literal が file に存在しない）。literal が存在する間は exit 1 になるため、削除前の baseline では fail、削除後は pass という遷移を VC で実証できる。
 - 1 command = 1 concrete file とする。複数 file を一度に渡すと、1 file でも literal を含まなければ exit 0 になり「全 file から消えた」と誤読できるため、file ごとに VC を分ける。
 - `-q` / `--quiet` を併用しない。ripgrep 14.1.0 には `--files-without-match` との併用で exit status が反転する upstream bug（#3108）があり、15.0.0 で修正された。バージョン依存を避けるため plain `rg` を使う。

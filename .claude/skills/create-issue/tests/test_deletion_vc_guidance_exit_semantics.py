@@ -3,13 +3,15 @@
 
 検証内容:
 1. SKILL.md / references/body-authoring.md の「削除確認パターン」節に、
-   `rg --files-without-match --fixed-strings "<literal>" <file>` (1 command = 1 file) が
+   `rg --files-without-match --fixed-strings -- "<literal>" <file>` (1 command = 1 file) が
    存在し、`-c` / `--count` / `-q` / `--quiet` / `!` 否定検索の例が残っていないこと。
 2. その canonical 置換形を repo の実 `baseline_vc_preflight.py` に real subprocess として
    渡し、baseline fixture では expected_fail、current-head fixture では
    expected_pass_resolved_on_current_head に分類されること（mock / fake classifier は使わない）。
+   fixture の literal は `-` で始まる値を使い、`--` separator が option parse error を防ぐことも固定する。
 
-rg / git が利用できない場合は SKIP (PASS 扱い) にせず FAIL とする。
+uv / pytest / rg / git が利用できない場合は SKIP (PASS 扱い) にせず FAIL (assertion failure) とする。
+exit 77 のためだけの wrapper / adapter は追加しない（Issue #2943 契約）。
 """
 
 from __future__ import annotations
@@ -27,17 +29,8 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 SKILL_MD = REPO_ROOT / ".claude" / "skills" / "create-issue" / "SKILL.md"
-BODY_AUTHORING_MD = (
-    REPO_ROOT / ".claude" / "skills" / "create-issue" / "references" / "body-authoring.md"
-)
-PREFLIGHT_SCRIPT = (
-    REPO_ROOT
-    / ".claude"
-    / "skills"
-    / "issue-contract-review"
-    / "scripts"
-    / "baseline_vc_preflight.py"
-)
+BODY_AUTHORING_MD = REPO_ROOT / ".claude" / "skills" / "create-issue" / "references" / "body-authoring.md"
+PREFLIGHT_SCRIPT = REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts" / "baseline_vc_preflight.py"
 
 SECTION_TITLE = "削除確認パターン"
 SEARCH_COMMANDS = {"rg", "grep", "egrep", "fgrep"}
@@ -138,7 +131,14 @@ def _search_commands(section: list[str]) -> list[list[str]]:
 
 
 def _flag_tokens(tokens: list[str]) -> list[str]:
-    return [t for t in tokens[1:] if t.startswith("-") and t != "-"]
+    """`--` (option parsing の終端) より前の option token だけを返す。"""
+    flags: list[str] = []
+    for t in tokens[1:]:
+        if t == "--":
+            break
+        if t.startswith("-") and t != "-":
+            flags.append(t)
+    return flags
 
 
 def _has_count_flag(tokens: list[str]) -> bool:
@@ -170,14 +170,16 @@ def _is_canonical_absence_form(tokens: list[str]) -> bool:
         tokens[0] == "rg"
         and "--files-without-match" in tokens
         and "--fixed-strings" in tokens
+        and "--" in tokens
+        and tokens.index("--") > max(tokens.index("--files-without-match"), tokens.index("--fixed-strings"))
     )
 
 
 def _path_operands(tokens: list[str]) -> list[str]:
-    """canonical 形 (boolean long flag のみ) の positional から path operand を返す。"""
-    positionals = [t for t in tokens[1:] if not t.startswith("-")]
-    # 先頭の positional は pattern (literal)、残りが path operand
-    return positionals[1:]
+    """canonical 形 (boolean long flag + `--` separator) の `--` 以降から path operand を返す。"""
+    after = tokens[tokens.index("--") + 1 :]
+    # `--` 直後の先頭 positional は pattern (literal)、残りが path operand
+    return after[1:]
 
 
 # ---------------------------------------------------------------------------
@@ -196,34 +198,34 @@ def _assert_section_is_canonical(doc_name: str, section: list[str]) -> None:
         assert not _is_negated(tokens), f"{doc_name}: ! 否定検索が例として残っている: {rendered}"
 
     canonical = [t for t in commands if _is_canonical_absence_form(t)]
-    assert canonical, f"{doc_name}: canonical 置換形 (--files-without-match + --fixed-strings) がない"
+    assert canonical, f"{doc_name}: canonical 置換形 (--files-without-match + --fixed-strings + `--` separator) がない"
     for tokens in canonical:
         operands = _path_operands(tokens)
-        assert len(operands) == 1, (
-            f"{doc_name}: path operand がちょうど 1 つではない: {operands} ({' '.join(tokens)})"
-        )
+        assert len(operands) == 1, f"{doc_name}: path operand がちょうど 1 つではない: {operands} ({' '.join(tokens)})"
         assert operands == ["<file>"], f"{doc_name}: file placeholder が <file> ではない: {operands}"
 
 
 def test_guidance_deletion_section_has_canonical_single_file_absence_form() -> None:
     """GIVEN 削除確認パターン節 WHEN rg command を抽出 THEN canonical absence 形のみが残る."""
     _assert_section_is_canonical("SKILL.md", _skill_section_lines())
-    _assert_section_is_canonical(
-        "references/body-authoring.md", _body_authoring_section_lines()
-    )
+    _assert_section_is_canonical("references/body-authoring.md", _body_authoring_section_lines())
 
 
 # ---------------------------------------------------------------------------
 # test 2: 実 baseline_vc_preflight による分類観測
 # ---------------------------------------------------------------------------
 
-LITERAL = "DELETION_TARGET_LITERAL_2943"
+# `-` で始まる literal。`--` separator がなければ rg は option と解釈して exit 2 になる。
+LITERAL = "--DELETION_TARGET_LITERAL_2943"
+# 旧形 `rg -c` の対照用（旧形は dash-leading literal をそもそも扱えないため dash なしの部分文字列を使う）。
+PLAIN_LITERAL = LITERAL.lstrip("-")
 TARGET_FILE = "target.md"
 
 
 def _require_tools() -> None:
-    # SKIP (exit 77 相当) は PASS ではないため、利用不能時は FAIL にする。
-    missing = [tool for tool in ("rg", "git") if shutil.which(tool) is None]
+    # Issue #2943 契約: tool 不在は SKIP / PASS ではなく hard FAIL (assertion failure)。
+    # exit 77 のためだけの wrapper は追加しない。uv / pytest は本 test の起動経路として必須。
+    missing = [tool for tool in ("uv", "rg", "git") if shutil.which(tool) is None]
     assert not missing, f"必要な tool が利用不能 (SKIP は PASS ではない): {missing}"
     assert PREFLIGHT_SCRIPT.is_file(), f"baseline_vc_preflight.py がない: {PREFLIGHT_SCRIPT}"
 
@@ -258,9 +260,7 @@ def _vc_body(command: str) -> str:
     )
 
 
-def _run_preflight(
-    body_file: Path, repo: Path, *extra: str
-) -> tuple[int, dict[str, Any], dict[str, Any]]:
+def _run_preflight(body_file: Path, repo: Path, *extra: str) -> tuple[int, dict[str, Any], dict[str, Any]]:
     proc = subprocess.run(
         [
             sys.executable,
@@ -289,12 +289,10 @@ def test_replacement_command_classified_by_real_baseline_vc_preflight(
     """GIVEN canonical 置換形 WHEN 実 baseline_vc_preflight に渡す THEN baseline=fail / current-head=pass."""
     _require_tools()
 
-    new_command = (
-        _canonical_command_from_fenced_block()
-        .replace("<literal>", LITERAL)
-        .replace("<file>", TARGET_FILE)
-    )
-    old_command = f'rg -c "{LITERAL}" {TARGET_FILE}'
+    new_command = _canonical_command_from_fenced_block().replace("<literal>", LITERAL).replace("<file>", TARGET_FILE)
+    old_command = f'rg -c "{PLAIN_LITERAL}" {TARGET_FILE}'
+    assert "--" in _tokenize(new_command), f"canonical 形に `--` separator がない: {new_command}"
+    assert LITERAL.startswith("-"), "fixture literal は dash-leading でなければならない"
 
     repo = tmp_path / "fixture_repo"
     repo.mkdir()
@@ -321,6 +319,21 @@ def test_replacement_command_classified_by_real_baseline_vc_preflight(
     assert new_baseline["exit_code"] == 1
     assert new_baseline["classification"] == "expected_fail"
     assert new_baseline["category"] == "expected_baseline_fail"
+    # dash-leading literal が option parse error (rg exit 2) になっていないこと
+    assert "unrecognized flag" not in json.dumps(new_baseline, ensure_ascii=False)
+
+    # 対照: `--` separator のない旧 canonical 形は dash-leading literal を option と解釈し rg exit 2
+    no_sep = subprocess.run(
+        ["rg", "--files-without-match", "--fixed-strings", LITERAL, TARGET_FILE],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    observations.append(
+        f"no-separator form (dash-leading literal) rg exit_code={no_sep.returncode} stderr={no_sep.stderr.strip()!r}"
+    )
+    assert no_sep.returncode == 2
+    assert "unrecognized flag" in no_sep.stderr
 
     # 対照: 旧形 rg -c は literal あり baseline で exit 0 / unexpected pass
     _, _, old_present = _run_preflight(old_body, repo)
