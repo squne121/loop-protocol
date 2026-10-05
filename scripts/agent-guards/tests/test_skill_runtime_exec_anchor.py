@@ -513,6 +513,15 @@ elif tuple(argv) in {
         "--repo",
         "squne121/loop-protocol",
         "--json",
+        "title,body,updatedAt,state",
+    ),
+    (
+        "issue",
+        "view",
+        "1498",
+        "--repo",
+        "squne121/loop-protocol",
+        "--json",
         "number,title,body,labels,url,updatedAt",
     ),
 }:
@@ -864,6 +873,10 @@ def _fake_gh(args, *positional, **kwargs):
         (
             "issue", "view", "1498", "--repo", "squne121/loop-protocol",
             "--json", "title,body,updatedAt",
+        ),
+        (
+            "issue", "view", "1498", "--repo", "squne121/loop-protocol",
+            "--json", "title,body,updatedAt,state",
         ),
         (
             "issue", "view", "1498", "--repo", "squne121/loop-protocol",

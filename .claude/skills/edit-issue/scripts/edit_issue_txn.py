@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -799,7 +800,7 @@ def _child_error(cp: subprocess.CompletedProcess[str], code: str) -> dict[str, s
 def _fetch_issue(issue_number: int, repo: str) -> tuple[dict[str, Any] | None, str]:
     gh = shutil.which("gh") or "gh"
     cp = _run_command(
-        [gh, "issue", "view", str(issue_number), "--repo", repo, "--json", "title,body,updatedAt"],
+        [gh, "issue", "view", str(issue_number), "--repo", repo, "--json", "title,body,updatedAt,state"],
         env=_sanitized_gh_env(),
     )
     if cp.returncode != 0:
@@ -808,6 +809,177 @@ def _fetch_issue(issue_number: int, repo: str) -> tuple[dict[str, Any] | None, s
         return json.loads(cp.stdout), ""
     except json.JSONDecodeError:
         return None, "gh_issue_view_non_json"
+
+
+# Issue #2922: pre-existing readiness defect compatibility lane.
+# A CLOSED historical Issue whose live body already carries blocking readiness
+# defects may still receive a note-only update (`## Notes for Reviewer` only)
+# as long as the readiness defect multiset is exactly unchanged. The lane never
+# bypasses guard / hygiene / sha / updatedAt / readback checks.
+NOTES_FOR_REVIEWER_HEADING = "## Notes for Reviewer"
+PREEXISTING_READINESS_CHECKER_EXIT_CODES = frozenset({0, 1})
+NATIVE_RELATIONSHIP_LIST_FIELDS = ("add_blocked_by", "remove_blocked_by", "add_blocking", "remove_blocking")
+
+
+def _native_relationships_is_noop(relationship_input: Any) -> bool:
+    if relationship_input is None:
+        return True
+    if not isinstance(relationship_input, dict):
+        return False
+    parent = relationship_input.get("parent") or {"action": "unchanged"}
+    if not isinstance(parent, dict) or parent.get("action", "unchanged") != "unchanged":
+        return False
+    return not any(relationship_input.get(field) for field in NATIVE_RELATIONSHIP_LIST_FIELDS)
+
+
+def _compat_lane_static_preconditions_met(title_update: dict[str, Any], relationship_input: Any) -> bool:
+    """Preconditions that need no gh call (title / native relationship scope).
+
+    The live state precondition (CLOSED) is checked separately through a live
+    live `state` of the single `_fetch_issue` snapshot, only once this cheap
+    check has passed.
+    """
+    return not title_update.get("required") and _native_relationships_is_noop(relationship_input)
+
+
+_PROSE_BOUNDARY_POLICY_MODULE_NAME = "_edit_issue_txn_prose_boundary_policy"
+_PROSE_BOUNDARY_POLICY_RELPATH = Path(".claude") / "skills" / "create-issue" / "scripts" / "prose_boundary_policy.py"
+
+
+def _load_prose_boundary_policy() -> Any:
+    """Load the shared GFM fence / ATX heading SSOT (prose_boundary_policy.py).
+
+    Resolved from the real on-disk script location (not the mutable REPO_ROOT
+    that tests monkeypatch) and loaded lazily under a unique module name, so
+    title / body-only calls outside the compatibility lane never depend on it
+    and a same-named `prose_boundary_policy` already in `sys.modules` is never
+    shadowed or reused.
+    """
+    cached = sys.modules.get(_PROSE_BOUNDARY_POLICY_MODULE_NAME)
+    if cached is not None:
+        return cached
+    import importlib.util
+
+    module_path = SCRIPT_PATH.parents[4] / _PROSE_BOUNDARY_POLICY_RELPATH
+    spec = importlib.util.spec_from_file_location(_PROSE_BOUNDARY_POLICY_MODULE_NAME, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_PROSE_BOUNDARY_POLICY_MODULE_NAME] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(_PROSE_BOUNDARY_POLICY_MODULE_NAME, None)
+        raise
+    return module
+
+
+def _split_h2_sections(body: str) -> list[tuple[str | None, str]]:
+    """Split a body into (heading, raw_text) chunks at top-level H2 lines.
+
+    The first chunk (heading None) is the preamble before the first H2. Fenced
+    code and H2 detection follow CommonMark / GFM exactly through the shared
+    `prose_boundary_policy` SSOT: 0-3 spaces indent fences and ATX headings,
+    4+ spaces indent is code, a closer must be the same character and at least
+    as long as its opener. Lines inside a fence never start a new section. The
+    heading key is `"## <text>"`.
+    """
+    policy = _load_prose_boundary_policy()
+    lines = body.splitlines(keepends=True)
+    fenced: set[int] = set()
+    cursor = 0
+    for block_text, block_kind in policy.iter_markdown_blocks(body):
+        block_len = len(block_text.splitlines(keepends=True))
+        if block_kind == policy.BLOCK_KIND_CODE_FENCE:
+            fenced.update(range(cursor, cursor + block_len))
+        cursor += block_len
+    if cursor != len(lines):
+        raise ValueError("markdown block segmentation did not cover every body line")
+
+    chunks: list[tuple[str | None, list[str]]] = [(None, [])]
+    for index, line in enumerate(lines):
+        heading = None if index in fenced else policy.parse_atx_heading_line(line.rstrip("\r\n"))
+        if heading is not None and heading["level"] == 2:
+            chunks.append((f"## {heading['text']}", [line]))
+        else:
+            chunks[-1][1].append(line)
+    return [(heading, "".join(chunk_lines)) for heading, chunk_lines in chunks]
+
+
+def _non_note_sections(body: str) -> list[tuple[str | None, str]]:
+    # Trailing newlines are separator bytes between sections (appending a note
+    # section legitimately adds a blank line after the previous section), so
+    # they are not part of a section's compared content.
+    return [
+        (heading, text.rstrip("\r\n"))
+        for heading, text in _split_h2_sections(body)
+        if heading != NOTES_FOR_REVIEWER_HEADING
+    ]
+
+
+def _only_notes_section_differs(live_body: str, candidate_body: str) -> bool:
+    try:
+        return _non_note_sections(live_body) == _non_note_sections(candidate_body)
+    except (ImportError, ValueError, OSError):
+        # Boundary SSOT unavailable (missing / unreadable file) / inconsistent
+        # segmentation: fail closed.
+        return False
+
+
+def _defect_multiset_from_checker_output(rc: int, stdout: str) -> Counter | None:
+    """Opaque (rule_id, category, section, minimal_context) multiset, or None (fail-closed)."""
+    if rc not in PREEXISTING_READINESS_CHECKER_EXIT_CODES:
+        return None
+    try:
+        data = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("errors"), list):
+        return None
+    counter: Counter = Counter()
+    for error in data["errors"]:
+        if not isinstance(error, dict):
+            return None
+        key = tuple(
+            json.dumps(error.get(field), sort_keys=True)
+            for field in ("rule_id", "category", "section", "minimal_context")
+        )
+        counter[key] += 1
+    return counter
+
+
+def _preexisting_readiness_defects_unchanged(
+    live_body: str, mutated_candidate: str, candidate_readiness_cp: subprocess.CompletedProcess[str]
+) -> bool:
+    """True only when the candidate changes nothing but the notes section and
+    the real static readiness checker reports an identical defect multiset for
+    the live body and the mutated candidate (fail-closed otherwise)."""
+    if not _only_notes_section_differs(live_body, mutated_candidate):
+        return False
+    candidate_defects = _defect_multiset_from_checker_output(
+        candidate_readiness_cp.returncode, candidate_readiness_cp.stdout
+    )
+    if candidate_defects is None:
+        return False
+    tmp_dir = REPO_ROOT / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    live_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".md", delete=False, dir=str(tmp_dir), encoding="utf-8"
+        ) as live_file:
+            live_file.write(live_body)
+            live_path = Path(live_file.name)
+        live_cp = _run_command(
+            [sys.executable, str(READINESS_SCRIPT), "--body-file", str(live_path), "--mode", "static"]
+        )
+    finally:
+        if live_path is not None:
+            live_path.unlink(missing_ok=True)
+    live_defects = _defect_multiset_from_checker_output(live_cp.returncode, live_cp.stdout)
+    if live_defects is None:
+        return False
+    return live_defects == candidate_defects
 
 
 def _render_result(
@@ -1034,7 +1206,14 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             errors=state.errors,
         )
 
-    if forwarded_status == "needs_fix" and not readiness_result.get("resolution_evidence"):
+    # Issue #2922: the forwarded needs_fix (no resolution_evidence) rejection is
+    # deferred until after the live readback so the pre-existing readiness
+    # compatibility lane can evaluate the live state. Any unmet lane condition
+    # reproduces the original immediate rejection (same code, no child
+    # process, no mutation).
+    deferred_needs_fix = forwarded_status == "needs_fix" and not readiness_result.get("resolution_evidence")
+
+    def _reject_needs_fix_without_resolution_evidence() -> dict[str, Any]:
         state.errors.append(
             {
                 "code": "readiness_needs_fix_without_resolution_evidence",
@@ -1061,7 +1240,24 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             errors=state.errors,
         )
 
+    # The CLOSED precondition is the live `state` of the single
+    # `gh issue view --json title,body,updatedAt,state` readback taken below
+    # (never caller-declared, and never a separate request). A missing /
+    # non-str state, or a failed readback, is treated as "not CLOSED"
+    # (fail-closed, original rejection).
+    compat_lane_static_ok = _compat_lane_static_preconditions_met(title_update, input_data.get("native_relationships"))
+    live_state: str | None = None
+
+    def _live_state_is_closed() -> bool:
+        return live_state == "CLOSED"
+
+    if deferred_needs_fix and not compat_lane_static_ok:
+        return _reject_needs_fix_without_resolution_evidence()
     issue_data, issue_error = _fetch_issue(state.issue_number, state.repo)
+    if isinstance(issue_data, dict) and isinstance(issue_data.get("state"), str):
+        live_state = issue_data["state"]
+    if deferred_needs_fix and (issue_data is None or not _live_state_is_closed()):
+        return _reject_needs_fix_without_resolution_evidence()
     if issue_data is None:
         state.errors.append({"code": "issue_readback_failed", "message": issue_error})
         return _render_result(
@@ -1221,8 +1417,27 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             readiness_cp = _run_command(
                 [sys.executable, str(READINESS_SCRIPT), "--body-file", str(candidate_path), "--mode", "static"]
             )
-            if readiness_cp.returncode != 0:
-                state.errors.append(_child_error(readiness_cp, "guard_or_readiness_failed_before_mutation"))
+            # Issue #2922: forwarded needs_fix, or a failing candidate static
+            # readiness, is only tolerated when the pre-existing readiness
+            # compatibility lane proves the defect multiset is unchanged.
+            if deferred_needs_fix or readiness_cp.returncode != 0:
+                compat_lane_ok = (
+                    compat_lane_static_ok
+                    and _live_state_is_closed()
+                    and _preexisting_readiness_defects_unchanged(current_body, mutated_candidate, readiness_cp)
+                )
+                if not compat_lane_ok and deferred_needs_fix:
+                    state.errors.append(
+                        {
+                            "code": "readiness_needs_fix_without_resolution_evidence",
+                            "message": "forwarded readiness status=needs_fix without resolution_evidence",
+                        }
+                    )
+                elif not compat_lane_ok:
+                    state.errors.append(_child_error(readiness_cp, "guard_or_readiness_failed_before_mutation"))
+            else:
+                compat_lane_ok = True
+            if not compat_lane_ok:
                 return _render_result(
                     native_relationships=rel_result_for_output,
                     status="failed_no_mutation", issue_number=state.issue_number, repo=state.repo,
