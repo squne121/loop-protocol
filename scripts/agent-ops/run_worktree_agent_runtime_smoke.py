@@ -8087,11 +8087,11 @@ def build_parser() -> argparse.ArgumentParser:
             "absolute-path native claude binary or a transparent wrapper). "
             "'--claude-adapter claude-gpt' (requires --claude-bin) is what "
             "opts into scripts/claude-gpt/launch.sh's own CLI contract: a "
-            "literal `--` separator before claude's own fixed argv, and "
-            "CLAUDE_GPT_RUNTIME_SMOKE_HOOKS=subagent-start-stop instead of "
-            "a caller-supplied --settings JSON flag (which that launcher "
-            "rejects as a policy-weakening flag). Default 'native' keeps "
-            "every pre-existing --claude-bin caller's argv unchanged."
+            "literal `--` separator before claude's own fixed argv. The "
+            "claude-gpt adapter passes the same fixed --settings overlay as "
+            "the native adapter, after the `--` separator, to the underlying "
+            "claude; the launcher itself injects no hooks. Default 'native' "
+            "keeps every pre-existing --claude-bin caller's argv unchanged."
         ),
     )
     parser.add_argument(
