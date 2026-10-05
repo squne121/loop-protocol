@@ -1,280 +1,44 @@
 #!/bin/sh
 # scripts/claude-gpt/preflight.sh
 #
-# claude-gpt launcher の起動前 preflight。単体実行可能。
-# `launch.sh` と `runtime_smoke_test.sh` の双方から呼ばれる。
+# claude-gpt の起動前 preflight 入口。単体実行可能。
 #
-# チェック内容（Issue #2158 In Scope / Scope Reframe 2026-08-15 反映）:
-#   1. `claude-code-proxy` バイナリの存在
-#   2. ChatGPT subscription 認証状態（proxy 専用 HOME/CCP_CONFIG_DIR で確認。P0-2）
-#   3. GPT 専用ディレクトリ（CLAUDE_CONFIG_DIR / proxy config / state / proxy home）の
-#      canonical path が repository root / worktree 配下でないこと
-#   4. Claude Code セッション設定（settings.local.json）で proxy credential/config/state
-#      ディレクトリへの read を拒否する deny rule が正しい絶対パス構文（`Read(//...)`)
-#      で生成されていること（best-effort な軽量防御。P0-3）
+# Issue #2925 で launcher が upstream Minimal client contract へ縮退したため、この script は
+# 2 つの役割だけを持つ（旧 launcher の isolated HOME / settings / credential / path 検査は
+# 検査対象そのものが無くなったため撤去した）。
 #
-# 出力: 構造化 JSON を stdout に返す（scripts/CLAUDE.md 不変条件準拠）。
-# `canonical_paths` / `read_restriction` は `--env-only` モードでは実検査を行わない
-# （ディレクトリ・設定ファイルがまだ存在しない前提のため）。この場合 `applicable: false`
-# を返し、`ok` を無条件 true として出力しない（PR #2162 P0-1 反映：未検証値を検証済み
-# であるかのように証跡へ混入させない）。
+#   1. （引数なし / --env-only）接続先 server の診断。`launch.sh --check-only` と同一の
+#      実装・同一の JSON を返す。ChatGPT subscription 認証は proxy server の所有者の責務
+#      であり、この script は認証状態を判定しない。到達性と /v1/models の required model
+#      set（gpt-6-sol および gpt-6-luna）だけを接続先 server に対して確認する。
+#   2. （--workflow-profile <profile>）`workflow_capability_preflight.py` への薄い dispatcher。
+#      `CLAUDE_GPT_WORKFLOW_CAPABILITIES_V1` JSON を返す（判定ロジックはこの script に
+#      複製しない）。
 #
 # Exit code:
-#   0  = 全チェック PASS
-#   3  = claude-code-proxy バイナリが見つからない（環境不可）
-#   4  = ChatGPT subscription 認証が利用不能（環境不可）
-#   5  = canonical path 違反（repo/worktree 配下への書き込みを拒否）
-#   6  = read 制限 settings が未生成または不正
-#
-# 3 / 4 は「実行環境が利用不能」を意味し、呼び出し元（runtime_smoke_test.sh）はこれを
-# SKIP（exit 77）に変換してよい。5 / 6 は launcher の実装バグまたは host 側の不備であり
-# SKIP に変換してはならない。
+#   0   接続先 server の診断 PASS
+#   7   接続先 server の診断失敗（到達不能 / base URL 不正 / required model 不足）。
+#       呼び出し元は「実行環境が利用不能」として SKIP（exit 77）へ変換してよい。
+#   --workflow-profile 時は workflow_capability_preflight.py の exit code をそのまま返す。
 
 SELF_PATH=$0
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd -P)
-# shellcheck source=./lib.sh
-. "$SCRIPT_DIR/lib.sh"
 
-# `home_source` の lexical/effective-path classification（Issue #2803 AC3）:
-# 検査対象の `CLAUDE_GPT_HOME`（source 後の最終的な effective 値）が `lib.sh`
-# の canonical default 式（`${HOME}/.claude-gpt`）と文字列として lexical に
-# 一致するかどうかだけで判定する。caller が env var を明示指定したかどうか
-# という provenance（出自）を復元するものではない点に注意する（同じ実体を
-# 指す別表記——例えば末尾スラッシュ違い——を明示指定した場合も一致しなければ
-# `env_override` になる）。credential の中身（token / auth.json content）は
-# 一切含めず、`default` / `env_override` の2値のみを保持する。
-#
-# 「source 前に env var の有無を snapshot する」方式（一見自然に見えるが）は
-# 採用しない: `launch.sh` は本 script を invoke する前に自身の `lib.sh` を
-# source して `CLAUDE_GPT_HOME` を export 済みにしてしまうため、`launch.sh`
-# 経由（`launch.sh --check-only` 等）で本 script が子プロセスとして呼ばれる
-# 場合、元の外部呼び出し元が `CLAUDE_GPT_HOME` を未設定にしていたとしても
-# 本 script からは常に「既に export されている（= override されたように
-# 見える）」状態になり、`default` 判定が事実上到達不能になる（AC6 の
-# nested `launch.sh --check-only` 経路で実測確認済み）。effective 値と
-# canonical default 式の比較であれば、`launch.sh` 経由・単体実行のいずれでも
-# 同じ判定になり、この問題を回避できる。
-CANONICAL_DEFAULT_CLAUDE_GPT_HOME="${HOME}/.claude-gpt"
-if [ "$CLAUDE_GPT_HOME" = "$CANONICAL_DEFAULT_CLAUDE_GPT_HOME" ]; then
-  HOME_SOURCE=default
-else
-  HOME_SOURCE=env_override
-fi
-
-# --env-only: バイナリ存在 + ChatGPT subscription 認証のみ確認する（起動前の環境可用性判定用）。
-# runtime_smoke_test.sh の SKIP 判定はディレクトリ/設定ファイルがまだ存在しない段階で行うため、
-# canonical path 検証・read 制限 settings 検証（launch.sh がディレクトリ/設定を作成した後に
-# のみ意味を持つチェック）を除外したこのモードを使う。
-ENV_ONLY=false
-if [ "${1:-}" = "--env-only" ]; then
-  ENV_ONLY=true
-fi
-
-# --auto-mode-check <settings_path>: Issue #2203 AC1。launcher-generated settings の
-# autoMode 設定が effective config に正しく反映されているかを `claude auto-mode config`
-# / `claude auto-mode defaults` の readback で検証する独立モード。既存の完全モード
-# （引数なし）の exit code 契約（0/3/4/5/6）や、それを subprocess 経由で駆動する既存
-# hermetic test（test_launch_strict_mcp_config_normalization.py 等、fake claude binary
-# を使う）を汚染しないよう、この chunk 自体は別 subcommand として分離しているが、
-# `launch.sh`（通常起動フロー）は実際にこの `--auto-mode-check` を毎回 subprocess
-# 呼び出しし、readback 失敗時は起動を止める（launch.sh 内の Issue #2203 AC1
-# コメント参照。「配線は followup」という過去の記述は stale だったため訂正 —
-# Issue #2709 Background）。
-#
-# 出力 schema: `CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V2`（PR #2717 owner review
-# P1-1 反映。旧 `checks.classify_all_shell_enabled` / `checks.classify_all_shell_
-# verification_source`（bool/string）から、トップレベル `classify_all_shell`
-# tri-state/availability evidence object（4 フィールド）へ breaking shape change
-# したため、V1 のままでの互換維持は行わず schema identity を V2 へ cutover した）。
-#
-# Exit code:
-#   0  = auto-mode readback 成功。$defaults 保持・narrow scope 反映・hard_deny
-#        追加分保持・soft_deny 不変を確認。classifyAllShell は tri-state/
-#        availability evidence（`classify_all_shell` フィールド）として出力する
-#        のみで、単独では exit code に影響しない（Issue #2709 AC1/AC2/AC6）
-#   2  = 呼び出しエラー（settings_path 未指定・不存在）
-#   3  = claude バイナリが見つからない（環境不可）
-#   8  = narrow scope 未反映・hard_deny/soft_deny 不整合、classifyAllShell の
-#        direct readback が generated key 省略と矛盾する値を返した、または
-#        classifyAllShell の direct readback が exact bool でない値を返した
-#        （schema/capability drift。PR #2717 owner review P2-1）のいずれか
-#        （launcher バグまたは host 側の不備。fail-closed。Issue #2709 AC5）
-# --workflow-profile <profile>: Issue #2273. Thin dispatcher to the Python
-# `workflow_capability_preflight.py` module, which returns the structured
-# `CLAUDE_GPT_WORKFLOW_CAPABILITIES_V1` JSON result (trusted `uv` /
-# GitHub read capability / GitHub write (mutation) capability, judged
-# separately -- see that module's docstring and the Issue's
-# `## Result Schema` section). GPT-5.3-Codex-Spark delegation route
-# capability judgment (formerly a 4th dimension here) has been retired
-# (Issue #2651): `checks.spark.status` is now only `not_required` or
-# `retired`, never a live binary/auth-based judgment. This branch does
-# not duplicate any of that judgment logic in shell; it only forwards CLI
-# args and the exit code. A well-formed assessment (including `decision:
-# blocked`) exits 0; non-zero exit codes are reserved for invalid input /
-# internal errors so a `set -e` caller does not lose the JSON payload.
 if [ "${1:-}" = "--workflow-profile" ]; then
   shift
-  # P1-2 fix: `workflow_capability_preflight.py` judges trusted-`uv`
-  # availability itself (via `trusted_runtime_capabilities.check_trusted_uv`,
-  # which delegates to the canonical `skill_runtime_exec` resolver). Running
-  # an UNVERIFIED PATH `uv` here first, before that trusted judgment even
-  # runs, would execute untrusted code as a bootstrap step. Launch the
-  # Python module directly from system `python3` instead; it performs its
-  # own trusted-uv check as part of the assessment.
+  # `workflow_capability_preflight.py` は trusted `uv` の可用性を自身で判定する
+  # （`trusted_runtime_capabilities.check_trusted_uv`）。未検証の PATH `uv` を先に
+  # 実行しないよう、system `python3` から直接起動する。
   python3 "$SCRIPT_DIR/workflow_capability_preflight.py" --profile "$@"
   exit "$?"
 fi
 
-if [ "${1:-}" = "--auto-mode-check" ]; then
-  AUTO_MODE_SETTINGS_PATH="${2:-}"
-  if [ -z "$AUTO_MODE_SETTINGS_PATH" ] || [ ! -f "$AUTO_MODE_SETTINGS_PATH" ]; then
-    printf '{"schema":"CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V2","status":"blocked","reason":"settings_path_missing_or_not_found"}\n'
+case "${1:-}" in
+  "" | --env-only)
+    exec "$SCRIPT_DIR/launch.sh" --check-only
+    ;;
+  *)
+    printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"unknown_preflight_option","option":"%s"}\n' "$1" >&2
     exit 2
-  fi
-  CLAUDE_BIN_FOR_CHECK=$(claude_gpt_resolve_claude_bin)
-  if [ -z "$CLAUDE_BIN_FOR_CHECK" ]; then
-    printf '{"schema":"CLAUDE_GPT_AUTO_MODE_PREFLIGHT_RESULT_V2","status":"blocked","reason":"claude_binary_not_found"}\n'
-    exit 3
-  fi
-  claude_gpt_auto_mode_readback "$CLAUDE_BIN_FOR_CHECK" "$AUTO_MODE_SETTINGS_PATH"
-  exit "$?"
-fi
-
-CLAUDE_CONFIG_DIR_TARGET=$(claude_gpt_claude_config_dir)
-PROXY_CONFIG_DIR_TARGET=$(claude_gpt_proxy_config_dir)
-PROXY_STATE_DIR_TARGET=$(claude_gpt_proxy_state_dir)
-PROXY_HOME_TARGET=$(claude_gpt_proxy_home_dir)
-SETTINGS_PATH=$(claude_gpt_session_settings_path)
-
-BINARY_OK=false
-AUTH_OK=false
-AUTH_DETAIL="not_checked"
-PATH_OK=false
-PATH_APPLICABLE=false
-PATH_VIOLATIONS=""
-READ_RESTRICTION_OK=false
-READ_RESTRICTION_APPLICABLE=false
-EXIT_CODE=0
-
-# --- 1. バイナリ存在確認（P2: absolute path を一度解決し以降すべて同一値を使い回す） ---
-PROXY_BIN=$(claude_gpt_resolve_proxy_bin)
-PROXY_VERSION="unknown"
-if [ -n "$PROXY_BIN" ]; then
-  BINARY_OK=true
-  PROXY_VERSION=$(claude_gpt_proxy_version "$PROXY_BIN")
-else
-  EXIT_CODE=3
-fi
-
-# --- proxy 専用 HOME を用意する（credential isolation の前提。P0-2） ---
-# canonical path 違反チェックより前に mkdir すると repo/worktree 配下へ誤って書き込む
-# 危険があるため、先に canonical チェックだけ実施し、違反でなければ作る。
-if ! claude_gpt_reject_if_under_repo "$PROXY_HOME_TARGET" "$SELF_PATH"; then
-  PROXY_HOME_UNDER_REPO=true
-else
-  PROXY_HOME_UNDER_REPO=false
-  mkdir -p "$PROXY_HOME_TARGET" 2>/dev/null || true
-fi
-
-# --- 2. ChatGPT subscription 認証状態確認（proxy 専用 HOME/CCP_CONFIG_DIR で確認。P0-2） ---
-if [ "$BINARY_OK" = "true" ] && [ "$PROXY_HOME_UNDER_REPO" = "false" ]; then
-  AUTH_STATUS_OUTPUT=$(HOME="$PROXY_HOME_TARGET" CCP_CONFIG_DIR="$PROXY_CONFIG_DIR_TARGET" "$PROXY_BIN" codex auth status 2>&1)
-  AUTH_STATUS_RC=$?
-  if [ "$AUTH_STATUS_RC" -eq 0 ]; then
-    case "$AUTH_STATUS_OUTPUT" in
-      *Account:*)
-        AUTH_OK=true
-        AUTH_DETAIL="authenticated"
-        ;;
-      *)
-        AUTH_DETAIL="unexpected_status_output"
-        if [ "$EXIT_CODE" -eq 0 ]; then EXIT_CODE=4; fi
-        ;;
-    esac
-  else
-    AUTH_DETAIL="not_authenticated"
-    if [ "$EXIT_CODE" -eq 0 ]; then EXIT_CODE=4; fi
-  fi
-elif [ "$BINARY_OK" != "true" ]; then
-  AUTH_DETAIL="skipped_binary_missing"
-else
-  AUTH_DETAIL="skipped_proxy_home_under_repo"
-  if [ "$EXIT_CODE" -eq 0 ]; then EXIT_CODE=5; fi
-fi
-
-if [ "$ENV_ONLY" = "true" ]; then
-  # --env-only ではディレクトリ/設定ファイルがまだ存在しない前提のため、canonical path /
-  # read 制限 / sandbox チェックは実施しない。「未検証」であることを applicable:false で
-  # 明示し、無条件 true の ok を返さない（P0-1）。
-  PATH_APPLICABLE=false
-  READ_RESTRICTION_APPLICABLE=false
-else
-  # --- 3. canonical path 検証（repo / worktree 配下でないこと。proxy home も含む） ---
-  PATH_APPLICABLE=true
-  for d in "$CLAUDE_CONFIG_DIR_TARGET" "$PROXY_CONFIG_DIR_TARGET" "$PROXY_STATE_DIR_TARGET" "$PROXY_HOME_TARGET"; do
-    if ! claude_gpt_reject_if_under_repo "$d" "$SELF_PATH"; then
-      PATH_VIOLATIONS="${PATH_VIOLATIONS} ${d}"
-    fi
-  done
-  if [ -z "$PATH_VIOLATIONS" ]; then
-    PATH_OK=true
-  else
-    if [ "$EXIT_CODE" -eq 0 ]; then EXIT_CODE=5; fi
-  fi
-
-  # --- 4. read 制限 settings.local.json の存在・内容確認 ---
-  # launch.sh が事前に生成している前提。未生成なら preflight は fail-closed で失敗させる
-  # （生成は launch.sh の責務。preflight は「有効化されていることの確認」のみ行う）。
-  # `Read(//<absolute path>/**)` の二重スラッシュ絶対パス構文であることまで確認する（P0-3）。
-  READ_RESTRICTION_APPLICABLE=true
-  READ_RESTRICTION_OK=true
-  if [ ! -f "$SETTINGS_PATH" ]; then
-    READ_RESTRICTION_OK=false
-  fi
-  if ! grep -q "Read(/${PROXY_CONFIG_DIR_TARGET}" "$SETTINGS_PATH" 2>/dev/null; then
-    READ_RESTRICTION_OK=false
-  fi
-  if ! grep -q "Read(/${PROXY_STATE_DIR_TARGET}" "$SETTINGS_PATH" 2>/dev/null; then
-    READ_RESTRICTION_OK=false
-  fi
-  if ! grep -q "Read(/${PROXY_HOME_TARGET}" "$SETTINGS_PATH" 2>/dev/null; then
-    READ_RESTRICTION_OK=false
-  fi
-  if [ "$READ_RESTRICTION_OK" != "true" ]; then
-    if [ "$EXIT_CODE" -eq 0 ]; then EXIT_CODE=6; fi
-  fi
-fi
-
-cat <<JSON_EOF
-{
-  "schema": "CLAUDE_GPT_PREFLIGHT_RESULT_V1",
-  "env_only": ${ENV_ONLY},
-  "home_source": "${HOME_SOURCE}",
-  "binary_available": ${BINARY_OK},
-  "proxy": {
-    "absolute_path": "${PROXY_BIN}",
-    "version": "${PROXY_VERSION}"
-  },
-  "chatgpt_auth": {
-    "available": ${AUTH_OK},
-    "detail": "${AUTH_DETAIL}"
-  },
-  "canonical_paths": {
-    "applicable": ${PATH_APPLICABLE},
-    "ok": ${PATH_OK},
-    "claude_config_dir": "${CLAUDE_CONFIG_DIR_TARGET}",
-    "proxy_config_dir": "${PROXY_CONFIG_DIR_TARGET}",
-    "proxy_state_dir": "${PROXY_STATE_DIR_TARGET}",
-    "proxy_home_dir": "${PROXY_HOME_TARGET}",
-    "violations": "${PATH_VIOLATIONS}"
-  },
-  "read_restriction": {
-    "applicable": ${READ_RESTRICTION_APPLICABLE},
-    "ok": ${READ_RESTRICTION_OK},
-    "settings_path": "${SETTINGS_PATH}"
-  },
-  "exit_code": ${EXIT_CODE}
-}
-JSON_EOF
-
-exit "$EXIT_CODE"
+    ;;
+esac

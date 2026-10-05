@@ -526,22 +526,20 @@ def test_installer_bash_only_construct_fails_under_sh_execution_boundary(tmp_pat
 # --- fix_delta F7: end-to-end repair -> normal launcher re-selection path -------
 
 
-def test_repair_then_default_resolution_selects_managed_binary_and_passes_preflight(tmp_path):
+def test_repair_is_binary_scoped_and_does_not_redirect_launcher_auxiliary_evidence(tmp_path):
     """GIVEN PATH exposes an old/incompatible `claude-code-proxy` binary
     WHEN repair_proxy.sh (via the fixture installer) installs a compatible
-    proxy into `$CLAUDE_GPT_HOME/bin`, and afterwards
-    `claude_gpt_resolve_proxy_bin()` is called WITHOUT an explicit
-    `CLAUDE_GPT_PROXY_BIN` override
-    THEN resolution selects the managed binary (fix_delta F3 binary
-    precedence: home_bin_dir before PATH) -- not the stale PATH one -- and a
-    subsequent `launch.sh --check-only` PASSes using that managed binary
-    (repair -> normal launcher re-selection path actually works end-to-end,
-    not just each half in isolation).
+    proxy into `$CLAUDE_GPT_HOME/bin`
+    THEN (Issue #2925 AC3) the result states that only a BINARY was repaired
+    and that the running server must be restarted by its owner, and
+    `claude_gpt_resolve_proxy_bin()` (the default launcher's auxiliary
+    evidence) still reports the PATH binary: the launcher never starts a
+    proxy, so the repaired managed binary is not something it runs or
+    reports as the connected server.
     """
     required = _required_models()
     claude_gpt_home = tmp_path / "claude-gpt-home"
 
-    # Stale PATH candidate: must NOT be selected after repair.
     path_bin_dir = tmp_path / "path-bin"
     path_bin_dir.mkdir()
     old_path_proxy = write_fake_proxy(
@@ -555,17 +553,20 @@ def test_repair_then_default_resolution_selects_managed_binary_and_passes_prefli
     assert repair_result.returncode == 0, repair_result.stderr
     repair_payload = json.loads(repair_result.stdout)
     assert repair_payload["status"] == "ok"
+    assert repair_payload["repaired_scope"] == "binary_only"
+    assert repair_payload["server_restart_required"] is True
     managed_bin = claude_gpt_home / "bin" / "claude-code-proxy"
     assert repair_payload["installed_path"] == str(managed_bin)
     assert managed_bin.exists()
+    assert "NOT restarted" in repair_result.stderr
 
     resolve_env = dict(os.environ)
     resolve_env["CLAUDE_GPT_HOME"] = str(claude_gpt_home)
     resolve_env["PATH"] = f"{path_bin_dir}{os.pathsep}{resolve_env['PATH']}"
     resolve_env.pop("CLAUDE_GPT_PROXY_BIN", None)
 
-    # --- step 2: explicit-override-free resolution picks the managed binary,
-    #     not the stale PATH one. ---
+    # --- step 2: explicit-override-free resolution still reports the PATH
+    #     binary (auxiliary evidence), never the managed repair target. ---
     resolve_result = subprocess.run(
         ["sh", "-c", ". ./lib.sh; claude_gpt_resolve_proxy_bin"],
         cwd=str(SCRIPT_DIR),
@@ -576,28 +577,8 @@ def test_repair_then_default_resolution_selects_managed_binary_and_passes_prefli
     )
     assert resolve_result.returncode == 0, resolve_result.stderr
     resolved_bin = resolve_result.stdout.strip()
-    assert resolved_bin == str(managed_bin)
-    assert resolved_bin != str(old_path_proxy)
-
-    # --- step 3: launch.sh --check-only, with the same stale-PATH-present /
-    #     no-explicit-override environment, actually PASSes using the managed
-    #     binary (not merely that resolution *would* pick it in isolation). ---
-    check_only_env = dict(resolve_env)
-    check_only_env.pop("CLAUDE_GPT_CLAUDE_BIN", None)
-    check_result = subprocess.run(
-        [str(LAUNCH_SH), "--check-only"],
-        cwd=str(SCRIPT_DIR),
-        env=check_only_env,
-        capture_output=True,
-        text=True,
-        timeout=40,
-    )
-    assert check_result.returncode == 0, check_result.stderr
-    receipt = json.loads(check_result.stdout)
-    assert receipt["status"] == "ok"
-    assert receipt["model_alias_ok"] is True
-    assert receipt["proxy"]["absolute_path"] == str(managed_bin)
-    assert receipt["proxy"]["absolute_path"] != str(old_path_proxy)
+    assert resolved_bin == str(old_path_proxy)
+    assert resolved_bin != str(managed_bin)
 
 
 # --- misc: dry-run / curl-unavailable guardrails (scripts/CLAUDE.md 破壊的処理不変条件) --
