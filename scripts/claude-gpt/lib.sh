@@ -351,7 +351,7 @@ claude_gpt_probe_models() {
     return 1
   fi
   _cgt_pm_tmp=$(mktemp 2>/dev/null) || return 1
-  CGD_MODELS_HTTP_STATUS=$(curl -s --connect-timeout 2 -m 3 -o "$_cgt_pm_tmp" -w '%{http_code}' "${_cgt_pm_base}/v1/models" 2>/dev/null) || CGD_MODELS_HTTP_STATUS="000"
+  CGD_MODELS_HTTP_STATUS=$(curl -q --noproxy '*' -s --connect-timeout 2 -m 3 -o "$_cgt_pm_tmp" -w '%{http_code}' "${_cgt_pm_base}/v1/models" 2>/dev/null) || CGD_MODELS_HTTP_STATUS="000"
   [ -n "$CGD_MODELS_HTTP_STATUS" ] || CGD_MODELS_HTTP_STATUS="000"
   if [ "$CGD_MODELS_HTTP_STATUS" = "200" ]; then
     CGD_MODELS_JSON=$(cat "$_cgt_pm_tmp" 2>/dev/null)

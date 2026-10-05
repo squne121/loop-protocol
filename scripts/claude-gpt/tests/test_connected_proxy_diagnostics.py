@@ -20,6 +20,8 @@ import importlib.util
 import json
 import stat
 import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -267,7 +269,7 @@ def test_loopback_reject_non_loopback_hosts(tmp_path, host):
 
     exit code と stdout/stderr の `non_loopback` 分類を観測する。network request は発生しない。"""
     proc = _run_check_only_with_bash(tmp_path, f"http://{host}:18765")
-    assert proc.returncode != 0, (proc.stdout, proc.stderr)
+    assert proc.returncode == 7, (proc.stdout, proc.stderr)
     assert "non_loopback" in proc.stdout + proc.stderr, (proc.stdout, proc.stderr)
     connected = json.loads(proc.stdout)["connected_server"]
     assert connected["classification"] == "non_loopback"
@@ -299,6 +301,106 @@ def test_default_base_url_is_the_upstream_loopback_endpoint(tmp_path):
     env = H.base_env(tmp_path, ANTHROPIC_BASE_URL=None)
     proc = H.run_launcher(["--dry-run"], env)
     assert json.loads(proc.stdout)["base_url"] == "http://127.0.0.1:18765"
+
+
+# ---------------------------------------------------------------------------
+# probe must reach the validated loopback target directly (#2939 P1: ambient proxy / .curlrc)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingServer:
+    """In-process loopback HTTP server that records every request path it receives.
+
+    `models` is the `/v1/models` catalog it serves. A fake *proxy* serves an incomplete catalog
+    so that a probe wrongly routed through it cannot be mistaken for the real target."""
+
+    def __init__(self, models):
+        self.hits: list[str] = []
+        hits = self.hits
+        body = json.dumps({"data": [{"id": m} for m in models]}).encode()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                hits.append(self.path)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, fmt, *args):
+                return
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def _plain_curl_get(child_env: dict, url: str) -> None:
+    """Control: a bare `curl` run with the very same child environment.
+
+    Used to prove the ambient proxy setting really reaches child processes in this test
+    (so a PASS cannot come from the setting being silently dropped)."""
+    subprocess.run(
+        ["curl", "-s", "--connect-timeout", "2", "-m", "3", "-o", "/dev/null", f"{url}/v1/models"],
+        env=child_env,
+        capture_output=True,
+        timeout=10,
+    )
+
+
+# 大文字 HTTP_PROXY は curl 自身が（CGI 対策で）無視するため対象外。curl が実際に参照する変数のみ。
+@pytest.mark.parametrize("proxy_var", ["http_proxy", "ALL_PROXY", "all_proxy"])
+def test_probe_bypasses_ambient_proxy_and_reaches_the_loopback_target(tmp_path, proxy_var):
+    with _RecordingServer(("gpt-6-sol", "gpt-6-luna")) as target, _RecordingServer(("not-the-target",)) as proxy:
+        child_env = H.base_env(tmp_path, ANTHROPIC_BASE_URL=target.url, **{proxy_var: proxy.url})
+        assert child_env[proxy_var] == proxy.url
+        # control: the ambient proxy setting really diverts a plain curl in this environment.
+        _plain_curl_get(child_env, target.url)
+        assert proxy.hits, "control failed: ambient proxy setting did not reach curl; test would be a false PASS"
+        proxy.hits.clear()
+        target.hits.clear()
+
+        proc = H.run_launcher(["--check-only"], child_env)
+
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    connected = json.loads(proc.stdout)["connected_server"]
+    assert connected["model_catalog_ok"] is True and connected["missing_models"] == []
+    assert "/v1/models" in target.hits, "target never received /v1/models"
+    assert proxy.hits == [], f"probe was diverted through the ambient proxy: {proxy.hits}"
+
+
+def test_probe_ignores_default_curlrc_proxy_and_reaches_the_loopback_target(tmp_path):
+    with _RecordingServer(("gpt-6-sol", "gpt-6-luna")) as target, _RecordingServer(("not-the-target",)) as proxy:
+        child_env = H.base_env(tmp_path, ANTHROPIC_BASE_URL=target.url)
+        # curl 8.5 searches $CURL_HOME, $XDG_CONFIG_HOME/.curlrc, then $HOME/.curlrc. Write the same
+        # .curlrc to every candidate so it is read whichever one this curl prefers.
+        for directory in (Path(child_env["HOME"]), Path(child_env["XDG_CONFIG_HOME"])):
+            (directory / ".curlrc").write_text(f'proxy = "{proxy.url}"\n', encoding="utf-8")
+        # control: the .curlrc really diverts a plain curl run with this environment.
+        _plain_curl_get(child_env, target.url)
+        assert proxy.hits, "control failed: .curlrc proxy was not honoured; test would be a false PASS"
+        proxy.hits.clear()
+        target.hits.clear()
+
+        proc = H.run_launcher(["--check-only"], child_env)
+
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert json.loads(proc.stdout)["connected_server"]["model_catalog_ok"] is True
+    assert "/v1/models" in target.hits, "target never received /v1/models"
+    assert proxy.hits == [], f".curlrc proxy diverted the probe: {proxy.hits}"
 
 
 # ---------------------------------------------------------------------------
