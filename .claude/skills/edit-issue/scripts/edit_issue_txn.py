@@ -800,7 +800,7 @@ def _child_error(cp: subprocess.CompletedProcess[str], code: str) -> dict[str, s
 def _fetch_issue(issue_number: int, repo: str) -> tuple[dict[str, Any] | None, str]:
     gh = shutil.which("gh") or "gh"
     cp = _run_command(
-        [gh, "issue", "view", str(issue_number), "--repo", repo, "--json", "title,body,updatedAt"],
+        [gh, "issue", "view", str(issue_number), "--repo", repo, "--json", "title,body,updatedAt,state"],
         env=_sanitized_gh_env(),
     )
     if cp.returncode != 0:
@@ -809,32 +809,6 @@ def _fetch_issue(issue_number: int, repo: str) -> tuple[dict[str, Any] | None, s
         return json.loads(cp.stdout), ""
     except json.JSONDecodeError:
         return None, "gh_issue_view_non_json"
-
-
-def _fetch_issue_state(issue_number: int, repo: str) -> tuple[str | None, str]:
-    """Live Issue state via a dedicated `gh issue view --json state` readback.
-
-    Kept separate from `_fetch_issue` so that every existing `_fetch_issue`
-    caller / fake keeps its exact `--json title,body,updatedAt` argv. Only the
-    pre-existing readiness compatibility lane calls this, and only when it
-    actually needs the live state. Any failure returns (None, reason) so the
-    caller fails closed with the original rejection.
-    """
-    gh = shutil.which("gh") or "gh"
-    cp = _run_command(
-        [gh, "issue", "view", str(issue_number), "--repo", repo, "--json", "state"],
-        env=_sanitized_gh_env(),
-    )
-    if cp.returncode != 0:
-        return None, _bounded(cp.stderr.strip() or cp.stdout.strip())
-    try:
-        data = json.loads(cp.stdout)
-    except (json.JSONDecodeError, TypeError):
-        return None, "gh_issue_view_state_non_json"
-    live_state = data.get("state") if isinstance(data, dict) else None
-    if not isinstance(live_state, str) or not live_state:
-        return None, "gh_issue_view_state_missing"
-    return live_state, ""
 
 
 # Issue #2922: pre-existing readiness defect compatibility lane.
@@ -862,31 +836,74 @@ def _compat_lane_static_preconditions_met(title_update: dict[str, Any], relation
     """Preconditions that need no gh call (title / native relationship scope).
 
     The live state precondition (CLOSED) is checked separately through a live
-    `_fetch_issue_state` readback, only once this cheap check has passed.
+    live `state` of the single `_fetch_issue` snapshot, only once this cheap
+    check has passed.
     """
     return not title_update.get("required") and _native_relationships_is_noop(relationship_input)
 
 
-def _split_h2_sections(body: str) -> list[tuple[str | None, str]]:
-    """Split a body into (heading, raw_text) chunks at top-level `## ` lines.
+_PROSE_BOUNDARY_POLICY_MODULE_NAME = "_edit_issue_txn_prose_boundary_policy"
+_PROSE_BOUNDARY_POLICY_RELPATH = Path(".claude") / "skills" / "create-issue" / "scripts" / "prose_boundary_policy.py"
 
-    The first chunk (heading None) is the preamble before the first H2. Lines
-    inside fenced code blocks never start a new section.
+
+def _load_prose_boundary_policy() -> Any:
+    """Load the shared GFM fence / ATX heading SSOT (prose_boundary_policy.py).
+
+    Resolved from the real on-disk script location (not the mutable REPO_ROOT
+    that tests monkeypatch) and loaded lazily under a unique module name, so
+    title / body-only calls outside the compatibility lane never depend on it
+    and a same-named `prose_boundary_policy` already in `sys.modules` is never
+    shadowed or reused.
     """
+    cached = sys.modules.get(_PROSE_BOUNDARY_POLICY_MODULE_NAME)
+    if cached is not None:
+        return cached
+    import importlib.util
+
+    module_path = SCRIPT_PATH.parents[4] / _PROSE_BOUNDARY_POLICY_RELPATH
+    spec = importlib.util.spec_from_file_location(_PROSE_BOUNDARY_POLICY_MODULE_NAME, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_PROSE_BOUNDARY_POLICY_MODULE_NAME] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(_PROSE_BOUNDARY_POLICY_MODULE_NAME, None)
+        raise
+    return module
+
+
+def _split_h2_sections(body: str) -> list[tuple[str | None, str]]:
+    """Split a body into (heading, raw_text) chunks at top-level H2 lines.
+
+    The first chunk (heading None) is the preamble before the first H2. Fenced
+    code and H2 detection follow CommonMark / GFM exactly through the shared
+    `prose_boundary_policy` SSOT: 0-3 spaces indent fences and ATX headings,
+    4+ spaces indent is code, a closer must be the same character and at least
+    as long as its opener. Lines inside a fence never start a new section. The
+    heading key is `"## <text>"`.
+    """
+    policy = _load_prose_boundary_policy()
+    lines = body.splitlines(keepends=True)
+    fenced: set[int] = set()
+    cursor = 0
+    for block_text, block_kind in policy.iter_markdown_blocks(body):
+        block_len = len(block_text.splitlines(keepends=True))
+        if block_kind == policy.BLOCK_KIND_CODE_FENCE:
+            fenced.update(range(cursor, cursor + block_len))
+        cursor += block_len
+    if cursor != len(lines):
+        raise ValueError("markdown block segmentation did not cover every body line")
+
     chunks: list[tuple[str | None, list[str]]] = [(None, [])]
-    fence: str | None = None
-    for line in body.splitlines(keepends=True):
-        marker = line.lstrip()[:3]
-        if marker in ("```", "~~~"):
-            if fence is None:
-                fence = marker
-            elif fence == marker:
-                fence = None
-        if fence is None and line.startswith("## "):
-            chunks.append((line.rstrip("\r\n").rstrip(), [line]))
+    for index, line in enumerate(lines):
+        heading = None if index in fenced else policy.parse_atx_heading_line(line.rstrip("\r\n"))
+        if heading is not None and heading["level"] == 2:
+            chunks.append((f"## {heading['text']}", [line]))
         else:
             chunks[-1][1].append(line)
-    return [(heading, "".join(lines)) for heading, lines in chunks]
+    return [(heading, "".join(chunk_lines)) for heading, chunk_lines in chunks]
 
 
 def _non_note_sections(body: str) -> list[tuple[str | None, str]]:
@@ -901,7 +918,11 @@ def _non_note_sections(body: str) -> list[tuple[str | None, str]]:
 
 
 def _only_notes_section_differs(live_body: str, candidate_body: str) -> bool:
-    return _non_note_sections(live_body) == _non_note_sections(candidate_body)
+    try:
+        return _non_note_sections(live_body) == _non_note_sections(candidate_body)
+    except (ImportError, ValueError):
+        # Boundary SSOT unavailable / inconsistent segmentation: fail closed.
+        return False
 
 
 def _defect_multiset_from_checker_output(rc: int, stdout: str) -> Counter | None:
@@ -1218,21 +1239,22 @@ def run_transaction(input_data: dict[str, Any]) -> dict[str, Any]:
             errors=state.errors,
         )
 
-    # The CLOSED precondition is a live `gh issue view --json state` readback
-    # (never caller-declared). It runs lazily and at most once, only when the
-    # compat lane actually needs it; any failure / unparsable / missing state
-    # is treated as "not CLOSED" (fail-closed, original rejection).
+    # The CLOSED precondition is the live `state` of the single
+    # `gh issue view --json title,body,updatedAt,state` readback taken below
+    # (never caller-declared, and never a separate request). A missing /
+    # non-str state, or a failed readback, is treated as "not CLOSED"
+    # (fail-closed, original rejection).
     compat_lane_static_ok = _compat_lane_static_preconditions_met(title_update, input_data.get("native_relationships"))
-    live_state_cache: list[str | None] = []
+    live_state: str | None = None
 
     def _live_state_is_closed() -> bool:
-        if not live_state_cache:
-            live_state_cache.append(_fetch_issue_state(state.issue_number, state.repo)[0])
-        return live_state_cache[0] == "CLOSED"
+        return live_state == "CLOSED"
 
     if deferred_needs_fix and not compat_lane_static_ok:
         return _reject_needs_fix_without_resolution_evidence()
     issue_data, issue_error = _fetch_issue(state.issue_number, state.repo)
+    if isinstance(issue_data, dict) and isinstance(issue_data.get("state"), str):
+        live_state = issue_data["state"]
     if deferred_needs_fix and (issue_data is None or not _live_state_is_closed()):
         return _reject_needs_fix_without_resolution_evidence()
     if issue_data is None:

@@ -147,8 +147,7 @@ def _install(
     repo_tmp: Path,
     *,
     live_body: str,
-    state: str | None = "CLOSED",
-    state_error: str | None = None,
+    state: Any = "CLOSED",
     readiness: Callable[[list[str], int], _CP] | None = None,
     hygiene: Callable[[list[str]], _CP] | None = None,
     readback_body: Callable[[str], str] | None = None,
@@ -160,21 +159,19 @@ def _install(
         executor_inputs=[],
         children=[],
         fetches=0,
-        state_fetches=0,
         remote={"body": live_body, "updatedAt": LIVE_UPDATED_AT},
         readiness_calls=0,
     )
 
     def _fetch(*_args: object, **_kwargs: object) -> tuple[dict | None, str]:
         env.fetches += 1
-        # `_fetch_issue` never carries `state` (its gh argv is the pre-PR form).
-        return {"title": "t", "body": env.remote["body"], "updatedAt": env.remote["updatedAt"]}, ""
-
-    def _fetch_state(*_args: object, **_kwargs: object) -> tuple[str | None, str]:
-        env.state_fetches += 1
-        if state_error is not None or state is None:
-            return None, state_error or "gh_issue_view_state_missing"
-        return state, ""
+        # Single snapshot (`--json title,body,updatedAt,state`): the live state
+        # comes from the same readback as title / body / updatedAt. `state=None`
+        # models a readback whose `state` key is absent.
+        issue: dict[str, Any] = {"title": "t", "body": env.remote["body"], "updatedAt": env.remote["updatedAt"]}
+        if state is not None:
+            issue["state"] = state
+        return issue, ""
 
     def _run(args: list[str], **_kwargs: object) -> _CP:
         if not allow_children:
@@ -202,7 +199,6 @@ def _install(
         return _CP(0), {"new_body_sha256": txn._sha256_text(new_body)}
 
     monkeypatch.setattr(txn, "_fetch_issue", _fetch)
-    monkeypatch.setattr(txn, "_fetch_issue_state", _fetch_state)
     monkeypatch.setattr(txn, "_run_command", _run)
     monkeypatch.setattr(txn, "_invoke_controlled_exec", _invoke)
     return env
@@ -311,7 +307,6 @@ def test_preexisting_readiness_open_issue_unchanged(
     )
     _assert_rejected(result, env, NEEDS_FIX_ERROR)
     assert env.children == []
-    assert env.state_fetches == 1
 
     # candidate static readiness failure: legacy rejection even with the same live defect.
     result, env = _run_lane(
@@ -431,7 +426,6 @@ def test_preexisting_readiness_human_judgment_fail_closed(
     assert result["mutation_started"] is False
     assert env.invoked == []
     assert env.fetches == 0  # fail-closed before any live readback
-    assert env.state_fetches == 0
     assert result["errors"][0]["code"] == "readiness_forwarding_requires_human_judgment"
 
 
@@ -506,7 +500,6 @@ def test_preexisting_readiness_title_or_relationship_rejected(
     )
     result = txn.run_transaction(payload)
     _assert_rejected(result, env, reject_code)
-    assert env.state_fetches == 0  # cheap static preconditions fail first; no state readback needed
 
 
 # --- AC8 --------------------------------------------------------------------
@@ -713,14 +706,14 @@ def test_preexisting_readiness_result_schema_unchanged(
     assert lane_result["schema"] == txn.RESULT_SCHEMA
 
 
-# --- live state readback is a separate, lazily-invoked helper -----------------
+# --- live state comes from the single `_fetch_issue` snapshot ---------------
 
 
 @LANES
 @pytest.mark.parametrize(
     "state_kwargs",
-    [{"state_error": "gh: boom"}, {"state": None}, {"state": ""}],
-    ids=["gh_failure", "state_missing", "state_empty"],
+    [{"state": None}, {"state": ""}, {"state": 1}],
+    ids=["state_missing", "state_empty", "state_not_str"],
 )
 def test_preexisting_readiness_state_readback_failure_fail_closed(
     repo_tmp: Path,
@@ -735,44 +728,28 @@ def test_preexisting_readiness_state_readback_failure_fail_closed(
         monkeypatch, repo_tmp, live_body=live, new_body=new, forwarded_status=forwarded_status, **state_kwargs
     )
     _assert_rejected(result, env, reject_code)
-    assert env.state_fetches == 1
     if forwarded_status == "needs_fix":
         assert env.children == []  # original rejection: no child process at all
 
 
 @pytest.mark.parametrize("forwarded_status", ["needs_fix", "go"])
-def test_preexisting_readiness_state_fetched_only_when_lane_needed(
+def test_preexisting_readiness_state_reuses_snapshot_no_extra_readback(
     repo_tmp: Path, monkeypatch: pytest.MonkeyPatch, forwarded_status: str
 ) -> None:
-    # Normal clean path: candidate static readiness passes (forwarded `go`), so
-    # the compat lane is never entered and no state readback happens.
+    # The compat lane decision adds no readback of its own: the same number of
+    # `_fetch_issue` snapshots (live + post-edit) is taken as for a clean edit.
     clean_live = _body()
     clean_new = _body(notes="note")
-    if forwarded_status == "go":
-        result, env = _run_lane(
-            monkeypatch, repo_tmp, live_body=clean_live, new_body=clean_new, forwarded_status="go"
-        )
-        assert result["status"] == "ok", result["errors"]
-        assert env.state_fetches == 0
-        return
+    clean_result, clean_env = _run_lane(
+        monkeypatch, repo_tmp, live_body=clean_live, new_body=clean_new, forwarded_status="go"
+    )
+    assert clean_result["status"] == "ok", clean_result["errors"]
 
-    # needs_fix forwarding needs the lane -> exactly one state readback, reused
-    # by the later candidate-readiness decision (cached, not re-fetched).
     live = _body(defects=("a",))
     new = _body(defects=("a",), notes="note")
-    result, env = _run_lane(monkeypatch, repo_tmp, live_body=live, new_body=new, forwarded_status="needs_fix")
+    result, env = _run_lane(monkeypatch, repo_tmp, live_body=live, new_body=new, forwarded_status=forwarded_status)
     assert result["status"] == "ok", result["errors"]
-    assert env.state_fetches == 1
-
-
-def test_preexisting_readiness_candidate_lane_state_fetched_once_on_readiness_failure(
-    repo_tmp: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    live = _body(defects=("a",))
-    new = _body(defects=("a",), notes="note")
-    result, env = _run_lane(monkeypatch, repo_tmp, live_body=live, new_body=new, forwarded_status="go")
-    assert result["status"] == "ok", result["errors"]
-    assert env.state_fetches == 1
+    assert env.fetches == clean_env.fetches
 
 
 # --- forwarded needs_fix + CLOSED + unchanged body (reviewer warning 2) -------
@@ -794,4 +771,124 @@ def test_preexisting_readiness_needs_fix_closed_unchanged_body_current_behavior(
     assert result["mutation_started"] is False
     assert result["body_update"]["attempted"] is False
     assert env.invoked == []
-    assert env.state_fetches == 1
+
+
+# --- AC11: single snapshot readback -----------------------------------------
+
+_REAL_FETCH_ISSUE = txn._fetch_issue
+
+
+@pytest.mark.parametrize(
+    ("forwarded_status", "reject_code"),
+    [("needs_fix", NEEDS_FIX_ERROR), ("go", READINESS_ERROR)],
+    ids=["needs_fix_forwarding", "candidate_static_readiness"],
+)
+@pytest.mark.parametrize("snapshot_state", ["OPEN", "CLOSED"])
+def test_preexisting_readiness_single_snapshot_fetch_issue(
+    repo_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    forwarded_status: str,
+    reject_code: str,
+    snapshot_state: str,
+) -> None:
+    live = _body(defects=("a",))
+    new = _body(defects=("a",), notes="note")
+    env = _install(monkeypatch, repo_tmp, live_body=live)
+    # Run the real `_fetch_issue` on top of a recording gh-level fake.
+    monkeypatch.setattr(txn, "_fetch_issue", _REAL_FETCH_ISSUE)
+    child_runner = txn._run_command
+    gh_argvs: list[list[str]] = []
+
+    def _run(args: list[str], **kwargs: object) -> _CP:
+        if "view" in args and "issue" in args:
+            gh_argvs.append(list(args[1:]))
+            return _CP(
+                0,
+                stdout=json.dumps(
+                    {
+                        "title": "t",
+                        "body": env.remote["body"],
+                        "updatedAt": env.remote["updatedAt"],
+                        # `state` here is the only place the live state can come from.
+                        "state": snapshot_state,
+                    }
+                ),
+            )
+        return child_runner(args, **kwargs)
+
+    monkeypatch.setattr(txn, "_run_command", _run)
+    payload = _payload(repo_tmp, live_body=live, new_body=new, forwarded_status=forwarded_status)
+    result = txn.run_transaction(payload)
+
+    json_args = [argv[argv.index("--json") + 1] for argv in gh_argvs]
+    assert json_args and all(value == "title,body,updatedAt,state" for value in json_args), json_args
+    assert "state" not in json_args  # no standalone `--json state` request is ever issued
+    assert not hasattr(txn, "_fetch_issue_state")
+    if snapshot_state == "OPEN":
+        _assert_rejected(result, env, reject_code)
+        assert len(gh_argvs) == 1  # the single live readback decided the rejection
+    else:
+        # CLOSED comes from that same readback and the compat lane allows the note-only edit.
+        assert result["status"] == "ok", result["errors"]
+        assert env.invoked
+
+
+# --- AC12: CommonMark fence semantics for the Notes boundary -----------------
+
+# Each tail is the Notes content after a `note` line; `{x}` is the item under
+# `## Allowed Paths`. `real_h2=True` means that `## Allowed Paths` line is a real
+# (non-code) H2 section after Notes; changing it must be refused. `real_h2=False`
+# means it is code / prose inside the Notes section; changing it is note-only.
+_BOUNDARY_CASES = [
+    pytest.param("    ```\n\n## Allowed Paths\n\n- {x}\n", True, id="indent4_backtick_not_fence"),
+    pytest.param("    ~~~\n\n## Allowed Paths\n\n- {x}\n", True, id="indent4_tilde_not_fence"),
+    pytest.param("text\n\n  ## Allowed Paths\n\n- {x}\n", True, id="indent2_h2_is_real_h2"),
+    pytest.param("text\n\n   ## Allowed Paths\n\n- {x}\n", True, id="indent3_h2_is_real_h2"),
+    pytest.param("```\ncode\n```\n\n## Allowed Paths\n\n- {x}\n", True, id="closed_fence_then_real_h2"),
+    pytest.param(
+        "~~~\n```\n## Allowed Paths\n\n- inner\n~~~\n\n## Allowed Paths\n\n- {x}\n",
+        True,
+        id="tilde_fence_not_closed_by_backtick",
+    ),
+    pytest.param("````\ncode\n`````\n\n## Allowed Paths\n\n- {x}\n", True, id="four_backtick_closed_by_five"),
+    pytest.param("````\n```\n## Allowed Paths\n\n- {x}\n````\n", False, id="four_backtick_not_closed_by_three"),
+    pytest.param("```\n~~~\n## Allowed Paths\n\n- {x}\n```\n", False, id="backtick_fence_not_closed_by_tilde"),
+    pytest.param("   ```\n## Allowed Paths\n\n- {x}\n   ```\n", False, id="indent3_backtick_is_fence"),
+    pytest.param("    ## Allowed Paths\n\n- {x}\n", False, id="indent4_h2_is_not_h2"),
+]
+
+
+@LANES
+@pytest.mark.parametrize(("tail", "real_h2"), _BOUNDARY_CASES)
+def test_preexisting_readiness_note_boundary_commonmark_fence_semantics(
+    repo_tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    forwarded_status: str,
+    reject_code: str,
+    tail: str,
+    real_h2: bool,
+) -> None:
+    def _with(x: str) -> str:
+        return _body(defects=("a",), notes="note\n\n" + tail.format(x=x))
+
+    live = _with("a.py")
+    candidate = _with("b.py")
+
+    # Pure boundary predicate.
+    assert txn._only_notes_section_differs(live, candidate) is (not real_h2)
+    assert txn._only_notes_section_differs(live, live) is True
+
+    # End-to-end: the readiness defect multiset is identical (a single
+    # `DEFECT a`) for live and candidate, so only the boundary decision can reject.
+    live_defects = txn._defect_multiset_from_checker_output(1, _fake_readiness_output(live))
+    candidate_defects = txn._defect_multiset_from_checker_output(1, _fake_readiness_output(candidate))
+    assert live_defects == candidate_defects
+
+    result, env = _run_lane(
+        monkeypatch, repo_tmp, live_body=live, new_body=candidate, forwarded_status=forwarded_status
+    )
+    if real_h2:
+        _assert_rejected(result, env, reject_code)
+    else:
+        assert result["status"] == "ok", result["errors"]
+        assert env.invoked

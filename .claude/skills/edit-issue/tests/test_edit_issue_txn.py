@@ -785,10 +785,14 @@ def test_needs_fix_forwarding_does_not_mutate_without_resolution_evidence(
     # Issue #2922: the rejection is deferred until after the live readback
     # (`_fetch_issue`); an OPEN Issue is still rejected with no child process.
     def _fetch(*_args: object, **_kwargs: object) -> tuple[dict | None, str]:
-        return {"title": "old", "body": "old issue body", "updatedAt": "2026-07-03T10:40:51Z"}, ""
+        return {
+            "title": "old",
+            "body": "old issue body",
+            "updatedAt": "2026-07-03T10:40:51Z",
+            "state": "OPEN",
+        }, ""
 
     monkeypatch.setattr(txn, "_fetch_issue", _fetch)
-    monkeypatch.setattr(txn, "_fetch_issue_state", lambda *_a, **_k: ("OPEN", ""))
     monkeypatch.setattr(txn, "_run_command", _run)
 
     result = txn.run_transaction(payload)
@@ -798,54 +802,24 @@ def test_needs_fix_forwarding_does_not_mutate_without_resolution_evidence(
     assert result["errors"][0]["code"] == "readiness_needs_fix_without_resolution_evidence"
 
 
-def test_fetch_issue_argv_is_unchanged_and_does_not_request_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Issue #2922: other callers / fakes match this argv exactly; the live
-    # `state` must never be added to it.
+def test_fetch_issue_argv_single_snapshot_includes_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Issue #2922: one `gh issue view` readback carries title / body /
+    # updatedAt / state; there is no separate state-only request helper.
     seen: list[list[str]] = []
 
     def _run(args: list[str], **_kwargs: object) -> _CP:
         seen.append(args)
-        return _CP(0, stdout='{"title":"t","body":"b","updatedAt":"u"}')
+        return _CP(0, stdout='{"title":"t","body":"b","updatedAt":"u","state":"CLOSED"}')
 
     monkeypatch.setattr(txn, "_run_command", _run)
     issue, err = txn._fetch_issue(1, "squne121/loop-protocol")
     assert err == ""
-    assert issue == {"title": "t", "body": "b", "updatedAt": "u"}
+    assert issue == {"title": "t", "body": "b", "updatedAt": "u", "state": "CLOSED"}
+    assert len(seen) == 1
     assert seen[0][1:] == [
-        "issue", "view", "1", "--repo", "squne121/loop-protocol", "--json", "title,body,updatedAt",
+        "issue", "view", "1", "--repo", "squne121/loop-protocol", "--json", "title,body,updatedAt,state",
     ]
-
-
-def test_fetch_issue_state_argv_and_result(monkeypatch: pytest.MonkeyPatch) -> None:
-    seen: list[list[str]] = []
-
-    def _run(args: list[str], **_kwargs: object) -> _CP:
-        seen.append(args)
-        return _CP(0, stdout='{"state":"CLOSED"}')
-
-    monkeypatch.setattr(txn, "_run_command", _run)
-    assert txn._fetch_issue_state(7, "squne121/loop-protocol") == ("CLOSED", "")
-    assert seen[0][1:] == ["issue", "view", "7", "--repo", "squne121/loop-protocol", "--json", "state"]
-
-
-@pytest.mark.parametrize(
-    "cp",
-    [
-        _CP(1, stderr="gh: boom"),
-        _CP(0, stdout="not json"),
-        _CP(0, stdout="[]"),
-        _CP(0, stdout="{}"),
-        _CP(0, stdout='{"state":null}'),
-        _CP(0, stdout='{"state":""}'),
-        _CP(0, stdout='{"state":1}'),
-    ],
-    ids=["gh_failure", "non_json", "non_object", "state_missing", "state_null", "state_empty", "state_not_str"],
-)
-def test_fetch_issue_state_failure_returns_none(monkeypatch: pytest.MonkeyPatch, cp: _CP) -> None:
-    monkeypatch.setattr(txn, "_run_command", lambda *_a, **_k: cp)
-    live_state, err = txn._fetch_issue_state(7, "squne121/loop-protocol")
-    assert live_state is None
-    assert err
+    assert not hasattr(txn, "_fetch_issue_state")
 
 
 def _assert_no_child_stdout_stderr_leak(
