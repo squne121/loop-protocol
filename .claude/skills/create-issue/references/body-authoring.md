@@ -139,32 +139,34 @@ Issue 起票時に動作検証の適用判定セクションを記載する。`r
 
 ### `actual`/`canonical` ランタイム受け入れと `fixture` 意味論との AC 分離規則（Issue #2807）
 
-AC が **actual / canonical / default runtime selection**（例: current-head production launcher が通常の binary resolution で選択する proxy / 依存プロセスの identity）を要求する場合、fixture proxy を明示注入する hermetic test（fixture-only VC）を、その AC の唯一の evidence にしてはならない。
+AC が **actual / canonical / default runtime selection**（例: current-head production launcher が接続する server（`ANTHROPIC_BASE_URL` の向き先）の診断結果）を要求する場合、fixture / mock server を明示注入する hermetic test（fixture-only VC）を、その AC の唯一の evidence にしてはならない。
 
 少なくとも次の2種類の AC を区別して起票する。
 
 1. **fixture semantics AC**: catalog mismatch / repair / precedence 等のロジックを hermetic fixture（fake binary injection 等）で検証する AC。
-2. **canonical runtime acceptance AC**: current-head production launcher を通常の binary resolution で external process として起動し、actual selected proxy identity と `--check-only` 相当の結果を観測する AC。
+2. **canonical runtime acceptance AC**: current-head production launcher を external process として起動し、actual connected server の diagnosis（`launch_check_only.connected_server`）と `--check-only` 相当の結果を観測する AC（connected-server AC）。launcher は proxy を選択・起動せず、`ANTHROPIC_BASE_URL` が実際に向く running server だけを診断する。
 
 fixture semantics AC の PASS は canonical runtime acceptance AC の代替にならない。**両方が必要な場合は、単一の AC/VC に混在させず、別々の AC と別々の VC に分離して起票する**。1つの AC に fixture-only VC と「real smoke は SKIP でよい」という記述を同居させ、それを canonical runtime acceptance の充足として扱わない。
 
-**canonical runtime acceptance evidence の必須フィールド**（fixture proxy の path/version のみでは不十分）:
+**canonical runtime acceptance evidence の必須フィールド**（fixture / mock server に向けた check-only の evidence のみでは不十分）:
 
 - `run_head_sha`
 - `git_dirty`
 - 実行 command identity（実際に起動したコマンド文字列 / invocation）
 - launcher hash
-- selected proxy の absolute path / version / hash
+- actual connected server の diagnosis（`connected_server` の `base_url` / `reachable` / `model_catalog_ok` / `classification`）
 
 上記の必須フィールドと既存 producer `CLAUDE_GPT_SMOKE_RESULT_V1`（`scripts/claude-gpt/runtime_smoke_test.sh`）の実 schema との対応（新しい schema field は追加しない）:
 
 - `run_head_sha` := `CLAUDE_GPT_SMOKE_RESULT_V1.sut.git_head`
 - `git_dirty` := `CLAUDE_GPT_SMOKE_RESULT_V1.sut.git_dirty`
 - launcher hash := `CLAUDE_GPT_SMOKE_RESULT_V1.sut.launch_sh_sha256`
-- selected proxy の absolute path / version / hash := `CLAUDE_GPT_SMOKE_RESULT_V1.proxy.absolute_path` / `.proxy.version` / `.proxy.sha256`
+- actual connected server の diagnosis := `CLAUDE_GPT_SMOKE_RESULT_V1.launch_check_only.connected_server`（`launch.sh --check-only` の `CLAUDE_GPT_LAUNCH_RESULT_V1.connected_server` と同一。**接続先 authority はこれのみ**）
+- `launch_check_only.local_proxy_binary_auxiliary`（PATH 上の `claude-code-proxy` binary の path / version）は **非 authority の補助診断** であり、接続先 server が動かしている binary とは限らない。evidence 要件を満たす根拠にしない
+- 接続先 server の version / hash は現行 interface から観測できないため **「未確認」** と記録する（`connected_server.version` は常に `"未確認"`。PATH 上の binary の version を server version として代用しない）
 - 実行 command identity := authoritative evidence に束縛された literal command 文字列とその command SHA256
 
-fixture proxy の path/version のみを記載した evidence は、canonical runtime acceptance AC の充足として **明示的に不十分** である。catalog / proxy-selection AC は fake `CLAUDE_GPT_PROXY_BIN` override なしの current-head production `scripts/claude-gpt/launch.sh --check-only` を canonical acceptance の最低限とし、authenticated request / transport の意味論自体を AC が要求する場合に限り `scripts/claude-gpt/runtime_smoke_test.sh` の full smoke を追加要求する。full smoke の認証不足 SKIP は catalog-only AC を failure 扱いしないが、authenticated request / transport AC 自体を PASS にはしない。canonical runtime evidence の取得には、新しい harness を作らず既存の `scripts/claude-gpt/launch.sh --check-only` / `scripts/claude-gpt/runtime_smoke_test.sh` のような current-head production 実行資産を参照する。
+fixture / mock server に向けた check-only の evidence（`ANTHROPIC_BASE_URL` を fixture / mock server へ向けた結果や、PATH 上の binary の path / version のみを記載した evidence）は、canonical runtime acceptance AC の充足として **明示的に不十分** である。catalog / connected-server AC は `ANTHROPIC_BASE_URL` を fixture / mock server へ向けない current-head production `scripts/claude-gpt/launch.sh --check-only`（接続先 server の `connected_server` 診断。catalog 不足は `reason: model_alias_not_resolved` / `cause: connected_server_model_catalog_incomplete`）を canonical acceptance の最低限とし、`connected_server.model_catalog_ok` は `/v1/models` に required model が列挙されていることだけを示す（実 ChatGPT subscription request の受理や provider fallback の不在の証明ではない）。`CLAUDE_GPT_PROXY_BIN` は補助 binary path の解決にのみ影響し接続先 server の authority ではないため、fake `CLAUDE_GPT_PROXY_BIN` の有無を connected-server AC の充足判定に使わない。authenticated request / transport の意味論自体を AC が要求する場合に限り `scripts/claude-gpt/runtime_smoke_test.sh` の full smoke を追加要求する。full smoke の認証不足 SKIP は catalog-only AC を failure 扱いしないが、authenticated request / transport AC 自体を PASS にはしない。canonical runtime evidence の取得には、新しい harness を作らず既存の `scripts/claude-gpt/launch.sh --check-only` / `scripts/claude-gpt/runtime_smoke_test.sh` のような current-head production 実行資産を参照する。
 
 ### 実行時検証プロファイルの assertion binding 記法（`runtime_assertion_bindings`, Issue #2771）
 
