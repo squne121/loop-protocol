@@ -100,6 +100,34 @@ def test_check_only_prefix_lookalike_model_ids_do_not_count_as_required_models(t
     assert sorted(payload["connected_server"]["missing_models"]) == ["gpt-6-luna", "gpt-6-sol"]
 
 
+@pytest.mark.parametrize(
+    "raw_body",
+    [
+        '{"note":"gpt-6-sol","fallback":"gpt-6-luna"}',  # 別 field の値は catalog ではない
+        '{"data":{"gpt-6-sol":1,"gpt-6-luna":2}}',  # data が list ではない
+        '{"data":["gpt-6-sol","gpt-6-luna"]}',  # 要素が object ではない
+        '{"data":[{"name":"gpt-6-sol"},{"name":"gpt-6-luna"}]}',  # id ではなく name
+        '{"data":[{"id":"gpt-6-sol-mini"},{"id":"xgpt-6-luna"}]}',  # prefix / suffix lookalike
+        '["gpt-6-sol","gpt-6-luna"]',  # top-level が object ではない
+        "not json gpt-6-sol gpt-6-luna",  # parse 不能
+        "",
+    ],
+)
+def test_check_only_requires_exact_data_id_in_a_structured_catalog(tmp_path, raw_body):
+    with H.FakeServer(raw_models_body=raw_body) as server:
+        proc, payload = _check_only(tmp_path, server.url)
+    assert proc.returncode == 7, (proc.stdout, proc.stderr)
+    assert sorted(payload["connected_server"]["missing_models"]) == ["gpt-6-luna", "gpt-6-sol"]
+
+
+def test_check_only_reports_only_the_missing_one_for_a_partial_structured_catalog(tmp_path):
+    body = '{"object":"list","data":[{"id":"gpt-6-sol","note":"gpt-6-luna"}]}'
+    with H.FakeServer(raw_models_body=body) as server:
+        proc, payload = _check_only(tmp_path, server.url)
+    assert proc.returncode == 7
+    assert payload["connected_server"]["missing_models"] == ["gpt-6-luna"]
+
+
 def test_normal_launch_is_blocked_on_an_incomplete_catalog_and_never_reaches_claude(tmp_path):
     with H.FakeServer(models=("gpt-6-sol",)) as server:
         proc, observed, _env = H.run_launcher_with_fake_claude(tmp_path, server.url, ("-p", "x"))
@@ -295,3 +323,50 @@ def test_failure_receipt_states_the_repair_scope_and_who_must_restart_the_server
     assert payload["repair_command"] == "scripts/claude-gpt/repair_proxy.sh"
     assert "BINARY" in payload["repair_scope"] and "owner must restart" in payload["repair_scope"]
     assert "SERVER OWNER" in payload["start_hint"]
+
+
+# ---------------------------------------------------------------------------
+# auxiliary PATH binary must never block the launcher (hanging --version)
+# ---------------------------------------------------------------------------
+
+
+def _write_hanging_path_proxy(directory: Path, started: Path) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    binary = directory / "claude-code-proxy"
+    binary.write_text(
+        f'#!/bin/sh\necho started >> "{started}"\nsleep 60 &\nsleep 60\n',
+        encoding="utf-8",
+    )
+    binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+    return binary
+
+
+def test_hanging_auxiliary_binary_does_not_block_dry_run_or_normal_launch(tmp_path):
+    started = tmp_path / "aux-started"
+    path_bin = _write_hanging_path_proxy(tmp_path / "bin", started)
+    search_path = str(path_bin.parent) + ":" + H.base_env(tmp_path)["PATH"]
+    with H.FakeServer() as server:
+        launch_env = H.base_env(tmp_path, ANTHROPIC_BASE_URL=server.url, PATH=search_path)
+        dry = H.run_launcher(["--dry-run"], launch_env, timeout=10)
+        assert dry.returncode == 0, dry.stderr
+        assert not started.exists(), "dry-run must not execute the auxiliary PATH binary"
+        proc, observed, _ = H.run_launcher_with_fake_claude(tmp_path, server.url, ("-p", "x"), PATH=search_path)
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert observed is not None
+    assert not started.exists(), "normal launch must not execute the auxiliary PATH binary"
+
+
+def test_hanging_auxiliary_binary_is_bounded_and_unconfirmed_in_check_only(tmp_path):
+    import time
+
+    started = tmp_path / "aux-started"
+    path_bin = _write_hanging_path_proxy(tmp_path / "bin", started)
+    search_path = str(path_bin.parent) + ":" + H.base_env(tmp_path)["PATH"]
+    with H.FakeServer() as server:
+        t0 = time.monotonic()
+        proc, payload = _check_only(tmp_path, server.url, PATH=search_path)
+        elapsed = time.monotonic() - t0
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert elapsed < 15, f"check-only blocked on the auxiliary binary for {elapsed:.1f}s"
+    assert payload["local_proxy_binary_auxiliary"]["version"] == "unknown"
+    assert payload["connected_server"]["model_catalog_ok"] is True

@@ -43,7 +43,10 @@ _FAKE_SERVER_SOURCE = textwrap.dedent(
         def do_GET(self):  # noqa: N802
             if self.path == "/v1/models":
                 status = config["models_status"]
-                body = json.dumps({"data": [{"id": m} for m in config["models"]]}).encode()
+                if config.get("raw_models_body") is not None:
+                    body = config["raw_models_body"].encode()
+                else:
+                    body = json.dumps({"data": [{"id": m} for m in config["models"]]}).encode()
             elif self.path == "/healthz":
                 status = 200
                 body = b'{"ok":true}'
@@ -79,10 +82,11 @@ sys.exit(int(os.environ.get("FAKE_CLAUDE_EXIT", "0")))
 class FakeServer:
     """Separate-process fake claude-code-proxy bound to a real loopback TCP port."""
 
-    def __init__(self, models=REQUIRED_MODELS, models_status: int = 200):
+    def __init__(self, models=REQUIRED_MODELS, models_status: int = 200, raw_models_body: str | None = None):
         self.proc = subprocess.Popen(
             [sys.executable, "-c", _FAKE_SERVER_SOURCE,
-             json.dumps({"models": list(models), "models_status": models_status})],
+             json.dumps({"models": list(models), "models_status": models_status,
+                         "raw_models_body": raw_models_body})],
             stdout=subprocess.PIPE,
             text=True,
         )

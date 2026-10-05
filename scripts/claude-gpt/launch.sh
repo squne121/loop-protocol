@@ -46,8 +46,8 @@ BASE_URL="${ANTHROPIC_BASE_URL:-$CLAUDE_GPT_DEFAULT_BASE_URL}"
 
 # --- どの経路（通常起動・--check-only・--dry-run・引数エラー含む）で終了しても、どの
 #     worktree / commit から起動したかを stderr で確認できるようにする（stale worktree
-#     起動事故の早期検出）。proxy= は PATH 上の binary の version（補助 evidence であり、
-#     接続先 server の version ではない）。 ---
+#     起動事故の早期検出）。proxy= は PATH 上の binary の有無のみ（補助 evidence であり、実行も
+#     version 取得もしない。接続先 server の version ではない）。 ---
 CLAUDE_GPT_GIT_HEAD=$(claude_gpt_git_head "$REPO_ROOT")
 CLAUDE_GPT_GIT_HEAD_SHORT="unknown"
 if [ "$CLAUDE_GPT_GIT_HEAD" != "unknown" ]; then
@@ -55,11 +55,13 @@ if [ "$CLAUDE_GPT_GIT_HEAD" != "unknown" ]; then
 fi
 CLAUDE_GPT_GIT_DIRTY=$(claude_gpt_git_dirty "$REPO_ROOT")
 LOCAL_PROXY_BIN=$(claude_gpt_resolve_proxy_bin)
-LOCAL_PROXY_VERSION="unknown"
-if [ -n "$LOCAL_PROXY_BIN" ]; then
-  LOCAL_PROXY_VERSION=$(claude_gpt_proxy_version "$LOCAL_PROXY_BIN")
+# PATH 上の binary は補助 evidence に過ぎないため、通常起動 / --dry-run では実行しない
+# （version の取得は --check-only の auxiliary evidence に限る）。
+LOCAL_PROXY_NOTE="not_probed"
+if [ -z "$LOCAL_PROXY_BIN" ]; then
+  LOCAL_PROXY_NOTE="absent"
 fi
-echo "launcher=${LAUNCHER_ABS_PATH} git=${CLAUDE_GPT_GIT_HEAD_SHORT} dirty=${CLAUDE_GPT_GIT_DIRTY} proxy=${LOCAL_PROXY_VERSION}" >&2
+echo "launcher=${LAUNCHER_ABS_PATH} git=${CLAUDE_GPT_GIT_HEAD_SHORT} dirty=${CLAUDE_GPT_GIT_DIRTY} proxy=${LOCAL_PROXY_NOTE}" >&2
 
 CHECK_ONLY=false
 DRY_RUN=false

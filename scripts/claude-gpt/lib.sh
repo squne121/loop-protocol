@@ -92,18 +92,36 @@ claude_gpt_required_model_set() {
 }
 
 # claude_gpt_missing_models: 引数1 に `/v1/models` の生 JSON 文字列、引数2 以降に
-# required base model ID 群を受け取り、生 JSON 中に存在しない model ID だけを改行区切りで
+# required base model ID 群を受け取り、catalog に存在しない model ID だけを改行区切りで
 # 返す（欠落が無ければ何も出力しない）。1 つでも欠ければ catalog は不完全であり、
 # 一方だけ揃っている状態を PASS にしない。
+# 判定は JSON を構造的に parse し、top-level object の `data` が list であり、その要素
+# （object）の `id` が required model ID と完全一致するものだけを authority とする。
+# 生 JSON 中の部分文字列一致・別 field の値・prefix / suffix の似た ID は存在と扱わない。
+# parse 不能 / 想定外 schema / python3 不在は全 model 欠落（fail-closed）とする。
 claude_gpt_missing_models() {
   _cgt_miss_json="$1"
   shift
-  for _cgt_miss_required in "$@"; do
-    case "$_cgt_miss_json" in
-      *"\"$_cgt_miss_required\""*) : ;;
-      *) printf '%s\n' "$_cgt_miss_required" ;;
-    esac
-  done
+  if ! command -v python3 >/dev/null 2>&1; then
+    for _cgt_miss_required in "$@"; do printf '%s\n' "$_cgt_miss_required"; done
+    return 0
+  fi
+  printf '%s' "$_cgt_miss_json" | python3 -c '
+import json, sys
+required = sys.argv[1:]
+try:
+    doc = json.loads(sys.stdin.read())
+except ValueError:
+    doc = None
+ids = set()
+if isinstance(doc, dict) and isinstance(doc.get("data"), list):
+    for entry in doc["data"]:
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str):
+            ids.add(entry["id"])
+for name in required:
+    if name not in ids:
+        print(name)
+' "$@"
 }
 
 # --- claude 実行バイナリの解決 ---
@@ -137,21 +155,27 @@ claude_gpt_home_bin_dir() {
   printf '%s/bin\n' "$CLAUDE_GPT_HOME"
 }
 
-# claude_gpt_proxy_version: proxy バイナリの version 識別子を取得する。`--version` が
-# 使えない場合は sha256、それも取れなければ "unknown" を返す。
+# claude_gpt_proxy_version: proxy バイナリの version 識別子を補助 evidence として取得する。
+# PATH 上の binary は launcher の前提ではないため、`--version` は bounded（2 秒、超過時は
+# 強制終了）で実行する。出力は pipe ではなく一時 file へ受け、孫 process が pipe を保持して
+# 呼び出し元を block することを避ける。timeout command が無い / 時間切れ / 空出力は
+# "unknown"（未確認）として扱い、診断を block しない。
 # 引数1: proxy バイナリの絶対パス
 claude_gpt_proxy_version() {
   proxy_bin="$1"
-  if [ -z "$proxy_bin" ]; then
+  if [ -z "$proxy_bin" ] || ! command -v timeout >/dev/null 2>&1; then
     printf 'unknown\n'
     return 0
   fi
-  version_output=$("$proxy_bin" --version 2>/dev/null | head -n1)
+  _cgt_pv_tmp=$(mktemp 2>/dev/null) || { printf 'unknown\n'; return 0; }
+  timeout -k 1 2 "$proxy_bin" --version >"$_cgt_pv_tmp" 2>/dev/null </dev/null || true
+  version_output=$(head -n1 "$_cgt_pv_tmp" 2>/dev/null)
+  rm -f "$_cgt_pv_tmp" 2>/dev/null
   if [ -n "$version_output" ]; then
     printf '%s\n' "$version_output"
-    return 0
+  else
+    printf 'unknown\n'
   fi
-  claude_gpt_sha256_file "$proxy_bin"
 }
 
 # claude_gpt_sha256_file: 任意ファイルの sha256。sha256sum / shasum いずれも無ければ "unknown"。

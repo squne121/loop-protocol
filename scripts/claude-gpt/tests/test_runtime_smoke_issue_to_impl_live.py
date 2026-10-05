@@ -135,10 +135,33 @@ def _events(stdout: str):
                 yield obj
 
 
+_GH_READ_RE = re.compile(r"\bgh\s+(issue|api|repo|pr)\b")
+
+
+def _last_succeeded(calls: list[tuple[str, str]], results: dict[str, bool]) -> bool:
+    """The most recent critical call must have a matching tool_result that is not an error.
+
+    A command string that merely appears in a tool_use (no tool_result, or an errored one) is not
+    evidence the operation ran. A retry that finally succeeds is accepted (last call wins)."""
+    if not calls:
+        return False
+    tool_id = calls[-1][0]
+    return tool_id in results and results[tool_id] is False
+
+
 def evaluate_workflow_stream(stdout: str, hook_events: list[dict]) -> dict:
-    """Judge the issue-refinement-loop run from structured events only."""
+    """Judge the issue-refinement-loop run from structured events only.
+
+    Every critical step (GitHub read / planner / terminal mutation) is judged by its own
+    ``tool_use.id`` -> ``tool_result`` (present and ``is_error != true``), not by command text alone.
+    A representative run must also have started at least one SubAgent and every SubagentStart must
+    have a SubagentStop (dispatch-only never passes)."""
     bash_commands: list[str] = []
-    tool_use_ids: dict[str, str] = {}
+    gh_calls: list[tuple[str, str]] = []
+    planner_calls: list[tuple[str, str]] = []
+    preflight_calls: list[tuple[str, str]] = []
+    terminal_calls: list[tuple[str, str]] = []
+    results: dict[str, bool] = {}  # tool_use_id -> is_error (True if any result for the id errored)
     errored_results = 0
     final_text = ""
     result_is_error = None
@@ -152,10 +175,23 @@ def evaluate_workflow_stream(stdout: str, hook_events: list[dict]) -> dict:
                 command = (block.get("input") or {}).get("command")
                 if isinstance(command, str):
                     bash_commands.append(command)
-                    if block.get("id"):
-                        tool_use_ids[block["id"]] = command
-            elif block.get("type") == "tool_result" and block.get("is_error"):
-                errored_results += 1
+                    tool_id = block.get("id")
+                    if not tool_id:
+                        continue
+                    if _GH_READ_RE.search(command):
+                        gh_calls.append((tool_id, command))
+                    if _PLANNER_MARKER in command:
+                        planner_calls.append((tool_id, command))
+                    if "run_refinement_preflight.py" in command:
+                        preflight_calls.append((tool_id, command))
+                    if any(m in command for m in _TERMINAL_MARKERS):
+                        terminal_calls.append((tool_id, command))
+            elif block.get("type") == "tool_result":
+                is_error = bool(block.get("is_error"))
+                errored_results += int(is_error)
+                tool_id = block.get("tool_use_id")
+                if tool_id:
+                    results[tool_id] = results.get(tool_id, False) or is_error
         if event.get("type") == "result":
             final_text = str(event.get("result") or "")
             result_is_error = bool(event.get("is_error"))
@@ -167,21 +203,37 @@ def evaluate_workflow_stream(stdout: str, hook_events: list[dict]) -> dict:
     reason_match = re.search(
         r"\b(human_judgment_required|approved|needs_fix|max_iterations_reached|scope_change|blocked)\b", final_text
     )
+    # GitHub read: an explicit `gh` read is judged by its own result; when the run never called `gh`
+    # directly, a successful preflight/planner (which read the Issue through gh) is the evidence.
+    if gh_calls:
+        github_read_ok = _last_succeeded(gh_calls, results)
+    else:
+        github_read_ok = _last_succeeded(preflight_calls, results) or _last_succeeded(planner_calls, results)
+    planner_ok = _last_succeeded(planner_calls, results)
+    terminal_ok = _last_succeeded(terminal_calls, results)
     summary = {
         "github_read": bool(_GITHUB_READ_RE.search(joined)),
+        "github_read_result_ok": github_read_ok,
         "planner_ran": _PLANNER_MARKER in joined,
+        "planner_result_ok": planner_ok,
         "subagents_started": len(starts),
         "subagents_completed": len(starts & stops),
         "dispatch_only_subagents": sorted(a for a in starts - stops if a),
         "terminal_step": terminal,
+        "terminal_result_ok": terminal_ok,
         "canonical_terminal_reason": reason_match.group(1) if reason_match else None,
         "result_is_error": result_is_error,
         "errored_tool_results": errored_results,
     }
     summary["ok"] = bool(
         summary["github_read"]
+        and github_read_ok
         and summary["planner_ran"]
+        and planner_ok
         and summary["terminal_step"]
+        and terminal_ok
+        and summary["subagents_started"] >= 1
+        and summary["subagents_completed"] == summary["subagents_started"]
         and not summary["dispatch_only_subagents"]
         and result_is_error is False
     )
@@ -200,8 +252,21 @@ def _bash(command: str, tool_id: str) -> str:
     })
 
 
-def _stream(commands, *, is_error=False, final="terminal reason: human_judgment_required"):
-    lines = [_bash(cmd, f"toolu_{i}") for i, cmd in enumerate(commands)]
+def _tool_result(tool_id: str, *, is_error: bool = False) -> str:
+    return json.dumps({
+        "type": "user",
+        "message": {"content": [{"type": "tool_result", "tool_use_id": tool_id, "is_error": is_error, "content": "x"}]},
+    })
+
+
+def _stream(commands, *, is_error=False, final="terminal reason: human_judgment_required",
+            errored=(), missing=()):
+    """``errored`` / ``missing`` are command indexes whose tool_result is an error / absent."""
+    lines = []
+    for i, cmd in enumerate(commands):
+        lines.append(_bash(cmd, f"toolu_{i}"))
+        if i not in missing:
+            lines.append(_tool_result(f"toolu_{i}", is_error=i in errored))
     lines.append(json.dumps({"type": "result", "is_error": is_error, "result": final}))
     return "\n".join(lines) + "\n"
 
@@ -212,43 +277,74 @@ _FULL = [
     "uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/publish_termination_report.py "
     "--input-file x.json",
 ]
+_GH, _PLAN, _PUBLISH = 0, 1, 2
+_SUBAGENT_DONE = [
+    {"hook_event": "SubagentStart", "agent_id": "a1"},
+    {"hook_event": "SubagentStop", "agent_id": "a1"},
+]
 
 
 def test_workflow_evaluator_accepts_a_run_that_reaches_a_canonical_terminal_step():
-    result = evaluate_workflow_stream(_stream(_FULL), [])
+    # positive control: all critical tool_results succeed and one SubAgent started and completed.
+    result = evaluate_workflow_stream(_stream(_FULL), _SUBAGENT_DONE)
     assert result["ok"] is True, result
     # repository contract 由来の human_judgment_required は launcher FAIL ではない。
     assert result["canonical_terminal_reason"] == "human_judgment_required"
     assert result["terminal_step"] == "publish_termination_report.py"
+    assert result["subagents_started"] == 1 and result["subagents_completed"] == 1
+
+
+def test_workflow_evaluator_accepts_edit_issue_txn_as_the_terminal_mutation():
+    edit = "uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/edit_issue_txn.py"
+    commands = [_FULL[0], _FULL[1], edit]
+    result = evaluate_workflow_stream(_stream(commands), _SUBAGENT_DONE)
+    assert result["ok"] is True and result["terminal_step"] == "edit_issue_txn.py", result
+
+
+def test_workflow_evaluator_accepts_a_retry_that_finally_succeeds():
+    commands = [_FULL[0], _FULL[1], _FULL[1], _FULL[2]]
+    result = evaluate_workflow_stream(_stream(commands, errored={1}), _SUBAGENT_DONE)
+    assert result["ok"] is True, result
 
 
 @pytest.mark.parametrize(
-    "label, commands, hook_events, is_error",
+    "label, commands, hook_events, is_error, errored, missing",
     [
-        ("no_terminal_step", _FULL[:2], [], False),
-        ("no_planner", [_FULL[0], _FULL[2]], [], False),
-        ("no_github_read", ["echo hello", "echo again"], [], False),
+        ("no_terminal_step", _FULL[:2], _SUBAGENT_DONE, False, (), ()),
+        ("no_planner", [_FULL[0], _FULL[2]], _SUBAGENT_DONE, False, (), ()),
+        ("no_github_read", ["echo hello", "echo again"], _SUBAGENT_DONE, False, (), ()),
         # preflight が cwd 不適合で拒否され、planner / SubAgent / terminal step が一度も走らなかった run。
         ("preflight_rejected_planner_never_ran",
          [_FULL[0], "uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/run_refinement_preflight.py"],
-         [], False),
-        ("claude_result_is_error", _FULL, [], True),
-        ("dispatch_only_subagent", _FULL,
-         [{"hook_event": "SubagentStart", "agent_id": "a1"}], False),
+         [], False, (), ()),
+        ("claude_result_is_error", _FULL, _SUBAGENT_DONE, True, (), ()),
+        ("dispatch_only_subagent", _FULL, [{"hook_event": "SubagentStart", "agent_id": "a1"}], False, (), ()),
+        # poison: command 文字列だけ出て実行が成立していない / SubAgent が 0 件の run は PASS にしない。
+        ("zero_subagents", _FULL, [], False, (), ()),
+        ("one_of_two_subagents_never_stopped", _FULL,
+         _SUBAGENT_DONE + [{"hook_event": "SubagentStart", "agent_id": "a2"}], False, (), ()),
+        ("planner_tool_result_is_error", _FULL, _SUBAGENT_DONE, False, {_PLAN}, ()),
+        ("planner_tool_result_missing", _FULL, _SUBAGENT_DONE, False, (), {_PLAN}),
+        ("terminal_publish_tool_result_missing", _FULL, _SUBAGENT_DONE, False, (), {_PUBLISH}),
+        ("terminal_publish_tool_result_is_error", _FULL, _SUBAGENT_DONE, False, {_PUBLISH}, ()),
+        ("github_read_tool_result_is_error", _FULL, _SUBAGENT_DONE, False, {_GH}, ()),
+        ("github_read_tool_result_missing", _FULL, _SUBAGENT_DONE, False, (), {_GH}),
     ],
 )
-def test_workflow_evaluator_rejects_runs_that_stop_short(label, commands, hook_events, is_error):
-    result = evaluate_workflow_stream(_stream(commands, is_error=is_error), hook_events)
+def test_workflow_evaluator_rejects_runs_that_stop_short(label, commands, hook_events, is_error, errored, missing):
+    result = evaluate_workflow_stream(
+        _stream(commands, is_error=is_error, errored=errored, missing=missing), hook_events
+    )
     assert result["ok"] is False, (label, result)
 
 
-def test_workflow_evaluator_accepts_completed_subagents():
-    events = [
-        {"hook_event": "SubagentStart", "agent_id": "a1"},
-        {"hook_event": "SubagentStop", "agent_id": "a1"},
-    ]
-    result = evaluate_workflow_stream(_stream(_FULL), events)
-    assert result["ok"] is True and result["subagents_completed"] == 1
+def test_workflow_evaluator_rejects_a_tool_use_without_an_id_link():
+    # tool_use.id と tool_result.tool_use_id が結び付かない（別 id の result）場合は成功扱いにしない。
+    lines = [_bash(cmd, f"toolu_{i}") for i, cmd in enumerate(_FULL)]
+    lines += [_tool_result(f"other_{i}") for i in range(len(_FULL))]
+    lines.append(json.dumps({"type": "result", "is_error": False, "result": "blocked"}))
+    result = evaluate_workflow_stream("\n".join(lines) + "\n", _SUBAGENT_DONE)
+    assert result["ok"] is False, result
 
 
 def test_workflow_prompt_pins_known_operation_vocabulary_to_the_registry():
