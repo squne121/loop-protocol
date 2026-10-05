@@ -341,9 +341,15 @@ if [ "$SCENARIO" = "default" ]; then
 else
   # auto_classifier: `echo` のような事前許可済みコマンドは classifier を通らないため使わない。
   # scratch directory 内のファイル作成は無害だが、permission 許可済みルールには含まれない。
+  # `test ! -e` guard と「brand-new file / 何も上書きしない」の一文は、live で Auto mode classifier が
+  # `mkdir -p X && printf ... > X/file` の redirect を「既存 file の上書きかもしれない」と読んで
+  # deny した 1 件（同 probe は先行 6 回 PASS）を受けた曖昧さの除去である。classifier は非決定的で、
+  # guard で deny が起きなくなると保証するものではない。この probe は allow rule に入れず classifier を
+  # 通し続け、PASS 条件（Auto mode / tool_use / tool_result 成功 / file 実在 / 最終 text）は変えない。
   CLASSIFIER_SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/claude-gpt-auto-classifier.XXXXXX")
+  CLASSIFIER_PROBE_FILE="${CLASSIFIER_SCRATCH}/probe/classifier_probe.txt"
   run_step "classifier_file_create" "$CLASSIFIER_MARKER" "Bash" "" \
-    "You are running inside an automated runtime smoke test with no human present. Use the Bash tool (an actual tool call) to run exactly: mkdir -p ${CLASSIFIER_SCRATCH}/probe && printf '%s' ${CLASSIFIER_MARKER} > ${CLASSIFIER_SCRATCH}/probe/classifier_probe.txt  After it finishes, reply with exactly: ${CLASSIFIER_MARKER}"
+    "You are running inside an automated runtime smoke test with no human present. This creates a brand-new file inside a fresh empty scratch directory; nothing is overwritten. Use the Bash tool (an actual tool call) to run exactly: test ! -e ${CLASSIFIER_PROBE_FILE} && mkdir -p ${CLASSIFIER_SCRATCH}/probe && printf '%s' ${CLASSIFIER_MARKER} > ${CLASSIFIER_PROBE_FILE}  After it finishes, reply with exactly: ${CLASSIFIER_MARKER}"
   if [ -f "${CLASSIFIER_SCRATCH}/probe/classifier_probe.txt" ] \
     && [ "$(cat "${CLASSIFIER_SCRATCH}/probe/classifier_probe.txt")" = "$CLASSIFIER_MARKER" ]; then
     CLASSIFIER_FILE_OK=true

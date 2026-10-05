@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -46,6 +47,10 @@ _SCRIPTED_CLAUDE = textwrap.dedent(
     def emit(obj):
         sys.stdout.write(json.dumps(obj) + "\\n")
 
+    if os.environ.get("FAKE_PROMPT_LOG"):
+        with open(os.environ["FAKE_PROMPT_LOG"], "a", encoding="utf-8") as fh:
+            fh.write(prompt + "\\n=====\\n")
+
     emit({{"type": "system", "subtype": "init", "permissionMode": mode, "model": "gpt-6-sol[1m]"}})
 
     def tool(name, body, is_error=False, tid="toolu_1"):
@@ -60,7 +65,8 @@ _SCRIPTED_CLAUDE = textwrap.dedent(
         final = "272000"
     elif "Use the Bash tool" in prompt and "mkdir -p" in prompt:
         command = re.search(r"run exactly: (.*?)  After it finishes", prompt, re.S).group(1)
-        if os.environ.get("FAKE_SKIP_CLASSIFIER_EXEC") != "1":
+        # classifier が deny した run は command を実行しない（FAKE_BASH_RESULT_ERROR）。
+        if os.environ.get("FAKE_SKIP_CLASSIFIER_EXEC") != "1" and os.environ.get("FAKE_BASH_RESULT_ERROR") != "1":
             subprocess.run(["sh", "-c", command], check=False)
         if os.environ.get("FAKE_BASH_RESULT_ERROR") == "1":
             emit({{"type": "system", "subtype": "permission_denied", "tool": "Bash"}})
@@ -270,6 +276,38 @@ def test_auto_classifier_scenario_fails_when_the_classified_operation_did_not_co
     assert proc.returncode == 1
     assert payload["auto_mode"]["classifier_file_create_completed"] is False
     assert payload["status"] == "fail"
+    # 最終 text が成功を主張し tool_result も非 error でも（step の stream check は ok）、file が実際に
+    # 作られていなければ FAIL（text / tool_result の自己申告だけでは PASS にしない）。
+    check = payload["steps"][0]["check"]
+    assert check["ok"] is True and check["final_text_marker"] is True
+
+
+def test_classifier_probe_prompt_has_the_overwrite_ambiguity_guard_on_a_fresh_scratch_dir(tmp_path, smoke_repo):
+    prompt_log = tmp_path / "prompts.log"
+    with H.FakeServer() as server:
+        proc, payload = _run_smoke(
+            tmp_path,
+            smoke_repo,
+            ["--scenario", "auto_classifier"],
+            server_url=server.url,
+            FAKE_PROMPT_LOG=str(prompt_log),
+        )
+    assert proc.returncode == 0 and payload["status"] == "pass", (proc.stdout, proc.stderr)
+    prompt = prompt_log.read_text(encoding="utf-8")
+    assert "This creates a brand-new file inside a fresh empty scratch directory; nothing is overwritten." in prompt
+    match = re.search(
+        r"run exactly: test ! -e (\S+/probe/classifier_probe\.txt) && mkdir -p (\S+)/probe && "
+        r"printf '%s' (\S+) > (\S+/probe/classifier_probe\.txt)  After it finishes",
+        prompt,
+    )
+    assert match, prompt
+    guarded, scratch, _marker, written = match.groups()
+    assert guarded == written == f"{scratch}/probe/classifier_probe.txt"
+    # scratch は mktemp -d で作った fresh な空 directory（probe は実行後に消える）。classifier を通す
+    # 操作であり続ける: 事前許可済みの `echo` は使わない。
+    assert re.search(r"/claude-gpt-auto-classifier\.[A-Za-z0-9]{6}$", scratch), scratch
+    assert not Path(scratch).exists()
+    assert "run exactly: echo" not in prompt
 
 
 def test_failed_step_records_public_safe_failure_detail_and_passing_steps_do_not(tmp_path, smoke_repo):
@@ -283,6 +321,7 @@ def test_failed_step_records_public_safe_failure_detail_and_passing_steps_do_not
             FAKE_BASH_RESULT_ERROR="1",
         )
     assert proc.returncode == 1 and payload["status"] == "fail"
+    assert payload["auto_mode"]["classifier_file_create_completed"] is False
     check = payload["steps"][0]["check"]
     assert check["ok"] is False and check["tool_completed_with_marker"] is False
     detail = check["failure_detail"]
