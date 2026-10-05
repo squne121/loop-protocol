@@ -4086,6 +4086,43 @@ def _claude_agent_handback_report_text(
     return texts[0]
 
 
+def extract_claude_child_final_report_text(stdout: str) -> str:
+    """Issue #2923: the JSON-UNESCAPED final report text of every correlated
+    child (newline-joined), taken ONLY from the same child-scoped sources
+    ``_marker_provenance_verified`` consumes -- a usable ``SubagentStop``'s own
+    ``last_assistant_message`` and, when that is absent, the correlated Agent
+    tool ``handbackReport.text`` (``_claude_agent_handback_report_text``).
+
+    In raw stream-json a ``"`` inside model text appears as ``\\"``, so a
+    ``--expect-marker`` literal containing a double quote never matches the raw
+    stdout even when the child produced it.  This gives the ``--expect-marker-source
+    subagent`` missing-check the child's unescaped body.  The Agent tool-input
+    prompt, the parent's assistant text and every other stream string are NOT
+    child output and are never returned, so a quoted literal that only they carry
+    stays in ``expected_markers_missing``.  Only a Stop preceded by a Start of the
+    same ``agent_id`` is considered; provenance itself is still decided by
+    ``subagent_causal_evidence_verdict``."""
+    events = [e for e in extract_claude_hook_lifecycle_events(stdout) if not e["contradictory"]]
+    started = {
+        e["agent_id"]: e["stream_index"]
+        for e in events
+        if e["hook_event"] == "SubagentStart" and e["agent_id"]
+    }
+    texts: list[str] = []
+    for stop in events:
+        agent_id = stop["agent_id"]
+        if stop["hook_event"] != "SubagentStop" or not agent_id:
+            continue
+        if agent_id not in started or started[agent_id] >= stop["stream_index"]:
+            continue
+        text = stop["last_assistant_message"] or _claude_agent_handback_report_text(
+            stdout, agent_id, session_id=stop["session_id"], prompt_id=stop["prompt_id"]
+        )
+        if text:
+            texts.append(text)
+    return "\n".join(texts)
+
+
 def _marker_provenance_verified(
     expected_markers: list[str] | None,
     last_assistant_message: str | None,
@@ -9263,7 +9300,15 @@ def main(argv: list[str] | None = None) -> int:
                 if args.expect_marker_source == "main":
                     marker_search_text = extract_claude_main_output_text(out)
                 else:
-                    marker_search_text = out + "\n" + err
+                    # Issue #2923: raw stdout/stderr (byte-identical to the
+                    # pre-#2923 search text) PLUS the correlated child's own
+                    # JSON-unescaped final report, so a marker containing a
+                    # double quote is observed in the same child-scoped
+                    # representation ``_marker_provenance_verified`` uses.
+                    # Prompt / tool-input / parent text is never added.
+                    marker_search_text = (
+                        out + "\n" + err + "\n" + extract_claude_child_final_report_text(out)
+                    )
                 missing = [m for m in args.expect_marker if m not in marker_search_text]
                 schema_summary["expected_markers_missing"] = missing
                 if missing:
