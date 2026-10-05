@@ -1146,6 +1146,145 @@ class TestSourceEvidenceAdapterCliSmoke:
         negatives["hash_valid_old_ref_with_new_main_pin"] = rejected.returncode
         fixture.rejection_artifact("old-commit-wrong-target", negatives)
 
+    def test_operator_resolution_rejects_unverified_c1_ref_cli(self, tmp_path):
+        from copy import deepcopy
+
+        fixture = _C1Fixture(tmp_path)
+        first = fixture.acquire()
+        ref = deepcopy(first["envelope"]["evidence_refs"][0])
+        assert ref["verification_status"] == "verified"
+        ref["verification_status"] = "unverified"
+        envelope = deepcopy(first["envelope"])
+        envelope["evidence_refs"] = [ref]
+        # The envelope schema permits the candidate: only the resolution's
+        # independent evidence check must prevent the promotion to proceed.
+        assert validate_envelope(envelope, expected_baseline=first["envelope"]["baseline"])["ok"]
+        candidate = fixture.pin_test_candidate(envelope)
+        fixture.select_operator(candidate)
+        assert candidate["envelope"]["evidence_refs"][0]["excerpt_sha256"] == ref["excerpt_sha256"]
+        assert candidate["state_sha256"] == hashlib.sha256(fixture.state.read_bytes()).hexdigest()
+        assert fixture.initial_pin == hashlib.sha256(fixture.initial.read_bytes()).hexdigest()
+        rejected = fixture.assert_stopped()
+        assert rejected.returncode == 2, rejected.stderr
+        result = json.loads(rejected.stdout)
+        assert result["validation"]["ok"] is False
+        assert "evidence ref is not verified" in result["validation"]["errors"]
+        assert result["effective_step1_action"] == "human_review"
+        assert result["claim_resolution"] == "unresolved"
+        assert result["routing_action"]["action"] == "human_review"
+        assert result["runtime_counts"] == {"run_acquisition": 0, "collector_dispatch": 0}
+        fixture.rejection_artifact(
+            "unverified-c1-ref",
+            {
+                "unverified_ref": ref["verification_status"],
+                "exit_code": rejected.returncode,
+                "validation_errors": result["validation"]["errors"],
+                "effective_step1_action": result["effective_step1_action"],
+                "runtime_counts": result["runtime_counts"],
+            },
+        )
+
+    def test_operator_resolution_rejects_worktree_head_false_main_binding_cli(self, tmp_path):
+        from copy import deepcopy
+
+        fixture = _C1Fixture(tmp_path)
+        first = fixture.acquire()
+        linked = tmp_path / "linked-worktree"
+        subprocess.run(
+            ["git", "-C", str(fixture.repo), "worktree", "add", "-q", "--detach", str(linked), fixture.main],
+            check=True,
+        )
+        # Advance only the linked worktree's detached HEAD. The canonical main
+        # ref and its independently pinned C1 target remain at the first commit.
+        (linked / "detached-only.txt").write_text("not on main\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(linked), "add", "detached-only.txt"], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(linked),
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "user.name=Fixture",
+                "commit",
+                "-qm",
+                "detached HEAD only",
+            ],
+            check=True,
+        )
+        main_ref = subprocess.check_output(
+            ["git", "-C", str(linked), "rev-parse", "refs/heads/main"], text=True
+        ).strip()
+        worktree_head = subprocess.check_output(["git", "-C", str(linked), "rev-parse", "HEAD"], text=True).strip()
+        assert main_ref == fixture.main != worktree_head
+        assert (
+            subprocess.run(
+                ["git", "-C", str(linked), "symbolic-ref", "-q", "HEAD"], capture_output=True, check=False
+            ).returncode
+            == 1
+        )
+        fixture.request_data["repo_root"] = str(linked)
+        fixture.write(fixture.request_file, fixture.request_data)
+        fixture.select_operator(first)
+        # The legitimate main-pinned resolution still succeeds despite HEAD drift.
+        valid = fixture.resolve()
+        assert valid.returncode == 0, valid.stderr
+        assert json.loads(valid.stdout)["effective_step1_action"] == "proceed"
+        assert json.loads(valid.stdout)["runtime_counts"] == {"run_acquisition": 0, "collector_dispatch": 0}
+        fixture.resolved.unlink()
+
+        # Construct a fully self-consistent but false HEAD-as-main bundle.
+        # If the CLI substituted HEAD for refs/heads/main, all other pins,
+        # evidence bytes and the operator tuple would agree and it could proceed.
+        envelope = deepcopy(first["envelope"])
+        envelope["baseline"] = c1_baseline(issue_body=fixture.body, main_sha=worktree_head)
+        ref = envelope["evidence_refs"][0]
+        ref["commit_sha"] = worktree_head
+        ref["permalink"] = f"https://github.com/{C1_REPO}/blob/{worktree_head}/{C1_PATH}#L1-L3"
+        assert ref["excerpt_sha256"] == first["envelope"]["evidence_refs"][0]["excerpt_sha256"]
+        from validate_repo_evidence_ref import validate_repo_evidence_ref
+
+        assert validate_repo_evidence_ref(ref, repo_root=linked)["status"] == "verified"
+        assert validate_envelope(envelope, expected_baseline=envelope["baseline"])["ok"]
+        fixture.request_data["claim"].update({"baseline": envelope["baseline"], "commit_sha": worktree_head})
+        fixture.write(fixture.request_file, fixture.request_data)
+        fixture.context_data["canonical_main_sha"] = worktree_head
+        fixture.write(fixture.context, fixture.context_data)
+        candidate = fixture.pin_test_candidate(envelope)
+        decision = fixture.select_operator(
+            candidate,
+            override=lambda d: d.update(
+                {
+                    "canonical_main_sha": worktree_head,
+                    "evidence": {**d["evidence"], "commit_sha": worktree_head},
+                }
+            ),
+        )
+        assert candidate["initial_binding"] in json.loads(fixture.state.read_bytes())["resolution_bindings"]
+        assert candidate["state_sha256"] == hashlib.sha256(fixture.state.read_bytes()).hexdigest()
+        assert fixture.initial_pin == hashlib.sha256(fixture.initial.read_bytes()).hexdigest()
+        assert decision["evidence"]["commit_sha"] == worktree_head
+        assert (
+            main_ref
+            == subprocess.check_output(["git", "-C", str(linked), "rev-parse", "refs/heads/main"], text=True).strip()
+        )
+        rejected = fixture.assert_stopped()
+        assert rejected.returncode == 1, rejected.stderr
+        assert "canonical main ref drift" in rejected.stderr
+        assert not fixture.resolved.exists()  # no success result and no redispatch to compensate
+        fixture.rejection_artifact(
+            "head-false-main-binding",
+            {
+                "canonical_main_ref": main_ref,
+                "linked_worktree_head": worktree_head,
+                "legitimate_main_pinned_exit_code": valid.returncode,
+                "head_as_main_exit_code": rejected.returncode,
+                "head_as_main_error": "canonical main ref drift",
+                "result_written": fixture.resolved.exists(),
+            },
+        )
+
     def test_operator_resolution_rejects_authentic_old_tuple_receipt_cli(self, tmp_path):
         fixture = _C1Fixture(tmp_path)
         old = fixture.acquire()
