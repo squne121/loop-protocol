@@ -892,3 +892,27 @@ def test_preexisting_readiness_note_boundary_commonmark_fence_semantics(
     else:
         assert result["status"] == "ok", result["errors"]
         assert env.invoked
+
+
+# --- boundary SSOT unavailable (reviewer warning: FileNotFoundError leak) -----
+
+
+@LANES
+def test_preexisting_readiness_note_boundary_ssot_unavailable_fail_closed(
+    repo_tmp: Path, monkeypatch: pytest.MonkeyPatch, forwarded_status: str, reject_code: str
+) -> None:
+    # Force the shared prose boundary SSOT to be missing on disk. A cached
+    # module from an earlier test must not mask the failure; monkeypatch
+    # restores the previous sys.modules entry (or absence) afterwards.
+    monkeypatch.delitem(sys.modules, txn._PROSE_BOUNDARY_POLICY_MODULE_NAME, raising=False)
+    monkeypatch.setattr(txn, "_PROSE_BOUNDARY_POLICY_RELPATH", Path("missing") / "prose_boundary_policy.py")
+
+    live = _body(defects=("a",))
+    new = _body(defects=("a",), notes="note")
+    # (1) a missing SSOT file fails closed instead of raising FileNotFoundError.
+    assert txn._only_notes_section_differs(live, new) is False
+    assert txn._PROSE_BOUNDARY_POLICY_MODULE_NAME not in sys.modules
+
+    # (2) the compatibility lane is rejected before any mutation.
+    result, env = _run_lane(monkeypatch, repo_tmp, live_body=live, new_body=new, forwarded_status=forwarded_status)
+    _assert_rejected(result, env, reject_code)

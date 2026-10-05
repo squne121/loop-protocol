@@ -920,8 +920,9 @@ def _non_note_sections(body: str) -> list[tuple[str | None, str]]:
 def _only_notes_section_differs(live_body: str, candidate_body: str) -> bool:
     try:
         return _non_note_sections(live_body) == _non_note_sections(candidate_body)
-    except (ImportError, ValueError):
-        # Boundary SSOT unavailable / inconsistent segmentation: fail closed.
+    except (ImportError, ValueError, OSError):
+        # Boundary SSOT unavailable (missing / unreadable file) / inconsistent
+        # segmentation: fail closed.
         return False
 
 
