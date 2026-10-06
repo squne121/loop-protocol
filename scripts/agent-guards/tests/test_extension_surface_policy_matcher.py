@@ -963,6 +963,20 @@ def _case(**overrides):
     return {**_NEGATIVE_BASE, **overrides}
 
 
+def _predicate_case(path: str):
+    """Allowed Path entry `path` plus a `git diff` VC naming the SAME string.
+
+    Every other exemption condition (opt-in, declaration, AC, canonical VC,
+    `git diff` shape, path-as-token) is satisfied, so ONLY the exact-file-path
+    predicate (`_is_exact_file_path_entry`, In Scope 2) can reject the case.
+    Do not inherit `_NEGATIVE_BASE`: its VC names only `lib.sh`, which would let
+    the VC check (condition 6) mask a predicate regression."""
+    return _case(
+        paths=[path],
+        ac_vc_commands=_vc(("AC1", f"git diff origin/main -- {path}")),
+    )
+
+
 _NEGATIVE_CASES = {
     "no_declaration": _case(rva=_rva(None)),
     "ac_does_not_exist": _case(
@@ -985,10 +999,20 @@ _NEGATIVE_CASES = {
     "two_exact_paths_only_one_in_diff": _case(
         paths=[_LIB_SH, "scripts/claude-gpt/other.sh"],
     ),
-    "glob_allowed_path": _case(paths=["scripts/claude-gpt/**"]),
-    "glob_allowed_path_star": _case(paths=["scripts/claude-gpt/*"]),
-    "directory_allowed_path": _case(paths=["scripts/claude-gpt/"]),
-    "segment_without_extension": _case(paths=["scripts/claude-gpt/Makefile"]),
+    "glob_allowed_path": _predicate_case("scripts/claude-gpt/**"),
+    "glob_allowed_path_star": _predicate_case("scripts/claude-gpt/*"),
+    "glob_allowed_path_question": _predicate_case("scripts/claude-gpt/lib?.sh"),
+    "glob_allowed_path_bracket": _predicate_case("scripts/claude-gpt/lib[1].sh"),
+    "glob_allowed_path_brace": _predicate_case("scripts/claude-gpt/{lib,other}.sh"),
+    "directory_allowed_path": _predicate_case("scripts/claude-gpt/"),
+    "segment_without_extension": _predicate_case("scripts/claude-gpt/claude-gpt"),
+    "segment_without_extension_makefile": _predicate_case("scripts/claude-gpt/Makefile"),
+    "git_diff_token_is_option_with_path_not_the_path": _case(
+        ac_vc_commands=_vc(("AC1", f"git diff origin/main --output={_LIB_SH}"))
+    ),
+    "git_diff_token_is_path_with_suffix_not_the_path": _case(
+        ac_vc_commands=_vc(("AC1", f"git diff origin/main -- {_LIB_SH}.bak"))
+    ),
     "ac_vc_commands_not_provided": _case(ac_vc_commands=None),
     "unterminated_quote_is_not_tokenizable": _case(
         ac_vc_commands=_vc(("AC1", f"git diff 'unterminated {_LIB_SH}"))
@@ -1009,6 +1033,72 @@ def test_claude_gpt_comment_only_negative_cases_remain_needs_fix(case_id):
     assert coverage["verdict"] == "needs_fix", case_id
     assert "issue_time_exemptions" not in coverage
     assert any(_CLAUDE_GPT_PROFILE in item for item in coverage["missing"])
+
+
+@pytest.mark.parametrize(
+    "entry,expected",
+    [
+        # exact file path (extension-bearing final segment, no glob, no trailing "/")
+        ("scripts/claude-gpt/lib.sh", True),
+        ("scripts/claude-gpt/other.sh", True),
+        ("lib.sh", True),
+        ("scripts/claude-gpt/.hidden", True),
+        # glob characters, each individually
+        ("scripts/claude-gpt/**", False),
+        ("scripts/claude-gpt/*", False),
+        ("scripts/claude-gpt/*.sh", False),
+        ("scripts/claude-gpt/lib?.sh", False),
+        ("scripts/claude-gpt/lib[1].sh", False),
+        ("scripts/claude-gpt/lib[.sh", False),
+        ("scripts/claude-gpt/lib].sh", False),
+        ("scripts/claude-gpt/{lib,other}.sh", False),
+        ("scripts/claude-gpt/lib{.sh", False),
+        ("scripts/claude-gpt/lib}.sh", False),
+        # directory / trailing slash
+        ("scripts/claude-gpt/", False),
+        ("scripts/claude-gpt.d/", False),
+        # final segment without "." (no extension)
+        ("scripts/claude-gpt/Makefile", False),
+        ("scripts/claude-gpt/claude-gpt", False),
+        ("scripts.d/claude-gpt", False),
+        # degenerate
+        ("", False),
+        (".", False),
+        ("..", False),
+        ("scripts/claude-gpt/..", False),
+    ],
+)
+def test_is_exact_file_path_entry_predicate(entry, expected):
+    """Direct unit test of the fixed exact-file-path predicate (In Scope 2)."""
+    assert extension_surface_policy_matcher._is_exact_file_path_entry(entry) is expected
+
+
+def test_is_exact_file_path_entry_rejects_non_string():
+    assert extension_surface_policy_matcher._is_exact_file_path_entry(None) is False  # type: ignore[arg-type]
+    assert extension_surface_policy_matcher._is_exact_file_path_entry(123) is False  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        (f"git diff origin/main -- {_LIB_SH}", True),
+        (f"git diff --stat {_LIB_SH}", True),
+        (f"git diff origin/main --output={_LIB_SH}", False),
+        (f"git diff origin/main -- {_LIB_SH}.bak", False),
+        (f"git diff origin/main -- prefix/{_LIB_SH}", False),
+        (f"echo git diff {_LIB_SH}", False),
+        (f"rg 'git diff' {_LIB_SH}", False),
+        (f"git status -- {_LIB_SH}", False),
+        (f"git diff 'unterminated {_LIB_SH}", False),
+        ("git diff", False),
+    ],
+)
+def test_command_is_git_diff_for_path_requires_exact_path_token(command, expected):
+    """Direct unit test: the path must be a whole token after `git diff`."""
+    assert (
+        extension_surface_policy_matcher._command_is_git_diff_for_path(command, _LIB_SH)
+        is expected
+    )
 
 
 def test_two_exact_paths_each_with_their_own_git_diff_is_exempted():

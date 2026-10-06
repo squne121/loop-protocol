@@ -212,6 +212,13 @@ def _comment_only_body(
     )
 
 
+def _predicate_negative(path: str) -> dict:
+    return dict(
+        allowed_paths=f"- {path}",
+        vc_lines=f"# AC1\n$ git diff origin/main -- {path}",
+    )
+
+
 _COMMENT_ONLY_NEGATIVES = {
     "no_declaration": dict(declaration=""),
     "ac_does_not_exist": dict(
@@ -227,9 +234,21 @@ _COMMENT_ONLY_NEGATIVES = {
     "two_exact_paths_one_diffed": dict(
         allowed_paths=f"- {_LIB_SH}\n- scripts/claude-gpt/other.sh"
     ),
-    "glob_path": dict(allowed_paths="- scripts/claude-gpt/**"),
-    "directory_path": dict(allowed_paths="- scripts/claude-gpt/"),
-    "segment_without_extension": dict(allowed_paths="- scripts/claude-gpt/Makefile"),
+    # Predicate-only negatives: the AC1 `git diff` VC names the SAME string as the
+    # Allowed Path entry, so only the exact-file-path predicate can reject them.
+    "glob_path": _predicate_negative("scripts/claude-gpt/**"),
+    "glob_path_star": _predicate_negative("scripts/claude-gpt/*"),
+    "glob_path_question": _predicate_negative("scripts/claude-gpt/lib?.sh"),
+    "directory_path": _predicate_negative("scripts/claude-gpt/"),
+    "segment_without_extension": _predicate_negative("scripts/claude-gpt/claude-gpt"),
+    "segment_without_extension_makefile": _predicate_negative("scripts/claude-gpt/Makefile"),
+    # path-in-tokens strictness: the path must be a whole token of the git diff VC.
+    "git_diff_option_embeds_path": dict(
+        vc_lines=f"# AC1\n$ git diff origin/main --output={_LIB_SH}"
+    ),
+    "git_diff_path_with_suffix": dict(
+        vc_lines=f"# AC1\n$ git diff origin/main -- {_LIB_SH}.bak"
+    ),
     "other_rule_also_matches": dict(
         allowed_paths=f"- {_LIB_SH}\n- .claude/agents/implementation-worker.md"
     ),
