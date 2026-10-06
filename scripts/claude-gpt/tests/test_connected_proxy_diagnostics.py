@@ -395,7 +395,10 @@ def _write_curlrc_lane(child_env: dict, lane: str, text: str) -> None:
 
     XDG lane（`$XDG_CONFIG_HOME/curlrc` と `$XDG_CONFIG_HOME/.curlrc`）について:
     (a) manpage 上の XDG 候補は dot なしの `$XDG_CONFIG_HOME/curlrc` である。
-    (b) curl 8.10.0 で dot なし lookup が追加され、8.10.0 未満（観測: 8.5.0）は `.curlrc` のみを読む。
+    (b) XDG_CONFIG_HOME 探索自体は curl 7.73.0 で導入され
+        （7.73.0 以上 8.10.0 未満は `$XDG_CONFIG_HOME/.curlrc` を読む）、
+        dot なし `curlrc` の lookup は 8.10.0 で追加された（観測: 8.5.0 は `.curlrc` のみ）。
+        XDG lane の runtime prerequisite は curl >= 7.73.0。
     (c) よって 8.10.0 の前後どちらでも curlrc が読まれるよう、両 filename を XDG 配下のみに置き、
         HOME 側（`$HOME/.curlrc`）には置かない。HOME lane は `$HOME/.curlrc` の 1 file のみ。"""
     assert "CURL_HOME" not in child_env, "CURL_HOME must be unset so only HOME / XDG lanes are searched"
@@ -472,9 +475,10 @@ def test_probe_ignores_home_curlrc_proxy_lane_and_reaches_the_loopback_target(tm
 def test_probe_ignores_xdg_curlrc_proxy_lane_and_reaches_the_loopback_target(tmp_path):
     """XDG lane: `$XDG_CONFIG_HOME/{curlrc,.curlrc}` のみ materialize。`$HOME/.curlrc` は存在しない。
 
-    manpage 上の XDG 候補は dot なしの `$XDG_CONFIG_HOME/curlrc` だが、dot なし lookup の追加は curl 8.10.0。
-    8.10.0 未満（観測: 8.5.0）は `.curlrc` のみを読むため、8.10.0 の前後どちらでも curlrc が読まれるよう
-    両 filename を XDG lane 内だけに置き、HOME 側には置かない。"""
+    manpage 上の XDG 候補は dot なしの `$XDG_CONFIG_HOME/curlrc` だが、XDG_CONFIG_HOME 探索自体は curl 7.73.0 で導入され
+    （7.73.0 以上 8.10.0 未満は `$XDG_CONFIG_HOME/.curlrc` を読む）、dot なし curlrc の lookup は 8.10.0 で追加された
+    （観測: 8.5.0 は `.curlrc` のみ）。XDG lane の runtime prerequisite は curl >= 7.73.0 であり、
+    8.10.0 の前後どちらでも curlrc が読まれるよう両 filename を XDG lane 内だけに置き、HOME 側には置かない。"""
     _assert_probe_ignores_curlrc_proxy(tmp_path, "xdg")
 
 
@@ -486,9 +490,10 @@ def test_probe_ignores_home_curlrc_connect_to_lane_and_reaches_the_loopback_targ
 def test_probe_ignores_xdg_curlrc_connect_to_lane_and_reaches_the_loopback_target(tmp_path):
     """XDG lane: `$XDG_CONFIG_HOME/{curlrc,.curlrc}` のみ materialize。`$HOME/.curlrc` は存在しない。
 
-    manpage 上の XDG 候補は dot なしの `$XDG_CONFIG_HOME/curlrc` だが、dot なし lookup の追加は curl 8.10.0。
-    8.10.0 未満（観測: 8.5.0）は `.curlrc` のみを読むため、8.10.0 の前後どちらでも curlrc が読まれるよう
-    両 filename を XDG lane 内だけに置き、HOME 側には置かない。"""
+    manpage 上の XDG 候補は dot なしの `$XDG_CONFIG_HOME/curlrc` だが、XDG_CONFIG_HOME 探索自体は curl 7.73.0 で導入され
+    （7.73.0 以上 8.10.0 未満は `$XDG_CONFIG_HOME/.curlrc` を読む）、dot なし curlrc の lookup は 8.10.0 で追加された
+    （観測: 8.5.0 は `.curlrc` のみ）。XDG lane の runtime prerequisite は curl >= 7.73.0 であり、
+    8.10.0 の前後どちらでも curlrc が読まれるよう両 filename を XDG lane 内だけに置き、HOME 側には置かない。"""
     _assert_probe_ignores_curlrc_connect_to(tmp_path, "xdg")
 
 
