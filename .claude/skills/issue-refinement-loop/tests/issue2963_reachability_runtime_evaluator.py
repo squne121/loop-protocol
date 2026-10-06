@@ -272,7 +272,83 @@ def _high_ref_union(findings: list[Any]) -> tuple[list[str] | None, int]:
     return union, len(high)
 
 
-def evaluate_reachability_runtime(
+def _reviewer_invocation(lifecycle: list[dict[str, Any]]) -> dict[str, Any]:
+    """reviewer 型の lifecycle record から、実 invocation の identity（非空 `agent_id`）ごとの位置を集める。
+
+    実 stream-json（Claude Code 2.1.291）では 1 回の SubAgent invocation が複数の record を生む: SubagentStart は
+    `hook_started` 2 本 + `hook_response` 2 本、SubagentStop は `hook_started` 3 本 + `hook_response` 3 本で、
+    `extract_claude_hook_lifecycle_events` はそれぞれを 1 entry とする。`agent_id` を持つのは hook stdin を
+    echo する observer hook の `hook_response` だけで、`hook_started` や他の hook の response は `agent_id` が
+    None である。そのため invocation の identity は「reviewer 型かつ非空 `agent_id` を持つ record」の distinct な
+    `agent_id` で定義する。distinct な `agent_id` が複数ある場合は別 invocation の重複であり、規則 3 で FAIL する。
+    """
+    ids: dict[str, dict[str, set[str]]] = {"SubagentStart": {}, "SubagentStop": {}}
+    indexes: dict[str, list[int]] = {"SubagentStart": [], "SubagentStop": []}
+    for entry in lifecycle:
+        event = entry.get("hook_event")
+        agent_id = entry.get("agent_id")
+        if event not in ids or entry.get("agent_type") != REVIEWER_AGENT or not agent_id:
+            continue
+        ids[event].setdefault(agent_id, set())
+        indexes[event].append(entry["stream_index"])
+    return {
+        "start_ids": set(ids["SubagentStart"]),
+        "stop_ids": set(ids["SubagentStop"]),
+        # 空のときに min/max が例外にならないよう sentinel を入れる（lifecycle_ok は ids の判定で先に偽になる）。
+        "start_indexes": indexes["SubagentStart"] or [-1],
+        "stop_indexes": indexes["SubagentStop"] or [-1],
+    }
+
+
+def summarize_lifecycle_records(stdout: str) -> list[dict[str, Any]]:
+    """SubagentStart / SubagentStop の raw record の sanitized な要約（診断用。判定規則には使わない）。
+
+    `hook_started` / `hook_response` を区別し、HOME を含む path や payload は一切含めない。"""
+    runner = load_runner_module()
+    by_index = {e["stream_index"]: e for e in runner.extract_claude_hook_lifecycle_events(stdout)}
+    records: list[dict[str, Any]] = []
+    for index, event in enumerate(iter_stream_events(stdout)):
+        if event.get("type") != "system" or event.get("hook_event") not in ("SubagentStart", "SubagentStop"):
+            continue
+        derived = by_index.get(index, {})
+        records.append(
+            {
+                "stream_index": index,
+                "hook_event": event.get("hook_event"),
+                "subtype": event.get("subtype"),
+                "hook_id": event.get("hook_id"),
+                "agent_id": derived.get("agent_id"),
+                "agent_type": derived.get("agent_type"),
+            }
+        )
+    return records
+
+
+def summarize_tool_uses(stdout: str) -> list[dict[str, Any]]:
+    """tool_use の sanitized な要約（id / name / parent / stream_index のみ。input は含めない）。"""
+    tool_uses, _results = scan_tool_records(iter_stream_events(stdout))
+    return [
+        {
+            "id": tu["id"],
+            "name": tu["name"],
+            "parent_tool_use_id": tu["parent_tool_use_id"],
+            "stream_index": tu["stream_index"],
+        }
+        for tu in tool_uses
+    ]
+
+
+def evaluate_reachability_runtime(**kwargs: Any) -> dict[str, Any]:
+    """AC8 判定規則を評価し、診断用の sanitized な lifecycle / tool_use 要約を添えて返す。"""
+    outcome = _evaluate_rules(**kwargs)
+    stdout = kwargs.get("stdout") or ""
+    if iter_stream_events(stdout):
+        outcome["lifecycle_records"] = summarize_lifecycle_records(stdout)
+        outcome["tool_use_records"] = summarize_tool_uses(stdout)
+    return outcome
+
+
+def _evaluate_rules(
     *,
     stdout: str,
     tested_head: str,
@@ -299,16 +375,15 @@ def evaluate_reachability_runtime(
     agent_tool_ids = _reviewer_agent_tool_use_ids(tool_uses)
 
     # reviewer 区間（lifecycle が確定している場合だけ strict に決まる）。
-    starts = [e for e in lifecycle if e.get("hook_event") == "SubagentStart" and e.get("agent_type") == REVIEWER_AGENT]
-    stops = [e for e in lifecycle if e.get("hook_event") == "SubagentStop" and e.get("agent_type") == REVIEWER_AGENT]
+    invocation = _reviewer_invocation(lifecycle)
+    starts = invocation["start_indexes"]
+    stops = invocation["stop_indexes"]
     interval: list[dict[str, Any]] = []
     lifecycle_ok = (
-        len(starts) == 1
-        and len(stops) == 1
+        len(invocation["start_ids"]) == 1
+        and invocation["start_ids"] == invocation["stop_ids"]
         and not any(e.get("contradictory") for e in lifecycle)
-        and bool(starts[0].get("agent_id"))
-        and starts[0].get("agent_id") == stops[0].get("agent_id")
-        and starts[0]["stream_index"] < stops[0]["stream_index"]
+        and max(starts) < min(stops)
         and len(agent_tool_ids) == 1
     )
     if lifecycle_ok:
@@ -316,8 +391,7 @@ def evaluate_reachability_runtime(
         interval = [
             tu
             for tu in tool_uses
-            if tu["parent_tool_use_id"] == parent_id
-            and starts[0]["stream_index"] < tu["stream_index"] < stops[0]["stream_index"]
+            if tu["parent_tool_use_id"] == parent_id and min(starts) < tu["stream_index"] < max(stops)
         ]
 
     required = _required_observations(fixture_kind, invocation_dir, resolved_root, fixture_paths)
@@ -358,8 +432,8 @@ def evaluate_reachability_runtime(
             3,
             "reviewer SubagentStart/SubagentStop must be exactly one non-contradictory pair "
             "with the same agent_id (Start before Stop)",
-            reviewer_starts=len(starts),
-            reviewer_stops=len(stops),
+            reviewer_start_agent_ids=sorted(invocation["start_ids"]),
+            reviewer_stop_agent_ids=sorted(invocation["stop_ids"]),
         )
     if not interval:
         return _verdict("fail", 3, "no reviewer-attributed tool_use inside the SubagentStart/SubagentStop interval")
@@ -386,9 +460,9 @@ def evaluate_reachability_runtime(
     failed = [name for name, ok in observed.items() if not ok]
     evidence = {
         "lifecycle": {
-            "agent_id": starts[0]["agent_id"],
-            "start_stream_index": starts[0]["stream_index"],
-            "stop_stream_index": stops[0]["stream_index"],
+            "agent_id": next(iter(invocation["start_ids"])),
+            "start_stream_index": min(starts),
+            "stop_stream_index": max(stops),
         },
         "interval_tool_uses": [
             {"id": tu["id"], "name": tu["name"], "stream_index": tu["stream_index"]} for tu in interval

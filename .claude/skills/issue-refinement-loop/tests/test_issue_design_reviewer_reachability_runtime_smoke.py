@@ -304,6 +304,9 @@ def test_real_issue_design_reviewer_reachability_three_fixture_runtime_smoke() -
             "rule": outcome["rule"],
             "reason": outcome["reason"],
             "evidence": outcome["evidence"],
+            # 将来の FAIL を診断できるよう sanitized な lifecycle / tool_use 要約を残す（payload・path を含めない）。
+            "lifecycle_records": outcome.get("lifecycle_records"),
+            "tool_use_records": outcome.get("tool_use_records"),
             "raw_result": raw,
         }
 

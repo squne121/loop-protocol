@@ -113,10 +113,40 @@ class Stream:
             }
         )
 
+    def _hook_line(self, subtype: str, hook_event: str, hook_name: str, hook_id: str, payload: str = "") -> "Stream":
+        line: dict[str, Any] = {
+            "type": "system",
+            "subtype": subtype,
+            "hook_id": hook_id,
+            "hook_name": hook_name,
+            "hook_event": hook_event,
+        }
+        if subtype == "hook_response":
+            line.update({"output": payload, "stdout": payload, "stderr": "", "exit_code": 0, "outcome": "success"})
+        return self.add(line)
+
+    def _real_lifecycle(self, hook_event: str, agent_id: str, agent_type: str, hooks: int, name: str) -> "Stream":
+        """実 Claude Code 2.1.291 の record 形状: 1 invocation で configured hook の数だけ hook_started /
+        hook_response が出る。`agent_id` / `agent_type` を持つのは hook stdin を echo する 1 本の response だけ。"""
+        payload = json.dumps({"hook_event_name": hook_event, "agent_id": agent_id, "agent_type": agent_type})
+        ids = [f"{hook_event}-{agent_id}-hook{n}" for n in range(hooks)]
+        for hook_id in ids:
+            self._hook_line("hook_started", hook_event, name, hook_id)
+        for position, hook_id in enumerate(reversed(ids)):
+            self._hook_line("hook_response", hook_event, name, hook_id, payload if position == 0 else "")
+        return self
+
     def start(self, agent_id: str = "agent-1", agent_type: str = AGENT) -> "Stream":
-        return self._hook("SubagentStart", agent_id, agent_type)
+        return self._real_lifecycle("SubagentStart", agent_id, agent_type, 2, f"SubagentStart:{agent_type}")
 
     def stop(self, agent_id: str = "agent-1", agent_type: str = AGENT) -> "Stream":
+        return self._real_lifecycle("SubagentStop", agent_id, agent_type, 3, "SubagentStop")
+
+    def start_single(self, agent_id: str = "agent-1", agent_type: str = AGENT) -> "Stream":
+        """echo record だけの最小形（hook_started / 他 hook の response を持たない）。"""
+        return self._hook("SubagentStart", agent_id, agent_type)
+
+    def stop_single(self, agent_id: str = "agent-1", agent_type: str = AGENT) -> "Stream":
         return self._hook("SubagentStop", agent_id, agent_type)
 
     def tool(
@@ -305,6 +335,61 @@ def test_rule2_precedes_lifecycle_rule() -> None:
 
 
 # --- 規則 3: lifecycle / 区間 --------------------------------------------------------------------------------
+
+
+def test_real_record_shape_one_invocation_yields_many_lifecycle_records_but_is_one_invocation() -> None:
+    """実 stream の形状: 1 invocation の SubagentStart は 4 entry、SubagentStop は agent_type を持つのが 1 entry。"""
+    stream = normal_stream("negative")
+    lifecycle = EVAL.load_runner_module().extract_claude_hook_lifecycle_events(stream.text())
+    starts = [e for e in lifecycle if e["hook_event"] == "SubagentStart"]
+    stops = [e for e in lifecycle if e["hook_event"] == "SubagentStop"]
+    assert len(starts) == 4 and {e["agent_type"] for e in starts} == {AGENT}
+    assert len([e for e in starts if e["agent_id"]]) == 1
+    assert len(stops) == 6 and len([e for e in stops if e["agent_type"] == AGENT]) == 1
+    assert_outcome(evaluate(stream), "pass", 5)
+    records = evaluate(stream)["lifecycle_records"]
+    assert {r["subtype"] for r in records} == {"hook_started", "hook_response"}
+    assert all(r["hook_id"] for r in records)
+    assert sum(1 for r in records if r["agent_id"] == "agent-1" and r["hook_event"] == "SubagentStart") == 1
+
+
+def test_rule3_single_echo_record_shape_is_still_one_invocation() -> None:
+    s = Stream().init().agent_call().start_single()
+    _with_tools_inline(s).stop_single().agent_result().final()
+    assert_outcome(evaluate(s), "pass", 5)
+
+
+def test_rule3_same_agent_id_echoed_by_two_observer_hooks_is_one_invocation() -> None:
+    s = Stream().init().agent_call().start().start_single()
+    _with_tools_inline(s).stop().agent_result().final()
+    assert_outcome(evaluate(s), "pass", 5)
+
+
+def test_rule3_distinct_agent_ids_are_distinct_invocations_even_with_real_record_shape() -> None:
+    both = Stream().init().agent_call().start("agent-1").start("agent-2")
+    _with_tools_inline(both).stop("agent-1").stop("agent-2").agent_result().final()
+    assert_outcome(evaluate(both), "fail", 3)
+    only_start = Stream().init().agent_call().start("agent-1").start("agent-2")
+    _with_tools_inline(only_start).stop("agent-1").agent_result().final()
+    assert_outcome(evaluate(only_start), "fail", 3)
+
+
+def test_rule3_start_records_without_an_agent_id_echo_are_not_an_invocation() -> None:
+    s = Stream().init().agent_call()
+    for n in range(2):
+        s._hook_line("hook_started", "SubagentStart", f"SubagentStart:{AGENT}", f"h{n}")
+    _with_tools_inline(s).stop().agent_result().final()
+    assert_outcome(evaluate(s), "fail", 3)
+
+
+def test_rule3_stop_echo_without_reviewer_agent_type_is_missing_stop() -> None:
+    s = Stream().init().agent_call().start()
+    _with_tools_inline(s).stop(agent_type="other-agent").agent_result().final()
+    assert_outcome(evaluate(s), "fail", 3)
+
+
+def _with_tools_inline(stream: Stream) -> Stream:
+    return stream.root().head().read("producer").read("parser").read("consumer")
 
 
 def _with_tools(stream: Stream) -> Stream:
