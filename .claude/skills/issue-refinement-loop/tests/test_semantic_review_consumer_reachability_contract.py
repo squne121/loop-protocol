@@ -225,6 +225,21 @@ def test_reviewer_contract_requires_producer_parser_evaluator_caller_trace_and_u
     ):
         assert needle in section, f"{doc_name}: root/HEAD contract lacks {needle!r}"
     assert "git -C <invocation_dir> rev-parse --show-toplevel" in _flat(_launch_prompt(text))
+    # 観測の手順: 各 Bash は単独で実行し、source は Read tool で読む（Bash での代替は観測として数えない）。
+    prompt = _flat(_launch_prompt(text))
+    for scope, haystack in (("section", section), ("launch prompt", prompt)):
+        for needle in (
+            "git -C <root> rev-parse HEAD",
+            "pipe・redirect・`cd`・shell 変数・追加 flag・他 command との連結を使わない",
+            "Read tool で",
+            "`<root>/<repository 相対 path>`",
+            "`cat` など Bash での代替は観測として数えない",
+            "観測せずに `assessment: clear` を返さない"
+            if scope == "section"
+            else "観測せずに `assessment: clear` を返してはならない",
+        ):
+            assert needle in haystack, f"{doc_name}: {scope} lacks observation-procedure wording {needle!r}"
+    assert "単独で実行" in prompt and "cross-contract な検証要求がある場合に限り" in prompt
     # (2) 追跡順序: producer / parser -> evaluator signature -> decision-critical caller の具体引数
     _assert_in_order(
         section,

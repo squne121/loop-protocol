@@ -324,18 +324,42 @@ def summarize_lifecycle_records(stdout: str) -> list[dict[str, Any]]:
     return records
 
 
-def summarize_tool_uses(stdout: str) -> list[dict[str, Any]]:
-    """tool_use の sanitized な要約（id / name / parent / stream_index のみ。input は含めない）。"""
-    tool_uses, _results = scan_tool_records(iter_stream_events(stdout))
-    return [
-        {
+def sanitize_text(text: str, resolved_root: str, invocation_dir: str) -> str:
+    """絶対 path を placeholder へ置換する（invocation_dir は root 配下なので先に置換する）。HOME も残さない。"""
+    out = str(text)
+    for value, placeholder in ((invocation_dir, "<INVOCATION_DIR>"), (resolved_root, "<ROOT>")):
+        if value:
+            out = out.replace(value.rstrip("/"), placeholder)
+    return re.sub(r"/home/[^/\s\"']+", "<HOME>", out)
+
+
+def summarize_tool_uses(stdout: str, resolved_root: str = "", invocation_dir: str = "") -> list[dict[str, Any]]:
+    """tool_use の sanitized な要約（診断用。判定規則には使わない）。
+
+    全 tool_use に id / name / parent_tool_use_id / stream_index / result の is_error を付ける。reviewer 帰属
+    （parent が reviewer の Agent tool_use）の Bash は command（sanitized）と stdout の先頭 200 文字（sanitized）、
+    Read は `<ROOT>` へ相対化した file_path を添える。他の tool の input は含めない。"""
+    tool_uses, results = scan_tool_records(iter_stream_events(stdout))
+    reviewer_agent_ids = _reviewer_agent_tool_use_ids(tool_uses)
+    summary: list[dict[str, Any]] = []
+    for tu in tool_uses:
+        record: dict[str, Any] = {
             "id": tu["id"],
             "name": tu["name"],
             "parent_tool_use_id": tu["parent_tool_use_id"],
             "stream_index": tu["stream_index"],
         }
-        for tu in tool_uses
-    ]
+        result = results.get(tu["id"])
+        record["result_is_error"] = None if result is None else result["is_error"]
+        if tu["parent_tool_use_id"] in reviewer_agent_ids:
+            if tu["name"] == "Bash" and isinstance(tu["input"].get("command"), str):
+                record["input_summary"] = sanitize_text(tu["input"]["command"], resolved_root, invocation_dir)
+                if result is not None:
+                    record["stdout_head"] = sanitize_text(result["text"], resolved_root, invocation_dir)[:200]
+            elif tu["name"] == "Read" and isinstance(tu["input"].get("file_path"), str):
+                record["input_summary"] = sanitize_text(tu["input"]["file_path"], resolved_root, invocation_dir)
+        summary.append(record)
+    return summary
 
 
 def evaluate_reachability_runtime(**kwargs: Any) -> dict[str, Any]:
@@ -344,7 +368,9 @@ def evaluate_reachability_runtime(**kwargs: Any) -> dict[str, Any]:
     stdout = kwargs.get("stdout") or ""
     if iter_stream_events(stdout):
         outcome["lifecycle_records"] = summarize_lifecycle_records(stdout)
-        outcome["tool_use_records"] = summarize_tool_uses(stdout)
+        outcome["tool_use_records"] = summarize_tool_uses(
+            stdout, kwargs.get("resolved_root") or "", kwargs.get("invocation_dir") or ""
+        )
     return outcome
 
 

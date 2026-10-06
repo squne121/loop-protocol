@@ -649,3 +649,37 @@ def test_pipeline_extracted_raw_result_feeds_the_evaluator(kind: str) -> None:
     stream = normal_stream(kind)
     raw = EVAL.extract_reviewer_raw_result(stream.text())
     assert_outcome(evaluate(stream, kind, result=raw), "pass", 5)
+
+
+def test_rule4_real_deviation_compound_bash_and_cat_instead_of_read_is_fail() -> None:
+    """実 reviewer の逸脱形状: root / HEAD を 1 本の複合 Bash（shell 変数・連結）で実行し、source を cat で読む。"""
+    s = Stream().init().agent_call().start()
+    s.tool(
+        "Bash",
+        {"command": f"D={INV}; cat $D/bundle.json; git -C $D rev-parse --show-toplevel; git -C $D rev-parse HEAD"},
+        f"{{}}\n{ROOT}\n{HEAD}\n",
+    )
+    s.tool("Bash", {"command": f"cd {ROOT}/fixtures/synthetic_case/ && for f in *.py; do cat $f; done"}, "source")
+    s.handback(json.dumps(default_result("negative"))).stop().agent_result().final()
+    outcome = evaluate(s)
+    assert_outcome(outcome, "fail", 4)
+    assert all(not ok for ok in outcome["evidence"]["required_observations"].values())
+
+
+def test_artifact_tool_use_summary_is_sanitized_and_diagnosable() -> None:
+    home_path = "/home/someone/secret-project"
+    s = Stream().init().agent_call().start()
+    s.tool("Bash", {"command": f"cd {ROOT}/x && git -C {INV} log {home_path}"}, f"{ROOT}/x {home_path} " + "z" * 400)
+    s.read("producer")
+    s.tool("Grep", {"pattern": "secret-pattern"}, "hit")
+    s.stop().agent_result().final()
+    outcome = evaluate(s)
+    records = {r["name"]: r for r in outcome["tool_use_records"]}
+    bash = records["Bash"]
+    assert bash["input_summary"].startswith("cd <ROOT>/x && git -C <INVOCATION_DIR> log <HOME>")
+    assert len(bash["stdout_head"]) <= 200 and "/home/" not in bash["stdout_head"] and ROOT not in bash["stdout_head"]
+    assert records["Read"]["input_summary"] == PATHS["producer"].join(["<ROOT>/", ""])
+    assert records["Read"]["result_is_error"] is False
+    assert "input_summary" not in records["Grep"], "inputs of other tools must not be retained"
+    dumped = json.dumps(outcome["tool_use_records"])
+    assert "/home/" not in dumped and ROOT not in dumped and "secret-pattern" not in dumped
