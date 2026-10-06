@@ -455,6 +455,39 @@ in-place で reframe された。過去の設計判断・FAIL 記録は履歴と
 関数である。stale evidence の PASS への再利用を防ぐためのユーティリティ関数であり、
 runner の CLI からは呼び出されない（呼び出し元が evidence 再利用を判断する場面で使う）。
 
+### lifecycle 失敗時の生イベント保全（`--lifecycle-failure-evidence-json`、任意指定、Issue #2958）
+
+`--runtime claude --mode structured` の run で lifecycle verdict が失敗したときに限り、
+原因 channel を事後に特定するための raw lifecycle event だけを output dir 配下へ保存する
+opt-in flag。未指定なら何も保存せず、既存 caller の挙動は変わらない。
+
+```bash
+uv run python3 scripts/agent-ops/run_worktree_agent_runtime_smoke.py \
+  --worktree "$WORKTREE" --runtime claude --mode structured \
+  --prompt-file "$PROMPT" --output-dir "$OUT" \
+  --require-min-subagents 2 \
+  --lifecycle-failure-evidence-json "$OUT/lifecycle-failure-evidence.json"
+```
+
+- 保存する条件（いずれか）: `multi_child_lifecycle` が `verified: False`、
+  `duplicate_completions` が非空、または causal evidence を要求した run
+  （`--require-subagent-causal-evidence` / `--expect-marker` の既定 gate）で
+  `subagent_causal_evidence` が `no_evidence`。lifecycle が成功した run、
+  lifecycle を何も要求していない run では、flag を指定しても file は作られない。
+- 保存する内容（許可リストのみ）: SubagentStart / SubagentStop hook event の既存
+  field（`hook_event` / `stream_index` / `agent_id` / `agent_type` /
+  `agent_transcript_path_present`（path 自体は保存せず有無のみ） / `session_id` /
+  `prompt_id` / `stop_hook_active` / `contradictory`）、`user` event の
+  `tool_use_result` の `agentId` / `status`、task-notification の agent id と status
+  （本文は保存しない）、`settings_provenance.digest_sha256`。`last_assistant_message`、
+  assistant message 本文、prompt、secret、無関係な transcript は保存しない。
+- 件数上限: channel ごとに 100 件（超過分は保存せず、`*_total` に実数だけ残す）。
+- 出力先: `--output-dir` 配下の path のみ（相対 path は `--output-dir` と同様に
+  worktree 基準）。配下でない path は起動前に拒否する。file は排他的に新規作成し、
+  既存 file は上書きせず non-fatal な警告を stderr に出すだけである。
+- verdict・exit code・`summary.md` の既存 field は flag の有無で変わらない。
+  `runtime_version`（#2954）や prompt-echo（#2944）の扱いは本 flag の範囲外である。
+
 ## PR reviewer 向け: evidence の `tested_head` と live PR head の突き合わせ（照合手順）
 
 `summary.md` の `tested_head` は evidence 生成時点の worktree HEAD SHA である。

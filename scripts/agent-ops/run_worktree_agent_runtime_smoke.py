@@ -6808,6 +6808,191 @@ def write_evidence(output_dir: Path, *, schema_summary: dict) -> None:
     (output_dir / "summary.md").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
 
 
+# ---------------------------------------------------------------------------
+# Issue #2958: opt-in, bounded preservation of raw lifecycle events when a
+# structured Claude run's lifecycle verdict fails
+# (``--lifecycle-failure-evidence-json``).
+#
+# Ownership boundary: this is a pure projection of the already-captured
+# stream-json stdout through an explicit allowlist. It never changes the
+# verdict, exit code, or summary.md; it only decides whether a diagnostic JSON
+# is additionally written under ``--output-dir``. ``last_assistant_message``,
+# prompts, message bodies, task-notification bodies, and transcript content
+# are never read into the payload (``agent_transcript_path`` is reduced to a
+# presence boolean).
+# ---------------------------------------------------------------------------
+
+# Per-channel cap on preserved entries (hook events / tool_use_result entries /
+# task-notification completions), so the output stays bounded however large the
+# stream is.
+_LIFECYCLE_FAILURE_EVIDENCE_MAX_EVENTS_PER_CHANNEL = 100
+_LIFECYCLE_FAILURE_EVIDENCE_MAX_FIELD_CHARS = 128
+
+
+def _lifecycle_evidence_text(value: object) -> str | None:
+    """Allowlisted scalar string: redacted and length-bounded, else ``None``."""
+    if not isinstance(value, str) or not value:
+        return None
+    return _redact(value)[:_LIFECYCLE_FAILURE_EVIDENCE_MAX_FIELD_CHARS]
+
+
+def lifecycle_failure_reasons(
+    schema_summary: dict,
+    causal_evidence: dict | None,
+    *,
+    causal_evidence_gated: bool,
+) -> list[str]:
+    """Reasons the run's lifecycle verdict failed (empty list == no failure).
+
+    ``multi_child_lifecycle`` not verified / non-empty ``duplicate_completions``
+    are read from the already-computed verdict. ``no_evidence`` only counts when
+    the run required causal evidence (``causal_evidence_gated``, i.e. the same
+    condition under which ``no_evidence`` fails the run): a run that never
+    asked for SubAgent causal evidence has no such verdict to fail."""
+    reasons: list[str] = []
+    multi_child = schema_summary.get("multi_child_lifecycle")
+    if isinstance(multi_child, dict):
+        if not multi_child.get("verified"):
+            reasons.append("multi_child_lifecycle_not_verified")
+        if multi_child.get("duplicate_completions"):
+            reasons.append("duplicate_completions")
+    if (
+        causal_evidence_gated
+        and isinstance(causal_evidence, dict)
+        and causal_evidence.get("causal_evidence_source") == CAUSAL_EVIDENCE_SOURCE_NO_EVIDENCE
+    ):
+        reasons.append("subagent_causal_evidence_no_evidence")
+    return reasons
+
+
+def build_lifecycle_failure_evidence(
+    stdout: str, *, run_id: str, reasons: list[str], settings_digest_sha256: str | None
+) -> dict:
+    """Allowlist-only, bounded projection of the raw lifecycle events.
+
+    Reuses ``extract_claude_hook_lifecycle_events`` / ``_iter_claude_stream_events``
+    / ``_CLAUDE_TASK_NOTIFICATION_RE`` (the same parsers the verdict uses), so
+    the preserved events are exactly the ones that produced the verdict."""
+    cap = _LIFECYCLE_FAILURE_EVIDENCE_MAX_EVENTS_PER_CHANNEL
+
+    hook_events = extract_claude_hook_lifecycle_events(stdout)
+    hook_entries = [
+        {
+            "hook_event": event["hook_event"],
+            "stream_index": event["stream_index"],
+            "agent_id": _lifecycle_evidence_text(event["agent_id"]),
+            "agent_type": _lifecycle_evidence_text(event["agent_type"]),
+            "agent_transcript_path_present": bool(event["agent_transcript_path"]),
+            "session_id": _lifecycle_evidence_text(event["session_id"]),
+            "prompt_id": _lifecycle_evidence_text(event["prompt_id"]),
+            "stop_hook_active": (
+                event["stop_hook_active"] if isinstance(event["stop_hook_active"], bool) else None
+            ),
+            "contradictory": bool(event["contradictory"]),
+        }
+        for event in hook_events[:cap]
+    ]
+
+    tool_result_total = 0
+    tool_result_entries: list[dict] = []
+    for stream_index, payload in enumerate(_iter_claude_stream_events(stdout)):
+        if payload.get("type") != "user":
+            continue
+        tool_use_result = payload.get("tool_use_result")
+        if not isinstance(tool_use_result, dict):
+            continue
+        agent_id = _lifecycle_evidence_text(tool_use_result.get("agentId"))
+        if agent_id is None:
+            continue
+        tool_result_total += 1
+        if len(tool_result_entries) < cap:
+            tool_result_entries.append(
+                {
+                    "stream_index": stream_index,
+                    "agent_id": agent_id,
+                    "status": _lifecycle_evidence_text(tool_use_result.get("status")),
+                }
+            )
+
+    notification_total = 0
+    notification_entries: list[dict] = []
+    for match_index, match in enumerate(_CLAUDE_TASK_NOTIFICATION_RE.finditer(stdout)):
+        notification_total += 1
+        if len(notification_entries) < cap:
+            notification_entries.append(
+                {
+                    "match_index": match_index,
+                    "agent_id": _lifecycle_evidence_text(match.group(1)),
+                    "status": _lifecycle_evidence_text(match.group(2)),
+                }
+            )
+
+    digest = (
+        settings_digest_sha256
+        if isinstance(settings_digest_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", settings_digest_sha256)
+        else None
+    )
+    return {
+        "run_id": run_id,
+        "failure_reasons": list(reasons),
+        "max_events_per_channel": cap,
+        "hook_lifecycle_events": hook_entries,
+        "hook_lifecycle_events_total": len(hook_events),
+        "tool_use_results": tool_result_entries,
+        "tool_use_results_total": tool_result_total,
+        "task_notification_completions": notification_entries,
+        "task_notification_completions_total": notification_total,
+        "settings_provenance": {"digest_sha256": digest},
+    }
+
+
+def resolve_lifecycle_failure_evidence_path(raw_path: str, worktree: str, output_dir: Path) -> str | None:
+    """Absolute lexical path of the flag value when it lies strictly inside
+    ``output_dir``; ``None`` otherwise. A relative path is resolved against
+    the worktree, exactly like a relative ``--output-dir``."""
+    candidate = Path(raw_path)
+    if not candidate.is_absolute():
+        candidate = Path(worktree) / candidate
+    resolved = os.path.abspath(str(candidate))
+    base = os.path.abspath(str(output_dir))
+    if resolved == base or not resolved.startswith(base + os.sep):
+        return None
+    return resolved
+
+
+def write_lifecycle_failure_evidence(path: str, output_dir: Path, payload: dict) -> bool:
+    """Exclusively create ``path`` (inside ``output_dir``) with ``payload``.
+
+    Never overwrites: an existing file, a symlink, a path that escapes
+    ``output_dir`` after symlink resolution, or any OS error yields a
+    non-fatal ``[WARN]`` on stderr and ``False`` -- it never changes the
+    run's verdict or exit code."""
+    try:
+        real_parent = os.path.realpath(os.path.dirname(path))
+        real_base = os.path.realpath(str(output_dir))
+        if real_parent != real_base and not real_parent.startswith(real_base + os.sep):
+            print("[WARN] lifecycle failure evidence path escapes --output-dir; not written", file=sys.stderr)
+            return False
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    except FileExistsError:
+        print(
+            "[WARN] lifecycle failure evidence file already exists; not overwritten",
+            file=sys.stderr,
+        )
+        return False
+    except OSError as exc:
+        print(f"[WARN] could not write lifecycle failure evidence: {_redact(str(exc))}", file=sys.stderr)
+        return False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    except OSError as exc:
+        print(f"[WARN] could not write lifecycle failure evidence: {_redact(str(exc))}", file=sys.stderr)
+        return False
+    return True
+
+
 def count_session_log_metadata(raw_lines: list[str]) -> int:
     """Count lines whose parsed JSON object carries at least one allowlisted
     presence-signal key. Values are never persisted (Issue #1921 P1
@@ -8110,6 +8295,26 @@ def build_parser() -> argparse.ArgumentParser:
             "behavior is unchanged."
         ),
     )
+    parser.add_argument(
+        "--lifecycle-failure-evidence-json",
+        default=None,
+        help=(
+            "Issue #2958: opt-in path (inside --output-dir; a relative path is "
+            "resolved against the worktree like --output-dir) of a diagnostic "
+            "JSON that is created ONLY when a structured Claude run's lifecycle "
+            "verdict fails (multi_child_lifecycle not verified, non-empty "
+            "duplicate_completions, or subagent_causal_evidence no_evidence "
+            "when the run required causal evidence). It holds only allowlisted raw "
+            "lifecycle events (SubagentStart/SubagentStop hook fields except "
+            "last_assistant_message, tool_use_result agentId/status, "
+            "task-notification agent id/status) and "
+            "settings_provenance.digest_sha256, bounded per channel. Created "
+            "exclusively (an existing file is never overwritten; a non-fatal "
+            "warning is printed). Verdict, exit code and summary.md are "
+            "unchanged. Requires --runtime claude --mode structured. Omitted "
+            "by default, so nothing is saved."
+        ),
+    )
     parser.add_argument("--expect-marker", action="append", default=[])
     parser.add_argument(
         "--expect-ordered-marker",
@@ -8495,6 +8700,8 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--hermetic-agent-definition requires --runtime claude")
     if args.mode != "structured" and args.hermetic_agent_definition:
         parser.error("--hermetic-agent-definition requires --mode structured")
+    if args.lifecycle_failure_evidence_json and (args.runtime != "claude" or args.mode != "structured"):
+        parser.error("--lifecycle-failure-evidence-json requires --runtime claude --mode structured")
     if args.require_min_subagents < 0:
         parser.error("--require-min-subagents must be >= 0")
     if args.require_min_turns < 0:
@@ -8698,6 +8905,16 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError:
         output_dir_rel = None
 
+    # Issue #2958: validate the opt-in lifecycle failure evidence path before
+    # any side effect; a path outside --output-dir is rejected.
+    lifecycle_failure_evidence_path: str | None = None
+    if args.lifecycle_failure_evidence_json:
+        lifecycle_failure_evidence_path = resolve_lifecycle_failure_evidence_path(
+            args.lifecycle_failure_evidence_json, worktree, output_dir
+        )
+        if lifecycle_failure_evidence_path is None:
+            parser.error("--lifecycle-failure-evidence-json must be a path inside --output-dir")
+
     # Cheap, environment-independent checks (output directory exclusivity)
     # run before any capability/herdr preflight so they fail fast regardless
     # of whether claude/codex/herdr happen to be installed. This check
@@ -8721,6 +8938,7 @@ def main(argv: list[str] | None = None) -> int:
     # bottom of this function.
     exit_code = EXIT_OK
     resolved_runtime_bin: str | None = None
+    lifecycle_failure_evidence_payload: dict | None = None
 
     if args.mode == "interactive":
         skip_reason = preflight_herdr()
@@ -9451,6 +9669,26 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 exit_code = EXIT_FAIL
 
+            # Issue #2958: opt-in raw lifecycle evidence on lifecycle failure.
+            # Computed from the final lifecycle verdicts only; it never feeds
+            # back into errors / exit_code / schema_summary.
+            if lifecycle_failure_evidence_path is not None:
+                lifecycle_reasons = lifecycle_failure_reasons(
+                    schema_summary,
+                    causal_evidence,
+                    causal_evidence_gated=bool(causal_evidence_required),
+                )
+                if lifecycle_reasons:
+                    provenance = schema_summary.get("settings_provenance")
+                    lifecycle_failure_evidence_payload = build_lifecycle_failure_evidence(
+                        out,
+                        run_id=run_id,
+                        reasons=lifecycle_reasons,
+                        settings_digest_sha256=(
+                            provenance.get("digest_sha256") if isinstance(provenance, dict) else None
+                        ),
+                    )
+
             required_observations = sorted(set(args.require_observed_runtime_field))
             if required_observations:
                 # Issue #2854: only ``permission_mode`` has a native extractor
@@ -9862,6 +10100,11 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     write_evidence(output_dir, schema_summary=schema_summary)
+
+    if lifecycle_failure_evidence_payload is not None and lifecycle_failure_evidence_path is not None:
+        write_lifecycle_failure_evidence(
+            lifecycle_failure_evidence_path, output_dir, lifecycle_failure_evidence_payload
+        )
 
     for error in errors:
         print(f"[FAIL] {error}" if exit_code == EXIT_FAIL else f"SKIP: {error}", file=sys.stderr)
