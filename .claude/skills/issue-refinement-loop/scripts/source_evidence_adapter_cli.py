@@ -250,15 +250,12 @@ def _trusted_c1_context(context_path: Path, issue_body_path: Path, repo_root: Pa
         raise ValueError("independently pinned C1 claim/repository mismatch")
     if context.get("issue_number") != 2889 or context.get("issue_body_sha256") != _sha256(issue_body.encode("utf-8")):
         raise ValueError("fresh pinned Issue body snapshot mismatch")
-    main = subprocess.run(
-        ["git", "rev-parse", "--verify", "refs/heads/main^{commit}"],
-        cwd=repo_root,
-        capture_output=True,
-        check=True,
-        text=True,
-    ).stdout.strip()
-    if context.get("canonical_main_sha") != main:
-        raise ValueError("canonical main ref drift or missing independent main pin")
+    # Root pins the live GitHub main ref before invoking this offline adapter.
+    # Local refs/heads/main may be stale (or absent in a linked worktree); it
+    # cannot serve as the freshness authority for the root-owned pin.
+    main = context.get("canonical_main_sha")
+    if not isinstance(main, str) or len(main) not in (40, 64) or any(ch not in "0123456789abcdef" for ch in main):
+        raise ValueError("missing or invalid root-pinned canonical main SHA")
     target = context.get("c1_target")
     if not isinstance(target, dict) or target.get("repo") != C1_REPO or target.get("path") != C1_PATH:
         raise ValueError("independent C1 expected target mismatch")
@@ -279,7 +276,7 @@ def _trusted_c1_context(context_path: Path, issue_body_path: Path, repo_root: Pa
     return c1_baseline(issue_body=issue_body, main_sha=main), target
 
 
-def _operator_decision(snapshot_path: Path, readback_path: Path, *, persisted_at: str) -> tuple[dict, dict]:
+def _operator_decision(snapshot_path: Path, readback_path: Path, *, initial_result_sha256: str) -> tuple[dict, dict]:
     """Consume only root-selected with_human_context snapshot + drift readback.
 
     The root operator, not this CLI, chooses the lane and acquires both
@@ -305,15 +302,14 @@ def _operator_decision(snapshot_path: Path, readback_path: Path, *, persisted_at
         or readback.get("body_sha256") != snapshot["body_sha256"]
     ):
         raise ValueError("operator body hash mismatch")
-    if _utc(snapshot["updated_at"]) <= _utc(persisted_at):
-        raise ValueError("operator confirmation predates initial acquisition")
+    # GitHub timestamps still bind snapshot to readback, but comparing a
+    # local persisted_at to GitHub's clock is not a causal proof. The operator
+    # must explicitly name the result bytes pinned by Step 1 after acquisition.
+    _utc(snapshot["updated_at"])
     decision = json.loads(body)
-    if (
-        not isinstance(decision, dict)
-        or _utc(decision["recorded_at"]) <= _utc(persisted_at)
-        or _utc(decision["recorded_at"]) > _utc(snapshot["updated_at"])
-    ):
-        raise ValueError("operator decision not explicitly recorded after initial acquisition")
+    if not isinstance(decision, dict) or decision.get("initial_result_sha256") != initial_result_sha256:
+        raise ValueError("operator decision must identify the initial pinned result after acquisition")
+    _utc(decision["recorded_at"])
     return decision, {
         "issue_number": snapshot["issue_number"],
         "comment_id": snapshot["comment_id"],
@@ -374,7 +370,7 @@ def _resolve_only(args: argparse.Namespace, request: dict, repo_root: Path) -> d
     decision, receipt = _operator_decision(
         args.operator_snapshot_file,
         args.operator_readback_file,
-        persisted_at=prior["persisted_at"],
+        initial_result_sha256=args.expected_result_sha256,
     )
     overlay = decide_effective_step1_action(
         envelope,
@@ -452,6 +448,15 @@ def main(argv: list[str] | None = None) -> int:
                 default_budget=request.get("budget", {"max_total": 1, "per_claim_max": 1}),
             )
             result, new_state = run_adapter(request, state)
+            if c1:
+                # Dispatch/budget are already consumed even when this envelope
+                # cannot be resolved. Save that ledger BEFORE the C1 eligibility
+                # check; a retry of the same route must not call the collector.
+                # Preserve bindings for earlier successful claims, but do not
+                # create a binding for this attempt until eligibility succeeds.
+                if "resolution_bindings" in state:
+                    new_state["resolution_bindings"] = state["resolution_bindings"]
+                args.state_file.write_bytes(_encoded(new_state))
             result["runtime_counts"] = {
                 "run_acquisition": 1,
                 "collector_dispatch": len(result["envelope"].get("attempts", [])),

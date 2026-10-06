@@ -208,6 +208,7 @@ class _C1Fixture:
             "run_id": initial["initial_binding"]["run_id"],
             "claim_id": "C1",
             "envelope_sha256": initial["initial_binding"]["envelope_sha256"],
+            "initial_result_sha256": self.initial_pin,
             "canonical_main_sha": self.main,
             "evidence": {
                 "repo": C1_REPO,
@@ -914,6 +915,115 @@ class TestSourceEvidenceAdapterCliSmoke:
             before_state=before,
         )
 
+    def test_operator_c1_remote_main_advance_with_stale_local_main_cli(self, tmp_path):
+        """A live remote main pin, not stale refs/heads/main, owns freshness."""
+        fixture = _C1Fixture(tmp_path)
+        original = fixture.acquire()
+        fixture.select_operator(original)
+        bare = tmp_path / "remote.git"
+        publisher = tmp_path / "publisher"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
+        subprocess.run(["git", "-C", str(fixture.repo), "remote", "add", "origin", str(bare)], check=True)
+        subprocess.run(["git", "-C", str(fixture.repo), "push", "-q", "origin", "main"], check=True)
+        subprocess.run(["git", "clone", "-q", "--branch", "main", str(bare), str(publisher)], check=True)
+        (publisher / "advance.txt").write_text("remote-only change\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(publisher), "add", "advance.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(publisher), "-c", "user.email=fixture@example.invalid",
+             "-c", "user.name=Fixture", "commit", "-qm", "advance remote main"], check=True
+        )
+        subprocess.run(["git", "-C", str(publisher), "push", "-q", "origin", "main"], check=True)
+        subprocess.run(["git", "-C", str(fixture.repo), "fetch", "-q", "origin", "main"], check=True)
+        live_main = subprocess.check_output(
+            ["git", "--git-dir", str(bare), "rev-parse", "refs/heads/main"], text=True
+        ).strip()
+        stale_local = subprocess.check_output(
+            ["git", "-C", str(fixture.repo), "rev-parse", "refs/heads/main"], text=True
+        ).strip()
+        assert stale_local == fixture.main != live_main
+        assert subprocess.check_output(
+            ["git", "-C", str(fixture.repo), "rev-parse", "refs/remotes/origin/main"], text=True
+        ).strip() == live_main
+        fixture.main = live_main  # independent root-owned live remote observation
+        fixture.context_data["canonical_main_sha"] = live_main
+        fixture.write(fixture.context, fixture.context_data)
+        old = fixture.assert_stopped()
+        assert "request baseline" in old.stderr
+        fixture.request_data["run_id"] = "fresh-remote-run"
+        fixture.request_data["claim"]["baseline"] = c1_baseline(issue_body=fixture.body, main_sha=live_main)
+        fixture.request_data["claim"]["commit_sha"] = live_main
+        fixture.write(fixture.request_file, fixture.request_data)
+        fresh = fixture.acquire()
+        assert fresh["envelope"]["evidence_refs"][0]["commit_sha"] == live_main
+        fixture.select_operator(fresh)
+        resolved = fixture.resolve()
+        assert resolved.returncode == 0, resolved.stderr
+        assert json.loads(resolved.stdout)["effective_step1_action"] == "proceed"
+        assert json.loads(resolved.stdout)["runtime_counts"] == {"run_acquisition": 0, "collector_dispatch": 0}
+        fixture.rejection_artifact("stale-local-main", {
+            "stale_local_main": stale_local, "live_remote_main": live_main,
+            "old_pin_exit_code": old.returncode, "fresh_pin_exit_code": resolved.returncode,
+        })
+
+    def test_operator_c1_failed_collector_persists_dispatch_before_retry_cli(self, tmp_path):
+        """Real Git collector failure must not lose the no-redispatch ledger."""
+        fixture = _C1Fixture(tmp_path)
+        # Git SHA-1 object, but a SHA-256 ref claim: git show fetches actual
+        # bytes, then reference validation fails without any network/stub.
+        fixture.request_data["claim"]["object_format"] = "sha256"
+        fixture.write(fixture.request_file, fixture.request_data)
+        first = fixture.invoke(fixture.first_argv)
+        assert first.returncode == 1
+        assert "did not yield verified human_review" in first.stderr
+        assert not fixture.initial.exists()
+        state = json.loads(fixture.state.read_bytes())
+        assert state["dispatched_routes"] == [["fixture-run-a", "C1", "local_git:repo_blob_at_commit"]]
+        assert state["budget"]["_consumed_total"] == 0
+        assert "resolution_bindings" not in state
+        ledger = fixture.state.read_bytes()
+        retry = fixture.invoke(fixture.first_argv)
+        assert retry.returncode == 1
+        assert "duplicate_dispatch_forbidden" in retry.stderr
+        assert fixture.state.read_bytes() == ledger
+        assert not fixture.initial.exists()
+        fixture.rejection_artifact("failed-collector-ledger", {
+            "first_exit_code": first.returncode, "retry_exit_code": retry.returncode,
+            "persisted_dispatch_count": len(state["dispatched_routes"]),
+            "retry_rejected_before_collector": True, "state_unchanged_on_retry": True,
+        })
+
+    def test_operator_c1_clock_skew_uses_result_pin_not_cross_system_time_cli(self, tmp_path):
+        fixture = _C1Fixture(tmp_path)
+        initial = fixture.acquire()
+        fixture.select_operator(initial)
+        snapshot = json.loads(fixture.snapshot.read_bytes())
+        decision = json.loads(snapshot["body"])
+        # Simulate a GitHub server clock behind the host; the selected
+        # content still explicitly binds to the initial result byte SHA.
+        earlier = (datetime.fromisoformat(initial["persisted_at"]) - timedelta(hours=1)).isoformat()
+        decision["recorded_at"] = earlier
+        snapshot["body"] = json.dumps(decision, sort_keys=True)
+        snapshot["body_sha256"] = hashlib.sha256(snapshot["body"].encode()).hexdigest()
+        snapshot["updated_at"] = earlier
+        fixture.write(fixture.snapshot, snapshot)
+        fixture.write(fixture.readback, {key: value for key, value in snapshot.items() if key != "lane"})
+        valid = fixture.resolve()
+        assert valid.returncode == 0, valid.stderr
+        assert json.loads(valid.stdout)["effective_step1_action"] == "proceed"
+        for replacement in (None, "0" * 64):
+            wrong = dict(decision)
+            if replacement is None:
+                wrong.pop("initial_result_sha256")
+            else:
+                wrong["initial_result_sha256"] = replacement
+            snapshot["body"] = json.dumps(wrong, sort_keys=True)
+            snapshot["body_sha256"] = hashlib.sha256(snapshot["body"].encode()).hexdigest()
+            fixture.write(fixture.snapshot, snapshot)
+            fixture.write(fixture.readback, {key: value for key, value in snapshot.items() if key != "lane"})
+            rejected = fixture.assert_stopped()
+            assert rejected.returncode == 1
+            assert "initial pinned result" in rejected.stderr
+
     def test_operator_resolution_rejects_cross_run_or_tampered_first_result_cli(self, tmp_path):
         fixture = _C1Fixture(tmp_path)
         # No initial acquisition: fail closed without synthesizing a state.
@@ -1057,9 +1167,16 @@ class TestSourceEvidenceAdapterCliSmoke:
             ],
             check=True,
         )
+        fresh_main = subprocess.check_output(
+            ["git", "-C", str(fixture.repo), "rev-parse", "refs/heads/main"], text=True
+        ).strip()
+        fixture.context_data["canonical_main_sha"] = fresh_main  # root's newly observed main pin
+        fixture.write(fixture.context, fixture.context_data)
         old_commit = fixture.assert_stopped()
-        assert "main ref drift" in old_commit.stderr
-        # Restore the isolated fixture's main for independent target negatives.
+        assert "request baseline" in old_commit.stderr
+        # Restore the independent pin and isolated fixture's main for target negatives.
+        fixture.context_data["canonical_main_sha"] = fixture.main
+        fixture.write(fixture.context, fixture.context_data)
         subprocess.run(
             ["git", "-C", str(fixture.repo), "reset", "--hard", fixture.main], check=True, capture_output=True
         )
@@ -1253,9 +1370,9 @@ class TestSourceEvidenceAdapterCliSmoke:
         assert json.loads(valid.stdout)["runtime_counts"] == {"run_acquisition": 0, "collector_dispatch": 0}
         fixture.resolved.unlink()
 
-        # Construct a fully self-consistent but false HEAD-as-main bundle.
-        # If the CLI substituted HEAD for refs/heads/main, all other pins,
-        # evidence bytes and the operator tuple would agree and it could proceed.
+        # Construct a fully self-consistent but false HEAD-as-main candidate.
+        # The root-owned main pin is immutable: candidate request/receipt bytes
+        # cannot replace it even when evidence verifies at the detached HEAD.
         envelope = deepcopy(first["envelope"])
         envelope["baseline"] = c1_baseline(issue_body=fixture.body, main_sha=worktree_head)
         ref = envelope["evidence_refs"][0]
@@ -1268,8 +1385,6 @@ class TestSourceEvidenceAdapterCliSmoke:
         assert validate_envelope(envelope, expected_baseline=envelope["baseline"])["ok"]
         fixture.request_data["claim"].update({"baseline": envelope["baseline"], "commit_sha": worktree_head})
         fixture.write(fixture.request_file, fixture.request_data)
-        fixture.context_data["canonical_main_sha"] = worktree_head
-        fixture.write(fixture.context, fixture.context_data)
         candidate = fixture.pin_test_candidate(envelope)
         decision = fixture.select_operator(
             candidate,
@@ -1290,7 +1405,7 @@ class TestSourceEvidenceAdapterCliSmoke:
         )
         rejected = fixture.assert_stopped()
         assert rejected.returncode == 1, rejected.stderr
-        assert "canonical main ref drift" in rejected.stderr
+        assert "request baseline" in rejected.stderr
         assert not fixture.resolved.exists()  # no success result and no redispatch to compensate
         fixture.rejection_artifact(
             "head-false-main-binding",
@@ -1299,7 +1414,7 @@ class TestSourceEvidenceAdapterCliSmoke:
                 "linked_worktree_head": worktree_head,
                 "legitimate_main_pinned_exit_code": valid.returncode,
                 "head_as_main_exit_code": rejected.returncode,
-                "head_as_main_error": "canonical main ref drift",
+                "head_as_main_error": "request baseline differs from root-owned main pin",
                 "result_written": fixture.resolved.exists(),
             },
         )
@@ -1374,6 +1489,8 @@ class TestSourceEvidenceAdapterCliSmoke:
         for marker in (
             "--resolution-only",
             "--expected-result-sha256",
+            "initial_result_sha256",
+            "observed_base_sha",
             "state_sha256",
             "initial_binding",
             "--step1-context-file",
@@ -1462,7 +1579,14 @@ class TestEnvelopeValidationBinding:
             ],
             check=True,
         )
+        # A newly observed root-owned main pin makes the old request stale;
+        # advancing local HEAD alone is not a freshness authority.
+        fresh_main = subprocess.check_output(
+            ["git", "-C", str(root), "rev-parse", "refs/heads/main"], text=True
+        ).strip()
+        fixture.write(fixture.context, {**context, "canonical_main_sha": fresh_main})
         fixture.assert_stopped()
+        fixture.write(fixture.context, context)
         # For a hash-valid ref on the wrong path, the independent C1 target
         # guard rejects even if its permalink and excerpt SHA are internally valid.
         from copy import deepcopy
