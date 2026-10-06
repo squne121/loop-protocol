@@ -455,6 +455,54 @@ in-place で reframe された。過去の設計判断・FAIL 記録は履歴と
 関数である。stale evidence の PASS への再利用を防ぐためのユーティリティ関数であり、
 runner の CLI からは呼び出されない（呼び出し元が evidence 再利用を判断する場面で使う）。
 
+### lifecycle 失敗時の生イベント保全（`--lifecycle-failure-evidence-json`、任意指定、Issue #2958）
+
+`--runtime claude --mode structured` の run で lifecycle verdict が失敗したときに限り、
+原因 channel を事後に特定するための raw lifecycle event だけを output dir 配下へ保存する
+opt-in flag。未指定なら何も保存せず、既存 caller の挙動は変わらない。
+
+```bash
+uv run --locked python3 scripts/agent-ops/run_worktree_agent_runtime_smoke.py \
+  --worktree "$WORKTREE" --runtime claude --mode structured \
+  --prompt-file "$PROMPT" --output-dir "$OUT" \
+  --require-min-subagents 2 \
+  --lifecycle-failure-evidence-json "$OUT/lifecycle-failure-evidence.json"
+```
+
+- 保存する条件（いずれか）: `multi_child_lifecycle` が `verified: False`、
+  `duplicate_completions` が非空、または causal evidence を要求した run
+  （`--require-subagent-causal-evidence` / `--expect-marker` の既定 gate）で
+  `subagent_causal_evidence` が `no_evidence`。lifecycle が成功した run、
+  lifecycle を何も要求していない run では、flag を指定しても file は作られない。
+- 保存する内容（許可リストのみ）:
+  - SubAgent の SubagentStart / SubagentStop hook event の既存 field（`hook_event` /
+    `stream_index` / `agent_id` / `agent_type` / `agent_transcript_path_present`
+    （path 自体は保存せず有無のみ） / `session_id` / `prompt_id` / `stop_hook_active` /
+    `contradictory`）。
+  - `user` event の `tool_use_result` は `agent_id` と `status` の 2 key のみ
+    （`stream_index` は保存しない）。
+  - task-notification は `completed` の block だけを `agent_id` と `status` の 2 key で保存する
+    （`running` 等の他 status は保存も件数計上もしない。本文・`match_index` も保存しない）。
+    verdict 側の parser とは独立に、`queue-operation` event の `content` / `prompt`
+    のうち 1 field の内側にある 1 つの `<task-notification>` block だけから
+    `<task-id>` と `<status>` を取り出す。assistant / user / system 等の他 type の event に
+    含まれる notification 風の文字列、および複数 event / 複数 field / 複数 block に
+    分断された `<task-id>` と `<status>` は completion として採用しない。
+  - `settings_provenance.digest_sha256`。
+  - `last_assistant_message`、assistant message 本文、prompt、secret、無関係な transcript は
+    保存しない。
+- 件数上限: channel ごとに 100 件。超過分は保存せず、`*_total` に実数
+  （task-notification は completed block の総数）だけ残す。上限は先頭からの単純な切り捨て
+  ではなく、失敗原因の record を優先して残す: lifecycle verdict が指摘した agent id
+  （`duplicate_completions` / `orphan_starts` / `unknown_children`）の record と
+  `contradictory` な hook event を先に確保し、残りの枠を通常の record で埋め、
+  最終的な出力は元の stream 順に並べる。
+- 出力先: `--output-dir` 配下の path のみ（相対 path は `--output-dir` と同様に
+  worktree 基準）。配下でない path は起動前に拒否する。file は排他的に新規作成し、
+  既存 file は上書きせず non-fatal な警告を stderr に出すだけである。
+- verdict・exit code・`summary.md` の既存 field は flag の有無で変わらない。
+  `runtime_version`（#2954）や prompt-echo（#2944）の扱いは本 flag の範囲外である。
+
 ## PR reviewer 向け: evidence の `tested_head` と live PR head の突き合わせ（照合手順）
 
 `summary.md` の `tested_head` は evidence 生成時点の worktree HEAD SHA である。
