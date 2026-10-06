@@ -26,7 +26,17 @@ REQUIRED_IDENTITY_FIELDS = [
     "run_head_sha",
     "git_dirty",
     "launcher hash",
-    "absolute path / version / hash",
+    "actual connected server の diagnosis",
+]
+
+# Issue #2938: 接続先 authority は `launch_check_only.connected_server` のみ。
+# `local_proxy_binary_auxiliary` は非 authority の補助診断で、接続先 server の
+# version / hash は現行 interface から観測できないため「未確認」とする。
+CONNECTED_SERVER_AUTHORITY_MARKERS = [
+    "launch_check_only.connected_server",
+    "local_proxy_binary_auxiliary",
+    "非 authority の補助診断",
+    "「未確認」",
 ]
 
 FORBIDDEN_NEW_SURFACE_MARKERS = [
@@ -44,12 +54,14 @@ def _read(path: Path) -> str:
 def test_evidence_policy_requires_current_head_proxy_identity_binding_and_no_new_harness():
     """GIVEN body-authoring.md / evidence-policy.md の canonical runtime
     acceptance evidence 記述
-    WHEN current-head production launcher を fake proxy override なしで
-    external process 起動した結果を要求する
-    THEN actual selected proxy identity（run_head_sha + git_dirty + 実行
-    command identity + launcher hash + selected proxy absolute path/version/
-    hash）の記載を要求し、fixture proxy の path/version のみでは不十分と
-    明記していることを static に確認する（AC3）。AC8 側で本 test が保証する
+    WHEN current-head production launcher を fixture / mock server へ向けず
+    実接続先で external process 起動した結果を要求する
+    THEN actual connected server の diagnosis（run_head_sha + git_dirty + 実行
+    command identity + launcher hash + `connected_server` 診断）の記載を要求し、
+    接続先 server の version / hash は「未確認」、`local_proxy_binary_auxiliary`
+    は非 authority の補助診断と明記し、fixture / mock server に向けた
+    check-only の evidence のみでは不十分と明記していることを static に確認する
+    （AC3）。AC8 側で本 test が保証する
     のは、両ドキュメント本文に禁止マーカー文字列（new permanent daemon 等）
     が存在しないことのみであり、リポジトリ全体に new harness が追加されて
     いないことの網羅的証明ではない。「new harness を追加していない」ことの
@@ -59,27 +71,39 @@ def test_evidence_policy_requires_current_head_proxy_identity_binding_and_no_new
     body_authoring_text = _read(BODY_AUTHORING_PATH)
     evidence_policy_text = _read(EVIDENCE_POLICY_PATH)
 
-    # AC3: 両ドキュメントとも current-head production launcher を fake
-    # proxy override なしで external process 起動した結果 + actual
-    # selected proxy identity の必須フィールドを要求している。
-    assert "fake proxy override なしで" in body_authoring_text or (
-        "fake binary injection" in body_authoring_text
+    # AC3: 両ドキュメントとも current-head production launcher を
+    # fixture / mock server へ向けず実接続先で external process 起動した結果 +
+    # actual connected server の diagnosis の必須フィールドを要求している。
+    assert "fake binary injection" in body_authoring_text
+    assert (
+        "`ANTHROPIC_BASE_URL` を fixture / mock server へ向けない current-head production"
+        in body_authoring_text
     )
-    assert "fake proxy override なしで external process 起動した結果" in evidence_policy_text
+    assert (
+        "`ANTHROPIC_BASE_URL` を fixture / mock server へ向けず、実接続先に向けて "
+        "external process 起動した結果" in evidence_policy_text
+    )
 
     for field in REQUIRED_IDENTITY_FIELDS:
         assert field in body_authoring_text, f"missing field in body-authoring.md: {field}"
         assert field in evidence_policy_text, f"missing field in evidence-policy.md: {field}"
 
+    for marker in CONNECTED_SERVER_AUTHORITY_MARKERS:
+        assert marker in body_authoring_text, f"missing marker in body-authoring.md: {marker}"
+        assert marker in evidence_policy_text, f"missing marker in evidence-policy.md: {marker}"
+    assert "connected-server AC" in body_authoring_text
+    assert "connected-server AC" in evidence_policy_text
+
     assert "実行 command identity" in body_authoring_text
     assert "実行 command identity" in evidence_policy_text
 
-    # fixture proxy の path/version のみでは不十分、という明記。
+    # fixture / mock server に向けた check-only の evidence のみでは不十分、という明記。
     assert (
-        "fixture proxy の path/version のみでは不十分" in body_authoring_text
+        "fixture / mock server に向けた check-only の evidence のみでは不十分"
+        in body_authoring_text
     )
     assert (
-        "fixture proxy の path/version のみの evidence は、この evidence "
+        "fixture / mock server に向けた check-only の evidence は、この evidence "
         "要件を **充足しない**" in evidence_policy_text
     )
 

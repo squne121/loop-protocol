@@ -33,7 +33,7 @@ def test_actual_runtime_ac_cannot_be_satisfied_by_fixture_only_vc():
     # semantics を区別する規則そのものが存在すること。
     assert "ランタイム受け入れと `fixture` 意味論との AC 分離規則" in doc_text
     assert (
-        "fixture proxy を明示注入する hermetic test（fixture-only VC）を、"
+        "fixture / mock server を明示注入する hermetic test（fixture-only VC）を、"
         "その AC の唯一の evidence にしてはならない" in doc_text
     )
 
@@ -45,10 +45,17 @@ def test_actual_runtime_ac_cannot_be_satisfied_by_fixture_only_vc():
         "fixture" in doc_text
     )
     assert (
-        "current-head production launcher を通常の binary resolution で "
-        "external process として起動し、actual selected proxy identity と "
-        "`--check-only` 相当の結果を観測する AC" in doc_text
+        "current-head production launcher を external process として起動し、"
+        "actual connected server の diagnosis（`launch_check_only.connected_server`）と "
+        "`--check-only` 相当の結果を観測する AC（connected-server AC）" in doc_text
     )
+    # 接続先 authority は connected_server のみ。local_proxy_binary_auxiliary は
+    # 非 authority の補助診断で、接続先 server の version / hash は「未確認」。
+    assert "launch_check_only.connected_server" in doc_text
+    assert "local_proxy_binary_auxiliary" in doc_text
+    assert "非 authority の補助診断" in doc_text
+    assert "「未確認」" in doc_text
+    assert "connected_server_model_catalog_incomplete" in doc_text
 
     # 両方が必要な場合は別 AC/VC に分離する規則が明記されていること。
     assert (

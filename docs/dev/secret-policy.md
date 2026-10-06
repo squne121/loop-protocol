@@ -144,22 +144,30 @@ raw `gh` / raw `git push` 全般に対する production-grade な credential bou
 #2223（実装: raw gh/git push を deterministic deny し GitHub mutation production broker を
 実装する、OPEN）で対応する。
 
-**Issue #2299 による方針変更（#2203 の credential scrub 方針の一部を置換）:** 上記は
+**Issue #2299 / #2925 による方針変更（#2203 の credential scrub 方針の一部を置換）:** 上記は
 canary 専用の `GitHubMutationBroker` の credential boundary であり、これとは別に、
-`scripts/claude-gpt/launch.sh` が起動する Claude/AGY 子プロセス（isolated Claude-GPT
-session 本体）自身の credential scrub 方針は Issue #2299 により変更された。旧方針
-（#2203/PR #2214）は GitHub auth 関連 env var（`GH_TOKEN`/`GH_CONFIG_DIR` 系）を含め
+`scripts/claude-gpt/launch.sh` が起動する Claude 子プロセス（Claude-GPT session 本体）自身の
+credential 方針は Issue #2299 で変更され、さらに Issue #2925（PR #2932）で現行の形へ縮退した。
+旧方針（#2203/PR #2214）は GitHub auth 関連 env var（`GH_TOKEN`/`GH_CONFIG_DIR` 系）を含め
 すべて子プロセスから scrub していたが、これにより genuine `issue-creator` SubAgent が
 `create-issue` skill の dedupe read（`gh issue list`）で認証エラーとなり通常 workflow を
 完走できないという owner 指摘（Issue #2259 NOT_PLANNED, PR #2286 コメント）を受け、
 Issue #2299 で GitHub auth（`GH_TOKEN`/`GITHUB_TOKEN`/`GH_ENTERPRISE_TOKEN`/
 `GITHUB_ENTERPRISE_TOKEN`/`GH_HOST`/`GH_REPO`/`GH_CONFIG_DIR`）のみを ambient 値のまま
-native 同等に子プロセスへ共有する方針へ変更した。`HOME`/`XDG_CONFIG_HOME`/
-`XDG_CACHE_HOME` は引き続き空の隔離ディレクトリへ差し替え、`SSH_AUTH_SOCK`/
-`GIT_ASKPASS`/`SSH_ASKPASS`/`GIT_CREDENTIAL_HELPER`（GitHub auth とは無関係な secret）は
-引き続き scrub する。GitHub mutation の correctness は、この env 共有方針変更ではなく、
-GitHub 側の server-side protection（branch protection・required CI・repository
-permission）と mutation 前後の live readback によって担保する（Issue #2299 Outcome）。
+native 同等に子プロセスへ共有する方針へ変更した。
+
+現行 launcher（#2925 / PR #2932 で upstream の minimal client contract へ縮退済み）は、
+Native Claude Code と同じ ambient な user / project config・`HOME`・`XDG_*`・plugins・
+Skills・SubAgents・hooks・MCP / settings・GitHub auth をそのまま共有し、子プロセスの
+`HOME` / `XDG_*` / `CLAUDE_CONFIG_DIR` を隔離しない。launcher が追加する env は
+`ANTHROPIC_*`（接続先 `ANTHROPIC_BASE_URL` と role model alias）等の非 secret 値だけであり、
+credential に類似する値は `ANTHROPIC_AUTH_TOKEN` に設定する placeholder（実在する credential
+ではない固定値）のみである。launcher は `SSH_AUTH_SOCK` / `GIT_ASKPASS` / `SSH_ASKPASS` /
+`GIT_CREDENTIAL_HELPER` を scrub も unset もせず、ambient 値を native と共有する。secret を
+tracked file / argv / evidence に出さない制約は、この共有方針の下でも維持する。GitHub
+mutation の correctness は、この env 共有方針ではなく、GitHub 側の server-side protection
+（branch protection・required CI・repository permission）と mutation 前後の live readback に
+よって担保する（Issue #2299 Outcome）。
 
 ---
 
@@ -316,8 +324,14 @@ owner_local_observation_supersession_v1:
     - raw_trace_raw_prompt_tool_io_not_published_to_github
     - latitude_failure_not_a_claude_gpt_workflow_completion_gate
     - native_claude_settings_not_full_config_authority_for_claude_gpt
-    - claude_gpt_home_config_mcp_plugin_isolation_not_relaxed
     - issue_2375_pr_2392_schema_and_collection_budget_unchanged
+  superseded_constraints:
+    - constraint: claude_gpt_home_config_mcp_plugin_isolation_not_relaxed
+      superseded_by: "#2925 / PR #2932"
+      reason: >
+        claude-gpt launcher の HOME / config / MCP / plugin 隔離層が #2925 / PR #2932 で
+        撤去されたため、旧 retained constraint（隔離を緩和しない）は superseded。
+        現行 launcher は Native と ambient config を共有する
 ```
 
 `docs/dev/agent-observation-capability.md` が持つ synthetic-only 契約・

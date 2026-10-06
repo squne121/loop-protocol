@@ -702,61 +702,25 @@ key 集合は閉じており、集合外の key を持つ entry は malformed �
 
 ---
 
-## 12. live runtime verification における `home_source` の実効パス文字列一致判定（Issue #2803）
+## 12. live runtime verification における接続先 server 診断と実 request 受理の evidence 分離（Issue #2803 / #2938）
 
-### canonical `CLAUDE_GPT_HOME` を検証対象の launcher と同一にする
+### `CLAUDE_GPT_HOME` は補助 binary の導入先であり credential namespace ではない
 
-先行 Issue #2772 の AC10 相当の live runtime verification（実 ChatGPT subscription
-request を伴う検証）を行う際は、検証者は `scripts/claude-gpt/lib.sh` の canonical な
-`CLAUDE_GPT_HOME`（デフォルト値: `${HOME}/.claude-gpt`。同ファイルの
-`: "${CLAUDE_GPT_HOME:=${HOME}/.claude-gpt}"` 一箇所のみで defaulting される）を、
-本番の target launcher（`scripts/claude-gpt/launch.sh`）が実際に使う値と **必ず一致**
-させなければならない。検証者が ad-hoc に別の `CLAUDE_GPT_HOME` を明示指定すると、
-target launcher が参照している既存の認証済み credential namespace とは異なる、
-未認証の namespace を検証してしまう。
+Issue #2925 で `scripts/claude-gpt/launch.sh` は upstream の minimal client contract へ縮退した。現行 launcher は `HOME` / `XDG_*` / `CLAUDE_CONFIG_DIR` を隔離せず、Native Claude Code と同じ ambient な user / project config をそのまま使う。`scripts/claude-gpt/lib.sh` の `CLAUDE_GPT_HOME`（既定値: `${HOME}/.claude-gpt`）は、`repair_proxy.sh` が補助 binary を導入する先（`$CLAUDE_GPT_HOME/bin`）としてだけ使われる。`runtime_smoke_test.sh` の作業 directory と証跡は `CLAUDE_GPT_HOME` とは無関係であり、作業 directory は `mktemp -d`、証跡は `scripts/claude-gpt/.evidence/` または `--evidence-out` が指す path に置かれる。`CLAUDE_GPT_HOME` は認証済み credential を保持する namespace ではなく、Claude の子 process の `HOME` や config root にも影響しない（export されない）。したがって `CLAUDE_GPT_HOME` の値を launcher と揃えること、または別の値を指定することは、認証状態の検証対象を変える操作にならない。
 
-### ad-hoc override による `not_authenticated` の誤分類禁止
+ChatGPT subscription の認証は、接続先 proxy server の所有者の責務である。`scripts/claude-gpt/preflight.sh` も `launch.sh --check-only` も認証状態を判定せず、認証状態や認証不足を表す field も出力しない。
 
-検証者が一度も認証したことのない fresh temp directory を `CLAUDE_GPT_HOME` に
-明示指定して `launch.sh --check-only` / `preflight.sh` を実行し `not_authenticated`
-（`chatgpt_auth.detail: not_authenticated`）を得た場合、これを account/entitlement
-failure（ChatGPT アカウントの再認証が必要という結論）と誤分類してはならない。
-`not_authenticated` は「その `CLAUDE_GPT_HOME` の namespace に有効な認証情報が
-存在しない」ことだけを意味し、canonical な `CLAUDE_GPT_HOME` に既存の有効な認証が
-存在するかどうかとは独立した観測結果である。誤分類を避けるため、`not_authenticated`
-を account/entitlement 判定の根拠にする前に、検証者は自分が明示指定した
-`CLAUDE_GPT_HOME` が canonical default と一致しているか（override していないか）を
-確認しなければならない。
+### 2 種類の evidence と attribution を混同しない
 
-### 3 種類の evidence を混同しない
+次の evidence はそれぞれ独立した観測対象であり、いずれか単独を「runtime / entitlement PASS」と呼んではならない:
 
-以下の 3 種類の evidence はそれぞれ独立した観測対象であり、いずれか単独を
-「runtime/entitlement PASS」と呼んではならない:
+1. **接続先 server の診断**（`launch.sh --check-only` の `CLAUDE_GPT_LAUNCH_RESULT_V1`、および `runtime_smoke_test.sh` の `CLAUDE_GPT_SMOKE_RESULT_V1.launch_check_only` が持つ `connected_server`）: `ANTHROPIC_BASE_URL` が実際に向く running server への到達性（`reachable`）、`/v1/models` の HTTP status、required model の欠落（`missing_models`）、`model_catalog_ok`、`classification` だけを示す。`model_catalog_ok` は `/v1/models` に required model が列挙されていることだけを意味し、実 ChatGPT subscription request が受理されたこと、認証が有効であること、request ごとの routing / provider fallback の不在のいずれも証明しない。接続先 server の version / hash は現行 interface から観測できないため「未確認」と記録する。PATH 上の binary の情報（`local_proxy_binary_auxiliary`）は接続先 server が動かしている binary とは限らない非 authority の補助診断である。
+2. **configured connected-server への実 request の受理**（先行 Issue #2772 の AC10 相当）: 接続先 server の診断とは別に、`ANTHROPIC_BASE_URL` が向く server が実 request を受理したことを、`runtime_smoke_test.sh` の各 step の完了などで評価する。これは「接続先 server が request を受理した」ことだけを示す。`runtime_smoke_test.sh` の成功だけでは、ChatGPT subscription / Codex provider がその request を受理したという attribution は成立しない。generic / custom な `ANTHROPIC_BASE_URL` でも同じ smoke shape は成立しうるためであり、request ごとの routing は `CLAUDE_GPT_PROXY_LOG` を明示した場合にだけ観測され、通常は未観測である。
+3. **provider / subscription attribution**（別 evidence）: 実 ChatGPT subscription request が Codex provider に受理されたという attribution は、上記 2 とは別の evidence である。attribution への昇格は、canonical environment で server / provider の ownership が別 evidence により束縛された場合、または #2925 AC7 の operational trial などで provider / routing の evidence が得られた場合に限る。それ以外は「attribution 未確認」と記録する。
 
-1. **`home_source`（`scripts/claude-gpt/preflight.sh` が出力する
-   `home_source: default | env_override`）**: これは caller が env var を明示
-   指定したかどうかの provenance（出自）を復元するものではない。`lib.sh`
-   source 後の effective な `CLAUDE_GPT_HOME` の値が、canonical default 式
-   `${HOME}/.claude-gpt` と **lexical に（文字列として）一致するか**だけを
-   分類する diagnostic field である。POSIX の `${parameter:=word}` 系
-   defaulting は変数が unset/null のときにのみ代入するため、`lib.sh` source
-   後の値だけを見ても、その値が caller による明示指定由来か defaulting 由来か
-   という元の入力 provenance を一般には復元できない（caller が canonical
-   default 式と lexical に完全一致する値を明示指定した場合は `default` に
-   分類され、同じ実体を指す別表記——例えば末尾スラッシュ違い——を明示指定
-   した場合は `env_override` に分類される。realpath 等による filesystem
-   canonicalization は行わない）。credential の中身（token / auth.json
-   content）は一切含まない
-2. **stored-auth availability/status**（既存の `chatgpt_auth.available` /
-   `chatgpt_auth.detail`。その `CLAUDE_GPT_HOME` namespace に有効な認証情報が
-   存在するかどうか）
-3. **実 ChatGPT subscription request の受理**（先行 Issue #2772 の AC10 相当。
-   実際に ChatGPT subscription へのリクエストが成功したかどうか）
+upstream（raine/claude-code-proxy の公式 docs）の契約も踏まえる。`ANTHROPIC_AUTH_TOKEN=unused` は Claude Code の client credential 要件を満たすだけで、upstream の認証には使われない。provider credentials と routing は proxy server 側（`CCP_*` や `config.json`）の責務である。`/healthz` は provider credentials や upstream の可用性を検証せず、`/v1/models` は catalog discovery であり、`/v1/messages` の `model` が provider を選ぶ。proxy は Codex 以外の provider も route しうる。
 
-`home_source: env_override` はそれ自体 failure ではない（意図的な override は
-正当な運用でありうる）。ただし override 時は、検証者が target launcher と
-異なる credential namespace を検証していないかを `home_source` で確認した上で、
-上記 3 種類の evidence を個別に評価すること。
+`connected_server` の診断が `ok`（`model_catalog_ok: true`）でも、それだけで実 request の受理や attribution を主張してはならない。逆に診断が `failed`（例: `reason: model_alias_not_resolved` / `cause: connected_server_model_catalog_incomplete`、exit 7）の場合は接続先 server の catalog 不整合であり、ChatGPT アカウントの entitlement や再認証の要否を示すものではない。この区別を保ったまま 3 種類の evidence を個別に評価すること。
 
 ---
 

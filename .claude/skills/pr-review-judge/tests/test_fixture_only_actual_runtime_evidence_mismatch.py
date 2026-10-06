@@ -32,7 +32,7 @@ def _reproduce_2801_fixture() -> dict:
     """
 
     return {
-        "ac_requires": "actual_canonical_compatible_proxy_selection",
+        "ac_requires": "actual_canonical_connected_server_diagnosis",
         "assigned_vc": (
             "uv run --locked pytest "
             "scripts/claude-gpt/tests/test_proxy_model_compatibility.py"
@@ -58,7 +58,7 @@ def test_fixture_pass_and_real_smoke_skip_is_insufficient_for_actual_runtime_ac(
     # AC1: fixture-only 証跡が actual-runtime AC の evidence-source と
     # 一致しない場合の instruction wiring が明示されていること。
     assert fixture["vc_evidence_source"] == "fixture_only"
-    assert fixture["ac_requires"] == "actual_canonical_compatible_proxy_selection"
+    assert fixture["ac_requires"] == "actual_canonical_connected_server_diagnosis"
     assert (
         "actual / canonical / default runtime selection" in policy_text
         or "actual/canonical/default runtime selection" in policy_text
@@ -89,7 +89,7 @@ def test_fixture_pass_and_real_smoke_skip_is_insufficient_for_actual_runtime_ac(
 
 
 def test_canonical_smoke_nonzero_result_blocks_promotion_despite_fixture_pass():
-    """GIVEN canonical smoke が proxy_model_catalog_incompatible / non-zero を返す
+    """GIVEN canonical smoke が connected_server_model_catalog_incomplete / non-zero を返す
     WHEN 同一 head の fixture compatibility tests が PASS している
     THEN evidence-policy.md の instruction wiring は actual-runtime AC を
     PASS へ昇格させないと明記している（AC4）。
@@ -97,8 +97,9 @@ def test_canonical_smoke_nonzero_result_blocks_promotion_despite_fixture_pass():
     policy_text = _read_evidence_policy()
 
     canonical_smoke_result = {
-        "cause": "proxy_model_catalog_incompatible",
-        "exit_code": 1,
+        "reason": "model_alias_not_resolved",
+        "cause": "connected_server_model_catalog_incomplete",
+        "exit_code": 7,
         "status": "failed",
     }
     same_head_fixture_tests = {
@@ -106,13 +107,16 @@ def test_canonical_smoke_nonzero_result_blocks_promotion_despite_fixture_pass():
     }
 
     # AC4: canonical smoke が failed / non-zero を返した metadata を用意する。
-    assert canonical_smoke_result["cause"] == "proxy_model_catalog_incompatible"
+    assert canonical_smoke_result["cause"] == "connected_server_model_catalog_incomplete"
     assert canonical_smoke_result["exit_code"] != 0
     assert all(
         result == "PASS" for result in same_head_fixture_tests.values()
     )
 
-    assert "proxy_model_catalog_incompatible" in policy_text
+    assert "connected_server_model_catalog_incomplete" in policy_text
+    assert "`connected_server` 診断" in policy_text
+    assert "connected-server AC" in policy_text
+    assert "非 authority の補助診断" in policy_text
     assert "non-zero exit" in policy_text
     assert (
         "actual-runtime AC を PASS / ready-for-merge に **昇格させない**"
