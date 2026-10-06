@@ -125,6 +125,10 @@ def _validate_policy_contract(data: dict[str, Any], path: Path) -> None:
     if not isinstance(rules, list) or not rules:
         raise PolicyLoadError(f"policy yaml at {path} has an empty or missing 'rules' list")
 
+    for rule in rules:
+        if isinstance(rule, dict):
+            _validate_issue_time_exemption_property(rule)
+
     resolution = data.get("resolution")
     if not isinstance(resolution, dict):
         raise PolicyLoadError(f"policy yaml at {path} is missing a 'resolution' mapping")
@@ -659,6 +663,9 @@ def find_missing_rva_immediate_fields(rva_section_text: str) -> list[str]:
 ISSUE_TIME_EXEMPTION_DECLARATION_KEY = "executable_semantics_unchanged"
 ISSUE_TIME_EXEMPTION_MODE = "exact_file_path_git_diff_vc"
 _ISSUE_TIME_EXEMPTION_DECLARATION_KEYS = frozenset({"rule", "ac"})
+# Policy-side opt-in boundary; mirrors the JSON Schema (Issue #2961).
+ISSUE_TIME_EXEMPTION_OPT_IN_RULE_ID = "claude-gpt-lifecycle-invocation-change"
+_ISSUE_TIME_EXEMPTION_POLICY_KEYS = frozenset({"declaration_key", "mode"})
 _ISSUE_TIME_EXEMPTION_GLOB_CHARS = frozenset("*?[]{}")
 # Carrier identity shared by readiness `category` and review-issue
 # `non_blocking_improvements[].code` (information only, never blocking).
@@ -717,25 +724,43 @@ def _command_is_git_diff_for_path(command: str, path: str) -> bool:
     return path in tokens[2:]
 
 
-def _rule_issue_time_exemption_opt_in(rule: dict[str, Any]) -> bool:
-    """True iff the policy rule opted in via ``issue_time_exemption``.
+def _validate_issue_time_exemption_property(rule: dict[str, Any]) -> bool:
+    """Runtime mirror of the JSON Schema boundary for ``issue_time_exemption``
+    (Issue #2961, OWNER review PR #2965).
 
-    A present-but-unsupported value fails closed with ``PolicyLoadError``
-    (a policy integrity defect, never an Issue defect)."""
+    The schema allows the property only on
+    ``ISSUE_TIME_EXEMPTION_OPT_IN_RULE_ID`` and closes its key set to
+    ``{declaration_key, mode}``. The matcher does not run a JSON Schema
+    validator, so this check keeps runtime and schema semantics identical:
+    any other rule carrying the property, an extra / missing key, or an
+    unexpected value fails closed with ``PolicyLoadError``.
+
+    Returns True iff the rule carries a valid opt-in."""
     raw = rule.get("issue_time_exemption")
     if raw is None:
         return False
     if (
-        not isinstance(raw, dict)
+        rule.get("id") != ISSUE_TIME_EXEMPTION_OPT_IN_RULE_ID
+        or not isinstance(raw, dict)
+        or set(raw.keys()) != _ISSUE_TIME_EXEMPTION_POLICY_KEYS
         or raw.get("declaration_key") != ISSUE_TIME_EXEMPTION_DECLARATION_KEY
         or raw.get("mode") != ISSUE_TIME_EXEMPTION_MODE
     ):
         raise PolicyLoadError(
             f"rule {rule.get('id')!r} declares an unsupported issue_time_exemption "
-            f"{raw!r} (expected declaration_key {ISSUE_TIME_EXEMPTION_DECLARATION_KEY!r} / "
+            f"{raw!r} (only rule {ISSUE_TIME_EXEMPTION_OPT_IN_RULE_ID!r} may opt in, with "
+            f"exactly declaration_key {ISSUE_TIME_EXEMPTION_DECLARATION_KEY!r} / "
             f"mode {ISSUE_TIME_EXEMPTION_MODE!r}; Issue #2961)"
         )
     return True
+
+
+def _rule_issue_time_exemption_opt_in(rule: dict[str, Any]) -> bool:
+    """True iff the policy rule opted in via ``issue_time_exemption``.
+
+    A present-but-unsupported value fails closed with ``PolicyLoadError``
+    (a policy integrity defect, never an Issue defect)."""
+    return _validate_issue_time_exemption_property(rule)
 
 
 def evaluate_issue_time_exemptions(

@@ -1198,6 +1198,87 @@ def test_unsupported_policy_opt_in_fails_closed_with_policy_load_error():
         )
 
 
+_VALID_LOOKING_OPT_IN = {
+    "declaration_key": "executable_semantics_unchanged",
+    "mode": "exact_file_path_git_diff_vc",
+}
+
+
+def _evaluate_with_mutated_policy(mutate, paths, rule_id):
+    """Pass a mutated policy dict DIRECTLY to both decision-critical evaluators."""
+    path = paths[0]
+    kwargs = dict(
+        ac_section_text=_AC_SECTION,
+        ac_vc_commands=_vc(("AC1", f"git diff origin/main -- {path}")),
+    )
+    rva = _rva(f"{{rule: {rule_id}, ac: AC1}}")
+    policy = load_policy()
+    mutate(policy)
+    risk = evaluate_issue_risk_trigger(paths, "not_applicable", rva, policy=policy, **kwargs)
+    policy = load_policy()
+    mutate(policy)
+    coverage = evaluate_runtime_assertion_binding_coverage(
+        paths,
+        rva,
+        _AC_SECTION,
+        {"1"},
+        policy=policy,
+        ac_vc_commands=kwargs["ac_vc_commands"],
+    )
+    return risk, coverage
+
+
+@pytest.mark.parametrize(
+    "paths,rule_id",
+    [
+        ([".claude/agents/implementation-worker.md"], "agent-lifecycle-frontmatter-or-body-change"),
+        ([".claude/hooks/some_hook.py"], "hook-lifecycle-matcher-or-handler-change"),
+        ([".claude/skills/foo/SKILL.md"], "skill-invocation-procedure-or-contract-change"),
+        ([".claude/agents/implementation-worker.md"], "subagent-lifecycle-start-stop-delegation-fallback"),
+    ],
+)
+def test_runtime_matcher_rejects_exemption_copied_to_non_claude_gpt_rule(paths, rule_id):
+    """OWNER review PR #2965 Finding 2: a valid-looking opt-in copied to any
+    non-claude-gpt rule must fail closed in the runtime matcher itself
+    (mutated policy passed directly to both decision-critical evaluators)."""
+    assert rule_id != _CLAUDE_GPT_RULE_ID
+    assert any(r["id"] == rule_id for r in load_policy()["rules"])
+
+    def mutate(policy):
+        for rule in policy["rules"]:
+            if rule["id"] == rule_id:
+                rule["issue_time_exemption"] = dict(_VALID_LOOKING_OPT_IN)
+
+    with pytest.raises(extension_surface_policy_matcher.PolicyLoadError):
+        _evaluate_with_mutated_policy(mutate, paths, rule_id)
+
+
+def test_runtime_matcher_rejects_extra_key_in_claude_gpt_opt_in():
+    def mutate(policy):
+        for rule in policy["rules"]:
+            if rule["id"] == _CLAUDE_GPT_RULE_ID:
+                rule["issue_time_exemption"] = {**_VALID_LOOKING_OPT_IN, "extra": True}
+
+    with pytest.raises(extension_surface_policy_matcher.PolicyLoadError):
+        _evaluate_with_mutated_policy(mutate, [_LIB_SH], _CLAUDE_GPT_RULE_ID)
+
+
+def test_validate_policy_contract_rejects_misplaced_or_extra_key_opt_in(tmp_path):
+    for target, value in (
+        ("hook", dict(_VALID_LOOKING_OPT_IN)),
+        (_CLAUDE_GPT_RULE_ID, {**_VALID_LOOKING_OPT_IN, "extra": 1}),
+    ):
+        data = load_policy()
+        for rule in data["rules"]:
+            if target == _CLAUDE_GPT_RULE_ID and rule["id"] == target:
+                rule["issue_time_exemption"] = value
+            elif target == "hook" and rule["id"] != _CLAUDE_GPT_RULE_ID:
+                rule["issue_time_exemption"] = value
+                break
+        with pytest.raises(extension_surface_policy_matcher.PolicyLoadError):
+            extension_surface_policy_matcher._validate_policy_contract(data, tmp_path / "p.yaml")
+
+
 def test_old_call_signature_is_unchanged_and_never_exempts():
     """Callers that do not pass the new optional arguments keep the previous behaviour."""
     risk = evaluate_issue_risk_trigger([_LIB_SH], "not_applicable", _rva(_DECL_AC1))
