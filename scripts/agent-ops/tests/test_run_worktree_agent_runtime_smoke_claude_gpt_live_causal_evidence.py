@@ -72,32 +72,111 @@ def _native_claude_available() -> tuple[bool, str]:
     return True, claude_bin
 
 
-def _claude_gpt_available() -> tuple[bool, str]:
+_LAUNCH_RESULT_SCHEMA = "CLAUDE_GPT_LAUNCH_RESULT_V1"
+
+
+def _interpret_claude_gpt_launch_result(exit_code: int, stdout: str) -> tuple[bool, str]:
+    """Pure interpretation of a ``preflight.sh`` receipt (Issue #2950).
+
+    Available iff the exit code is 0 and stdout is a top-level JSON object that
+    binds exactly to the current ``CLAUDE_GPT_LAUNCH_RESULT_V1`` success shape:
+    ``status == "ok"``, ``mode == "check_only"`` and ``connected_server`` is an
+    object with ``reachable is True`` and ``model_catalog_ok is True``. Anything
+    else returns ``(False, <public-safe reason>)``; this function never raises
+    and never falls back to any older receipt shape.
+    """
+    try:
+        payload = json.loads(stdout)
+    except (json.JSONDecodeError, ValueError, TypeError, RecursionError):
+        # Input-content-independent: never echo any part of the malformed stdout.
+        stdout_len = len(stdout) if isinstance(stdout, str) else -1
+        return False, (
+            f"claude-gpt preflight exit_code={exit_code}: "
+            f"classification=invalid_json stdout_len={stdout_len}"
+        )
+    if not isinstance(payload, dict):
+        return False, (
+            f"claude-gpt preflight exit_code={exit_code}: top-level JSON is "
+            f"{type(payload).__name__}, expected object"
+        )
+    schema = payload.get("schema")
+    status = payload.get("status")
+    if schema != _LAUNCH_RESULT_SCHEMA:
+        # Neither the received schema value nor its status is echoed.
+        return False, (
+            f"claude-gpt preflight exit_code={exit_code}: classification=schema_mismatch"
+        )
+    detail = ""
+    if status != "ok":
+        reason, cause = payload.get("reason"), payload.get("cause")
+        if isinstance(reason, str):
+            detail += f" reason={reason[:80]!r}"
+        if isinstance(cause, str):
+            detail += f" cause={cause[:80]!r}"
+    if exit_code != 0 or status != "ok":
+        return False, (
+            f"claude-gpt preflight exit_code={exit_code} status={_safe_scalar(status)}{detail}"
+        )
+    mode = payload.get("mode")
+    if mode != "check_only":
+        return False, (
+            f"claude-gpt preflight exit_code={exit_code} status=ok: mode is not check_only"
+        )
+    server = payload.get("connected_server")
+    if not isinstance(server, dict):
+        return False, (
+            f"claude-gpt preflight exit_code={exit_code} status=ok: connected_server is not an object"
+        )
+    if server.get("reachable") is not True:
+        return False, (
+            f"claude-gpt preflight exit_code={exit_code} status=ok: connected_server.reachable is not true"
+        )
+    if server.get("model_catalog_ok") is not True:
+        return False, (
+            f"claude-gpt preflight exit_code={exit_code} status=ok: "
+            "connected_server.model_catalog_ok is not true"
+        )
+    return True, str(_LAUNCHER_PATH)
+
+
+def _safe_scalar(value: object) -> str:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return repr(value)[:80]
+    return type(value).__name__
+
+
+def _run_claude_gpt_preflight(
+    env: dict[str, str] | None = None,
+) -> tuple[int | None, str, str | None]:
+    """Run the real ``preflight.sh`` and return ``(exit_code, stdout, error)``.
+
+    ``env`` (when given) replaces the child environment so a test can inject
+    ``ANTHROPIC_BASE_URL``. ``error`` is non-None only when the process could
+    not be started or timed out (``exit_code`` is then None).
+    """
+    try:
+        result = subprocess.run(
+            ["sh", str(_PREFLIGHT_PATH)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+            cwd=str(_CHECKOUT_ROOT),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, "", f"claude-gpt preflight.sh failed to run: {exc}"
+    return result.returncode, result.stdout, None
+
+
+def _claude_gpt_available(env: dict[str, str] | None = None) -> tuple[bool, str]:
     if not _LAUNCHER_PATH.is_file():
         return False, f"launcher not found: {_LAUNCHER_PATH}"
     if not _PREFLIGHT_PATH.is_file():
         return False, f"preflight script not found: {_PREFLIGHT_PATH}"
-    try:
-        result = subprocess.run(
-            ["sh", str(_PREFLIGHT_PATH)], capture_output=True, text=True, timeout=30
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, f"claude-gpt preflight.sh failed to run: {exc}"
-    try:
-        payload = json.loads(result.stdout)
-    except (json.JSONDecodeError, ValueError):
-        return False, f"claude-gpt preflight.sh produced non-JSON output: {result.stdout[:200]!r}"
-    if payload.get("exit_code") != 0:
-        return False, f"claude-gpt preflight.sh exit_code={payload.get('exit_code')}"
-    if not payload.get("binary_available"):
-        return False, "claude-gpt preflight: binary_available is False"
-    proxy = payload.get("proxy") or {}
-    if not proxy.get("absolute_path"):
-        return False, "claude-gpt preflight: proxy.absolute_path missing (raine/claude-code-proxy unavailable)"
-    chatgpt_auth = payload.get("chatgpt_auth") or {}
-    if not chatgpt_auth.get("available"):
-        return False, "claude-gpt preflight: chatgpt_auth.available is False"
-    return True, str(_LAUNCHER_PATH)
+    exit_code, stdout, error = _run_claude_gpt_preflight(env)
+    if error is not None or exit_code is None:
+        return False, error or "claude-gpt preflight.sh did not run"
+    return _interpret_claude_gpt_launch_result(exit_code, stdout)
 
 
 # ---------------------------------------------------------------------------
