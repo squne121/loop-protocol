@@ -6865,17 +6865,100 @@ def lifecycle_failure_reasons(
     return reasons
 
 
+# Issue #2958 P1-2: the diagnostic task-notification projection is
+# EVENT-LOCAL and independent of the verdict's ``_CLAUDE_TASK_NOTIFICATION_RE``
+# (which scans the raw stdout as one DOTALL string). Only the known carrier --
+# a ``queue-operation`` stream event's ``content`` / ``prompt`` string -- is
+# read, one field at a time, and ``<task-id>`` / ``<status>`` are taken only
+# from inside a single ``<task-notification>`` block of that one field.
+_LIFECYCLE_EVIDENCE_NOTIFICATION_CARRIER_TYPE = "queue-operation"
+_LIFECYCLE_EVIDENCE_NOTIFICATION_CARRIER_FIELDS = ("content", "prompt")
+_LIFECYCLE_EVIDENCE_NOTIFICATION_BLOCK_RE = re.compile(
+    r"<task-notification>(.*?)</task-notification>", re.DOTALL
+)
+_LIFECYCLE_EVIDENCE_TASK_ID_RE = re.compile(r"<task-id>([0-9a-zA-Z_-]+)</task-id>")
+_LIFECYCLE_EVIDENCE_STATUS_RE = re.compile(r"<status>([a-z_]+)</status>")
+
+
+def _iter_event_local_completed_notifications(stdout: str):
+    """Yield ``(task_id, status)`` for each COMPLETED ``<task-notification>``
+    block found inside a single field of a single ``queue-operation`` event.
+
+    Fail-closed: a block without exactly one ``<task-id>`` and exactly one
+    ``<status>`` (e.g. task-id and status split across records / fields, or a
+    nested block) yields nothing. Notification-looking text carried by any
+    other event type (assistant / user / system ...) is never adopted."""
+    for payload in _iter_claude_stream_events(stdout):
+        if payload.get("type") != _LIFECYCLE_EVIDENCE_NOTIFICATION_CARRIER_TYPE:
+            continue
+        for field in _LIFECYCLE_EVIDENCE_NOTIFICATION_CARRIER_FIELDS:
+            value = payload.get(field)
+            if not isinstance(value, str):
+                continue
+            for block in _LIFECYCLE_EVIDENCE_NOTIFICATION_BLOCK_RE.finditer(value):
+                body = block.group(1)
+                task_ids = _LIFECYCLE_EVIDENCE_TASK_ID_RE.findall(body)
+                statuses = _LIFECYCLE_EVIDENCE_STATUS_RE.findall(body)
+                if len(task_ids) != 1 or len(statuses) != 1:
+                    continue
+                if statuses[0] != SPAWN_LAUNCH_MODE_COMPLETED:
+                    continue
+                yield task_ids[0], statuses[0]
+
+
+def _failure_preserving_indices(priority_flags: list[bool], cap: int) -> list[int]:
+    """Indices (ascending == original stream order) to keep within ``cap``:
+    priority records (those that caused the failure) first, then the earliest
+    ordinary records until the budget is spent."""
+    chosen = [index for index, flag in enumerate(priority_flags) if flag][:cap]
+    chosen_set = set(chosen)
+    for index in range(len(priority_flags)):
+        if len(chosen_set) >= cap:
+            break
+        if index not in chosen_set:
+            chosen_set.add(index)
+    return sorted(chosen_set)
+
+
+def lifecycle_failure_priority_agent_ids(schema_summary: dict) -> set[str]:
+    """Agent ids the already-computed lifecycle verdict blames
+    (duplicate completion / orphan start / unknown child)."""
+    multi_child = schema_summary.get("multi_child_lifecycle")
+    priority: set[str] = set()
+    if isinstance(multi_child, dict):
+        for key in ("duplicate_completions", "orphan_starts", "unknown_children"):
+            values = multi_child.get(key)
+            if isinstance(values, list):
+                priority.update(value for value in values if isinstance(value, str) and value)
+    return priority
+
+
 def build_lifecycle_failure_evidence(
-    stdout: str, *, run_id: str, reasons: list[str], settings_digest_sha256: str | None
+    stdout: str,
+    *,
+    run_id: str,
+    reasons: list[str],
+    settings_digest_sha256: str | None,
+    priority_agent_ids: set[str] | frozenset[str] | None = None,
 ) -> dict:
     """Allowlist-only, bounded projection of the raw lifecycle events.
 
-    Reuses ``extract_claude_hook_lifecycle_events`` / ``_iter_claude_stream_events``
-    / ``_CLAUDE_TASK_NOTIFICATION_RE`` (the same parsers the verdict uses), so
-    the preserved events are exactly the ones that produced the verdict."""
+    Hook events and ``tool_use_result`` entries reuse the verdict's own
+    parsers (``extract_claude_hook_lifecycle_events`` / ``_iter_claude_stream_
+    events``); task-notification completions are re-derived event-locally
+    (see ``_iter_event_local_completed_notifications``) rather than from the
+    verdict's global regex. Each channel is capped, but the cap is
+    failure-preserving: records of ``priority_agent_ids`` (and contradictory
+    hook events) are kept first, the remaining budget is filled with ordinary
+    records, and the output keeps the original stream order. ``*_total`` are
+    always the true counts."""
     cap = _LIFECYCLE_FAILURE_EVIDENCE_MAX_EVENTS_PER_CHANNEL
+    priority = priority_agent_ids or frozenset()
 
     hook_events = extract_claude_hook_lifecycle_events(stdout)
+    hook_flags = [
+        bool(event["contradictory"]) or (event["agent_id"] in priority) for event in hook_events
+    ]
     hook_entries = [
         {
             "hook_event": event["hook_event"],
@@ -6890,42 +6973,36 @@ def build_lifecycle_failure_evidence(
             ),
             "contradictory": bool(event["contradictory"]),
         }
-        for event in hook_events[:cap]
+        for event in (hook_events[i] for i in _failure_preserving_indices(hook_flags, cap))
     ]
 
-    tool_result_total = 0
-    tool_result_entries: list[dict] = []
-    for stream_index, payload in enumerate(_iter_claude_stream_events(stdout)):
+    tool_results: list[tuple[str, object]] = []
+    for payload in _iter_claude_stream_events(stdout):
         if payload.get("type") != "user":
             continue
         tool_use_result = payload.get("tool_use_result")
         if not isinstance(tool_use_result, dict):
             continue
-        agent_id = _lifecycle_evidence_text(tool_use_result.get("agentId"))
-        if agent_id is None:
+        raw_agent_id = tool_use_result.get("agentId")
+        if _lifecycle_evidence_text(raw_agent_id) is None:
             continue
-        tool_result_total += 1
-        if len(tool_result_entries) < cap:
-            tool_result_entries.append(
-                {
-                    "stream_index": stream_index,
-                    "agent_id": agent_id,
-                    "status": _lifecycle_evidence_text(tool_use_result.get("status")),
-                }
-            )
+        tool_results.append((raw_agent_id, tool_use_result.get("status")))
+    tool_result_entries = [
+        {
+            "agent_id": _lifecycle_evidence_text(tool_results[i][0]),
+            "status": _lifecycle_evidence_text(tool_results[i][1]),
+        }
+        for i in _failure_preserving_indices([agent_id in priority for agent_id, _ in tool_results], cap)
+    ]
 
-    notification_total = 0
-    notification_entries: list[dict] = []
-    for match_index, match in enumerate(_CLAUDE_TASK_NOTIFICATION_RE.finditer(stdout)):
-        notification_total += 1
-        if len(notification_entries) < cap:
-            notification_entries.append(
-                {
-                    "match_index": match_index,
-                    "agent_id": _lifecycle_evidence_text(match.group(1)),
-                    "status": _lifecycle_evidence_text(match.group(2)),
-                }
-            )
+    notifications = list(_iter_event_local_completed_notifications(stdout))
+    notification_entries = [
+        {
+            "agent_id": _lifecycle_evidence_text(notifications[i][0]),
+            "status": _lifecycle_evidence_text(notifications[i][1]),
+        }
+        for i in _failure_preserving_indices([agent_id in priority for agent_id, _ in notifications], cap)
+    ]
 
     digest = (
         settings_digest_sha256
@@ -6939,9 +7016,9 @@ def build_lifecycle_failure_evidence(
         "hook_lifecycle_events": hook_entries,
         "hook_lifecycle_events_total": len(hook_events),
         "tool_use_results": tool_result_entries,
-        "tool_use_results_total": tool_result_total,
+        "tool_use_results_total": len(tool_results),
         "task_notification_completions": notification_entries,
-        "task_notification_completions_total": notification_total,
+        "task_notification_completions_total": len(notifications),
         "settings_provenance": {"digest_sha256": digest},
     }
 
@@ -9687,6 +9764,7 @@ def main(argv: list[str] | None = None) -> int:
                         settings_digest_sha256=(
                             provenance.get("digest_sha256") if isinstance(provenance, dict) else None
                         ),
+                        priority_agent_ids=lifecycle_failure_priority_agent_ids(schema_summary),
                     )
 
             required_observations = sorted(set(args.require_observed_runtime_field))

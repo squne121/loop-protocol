@@ -292,12 +292,10 @@ def test_given_duplicate_stop_when_flag_set_then_allowlisted_events_preserved_on
     assert [h["agent_transcript_path_present"] for h in hooks] == [False, True, True]
     assert [h["stop_hook_active"] for h in hooks] == [None, False, True]
 
-    assert data["tool_use_results"] == [
-        {"stream_index": data["tool_use_results"][0]["stream_index"], "agent_id": AGENT_ID, "status": "completed"}
-    ]
-    assert [(n["agent_id"], n["status"]) for n in data["task_notification_completions"]] == [
-        (AGENT_ID, "completed")
-    ]
+    # Issue #2958 fixed allowlist: tool_use_results / notification entries
+    # carry ONLY agent_id and status (no stream_index / match_index).
+    assert data["tool_use_results"] == [{"agent_id": AGENT_ID, "status": "completed"}]
+    assert data["task_notification_completions"] == [{"agent_id": AGENT_ID, "status": "completed"}]
     assert data["settings_provenance"] == {"digest_sha256": _settings_digest(worktree)}
 
 
@@ -448,7 +446,10 @@ def test_given_huge_event_count_then_output_is_bounded(repo_with_worktree, tmp_p
         agent_id = f"agent{index:05d}"
         events.append(_hook_event("SubagentStart", agent_id=agent_id))
         events.append(_tool_result(agent_id=agent_id, status="async_launched"))
-        events.append(_notification(agent_id=agent_id, status="running"))
+        events.append(_notification(agent_id=agent_id, status="completed"))
+    # One orphan start (no completion) makes the lifecycle verdict fail.
+    events.append(_hook_event("SubagentStart", agent_id="orphan-tail"))
+    events.append(_tool_result(agent_id="orphan-tail", status="async_launched"))
     events.append({"type": "result", "subtype": "success"})
     flag = str(worktree / "artifacts" / "runtime-smoke" / "big" / EVIDENCE_NAME)
     result, out_dir = _run_runner(tmp_path, repo, worktree, events, "big", flag=flag)
@@ -462,7 +463,130 @@ def test_given_huge_event_count_then_output_is_bounded(repo_with_worktree, tmp_p
     assert len(data["tool_use_results"]) == cap
     assert len(data["task_notification_completions"]) == cap
     # The true totals are still reported so truncation is visible.
-    assert data["hook_lifecycle_events_total"] == total
-    assert data["tool_use_results_total"] == total
+    assert data["hook_lifecycle_events_total"] == total + 1
+    assert data["tool_use_results_total"] == total + 1
     assert data["task_notification_completions_total"] == total
     assert evidence_path.stat().st_size < 100_000
+    # The failure-causing orphan start survives the cap even though it is last.
+    assert any(h["agent_id"] == "orphan-tail" for h in data["hook_lifecycle_events"])
+    assert any(t["agent_id"] == "orphan-tail" for t in data["tool_use_results"])
+    for entry in data["tool_use_results"] + data["task_notification_completions"]:
+        assert set(entry) == {"agent_id", "status"}
+
+
+def test_given_failure_beyond_cap_then_failure_causing_events_preserved_and_output_is_bounded(
+    repo_with_worktree, tmp_path
+):
+    """P1-1: a duplicate completion that only occurs AFTER the per-channel cap
+    must still be preserved (failure-preserving cap, not prefix truncation)."""
+    repo, worktree = repo_with_worktree
+    cap = smoke._LIFECYCLE_FAILURE_EVIDENCE_MAX_EVENTS_PER_CHANNEL
+    normal = cap + 20
+    dup = "dup-after-cap"
+    events: list[dict] = [{"type": "system", "subtype": "init"}]
+    for index in range(normal):
+        agent_id = f"ok{index:05d}"
+        events.append(_hook_event("SubagentStart", agent_id=agent_id))
+        events.append(_tool_result(agent_id=agent_id, status="completed"))
+        events.append(_notification(agent_id=agent_id, status="completed"))
+        events.append(_hook_event("SubagentStop", agent_id=agent_id, stop_hook_active=False))
+    events.append(_hook_event("SubagentStart", agent_id=dup))
+    events.append(_tool_result(agent_id=dup, status="completed"))
+    events.append(_notification(agent_id=dup, status="completed"))
+    events.append(_hook_event("SubagentStop", agent_id=dup, stop_hook_active=False))
+    events.append(_hook_event("SubagentStop", agent_id=dup, stop_hook_active=True))
+    events.append({"type": "result", "subtype": "success"})
+    flag = str(worktree / "artifacts" / "runtime-smoke" / "beyond" / EVIDENCE_NAME)
+    result, out_dir = _run_runner(tmp_path, repo, worktree, events, "beyond", flag=flag)
+    assert result.returncode == 1, result.stderr
+    data = json.loads((out_dir / EVIDENCE_NAME).read_text(encoding="utf-8"))
+
+    assert "duplicate_completions" in data["failure_reasons"]
+    hooks = data["hook_lifecycle_events"]
+    assert len(hooks) == cap
+    assert data["hook_lifecycle_events_total"] == 2 * (normal + 1) + 1
+    dup_hooks = [h for h in hooks if h["agent_id"] == dup]
+    assert [h["hook_event"] for h in dup_hooks] == ["SubagentStart", "SubagentStop", "SubagentStop"]
+    assert [h["stop_hook_active"] for h in dup_hooks] == [None, False, True]
+    # Original stream order is kept after the priority selection.
+    assert [h["stream_index"] for h in hooks] == sorted(h["stream_index"] for h in hooks)
+
+    assert len(data["tool_use_results"]) == cap
+    assert {"agent_id": dup, "status": "completed"} in data["tool_use_results"]
+    assert len(data["task_notification_completions"]) == cap
+    assert {"agent_id": dup, "status": "completed"} in data["task_notification_completions"]
+    assert data["tool_use_results_total"] == normal + 1
+    assert data["task_notification_completions_total"] == normal + 1
+
+
+def _sse_lines(*events: dict) -> str:
+    return "\n".join(json.dumps(e) for e in events) + "\n"
+
+
+def _notification_block(task_id: str | None, status: str | None) -> str:
+    parts = []
+    if task_id is not None:
+        parts.append(f"<task-id>{task_id}</task-id>")
+    if status is not None:
+        parts.append(f"<status>{status}</status>")
+    return "<task-notification>" + "".join(parts) + "</task-notification>"
+
+
+def _evidence_notifications(stdout: str) -> dict:
+    data = smoke.build_lifecycle_failure_evidence(
+        stdout, run_id="r", reasons=["duplicate_completions"], settings_digest_sha256=None
+    )
+    return data
+
+
+def test_given_notification_like_text_in_non_carrier_events_then_not_adopted_as_completion():
+    fake = _notification_block("FAKE-X", "completed")
+    stdout = _sse_lines(
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": fake}]}},
+        {"type": "user", "message": {"content": fake}},
+        {"type": "system", "subtype": "init", "content": fake, "prompt": fake},
+        # A non-carrier event that merely mentions the shape inside a tool result.
+        _tool_result(agent_id="agent-real", status="async_launched"),
+    )
+    data = _evidence_notifications(stdout)
+    assert data["task_notification_completions"] == []
+    assert data["task_notification_completions_total"] == 0
+
+
+def test_given_task_id_and_status_split_across_records_then_completion_not_fabricated():
+    stdout = _sse_lines(
+        {"type": "queue-operation", "content": _notification_block("SPLIT-A", None)},
+        {"type": "queue-operation", "content": _notification_block(None, "completed")},
+        # Split across the two carrier fields of ONE event is also not joined.
+        {
+            "type": "queue-operation",
+            "content": _notification_block("SPLIT-B", None),
+            "prompt": _notification_block(None, "completed"),
+        },
+        # Split across two separate blocks inside one field is not joined either.
+        {
+            "type": "queue-operation",
+            "content": _notification_block("SPLIT-C", None) + _notification_block(None, "completed"),
+        },
+    )
+    data = _evidence_notifications(stdout)
+    assert data["task_notification_completions"] == []
+    assert data["task_notification_completions_total"] == 0
+
+
+def test_given_event_local_completed_notification_then_preserved_with_only_agent_id_and_status():
+    stdout = _sse_lines(
+        {"type": "queue-operation", "content": _notification_block("LOCAL-A", "completed")},
+        {"type": "queue-operation", "prompt": _notification_block("LOCAL-B", "completed")},
+        {"type": "queue-operation", "content": _notification_block("RUNNING-C", "running")},
+        {"type": "queue-operation", "content": _notification(agent_id="LOCAL-D")["content"]},
+    )
+    data = _evidence_notifications(stdout)
+    assert data["task_notification_completions"] == [
+        {"agent_id": "LOCAL-A", "status": "completed"},
+        {"agent_id": "LOCAL-B", "status": "completed"},
+        {"agent_id": "LOCAL-D", "status": "completed"},
+    ]
+    # Non-completed blocks are neither stored nor counted.
+    assert data["task_notification_completions_total"] == 3
+    assert NOTIFICATION_BODY_SENTINEL not in json.dumps(data)
