@@ -1045,9 +1045,9 @@ def test_exemption_does_not_remove_another_matched_rules_hard_requirement():
     [
         f"{{rule: {_CLAUDE_GPT_RULE_ID}, ac: AC1, extra: x}}",
         f"{{rule: {_CLAUDE_GPT_RULE_ID}}}",
-        f"{{ac: AC1}}",
+        "{ac: AC1}",
         f"{{rule: {_CLAUDE_GPT_RULE_ID}, ac: 1}}",
-        f"{{rule: '', ac: AC1}}",
+        "{rule: '', ac: AC1}",
         "AC1",
         f"[{{rule: {_CLAUDE_GPT_RULE_ID}, ac: AC1}}]",
     ],
