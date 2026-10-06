@@ -479,26 +479,14 @@ def _run_live_smoke(runtime_profile: str) -> None:
     assert payload["forbidden_mutation_tool_events"] == 0
     assert payload["tested_head"]
     if runtime_profile == "claude_gpt":
-        # AC7: the claude-gpt path must record the same oracle the existing
-        # worktree-agent-runtime-smoke runner already produces (Issue #2174
-        # AC8, #2219 AC1/AC7) -- launcher receipt, proxy PID/port/log
-        # side-channel, cleanup self-report, and an INDEPENDENT
-        # PID/listen-socket cleanup reconfirmation. No new attestation
-        # schema is asserted here.
+        # AC7 (Issue #2938): the claude-gpt path records the launcher receipt
+        # (resolved executable + digest). The launcher no longer starts or
+        # stops a proxy, so there is no proxy PID/port/log side-channel or
+        # cleanup reconfirmation to assert. ``launcher_result`` may be None
+        # for a normal (non --check-only) launch and is not asserted.
         launcher_receipt = payload["claude_gpt_launcher_receipt"]
         assert launcher_receipt["resolved_executable"]
         assert launcher_receipt["resolved_executable_digest"]
-        proxy_sidechannel = payload["claude_gpt_proxy_sidechannel"]
-        assert "proxy_pid" in proxy_sidechannel
-        assert "proxy_port" in proxy_sidechannel
-        assert "proxy_log" in proxy_sidechannel
-        assert "proxy_cleanup_ok_self_reported" in proxy_sidechannel
-        proxy_cleanup_independent = payload["claude_gpt_proxy_cleanup_independent"]
-        assert "cleanup_confirmed" in proxy_cleanup_independent
-        assert "pid_alive" in proxy_cleanup_independent
-        assert "port_listening" in proxy_cleanup_independent
-        if proxy_cleanup_independent["checked"]:
-            assert proxy_cleanup_independent["cleanup_confirmed"] is True
 
 
 @pytest.mark.claude_live
