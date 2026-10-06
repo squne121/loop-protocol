@@ -182,3 +182,82 @@ def test_skill_invocation_rule_selectors_split_skill_md_hard_scripts_advisory() 
         assert not (
             ".claude/skills/**/SKILL.md" in globs and ".claude/skills/**/scripts/**" in globs
         ), "SKILL.md and scripts/** must live in separate project selectors"
+
+
+# ---------------------------------------------------------------------------
+# Issue #2961: rule-level optional `issue_time_exemption` (comment-only
+# exemption opt-in). Only `claude-gpt-lifecycle-invocation-change` may carry
+# it; the closed validator pins its key names / enums.
+# ---------------------------------------------------------------------------
+
+_CLAUDE_GPT_RULE_ID = "claude-gpt-lifecycle-invocation-change"
+
+
+def _rule_by_id(policy: dict, rule_id: str) -> dict:
+    for rule in policy["rules"]:
+        if rule["id"] == rule_id:
+            return rule
+    raise AssertionError(f"policy yaml has no {rule_id!r} rule")
+
+
+def test_issue_time_exemption_only_on_claude_gpt_rule() -> None:
+    """AC7: the live policy has `issue_time_exemption` on the claude-gpt rule
+    only, with the closed key names / enum values, and the schema rejects it
+    on every other rule (hook / skill / subagent / agent)."""
+    policy = _load_policy()
+    schema = _load_schema()
+
+    carriers = [rule["id"] for rule in policy["rules"] if "issue_time_exemption" in rule]
+    assert carriers == [_CLAUDE_GPT_RULE_ID]
+    assert _rule_by_id(policy, _CLAUDE_GPT_RULE_ID)["issue_time_exemption"] == {
+        "declaration_key": "executable_semantics_unchanged",
+        "mode": "exact_file_path_git_diff_vc",
+    }
+    jsonschema.validate(instance=policy, schema=schema)
+
+    claude_gpt_exemption = _rule_by_id(policy, _CLAUDE_GPT_RULE_ID)["issue_time_exemption"]
+    for rule in policy["rules"]:
+        if rule["id"] == _CLAUDE_GPT_RULE_ID:
+            continue
+        mutated = copy.deepcopy(policy)
+        _rule_by_id(mutated, rule["id"])["issue_time_exemption"] = copy.deepcopy(
+            claude_gpt_exemption
+        )
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(instance=mutated, schema=schema)
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        {"declaration_key": "something_else", "mode": "exact_file_path_git_diff_vc"},
+        {"declaration_key": "executable_semantics_unchanged", "mode": "any_path"},
+        {"declaration_key": "executable_semantics_unchanged"},
+        {"mode": "exact_file_path_git_diff_vc"},
+        {
+            "declaration_key": "executable_semantics_unchanged",
+            "mode": "exact_file_path_git_diff_vc",
+            "unexpected": True,
+        },
+        "enabled",
+    ],
+)
+def test_issue_time_exemption_closed_validator_rejects_invalid_shapes(bad_value) -> None:
+    policy = copy.deepcopy(_load_policy())
+    _rule_by_id(policy, _CLAUDE_GPT_RULE_ID)["issue_time_exemption"] = bad_value
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=policy, schema=_load_schema())
+
+
+def test_existing_exceptions_are_not_altered_by_the_exemption_property() -> None:
+    """The descriptive `exceptions[]` (human_evidence_required / owner) stay
+    exactly as before; the exemption is a separate rule-level property."""
+    rule = _rule_by_id(_load_policy(), _CLAUDE_GPT_RULE_ID)
+    assert [e["id"] for e in rule["exceptions"]] == [
+        "claude-gpt-proven-not-distributed",
+        "claude-gpt-production-consumer-inventory-empty",
+    ]
+    assert all(
+        e["evaluation_mode"] == "human_evidence_required" and e["approval_authority"] == "owner"
+        for e in rule["exceptions"]
+    )

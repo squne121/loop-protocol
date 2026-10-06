@@ -841,3 +841,315 @@ def test_ac_number_declared_as_checked_task_list_item_is_read():
     declared AC, not just the unchecked `- [ ]` form."""
     section = "- [x] AC2: already-completed AC\n"
     assert extension_surface_policy_matcher.extract_ac_numbers(section) == {"2"}
+
+
+# ---------------------------------------------------------------------------
+# Issue #2961: issue-time comment-only exemption (claude-gpt rule only)
+# ---------------------------------------------------------------------------
+
+import dataclasses  # noqa: E402
+
+import pytest  # noqa: E402
+
+from extension_surface_policy_matcher import (  # noqa: E402
+    build_ac_vc_commands,
+    evaluate_runtime_assertion_binding_coverage,
+    format_issue_time_exemption_lines,
+)
+
+_CLAUDE_GPT_RULE_ID = "claude-gpt-lifecycle-invocation-change"
+_CLAUDE_GPT_PROFILE = "claude-gpt-process-io-smoke"
+_LIB_SH = "scripts/claude-gpt/lib.sh"
+_GIT_DIFF_LIB_SH = f"git diff origin/main -- {_LIB_SH}"
+
+
+@dataclasses.dataclass
+class _FakeVcEntry:
+    """Duck-typed stand-in for ``VcCommandEntry`` (ac_refs / command only)."""
+
+    ac_refs: set
+    command: str
+
+
+_AC_SECTION = (
+    "- [ ] AC1: lib.sh の comment だけが変わる\n"
+    "- [ ] AC2: 別の検証\n"
+)
+
+
+def _rva(declaration: str | None, decision: str = "not_applicable") -> str:
+    lines = [f"- decision: {decision}", "- reason: comment-only"]
+    if declaration is not None:
+        lines.append(f"- executable_semantics_unchanged: {declaration}")
+    return "\n".join(lines)
+
+
+_DECL_AC1 = f"{{rule: {_CLAUDE_GPT_RULE_ID}, ac: AC1}}"
+
+
+def _vc(*pairs: tuple[str, str]) -> dict[str, tuple[str, ...]]:
+    """``(ac_label, command)`` pairs -> ``ac_vc_commands`` via the shared helper."""
+    return build_ac_vc_commands(_FakeVcEntry({ac}, cmd) for ac, cmd in pairs)
+
+
+def _evaluate_both(
+    paths: list[str],
+    rva: str,
+    ac_section: str = _AC_SECTION,
+    ac_vc_commands=None,
+    declared_decision: str = "not_applicable",
+):
+    risk = evaluate_issue_risk_trigger(
+        allowed_path_entries=paths,
+        declared_decision=declared_decision,
+        rva_section_text=rva,
+        ac_section_text=ac_section,
+        ac_vc_commands=ac_vc_commands,
+    )
+    coverage = evaluate_runtime_assertion_binding_coverage(
+        allowed_path_entries=paths,
+        rva_section_text=rva,
+        ac_section_text=ac_section,
+        ac_vc_refs=set((ac_vc_commands or {}).keys()),
+        ac_vc_commands=ac_vc_commands,
+    )
+    return risk, coverage
+
+
+def test_claude_gpt_comment_only_declaration_not_hard_match():
+    """AC1: the #2956-shaped fixture yields neither EXTSURF001 (risk-trigger
+    needs_fix) nor RUNTIMEASSERT001 (binding coverage needs_fix) and carries
+    the applied exemption in `issue_time_exemptions`."""
+    risk, coverage = _evaluate_both(
+        [_LIB_SH], _rva(_DECL_AC1), ac_vc_commands=_vc(("AC1", _GIT_DIFF_LIB_SH))
+    )
+    expected = [{"rule_id": _CLAUDE_GPT_RULE_ID, "ac": "AC1", "paths": [_LIB_SH]}]
+    assert risk["verdict"] == "approve"
+    assert risk["reasons"] == []
+    assert risk["issue_time_exemptions"] == expected
+    assert coverage["verdict"] == "approve"
+    assert coverage["required_assertions"] == []
+    assert coverage["missing"] == []
+    assert coverage["issue_time_exemptions"] == expected
+    # The raw policy evaluation still reports the (descriptive) hard match.
+    assert risk["policy_evaluation"]["final_decision"] == "immediate"
+
+
+def test_claude_gpt_comment_only_declaration_with_real_canonical_parser():
+    """The same fixture driven by the REAL canonical VC parser result
+    (`VcParseResult.commands`), proving the duck-typed helper reads real entries."""
+    scripts = _REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    from vc_contract_syntax import parse_verification_commands_section
+
+    vc_section = f"```bash\n# AC1\n$ {_GIT_DIFF_LIB_SH}\n```\n"
+    parsed = parse_verification_commands_section(vc_section)
+    ac_vc_commands = build_ac_vc_commands(parsed.commands)
+    assert ac_vc_commands == {"1": (_GIT_DIFF_LIB_SH,)}
+    risk, coverage = _evaluate_both([_LIB_SH], _rva(_DECL_AC1), ac_vc_commands=ac_vc_commands)
+    assert risk["verdict"] == "approve" and coverage["verdict"] == "approve"
+
+
+_NEGATIVE_BASE = dict(
+    paths=[_LIB_SH],
+    rva=_rva(_DECL_AC1),
+    ac_section=_AC_SECTION,
+    ac_vc_commands=_vc(("AC1", _GIT_DIFF_LIB_SH)),
+)
+
+
+def _case(**overrides):
+    return {**_NEGATIVE_BASE, **overrides}
+
+
+_NEGATIVE_CASES = {
+    "no_declaration": _case(rva=_rva(None)),
+    "ac_does_not_exist": _case(
+        rva=_rva(f"{{rule: {_CLAUDE_GPT_RULE_ID}, ac: AC9}}"),
+        ac_vc_commands=_vc(("AC9", _GIT_DIFF_LIB_SH)),
+    ),
+    "no_canonical_vc_for_ac": _case(ac_vc_commands=_vc(("AC2", _GIT_DIFF_LIB_SH))),
+    "rg_git_diff_is_not_git_diff": _case(
+        ac_vc_commands=_vc(("AC1", f"rg 'git diff' {_LIB_SH}"))
+    ),
+    "echo_git_diff_is_not_git_diff": _case(
+        ac_vc_commands=_vc(("AC1", f"echo git diff {_LIB_SH}"))
+    ),
+    "git_diff_without_the_path": _case(
+        ac_vc_commands=_vc(("AC1", "git diff origin/main -- scripts/claude-gpt/other.sh"))
+    ),
+    "git_status_is_not_git_diff": _case(
+        ac_vc_commands=_vc(("AC1", f"git status -- {_LIB_SH}"))
+    ),
+    "two_exact_paths_only_one_in_diff": _case(
+        paths=[_LIB_SH, "scripts/claude-gpt/other.sh"],
+    ),
+    "glob_allowed_path": _case(paths=["scripts/claude-gpt/**"]),
+    "glob_allowed_path_star": _case(paths=["scripts/claude-gpt/*"]),
+    "directory_allowed_path": _case(paths=["scripts/claude-gpt/"]),
+    "segment_without_extension": _case(paths=["scripts/claude-gpt/Makefile"]),
+    "ac_vc_commands_not_provided": _case(ac_vc_commands=None),
+    "unterminated_quote_is_not_tokenizable": _case(
+        ac_vc_commands=_vc(("AC1", f"git diff 'unterminated {_LIB_SH}"))
+    ),
+}
+
+
+@pytest.mark.parametrize("case_id", sorted(_NEGATIVE_CASES))
+def test_claude_gpt_comment_only_negative_cases_remain_needs_fix(case_id):
+    """AC2: every negative fixture keeps the pre-#2961 hard requirement in BOTH
+    shared evaluators (EXTSURF001 / RUNTIMEASSERT001 sides)."""
+    case = _NEGATIVE_CASES[case_id]
+    risk, coverage = _evaluate_both(
+        case["paths"], case["rva"], case["ac_section"], case["ac_vc_commands"]
+    )
+    assert risk["verdict"] == "needs_fix", case_id
+    assert "issue_time_exemptions" not in risk
+    assert coverage["verdict"] == "needs_fix", case_id
+    assert "issue_time_exemptions" not in coverage
+    assert any(_CLAUDE_GPT_PROFILE in item for item in coverage["missing"])
+
+
+def test_two_exact_paths_each_with_their_own_git_diff_is_exempted():
+    """Positive counterpart: when EVERY exact path has a `git diff` VC naming it
+    (possibly in different commands of the declared AC) the exemption applies."""
+    other = "scripts/claude-gpt/other.sh"
+    ac_vc_commands = _vc(
+        ("AC1", _GIT_DIFF_LIB_SH), ("AC1", f"git diff --stat origin/main -- {other}")
+    )
+    risk, coverage = _evaluate_both([_LIB_SH, other], _rva(_DECL_AC1), ac_vc_commands=ac_vc_commands)
+    assert risk["verdict"] == "approve" and coverage["verdict"] == "approve"
+    assert risk["issue_time_exemptions"][0]["paths"] == sorted([_LIB_SH, other])
+
+
+def test_exemption_does_not_remove_another_matched_rules_hard_requirement():
+    """AC2 (other rule matches simultaneously): the claude-gpt rule alone is
+    excluded; the agent rule's hard `immediate` requirement stays."""
+    risk, coverage = _evaluate_both(
+        [_LIB_SH, ".claude/agents/implementation-worker.md"],
+        _rva(_DECL_AC1),
+        ac_vc_commands=_vc(("AC1", _GIT_DIFF_LIB_SH)),
+    )
+    assert risk["verdict"] == "needs_fix"
+    assert "agent-lifecycle-frontmatter-or-body-change" in risk["reasons"][0]
+    assert _CLAUDE_GPT_RULE_ID not in risk["reasons"][0]
+    assert risk["issue_time_exemptions"][0]["rule_id"] == _CLAUDE_GPT_RULE_ID
+    assert coverage["verdict"] == "needs_fix"
+    assert not any(_CLAUDE_GPT_PROFILE in item for item in coverage["missing"])
+    assert any("agent" in item for item in coverage["missing"])
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        f"{{rule: {_CLAUDE_GPT_RULE_ID}, ac: AC1, extra: x}}",
+        f"{{rule: {_CLAUDE_GPT_RULE_ID}}}",
+        f"{{ac: AC1}}",
+        f"{{rule: {_CLAUDE_GPT_RULE_ID}, ac: 1}}",
+        f"{{rule: '', ac: AC1}}",
+        "AC1",
+        f"[{{rule: {_CLAUDE_GPT_RULE_ID}, ac: AC1}}]",
+    ],
+)
+def test_malformed_declaration_is_not_applied(declaration):
+    """The declaration is a closed key set (`rule` / `ac`); anything else is not applied."""
+    risk, coverage = _evaluate_both(
+        [_LIB_SH], _rva(declaration), ac_vc_commands=_vc(("AC1", _GIT_DIFF_LIB_SH))
+    )
+    assert risk["verdict"] == "needs_fix" and coverage["verdict"] == "needs_fix"
+    assert risk["issue_time_exemption_rejections"]
+
+
+@pytest.mark.parametrize(
+    "paths,rule_id",
+    [
+        ([".claude/agents/implementation-worker.md"], "agent-lifecycle-frontmatter-or-body-change"),
+        ([".claude/hooks/some_hook.py"], "hook-lifecycle-matcher-or-handler-change"),
+        ([".claude/skills/foo/SKILL.md"], "skill-invocation-procedure-or-contract-change"),
+        ([".claude/agents/implementation-worker.md"], "subagent-lifecycle-start-stop-delegation-fallback"),
+        ([".claude/hooks/some_hook.py"], _CLAUDE_GPT_RULE_ID),
+    ],
+)
+def test_exemption_declaration_does_not_exempt_hook_or_skill_rule(paths, rule_id):
+    """AC7: hook / skill / subagent / agent rules (and the claude-gpt rule when
+    it is not even matched) never get the exemption, whatever is declared."""
+    path = paths[0]
+    risk, coverage = _evaluate_both(
+        paths,
+        _rva(f"{{rule: {rule_id}, ac: AC1}}"),
+        ac_vc_commands=_vc(("AC1", f"git diff origin/main -- {path}")),
+    )
+    assert risk["verdict"] == "needs_fix"
+    assert "issue_time_exemptions" not in risk
+    assert coverage["verdict"] == "needs_fix"
+    assert "issue_time_exemptions" not in coverage
+
+
+def test_only_claude_gpt_rule_opts_in_in_the_policy_file():
+    policy = load_policy()
+    opted_in = [r["id"] for r in policy["rules"] if "issue_time_exemption" in r]
+    assert opted_in == [_CLAUDE_GPT_RULE_ID]
+
+
+def test_unsupported_policy_opt_in_fails_closed_with_policy_load_error():
+    policy = load_policy()
+    for rule in policy["rules"]:
+        if rule["id"] == _CLAUDE_GPT_RULE_ID:
+            rule["issue_time_exemption"] = {"declaration_key": "other", "mode": "x"}
+    with pytest.raises(extension_surface_policy_matcher.PolicyLoadError):
+        evaluate_issue_risk_trigger(
+            [_LIB_SH],
+            "not_applicable",
+            _rva(_DECL_AC1),
+            policy=policy,
+            ac_section_text=_AC_SECTION,
+            ac_vc_commands=_vc(("AC1", _GIT_DIFF_LIB_SH)),
+        )
+
+
+def test_old_call_signature_is_unchanged_and_never_exempts():
+    """Callers that do not pass the new optional arguments keep the previous behaviour."""
+    risk = evaluate_issue_risk_trigger([_LIB_SH], "not_applicable", _rva(_DECL_AC1))
+    assert risk["verdict"] == "needs_fix"
+    assert "issue_time_exemptions" not in risk
+    coverage = evaluate_runtime_assertion_binding_coverage(
+        [_LIB_SH], _rva(_DECL_AC1), _AC_SECTION, {"1"}
+    )
+    assert coverage["verdict"] == "needs_fix"
+
+
+def test_exemption_does_not_weaken_an_immediate_declaration():
+    """A declared `immediate` Issue is evaluated exactly as before (the exemption
+    only removes the rule from the final-decision derivation)."""
+    risk = evaluate_issue_risk_trigger(
+        [_LIB_SH],
+        "immediate",
+        "- decision: immediate\n- reason: x",
+        ac_section_text=_AC_SECTION,
+        ac_vc_commands=_vc(("AC1", _GIT_DIFF_LIB_SH)),
+    )
+    assert risk["verdict"] == "needs_fix"
+    assert risk["missing_rva_immediate_fields"]
+
+
+def test_build_ac_vc_commands_is_a_pure_duck_typed_mapping():
+    entries = [
+        _FakeVcEntry({"AC1", "AC2"}, "cmd-a"),
+        _FakeVcEntry({"AC1"}, "cmd-b"),
+        _FakeVcEntry(set(), "unlabelled"),
+        _FakeVcEntry({"not-an-ac"}, "bogus"),
+    ]
+    assert build_ac_vc_commands(entries) == {"1": ("cmd-a", "cmd-b"), "2": ("cmd-a",)}
+    assert build_ac_vc_commands(None) == {}
+    assert build_ac_vc_commands([]) == {}
+
+
+def test_format_issue_time_exemption_lines_is_one_line_per_exemption():
+    lines = format_issue_time_exemption_lines(
+        [{"rule_id": _CLAUDE_GPT_RULE_ID, "ac": "AC1", "paths": [_LIB_SH]}]
+    )
+    assert lines == [
+        f"{_CLAUDE_GPT_RULE_ID}: exempted via executable_semantics_unchanged; "
+        f"ac=AC1; paths={_LIB_SH}"
+    ]

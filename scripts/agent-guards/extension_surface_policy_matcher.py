@@ -39,9 +39,10 @@ package (Issue #2290 "Notes for Reviewer").
 from __future__ import annotations
 
 import re
+import shlex
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 import yaml
 
@@ -634,11 +635,230 @@ def find_missing_rva_immediate_fields(rva_section_text: str) -> list[str]:
     return missing
 
 
+# ---------------------------------------------------------------------------
+# Issue-time comment-only exemption (Issue #2961, OWNER decision Option B)
+# ---------------------------------------------------------------------------
+#
+# A rule may opt in (policy side) to a narrowly scoped, structure-only
+# exemption from its ``default_decision`` hard requirement at Issue time via
+# the optional rule-level property ``issue_time_exemption``. Only
+# ``claude-gpt-lifecycle-invocation-change`` opts in. The Issue declares
+# ``executable_semantics_unchanged: {rule: <rule-id>, ac: AC<N>}`` in its
+# Runtime Verification Applicability section.
+#
+# This module verifies the STRUCTURE of the declaration and of the VC only
+# (a ``git diff`` VC that names each exempted exact file path). The existence
+# of such a VC is NOT proof that executable semantics are unchanged: the real
+# acceptance evidence is the PR-time VC execution and review. That residual
+# risk is accepted by design (Issue #2961).
+#
+# Both ``evaluate_issue_risk_trigger()`` and
+# ``evaluate_runtime_assertion_binding_coverage()`` call the SAME helper
+# below, so EXTSURF001 and RUNTIMEASSERT001 can never disagree.
+
+ISSUE_TIME_EXEMPTION_DECLARATION_KEY = "executable_semantics_unchanged"
+ISSUE_TIME_EXEMPTION_MODE = "exact_file_path_git_diff_vc"
+_ISSUE_TIME_EXEMPTION_DECLARATION_KEYS = frozenset({"rule", "ac"})
+_ISSUE_TIME_EXEMPTION_GLOB_CHARS = frozenset("*?[]{}")
+# Carrier identity shared by readiness `category` and review-issue
+# `non_blocking_improvements[].code` (information only, never blocking).
+ISSUE_TIME_EXEMPTION_CARRIER_CODE = "extension_surface_issue_time_exemption_applied"
+
+
+def build_ac_vc_commands(vc_commands: Optional[Iterable[Any]]) -> dict[str, tuple[str, ...]]:
+    """Pure helper: ``{AC digit: (VC command body, ...)}`` from canonical
+    parsed VC entries (Issue #2961).
+
+    ``vc_commands`` is duck-typed: any iterable of objects exposing
+    ``ac_refs`` (labels such as ``"AC1"``) and ``command`` -- in practice
+    ``vc_contract_syntax.VcParseResult.commands`` from the existing canonical
+    parser. No new parser is introduced and no raw Issue body is re-parsed
+    here. Entries without a canonical ``AC<N>`` reference are ignored.
+    """
+    mapping: dict[str, list[str]] = {}
+    for entry in vc_commands or ():
+        command = getattr(entry, "command", None)
+        if not isinstance(command, str):
+            continue
+        for ref in getattr(entry, "ac_refs", None) or ():
+            if not isinstance(ref, str):
+                continue
+            match = _AC_TOKEN_RE.match(ref.strip())
+            if match is None:
+                continue
+            mapping.setdefault(match.group(1), []).append(command)
+    return {digit: tuple(commands) for digit, commands in mapping.items()}
+
+
+def _is_exact_file_path_entry(entry: str) -> bool:
+    """Fixed predicate (Issue #2961 In Scope 2): no glob character, no
+    trailing ``/``, and a final path segment that contains ``.`` (an
+    extension-bearing basename)."""
+    if not isinstance(entry, str) or not entry:
+        return False
+    if any(ch in _ISSUE_TIME_EXEMPTION_GLOB_CHARS for ch in entry):
+        return False
+    if entry.endswith("/"):
+        return False
+    last_segment = entry.rsplit("/", 1)[-1]
+    return "." in last_segment and last_segment not in (".", "..")
+
+
+def _command_is_git_diff_for_path(command: str, path: str) -> bool:
+    """``shlex.split`` tokenisation (pure string processing, nothing is
+    executed): the first two tokens are ``git`` ``diff`` AND ``path`` appears
+    as a token. ``rg 'git diff'`` / ``echo git diff`` never qualify."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    if len(tokens) < 2 or tokens[0] != "git" or tokens[1] != "diff":
+        return False
+    return path in tokens[2:]
+
+
+def _rule_issue_time_exemption_opt_in(rule: dict[str, Any]) -> bool:
+    """True iff the policy rule opted in via ``issue_time_exemption``.
+
+    A present-but-unsupported value fails closed with ``PolicyLoadError``
+    (a policy integrity defect, never an Issue defect)."""
+    raw = rule.get("issue_time_exemption")
+    if raw is None:
+        return False
+    if (
+        not isinstance(raw, dict)
+        or raw.get("declaration_key") != ISSUE_TIME_EXEMPTION_DECLARATION_KEY
+        or raw.get("mode") != ISSUE_TIME_EXEMPTION_MODE
+    ):
+        raise PolicyLoadError(
+            f"rule {rule.get('id')!r} declares an unsupported issue_time_exemption "
+            f"{raw!r} (expected declaration_key {ISSUE_TIME_EXEMPTION_DECLARATION_KEY!r} / "
+            f"mode {ISSUE_TIME_EXEMPTION_MODE!r}; Issue #2961)"
+        )
+    return True
+
+
+def evaluate_issue_time_exemptions(
+    matched_rules: list[dict[str, Any]],
+    policy: dict[str, Any],
+    rva_section_text: str,
+    ac_section_text: Optional[str],
+    ac_vc_commands: Optional[dict[str, tuple[str, ...]]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Shared exemption decision used by BOTH risk-trigger and binding
+    coverage evaluators (Issue #2961).
+
+    Returns ``(exemptions, rejections)``. ``exemptions`` is
+    ``[{"rule_id", "ac", "paths"}]`` (applied exemptions only). ``rejections``
+    explains, in human-readable text, why a *present* declaration was not
+    applied (diagnostic only; it never changes any verdict). All of the
+    following must hold, otherwise nothing is exempted (fail-closed):
+
+    1. the rule opted in via ``issue_time_exemption``
+    2. every Allowed Path entry matching the rule is an exact file path
+    3. the declaration is well-formed (closed key set ``rule`` / ``ac``)
+    4. the referenced AC exists in ``ac_section_text``
+    5. ``ac_vc_commands`` has a canonical ``# AC<N>`` entry for that AC
+    6. every exact path has a ``git diff`` VC (see
+       ``_command_is_git_diff_for_path``) under that AC
+
+    ``ac_vc_commands is None`` (old call sites, parser unavailable) never
+    exempts. Structure only: not proof that executable semantics are
+    unchanged.
+    """
+    raw = _extract_rva_yaml_field(rva_section_text, ISSUE_TIME_EXEMPTION_DECLARATION_KEY)
+    if raw is None:
+        return [], []
+
+    key = ISSUE_TIME_EXEMPTION_DECLARATION_KEY
+    if ac_vc_commands is None:
+        return [], [f"{key} not applied: ac_vc_commands was not provided (fail-closed)"]
+    if not isinstance(raw, dict) or set(raw.keys()) != _ISSUE_TIME_EXEMPTION_DECLARATION_KEYS:
+        return [], [
+            f"{key} not applied: declaration must be a mapping with exactly the keys "
+            f"{sorted(_ISSUE_TIME_EXEMPTION_DECLARATION_KEYS)}"
+        ]
+    rule_id = raw.get("rule")
+    ac_label = raw.get("ac")
+    ac_match = _AC_TOKEN_RE.match(ac_label.strip()) if isinstance(ac_label, str) else None
+    if not isinstance(rule_id, str) or not rule_id.strip() or ac_match is None:
+        return [], [f"{key} not applied: 'rule' must be a rule id and 'ac' must be 'AC<N>'"]
+    rule_id = rule_id.strip()
+    ac_digit = ac_match.group(1)
+
+    matched = next((r for r in matched_rules if r.get("rule_id") == rule_id), None)
+    if matched is None or matched.get("enforcement") != "hard":
+        return [], [f"{key} not applied: rule {rule_id!r} is not a hard-matched rule of this Issue"]
+    policy_rule = next((r for r in (policy.get("rules") or []) if r.get("id") == rule_id), None)
+    if policy_rule is None or not _rule_issue_time_exemption_opt_in(policy_rule):
+        return [], [f"{key} not applied: rule {rule_id!r} has no issue_time_exemption opt-in"]
+
+    paths: list[str] = []
+    for hit in matched.get("matches") or []:
+        entry = hit.get("allowed_path_entry")
+        if entry not in paths:
+            paths.append(entry)
+    non_exact = [p for p in paths if not _is_exact_file_path_entry(p)]
+    if not paths or non_exact:
+        return [], [
+            f"{key} not applied: every Allowed Path matching {rule_id!r} must be an exact file "
+            f"path (not exact: {non_exact})"
+        ]
+
+    if ac_digit not in extract_ac_numbers(ac_section_text or ""):
+        return [], [f"{key} not applied: AC{ac_digit} does not exist in the Acceptance Criteria"]
+    commands = [c for c in (ac_vc_commands.get(ac_digit) or ()) if isinstance(c, str)]
+    if not commands:
+        return [], [f"{key} not applied: AC{ac_digit} has no canonical '# AC{ac_digit}' VC command"]
+    for path in paths:
+        candidates = {path}
+        normalized = AllowedPathsMatcher.normalize_path(path)
+        if normalized:
+            candidates.add(normalized)
+        if not any(_command_is_git_diff_for_path(c, cand) for c in commands for cand in candidates):
+            return [], [
+                f"{key} not applied: AC{ac_digit} has no 'git diff' VC command naming {path!r}"
+            ]
+
+    return [{"rule_id": rule_id, "ac": f"AC{ac_digit}", "paths": sorted(paths)}], []
+
+
+def format_issue_time_exemption_lines(exemptions: list[dict[str, Any]]) -> list[str]:
+    """One non-blocking carrier evidence line per applied exemption, shared by
+    both consumers so the text cannot drift between them (Issue #2961)."""
+    return [
+        f"{e['rule_id']}: exempted via {ISSUE_TIME_EXEMPTION_DECLARATION_KEY}; "
+        f"ac={e['ac']}; paths={', '.join(e['paths'])}"
+        for e in exemptions
+    ]
+
+
+def _matched_rules_without_exempted(
+    matched_rules: list[dict[str, Any]], exemptions: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    exempted_ids = {e["rule_id"] for e in exemptions}
+    return [r for r in matched_rules if r.get("rule_id") not in exempted_ids]
+
+
+def _most_restrictive_hard_decision(matched_rules: list[dict[str, Any]]) -> Optional[str]:
+    """Same derivation as ``evaluate_allowed_paths`` ``final_decision`` over
+    the given (possibly exemption-filtered) matched rules."""
+    final_decision: Optional[str] = None
+    for rule in matched_rules:
+        decision = rule.get("default_decision")
+        if rule.get("enforcement") == "hard" and decision in DECISION_RANK:
+            if final_decision is None or DECISION_RANK[decision] > DECISION_RANK[final_decision]:
+                final_decision = decision
+    return final_decision
+
+
 def evaluate_issue_risk_trigger(
     allowed_path_entries: list[str],
     declared_decision: Optional[str],
     rva_section_text: str,
     policy: Optional[dict[str, Any]] = None,
+    ac_section_text: Optional[str] = None,
+    ac_vc_commands: Optional[dict[str, tuple[str, ...]]] = None,
 ) -> dict[str, Any]:
     """High-level verdict shared verbatim by both consumers.
 
@@ -654,17 +874,41 @@ def evaluate_issue_risk_trigger(
         Runtime Verification Applicability ``decision`` (AC1 / AC2), or
       - ``declared_decision == "immediate"`` but the RVA section is missing
         one or more of the required immediate fields (AC6).
+
+    Issue #2961: ``ac_section_text`` / ``ac_vc_commands`` (optional; see
+    ``build_ac_vc_commands``) let a rule that opted in via
+    ``issue_time_exemption`` be excluded from the final decision when the
+    Issue carries a well-formed ``executable_semantics_unchanged``
+    declaration (see ``evaluate_issue_time_exemptions``). Other matched
+    rules are never exempted. ``ac_vc_commands=None`` never exempts. Applied
+    exemptions are reported under ``issue_time_exemptions`` (key present only
+    when an exemption was applied).
     """
     policy_evaluation = evaluate_allowed_paths(allowed_path_entries, policy=policy)
     reasons: list[str] = []
+    policy_data = policy if policy is not None else load_policy()
 
     declared_rank = DECISION_RANK.get(declared_decision) if declared_decision else None
-    final_decision = policy_evaluation["final_decision"]
+    exemptions, exemption_rejections = evaluate_issue_time_exemptions(
+        policy_evaluation["matched_rules"],
+        policy_data,
+        rva_section_text,
+        ac_section_text,
+        ac_vc_commands,
+    )
+    if exemptions:
+        effective_matched_rules = _matched_rules_without_exempted(
+            policy_evaluation["matched_rules"], exemptions
+        )
+        final_decision = _most_restrictive_hard_decision(effective_matched_rules)
+    else:
+        effective_matched_rules = policy_evaluation["matched_rules"]
+        final_decision = policy_evaluation["final_decision"]
 
     if policy_evaluation["has_match"] and final_decision is not None:
         final_rank = DECISION_RANK[final_decision]
         if declared_rank is None or declared_rank < final_rank:
-            matched_rule_ids = [r["rule_id"] for r in policy_evaluation["matched_rules"]]
+            matched_rule_ids = [r["rule_id"] for r in effective_matched_rules]
             reasons.append(
                 "declared Allowed Paths overlap with extension-surface risk-trigger "
                 f"policy rule(s) {matched_rule_ids} whose most-restrictive default_decision "
@@ -683,7 +927,7 @@ def evaluate_issue_risk_trigger(
             )
 
     verdict = "needs_fix" if reasons else "approve"
-    return {
+    result: dict[str, Any] = {
         "schema": SCHEMA_RISK_TRIGGER_VERDICT,
         "verdict": verdict,
         "reasons": reasons,
@@ -694,6 +938,13 @@ def evaluate_issue_risk_trigger(
         # when reasons is empty even if advisories is non-empty, AC6).
         "advisories": policy_evaluation.get("advisories", []),
     }
+    if exemptions:
+        # Issue #2961: carrier for applied exemptions (non-blocking).
+        result["issue_time_exemptions"] = exemptions
+    if exemption_rejections:
+        # Diagnostic only: never contributes to `reasons` / `verdict`.
+        result["issue_time_exemption_rejections"] = exemption_rejections
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1260,6 +1511,7 @@ def evaluate_runtime_assertion_binding_coverage(
     ac_section_text: str,
     ac_vc_refs: set[str],
     policy: Optional[dict[str, Any]] = None,
+    ac_vc_commands: Optional[dict[str, tuple[str, ...]]] = None,
 ) -> dict[str, Any]:
     """High-level verdict shared verbatim by both consumers (Issue #2771,
     mirrors ``evaluate_issue_risk_trigger``'s existing cross-consumer parity
@@ -1302,7 +1554,22 @@ def evaluate_runtime_assertion_binding_coverage(
     """
     policy_data = policy if policy is not None else load_policy()
     policy_evaluation = evaluate_allowed_paths(allowed_path_entries, policy=policy_data)
-    required = derive_required_runtime_assertions(policy_evaluation["matched_rules"], policy_data)
+    # Issue #2961: the SAME shared exemption helper as
+    # `evaluate_issue_risk_trigger()`; an exempted rule is excluded from the
+    # required-assertion derivation only (other rules stay hard).
+    exemptions, exemption_rejections = evaluate_issue_time_exemptions(
+        policy_evaluation["matched_rules"],
+        policy_data,
+        rva_section_text,
+        ac_section_text,
+        ac_vc_commands,
+    )
+    required = derive_required_runtime_assertions(
+        _matched_rules_without_exempted(policy_evaluation["matched_rules"], exemptions)
+        if exemptions
+        else policy_evaluation["matched_rules"],
+        policy_data,
+    )
 
     declared_decision: Optional[str] = None
     decision_match = re.search(r"decision:\s*(\S+)", rva_section_text or "")
@@ -1416,7 +1683,7 @@ def evaluate_runtime_assertion_binding_coverage(
             f"{c['profile']}/{c['assertion']}" for c in classified if c["disposition"] == disposition
         ]
 
-    return {
+    result: dict[str, Any] = {
         "schema": SCHEMA_RUNTIME_ASSERTION_BINDING_COVERAGE,
         "verdict": verdict,
         # STRUCTURAL completeness only: no field of this result is runtime
@@ -1441,6 +1708,11 @@ def evaluate_runtime_assertion_binding_coverage(
         "invalid_demonstrated_by_bindings": invalid_demonstrated_by_bindings,
         "reasons": reasons_out,
     }
+    if exemptions:
+        result["issue_time_exemptions"] = exemptions
+    if exemption_rejections:
+        result["issue_time_exemption_rejections"] = exemption_rejections
+    return result
 
 
 # ---------------------------------------------------------------------------
