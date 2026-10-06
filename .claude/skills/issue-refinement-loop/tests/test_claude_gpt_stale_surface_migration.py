@@ -161,11 +161,12 @@ def test_ac6_docs_current_concepts_present():
     assert re.search(r"(?s)CLAUDE_GPT_HOME.{0,600}credential namespace ではない", section_12)
     # `CLAUDE_GPT_HOME` is not tied to the smoke's temporary evidence / work dir (OWNER Finding 3).
     assert not re.search(r"smoke の一時証跡の置き場", section_12)
-    # any sentence linking CLAUDE_GPT_HOME with smoke evidence / work dir must deny the link.
-    for sentence in re.split(r"(?<=。)", section_12):
-        if "CLAUDE_GPT_HOME" in sentence and re.search(r"証跡|作業 directory", sentence):
-            assert "無関係" in sentence, sentence
-    assert re.search(r"(?s)runtime_smoke_test\.sh` の作業 directory と証跡は `CLAUDE_GPT_HOME` とは無関係", section_12)
+    # scoped launcher semantics (#2962): the launcher neither derives nor overwrites HOME / XDG_* /
+    # CLAUDE_CONFIG_DIR from CLAUDE_GPT_HOME, a caller-provided CLAUDE_GPT_HOME may be inherited by
+    # child processes, and runtime_smoke_test.sh does not use it to choose the work dir / evidence path.
+    assert "導出も上書きもしない" in section_12
+    assert "継承され得る" in section_12
+    assert re.search(r"runtime_smoke_test\.sh` は `CLAUDE_GPT_HOME` を[^。\n]*(?:使わない|参照しない)", section_12)
     # connected-server request acceptance and provider / subscription attribution are separate items
     # (OWNER Finding 2); the latter is established only by additional evidence.
     evidence_items = re.findall(r"(?m)^\d\. \*\*(.+?)\*\*", section_12)
