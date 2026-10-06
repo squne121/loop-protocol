@@ -534,7 +534,7 @@ claude_gpt_probe_live_catalog() {
     if ! kill -0 "$_cgt_probe_pid" 2>/dev/null; then
       break
     fi
-    if curl --fail --show-error -s -o /dev/null -m 1 "http://127.0.0.1:${_cgt_probe_port}/v1/models" 2>/dev/null; then
+    if curl -q --noproxy '*' --fail --show-error -s -o /dev/null -m 1 "http://127.0.0.1:${_cgt_probe_port}/v1/models" 2>/dev/null; then
       _cgt_probe_ready=true
       break
     fi
@@ -544,7 +544,7 @@ claude_gpt_probe_live_catalog() {
 
   _cgt_probe_models=""
   if [ "$_cgt_probe_ready" = "true" ]; then
-    _cgt_probe_models=$(curl --fail --show-error -s -m 3 "http://127.0.0.1:${_cgt_probe_port}/v1/models" 2>/dev/null)
+    _cgt_probe_models=$(curl -q --noproxy '*' --fail --show-error -s -m 3 "http://127.0.0.1:${_cgt_probe_port}/v1/models" 2>/dev/null)
   fi
 
   kill "$_cgt_probe_pid" 2>/dev/null
