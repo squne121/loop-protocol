@@ -462,7 +462,7 @@ runner の CLI からは呼び出されない（呼び出し元が evidence 再�
 opt-in flag。未指定なら何も保存せず、既存 caller の挙動は変わらない。
 
 ```bash
-uv run python3 scripts/agent-ops/run_worktree_agent_runtime_smoke.py \
+uv run --locked python3 scripts/agent-ops/run_worktree_agent_runtime_smoke.py \
   --worktree "$WORKTREE" --runtime claude --mode structured \
   --prompt-file "$PROMPT" --output-dir "$OUT" \
   --require-min-subagents 2 \
