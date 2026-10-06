@@ -106,13 +106,12 @@ sys.path.insert(0, str(_SCRIPTS_DIR))
 _DEFAULT_REPO_ROOT = _SCRIPTS_DIR.parents[3]
 sys.path.insert(0, str(_DEFAULT_REPO_ROOT / "scripts" / "agent-ops"))
 
-# Issue #2239 AC7 fix_delta (both the original PR and this fix_delta): reuse
-# -- do not re-implement -- the claude-gpt launcher receipt / proxy PID-port-
-# log side-channel parser / INDEPENDENT PID-listen-socket cleanup
-# reconfirmation already implemented for `worktree-agent-runtime-smoke`
-# (Issue #2174 AC8, #2219 AC1/AC7), plus `capture_runtime_version` (P1-5).
-# No new attestation schema is introduced here; this verifier only calls the
-# same production functions the existing runner already uses.
+# Issue #2239 AC7 fix_delta: reuse -- do not re-implement -- the claude-gpt
+# launcher receipt parser and `capture_runtime_version` (P1-5) already
+# implemented for `worktree-agent-runtime-smoke`. The proxy PID-port-log
+# side-channel / independent cleanup reconfirmation was removed in Issue #2938
+# because the launcher no longer starts or stops a proxy (Issue #2925). No new
+# attestation schema is introduced here.
 import run_worktree_agent_runtime_smoke as rwars  # noqa: E402
 
 _RESULT_SCHEMA = "AGENT_RETROSPECTIVE_LIVE_SMOKE_RESULT_V1"
@@ -263,7 +262,10 @@ def _resolve_claude_gpt(repo_root: Path) -> tuple[str | None, list[str]]:
     launcher = repo_root / "scripts" / "claude-gpt" / "launch.sh"
     if not launcher.is_file() or not __import__("os").access(launcher, __import__("os").X_OK):
         return None, []
-    return str(launcher), [str(launcher), "-C", str(repo_root)]
+    # The launcher accepts only --check-only / --dry-run / --claude-bin / --
+    # (Issue #2938): a `-C <repo_root>` prefix is `unknown_launcher_option`.
+    # The working directory is passed via `subprocess.run(cwd=repo_root)`.
+    return str(launcher), [str(launcher)]
 
 
 def _preflight_runtime_ok(argv_prefix: list[str], *, is_claude_gpt: bool) -> bool:
@@ -471,9 +473,10 @@ def main(argv: list[str] | None = None) -> int:
 
     import os as _os
 
+    # The launcher no longer reads any runtime-smoke hook-selection variable
+    # (Issue #2925 / #2938); hook observation is owned by the runner's
+    # --settings overlay, not by this verifier.
     launch_env = _os.environ.copy()
-    if is_claude_gpt:
-        launch_env["CLAUDE_GPT_RUNTIME_SMOKE_HOOKS"] = "subagent-start-stop"
 
     try:
         completed = subprocess.run(
@@ -491,39 +494,13 @@ def main(argv: list[str] | None = None) -> int:
         return _fail("live_invocation_transport_error", f"root Skill invocation could not be started: {exc}")
 
     claude_gpt_launcher_receipt: dict[str, Any] | None = None
-    claude_gpt_proxy_sidechannel: dict[str, Any] | None = None
-    claude_gpt_proxy_cleanup_independent: dict[str, Any] | None = None
     if is_claude_gpt:
-        # Issue #2239 AC7 fix_delta: reuse the launcher's own already-parsed
-        # CLAUDE_GPT_LAUNCH_RESULT_V1 receipt and proxy PID/port/log
-        # side-channel (Issue #2174 AC8, #2219 AC1/AC7), then INDEPENDENTLY
-        # re-confirm proxy cleanup (never trusting the launcher's own
-        # CLAUDE_GPT_PROXY_CLEANUP_OK self-report).
+        # Issue #2938: the launcher no longer starts a proxy, so it emits no
+        # proxy PID / port / cleanup lines and there is nothing to reconfirm.
+        # A normal (non --check-only) launch prints no receipt on stderr, so
+        # ``launcher_result`` may legitimately be None; it is recorded as-is
+        # and never used as a FAIL condition or assertion.
         launcher_result = rwars.extract_claude_gpt_launcher_receipt(completed.stderr)
-        claude_gpt_proxy_sidechannel = rwars.extract_claude_gpt_proxy_sidechannel(completed.stderr)
-        claude_gpt_proxy_cleanup_independent = rwars.verify_claude_gpt_proxy_cleanup_independent(
-            claude_gpt_proxy_sidechannel["proxy_pid"], claude_gpt_proxy_sidechannel["proxy_port"]
-        )
-        # Issue #2239 PR #2331 fix_delta P0/P1-2: `checked == False` (cleanup
-        # could not be independently reconfirmed at all) must FAIL, not pass
-        # through. Only `checked is True and cleanup_confirmed is True` is a
-        # success; every other combination (including `checked is False`) is
-        # a fail-closed FAIL.
-        cleanup_ok = (
-            claude_gpt_proxy_cleanup_independent.get("checked") is True
-            and claude_gpt_proxy_cleanup_independent.get("cleanup_confirmed") is True
-        )
-        if not cleanup_ok:
-            return _fail(
-                "claude_gpt_proxy_cleanup_not_independently_confirmed",
-                "claude-gpt proxy cleanup was not independently reconfirmed via PID/listen-socket check "
-                f"(self-reported={claude_gpt_proxy_sidechannel['proxy_cleanup_ok_self_reported']}, "
-                f"checked={claude_gpt_proxy_cleanup_independent.get('checked')})",
-                extra={
-                    "claude_gpt_proxy_sidechannel": claude_gpt_proxy_sidechannel,
-                    "claude_gpt_proxy_cleanup_independent": claude_gpt_proxy_cleanup_independent,
-                },
-            )
         claude_gpt_launcher_receipt = {
             "resolved_executable": resolved_executable,
             "resolved_executable_digest": _sha256_file(Path(resolved_executable)),
@@ -635,8 +612,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if claude_gpt_launcher_receipt is not None:
         receipt["claude_gpt_launcher_receipt"] = claude_gpt_launcher_receipt
-        receipt["claude_gpt_proxy_sidechannel"] = claude_gpt_proxy_sidechannel
-        receipt["claude_gpt_proxy_cleanup_independent"] = claude_gpt_proxy_cleanup_independent
 
     artifact_path = artifacts_dir / f"live_smoke_{args.runtime_profile}_{int(time.time())}_{nonce}.json"
     artifact_path.write_text(json.dumps(receipt, sort_keys=True, indent=2), encoding="utf-8")

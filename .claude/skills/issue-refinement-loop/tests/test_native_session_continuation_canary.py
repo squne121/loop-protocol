@@ -185,7 +185,9 @@ def _run_and_assert_pass_or_skip(adapter: str, claude_bin: str | None) -> None:
         f"runtime_fallback={evidence.get('runtime_fallback')}"
     )
     assert evidence.get("verdict") == "PASS"
-    assert evidence.get("provider_fallback") is False
+    # Issue #2938: provider fallback is not observable from the current
+    # check-only receipt, so PASS records "unobserved" (never False).
+    assert evidence.get("provider_fallback") == "unobserved"
     assert evidence.get("runtime_fallback") is False
 
     # AC8 (argv contract), self-verified by the runner and echoed into the
@@ -349,19 +351,11 @@ def test_detect_runtime_fallback_false_when_id_not_equal():
     assert module.detect_runtime_fallback(id_equal=False, marker_ok=False) is False
 
 
-def test_detect_provider_fallback_true_when_model_alias_not_ok():
+def test_provider_fallback_detector_is_removed():
+    """Issue #2938: provider fallback is not observable from the current
+    check-only receipt, so the receipt-based detector must not exist."""
     module = _load_canary_module()
-    assert module.detect_provider_fallback({"model_alias_ok": False}) is True
-
-
-def test_detect_provider_fallback_false_when_model_alias_ok():
-    module = _load_canary_module()
-    assert module.detect_provider_fallback({"model_alias_ok": True}) is False
-
-
-def test_detect_provider_fallback_false_when_receipt_missing():
-    module = _load_canary_module()
-    assert module.detect_provider_fallback(None) is False
+    assert not hasattr(module, "detect_provider_fallback")
 
 
 def test_marker_recalled_true_only_from_assistant_text():
@@ -376,22 +370,23 @@ def test_marker_recalled_true_only_from_assistant_text():
 
 def test_parse_claude_gpt_receipt_handles_embedded_multiline_json():
     """Regression for a live finding: the launch.sh --check-only success
-    receipt embeds a pretty-printed (multi-line) nested ``preflight``
-    object, which the reused single-line regex extractor cannot match."""
+    receipt nests multi-line objects (``connected_server`` etc.), which the
+    reused single-line regex extractor cannot match."""
     module = _load_canary_module()
     text = (
         'launcher=/x/launch.sh git=abc dirty=false proxy=v0.1.0\n'
         '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"ok","mode":"check_only",'
-        '"model_alias_ok":true,"preflight":{\n'
-        '  "schema": "CLAUDE_GPT_PREFLIGHT_RESULT_V1",\n'
-        '  "binary_available": true\n'
+        '"connected_server":{\n'
+        '  "reachable": true,\n'
+        '  "model_catalog_ok": true,\n'
+        '  "version": "未確認"\n'
         '}}\n'
     )
     receipt = module._parse_claude_gpt_receipt(text)
     assert receipt is not None
     assert receipt["status"] == "ok"
-    assert receipt["model_alias_ok"] is True
-    assert receipt["preflight"]["binary_available"] is True
+    assert receipt["connected_server"]["reachable"] is True
+    assert receipt["connected_server"]["model_catalog_ok"] is True
 
 
 def test_detect_claude_gpt_launch_failure_receipt_detects_blocked_status():
@@ -741,7 +736,8 @@ def test_resume_first_attempt_launcher_unavailable_reaches_skip_via_finish(monke
             # from the FIRST resume launch's own launcher receipt, not the
             # preflight probe.
             return 0, json.dumps(
-                {"schema": "CLAUDE_GPT_LAUNCH_RESULT_V1", "status": "ok", "model_alias_ok": True}
+                {"schema": "CLAUDE_GPT_LAUNCH_RESULT_V1", "status": "ok", "mode": "check_only",
+                 "connected_server": {"reachable": True, "model_catalog_ok": True, "classification": "ok"}}
             ), "", False
         if "--resume" in argv:
             resume_attempts["n"] += 1
@@ -841,7 +837,8 @@ def test_resume_retry_attempt_structural_failure_evidence_reflects_retry_not_sta
     def fake_run(argv, *, cwd=None, timeout=None, input_text=None, env=None):
         if "--check-only" in argv:
             return 0, json.dumps(
-                {"schema": "CLAUDE_GPT_LAUNCH_RESULT_V1", "status": "ok", "model_alias_ok": True}
+                {"schema": "CLAUDE_GPT_LAUNCH_RESULT_V1", "status": "ok", "mode": "check_only",
+                 "connected_server": {"reachable": True, "model_catalog_ok": True, "classification": "ok"}}
             ), "", False
         if "--resume" in argv:
             resume_attempts["n"] += 1
@@ -925,8 +922,8 @@ def _receipt(status: str, reason: str) -> dict:
     "rc,receipt,expected_verdict",
     [
         (3, _receipt("blocked", "claude_binary_not_found"), "skip"),
-        (4, _receipt("blocked", "chatgpt_auth_unavailable"), "skip"),
-        (7, _receipt("failed", "proxy_not_ready_or_bind_not_confirmed"), "skip"),
+        (4, _receipt("blocked", "legacy_exit_4_retained_in_skip_set"), "skip"),
+        (7, _receipt("failed", "connected_server_unreachable"), "skip"),
         (7, _receipt("failed", "model_alias_not_resolved"), "skip"),
         (2, _receipt("blocked", "missing_value"), "fail"),
         (2, _receipt("blocked", "unknown_launcher_option"), "fail"),
