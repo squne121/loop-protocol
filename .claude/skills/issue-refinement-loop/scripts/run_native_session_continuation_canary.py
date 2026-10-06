@@ -20,13 +20,26 @@ Native Claude Code session continuation canary for the ``claude-native`` and
 
 This runner (not the focused pytest process) owns the exit code contract:
 
-    0  = PASS  (all ID/terminal/argv assertions succeeded, no fallback)
-    1  = FAIL  (an assertion failed, OR an explicit runtime/provider
-                fallback indication was observed --
-                ``runtime_fallback: true`` / ``provider_fallback: true``.
+    0  = PASS  (all ID/terminal/argv assertions succeeded, no observed
+                runtime fallback)
+    1  = FAIL  (an assertion failed, OR an explicit runtime fallback
+                indication was observed -- ``runtime_fallback: true``.
                 Fallback-derived "success" is never promoted to PASS.)
-    77 = SKIP  (the selected runtime/auth/proxy/continuation capability is
-                unavailable -- never promoted to PASS)
+    77 = SKIP  (the selected runtime/connected-server/continuation
+                capability is unavailable -- never promoted to PASS)
+
+## Provider fallback (Issue #2938)
+
+Provider-level fallback (the server routing a request to a model other than
+the requested one) is NOT observable from the current
+``launch.sh --check-only`` receipt. ``connected_server.model_catalog_ok``
+only shows that the required models exist in ``/v1/models``; it is not
+evidence of per-request routing. This canary therefore never asserts
+"no provider fallback": a PASS artifact records
+``provider_fallback: "unobserved"`` (neither ``False`` nor ``True``), and a
+FAIL / SKIP artifact does not carry a ``provider_fallback`` key at all.
+Session continuation PASS is decided only from the session evidence
+(``detect_runtime_fallback`` etc.).
 
 ## Scope
 
@@ -442,9 +455,9 @@ def _parse_claude_gpt_receipt(text: str) -> dict | None:
 
     The reused generic ``extract_claude_gpt_launcher_receipt()`` uses a
     single-line regex (``[^\\n]*``), which does not match this launcher's
-    ``--check-only`` success receipt: it embeds a pretty-printed (multi-line)
-    nested ``preflight`` object inside the outer JSON object, confirmed
-    empirically against a live ``--check-only`` invocation. This local
+    ``--check-only`` success receipt, which nests the ``connected_server`` /
+    ``local_proxy_binary_auxiliary`` / ``launch_env`` objects inside the outer
+    JSON object (and may span multiple lines). This local
     parser uses ``json.JSONDecoder.raw_decode`` (bracket-aware, not
     line-bound) starting at the first occurrence of the receipt's marker
     (tolerant of whitespace between tokens), so it parses correctly
@@ -462,16 +475,17 @@ def _parse_claude_gpt_receipt(text: str) -> dict | None:
     return obj if isinstance(obj, dict) else None
 
 
-# Issue #2153 OWNER review P1 fix-delta: exit codes documented in
-# scripts/claude-gpt/launch.sh's own header comment as genuinely
-# environment-unavailable (not a caller/launcher integration bug):
-#   3 = claude-code-proxy / claude binary unavailable
-#   4 = ChatGPT subscription auth unavailable
-#   7 = proxy bind/readiness/model-alias resolution failure (proxy or
-#       model endpoint unavailable)
+# Issue #2153 OWNER review P1 fix-delta / Issue #2938: exit codes treated as
+# genuinely environment-unavailable (not a caller/launcher integration bug).
+# The current scripts/claude-gpt/launch.sh emits:
+#   3 = claude binary not found (reason: claude_binary_not_found)
+#   7 = connected server diagnostic failure (unreachable / invalid base URL /
+#       required model missing; e.g. reason: model_alias_not_resolved,
+#       cause: connected_server_model_catalog_incomplete)
+# Exit 4 is retained in the set for backward compatibility only; the current
+# launcher no longer emits it.
 # Everything else (including a missing/malformed/unknown-schema receipt,
-# exit 2 caller argv error, exit 5 canonical-path violation, exit 6
-# invalid generated settings, and any other/unknown exit code such as 9)
+# exit 2 caller argv error, and any other/unknown exit code such as 9)
 # is a caller/launcher integration bug and FAILs -- never SKIPs.
 _LAUNCHER_SKIP_EXIT_CODES = frozenset({3, 4, 7})
 
@@ -532,12 +546,13 @@ def preflight_claude_gpt(claude_bin: str, timeout_seconds: float) -> tuple[str, 
 
 def detect_claude_gpt_launch_failure_receipt(stdout: str, stderr: str) -> dict | None:
     """During a real (non-check-only) launch, a pre-claude launcher failure
-    (preflight_failed / proxy_not_ready_or_bind_not_confirmed /
-    model_alias_not_resolved / claude_binary_not_found) is printed as a
+    (``claude_binary_not_found`` / ``model_alias_not_resolved`` with a
+    ``connected_server_*`` cause) is printed as a
     ``CLAUDE_GPT_LAUNCH_RESULT_V1`` receipt to stdout, before claude's own
     stream-json ever starts. Detecting it here (rather than treating the
     absence of a terminal claude event as a plain FAIL) lets the canary
-    classify this as a runtime/proxy capability-unavailable SKIP (AC7)."""
+    classify this as a runtime/connected-server capability-unavailable
+    SKIP (AC7)."""
     receipt = _parse_claude_gpt_receipt(stdout) or _parse_claude_gpt_receipt(stderr)
     if receipt is not None and receipt.get("status") in ("blocked", "failed"):
         return receipt
@@ -546,19 +561,11 @@ def detect_claude_gpt_launch_failure_receipt(stdout: str, stderr: str) -> dict |
 
 # ---------------------------------------------------------------------------
 # Fallback detection (Issue #2153 AC7 / Runtime Exit Code Ownership).
-# Both signals are concrete, evidence-derived, and explicitly handled by
-# this canary -- fallback-derived "success" is never promoted to PASS.
+# The runtime-fallback signal is concrete, evidence-derived, and explicitly
+# handled by this canary -- fallback-derived "success" is never promoted to
+# PASS. Provider-level fallback is not observable from the current
+# check-only receipt (Issue #2938), so it is reported as "unobserved" only.
 # ---------------------------------------------------------------------------
-
-
-def detect_provider_fallback(launcher_receipt: dict | None) -> bool:
-    """claude-gpt lane only: the launcher's own preflight receipt reports
-    ``model_alias_ok: false`` -- the proxy silently substituted a model
-    other than the one requested. This is a genuine provider-level
-    fallback, not this canary's session-lifecycle assertion."""
-    if launcher_receipt is None:
-        return False
-    return launcher_receipt.get("model_alias_ok") is False
 
 
 def detect_runtime_fallback(id_equal: bool, marker_ok: bool) -> bool:
@@ -704,8 +711,15 @@ def main(argv: list[str] | None = None) -> int:
             code=code,
         )
         if verdict == "PASS":
-            evidence.setdefault("provider_fallback", False)
+            # Issue #2938: provider fallback is not observable from the
+            # current check-only receipt (``connected_server.model_catalog_ok``
+            # shows catalog presence only, not per-request routing), so a
+            # PASS never claims "no fallback" (False). FAIL / SKIP paths keep
+            # the key absent.
+            evidence["provider_fallback"] = "unobserved"
             evidence.setdefault("runtime_fallback", False)
+        else:
+            evidence.pop("provider_fallback", None)
         evidence["verdict"] = verdict
         evidence["exit_code"] = code
         write_evidence(args.output_dir, evidence)
@@ -745,10 +759,6 @@ def main(argv: list[str] | None = None) -> int:
             return finish(77, "SKIP", skip_reason=preflight_reason)
         if preflight_verdict == "fail":
             evidence["errors"].append(preflight_reason)
-            return finish(1, "FAIL")
-        if detect_provider_fallback(launcher_receipt):
-            evidence["provider_fallback"] = True
-            evidence["errors"].append("claude-gpt launcher receipt reports model_alias_ok=false (provider fallback)")
             return finish(1, "FAIL")
 
     before_fingerprint = repo_fingerprint(worktree_real, None) if args.require_clean_postcondition else None
@@ -1008,7 +1018,6 @@ def main(argv: list[str] | None = None) -> int:
     # is now run inside ``finish()`` itself (whenever ``before_fingerprint``
     # was actually captured), so this final success path shares the exact
     # same postcondition logic as every FAIL/SKIP return above.
-    evidence["provider_fallback"] = False
     evidence["runtime_fallback"] = False
     return finish(0, "PASS")
 

@@ -92,10 +92,16 @@ scripts/claude-gpt/launch.sh --check-only
 ```
 
 - 終了コード（exit code）: `0`
-- ChatGPT 認証状態（`chatgpt_auth.available`）: `true`（`detail: "authenticated"`）
-- proxy の絶対パス（`proxy.absolute_path`）: `/home/squne/.local/bin/claude-code-proxy`
-- proxy のバージョン（`proxy.version`）: `claude-code-proxy 0.1.34`
-- パス検証結果（`canonical_paths.ok` / `read_restriction.ok`）: いずれも `true`
+- 現行の可用性 evidence の schema（再測定していないため、過去の実測値は記録しない）:
+  `launch.sh --check-only` の `CLAUDE_GPT_LAUNCH_RESULT_V1` は、接続先 server
+  （`ANTHROPIC_BASE_URL` が実際に向く running server）の診断として
+  `launch_check_only.connected_server`（`reachable` / `models_http_status` /
+  `model_catalog_ok` / `classification`）を返す。`model_catalog_ok` は `/v1/models` に
+  required model が列挙されていることだけを示し、ChatGPT subscription 認証の成否や
+  実 request の受理を示さない。接続先 server の version は公開 endpoint から取得できない
+  ため `version: "未確認"` と記録される。PATH 上の binary の path / version は
+  `local_proxy_binary_auxiliary` に入るが、接続先 server が動かしている binary とは
+  限らない非 authority の補助診断である。
 - launcher の識別情報: `scripts/claude-gpt/launch.sh`
   の sha256 は `e006608d9999741adfcf7b3be230f0be8043128689c042413132fb22c905fa44`
 - Claude CLI の識別情報: `2.1.251 (Claude Code)` (`/home/squne/.local/bin/claude`)
@@ -112,10 +118,10 @@ nested_claude_proxy_transport_proven: false
 
 #### 実施内容と、当初の誤判定
 
-`scripts/claude-gpt/lib.sh` の `claude_gpt_build_proxy_env` と同一の env
-allowlist（`PATH`/`HOME`/`CCP_CONFIG_DIR`/`XDG_STATE_HOME`/`CCP_BIND_ADDRESS`/
-`CCP_LOG_STDERR`/`CCP_CODEX_TRANSPORT`）で実 `claude-code-proxy 0.1.34` を
-起動し（`chatgpt_auth: authenticated` 済み）、呼び出し元シェルに
+旧 launcher（launcher が子プロセスの env を組み立てていた旧実装。#2925 で撤去済み）が
+proxy 起動時に使っていた env allowlist（`PATH`/`HOME`/`CCP_CONFIG_DIR`/
+`XDG_STATE_HOME`/`CCP_BIND_ADDRESS`/`CCP_LOG_STDERR`/`CCP_CODEX_TRANSPORT`）と同一の
+構成で実 `claude-code-proxy 0.1.34` を起動し（ChatGPT 認証済み）、呼び出し元シェルに
 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL` 等を
 export した状態で、production `run_retrospective.py` の `invoke_agent()` /
 `build_agent_invocation_argv()` 経由（run-scoped `--settings` で
@@ -153,10 +159,11 @@ grep -n "_ENV_PASSTHROUGH_ALLOWLIST\|_RUN_SCOPED_ENV_PREFIX\|sanitize_subprocess
 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL` /
 `ANTHROPIC_DEFAULT_*_MODEL` / `CLAUDE_CONFIG_DIR` はいずれにも該当せず、
 呼び出し元プロセスの `os.environ` に何を設定していても nested `claude`
-subprocess には伝播しない。`HOME` は通過するが、`scripts/claude-gpt/launch.sh`
-が実際に claude-gpt 用 settings を書き込む先は `HOME` とは独立した
-`CLAUDE_CONFIG_DIR`（`claude_gpt_claude_config_dir()`）であるため、`HOME` の
-通過だけでは claude-gpt 側の proxy 設定を継承できない。
+subprocess には伝播しない。`HOME` は通過するが、旧 launcher（#2925 で撤去済み）が
+claude-gpt 用 settings を書き込んでいた先は `HOME` とは独立した隔離
+`CLAUDE_CONFIG_DIR` であったため、`HOME` の通過だけでは claude-gpt 側の proxy
+設定を継承できなかった。現行 launcher は `CLAUDE_CONFIG_DIR` / `HOME` を隔離せず、
+`ANTHROPIC_*` 等の非 secret env だけを追加して `claude` を exec する。
 
 結論: **production `run_retrospective.py` の nested-invocation 経路
 (`invoke_agent()`) には、Claude-GPT proxy へ nested claude を routing する
@@ -165,9 +172,10 @@ Native Claude lane（呼び出し元セッションの ambient 実 HOME 配下�
 credential）で行われていた可能性が高く、Claude-GPT lane の証拠としては
 成立しない。同様に、観測された proxy log 上の 31 件の `/v1/messages`
 リクエストは、同一 Unix user 上で並行動作していた無関係な別の claude-gpt
-セッション由来である可能性が高く（`<CLAUDE_GPT_HOME>/state/claude-code-proxy/proxy.log`
-は port/pid 等の instance 識別子を持たない、Unix user 単位で共有される
-単一ファイルであることを確認済み）、本検証の nested invocation に
+セッション由来である可能性が高く（旧 launcher が管理していた
+`<CLAUDE_GPT_HOME>/state/claude-code-proxy/proxy.log` は port/pid 等の instance
+識別子を持たない、Unix user 単位で共有される単一ファイルであることを当時確認済み。
+これは歴史的な実験記述であり、現行 launcher は proxy log path を管理しない）、本検証の nested invocation に
 帰属する証拠として採用できない。
 
 よって:
@@ -205,11 +213,20 @@ implementation Issue。修正内容（Allowed Paths: `run_retrospective.py` /
   `_MUTATION_CREDENTIAL_ENV_VARS` は引き続き除外されることを、
   `sanitize_subprocess_env()` と `_default_sanitized_env()` の両方について
   回帰確認する（18 tests、うち `-k "default_sanitized_env"` で 13 tests）。
-- **AC3**: `.claude/skills/agent-retrospective/scripts/tests/verify_claude_gpt_transport_passthrough.sh`
-  を新設し、修正後の実装で PR 時の一回限りの live verification を実施した
-  （下記「AC3 live 実施結果」参照）。
+- **AC3**: PR 時の一回限りの live verification script
+  （`verify_claude_gpt_transport_passthrough.sh`）を新設し、修正後の実装で live
+  verification を実施した（下記「AC3 live 実施結果」参照）。この script は撤去済みの旧
+  launcher 関数と launcher 管理の隔離 profile に依存していたため、#2925 縮退で削除済み
+  であり、現在は存在しない。
 
 #### AC3 live 実施結果（`transport_observed`、排他的帰属は主張しない）
+
+> **#2925 で撤去済みの旧 launcher 前提。再実行不能**: 本節は旧 launcher
+> （launcher が proxy を起動し、scratch `CLAUDE_GPT_HOME` を隔離 profile として
+> 使っていた実装）上で当時実施した一回限りの live verification の歴史的記録である。
+> 現行 launcher は proxy を起動・停止せず、`CLAUDE_GPT_HOME` は補助 binary の導入先で
+> あって credential namespace ではない。再実行手順は削除済みで、現行 interface で同じ
+> 検証を再現することはできない。
 
 `scripts/claude-gpt/launch.sh` 経由で起動した outer live Claude-GPT
 セッション（実 ChatGPT subscription 認証）から、`run_retrospective.py` の
@@ -290,8 +307,8 @@ uv run --locked pytest .claude/skills/agent-retrospective/scripts/tests/test_san
 # AC2
 uv run --locked pytest .claude/skills/agent-retrospective/scripts/tests/test_sanitize_subprocess_env_regression.py -q -k "default_sanitized_env"
 
-# AC3 (実 ChatGPT subscription 認証が必要。利用不能な環境では exit 77 で SKIP)
-bash .claude/skills/agent-retrospective/scripts/tests/verify_claude_gpt_transport_passthrough.sh
+# AC3: 旧 launcher 前提の live verification は #2925 縮退で撤去済みのため再実行不能
+# （verify_claude_gpt_transport_passthrough.sh は削除済み）。
 
 # AC4 (このエントリ自体の所在確認。Issue #2436 の元の parity_failed 判定が
 # 変更されていないことも同時に確認できる)
