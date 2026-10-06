@@ -164,8 +164,9 @@ def test_ac6_docs_current_concepts_present():
     # scoped launcher semantics (#2962): the launcher neither derives nor overwrites HOME / XDG_* /
     # CLAUDE_CONFIG_DIR from CLAUDE_GPT_HOME, a caller-provided CLAUDE_GPT_HOME may be inherited by
     # child processes, and runtime_smoke_test.sh does not use it to choose the work dir / evidence path.
-    assert "導出も上書きもしない" in section_12
-    assert "継承され得る" in section_12
+    # each fragment is asserted within one sentence together with CLAUDE_GPT_HOME (no 。 / newline between tokens).
+    assert re.search(r"CLAUDE_GPT_HOME[^。\n]*CLAUDE_CONFIG_DIR[^。\n]*導出も上書きもしない", section_12)
+    assert re.search(r"CLAUDE_GPT_HOME[^。\n]*継承され得る", section_12)
     assert re.search(r"runtime_smoke_test\.sh` は `CLAUDE_GPT_HOME` を[^。\n]*(?:使わない|参照しない)", section_12)
     # connected-server request acceptance and provider / subscription attribution are separate items
     # (OWNER Finding 2); the latter is established only by additional evidence.
