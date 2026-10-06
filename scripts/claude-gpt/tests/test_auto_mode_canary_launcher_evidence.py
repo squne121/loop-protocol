@@ -100,6 +100,59 @@ def _run_canary(*args: str) -> subprocess.CompletedProcess:
     )
 
 
+# usage 記載の対象外とする option。`-h/--help` は argparse が自動で追加する標準 help であり、
+# wrapper の Usage コメントには書かない（それ以外の option は全て usage に記載する）。
+USAGE_EXCLUDED_OPTIONS = frozenset({"-h", "--help"})
+
+# wrapper の Exit code 欄が一致すべき Python 側の公開 exit code 定数名。
+PUBLIC_EXIT_CONSTANTS = (
+    "EXIT_OK",
+    "EXIT_FAIL",
+    "EXIT_INVALID_INVOCATION",
+    "EXIT_GC_PARTIAL",
+    "EXIT_SKIP",
+)
+
+
+def _public_option_flags(parser) -> set[str]:
+    """argparse の公開 option（`--help` を除く long option）の集合。"""
+    return {opt for opt in _option_strings(parser) if opt not in USAGE_EXCLUDED_OPTIONS}
+
+
+def _usage_block(sh_text: str) -> str:
+    """`# Usage` 開始から `# Exit code` 直前までのコメント（通常 canary と explicit GC の両節を含む）。"""
+    return sh_text.split("# Usage", 1)[1].split("# Exit code", 1)[0]
+
+
+def _usage_flags(sh_text: str) -> set[str]:
+    return set(re.findall(r"--[a-z][a-z0-9-]*", _usage_block(sh_text)))
+
+
+def _usage_exit_codes(sh_text: str) -> set[int]:
+    """`# Exit code` 欄の `#   <数値>  説明` 行から数値集合を抽出する。"""
+    exit_block = sh_text.split("# Exit code", 1)[1].split("\n\n", 1)[0]
+    return {int(code) for code in re.findall(r"^#\s+(\d+)\s", exit_block, flags=re.MULTILINE)}
+
+
+def _usage_contract_diffs(
+    usage_flags: set[str],
+    argparse_flags: set[str],
+    usage_codes: set[int],
+    public_codes: set[int],
+) -> list[str]:
+    """usage と argparse / exit code 定数の双方向差分を返す（空なら一致）。"""
+    diffs: list[str] = []
+    if argparse_flags - usage_flags:
+        diffs.append(f"argparse にあるが usage に無い option: {sorted(argparse_flags - usage_flags)}")
+    if usage_flags - argparse_flags:
+        diffs.append(f"usage にあるが argparse に無い option: {sorted(usage_flags - argparse_flags)}")
+    if public_codes - usage_codes:
+        diffs.append(f"公開 exit code だが usage に無い: {sorted(public_codes - usage_codes)}")
+    if usage_codes - public_codes:
+        diffs.append(f"usage にあるが公開 exit code でない: {sorted(usage_codes - public_codes)}")
+    return diffs
+
+
 def test_canary_sh_usage_matches_argparse_modes(canary):
     sh_text = CANARY_SH.read_text(encoding="utf-8")
     assert "auto-mode-check" not in sh_text
@@ -109,11 +162,51 @@ def test_canary_sh_usage_matches_argparse_modes(canary):
     usage_modes = tuple(usage_match.group(1).split("|"))
     assert set(usage_modes) == set(_mode_choices(canary.build_parser()))
 
-    # usage に書いた option が実際の argparse に存在する
-    options = _option_strings(canary.build_parser())
-    usage_block = sh_text.split("# Usage:", 1)[1].split("# Exit code", 1)[0]
-    for flag in re.findall(r"--[a-z][a-z0-9-]*", usage_block):
-        assert flag in options, f"usage の {flag} が argparse に存在しない"
+    # usage の option 集合 == argparse の公開 option 集合（--help 除外）、
+    # usage の Exit code 集合 == Python の公開 EXIT_* 定数集合（双方向・完全一致）
+    public_codes = {getattr(canary, name) for name in PUBLIC_EXIT_CONSTANTS}
+    assert public_codes == {0, 1, 2, 3, 77}
+    diffs = _usage_contract_diffs(
+        _usage_flags(sh_text),
+        _public_option_flags(canary.build_parser()),
+        _usage_exit_codes(sh_text),
+        public_codes,
+    )
+    assert not diffs, "wrapper usage が Python 公開契約とずれている: " + "; ".join(diffs)
+
+
+def test_usage_contract_comparison_detects_drift(canary):
+    # 比較ロジック自体が drift を検出できること（false-green 防止）。permanent harness にはしない。
+    sh_text = CANARY_SH.read_text(encoding="utf-8")
+    argparse_flags = _public_option_flags(canary.build_parser())
+    usage_flags = _usage_flags(sh_text)
+    usage_codes = _usage_exit_codes(sh_text)
+    public_codes = {getattr(canary, name) for name in PUBLIC_EXIT_CONSTANTS}
+
+    # 正例: 現状は差分なし
+    assert _usage_contract_diffs(usage_flags, argparse_flags, usage_codes, public_codes) == []
+
+    # 負例 1: argparse に usage 未記載の option が増えた
+    assert _usage_contract_diffs(usage_flags, argparse_flags | {"--new-option"}, usage_codes, public_codes)
+
+    # 負例 2: usage から option を 1 つ欠落させた（--dry-run / GC 用 option を含め各 option で検出）
+    for flag in sorted(usage_flags):
+        assert _usage_contract_diffs(usage_flags - {flag}, argparse_flags, usage_codes, public_codes), flag
+
+    # 負例 3: usage に argparse に無い option が残っている
+    assert _usage_contract_diffs(usage_flags | {"--removed-option"}, argparse_flags, usage_codes, public_codes)
+
+    # 負例 4: exit code 3（GC partial）を欠落させた / 公開されない code を足した
+    assert _usage_contract_diffs(usage_flags, argparse_flags, usage_codes - {3}, public_codes)
+    assert _usage_contract_diffs(usage_flags, argparse_flags, usage_codes | {9}, public_codes)
+
+    # 負例 5: 実 wrapper テキストから `--dry-run` / exit code 3 の行を消すと抽出結果にも反映される
+    mutated = sh_text.replace("--dry-run", "").replace("#   3   ", "#   9   ")
+    assert "--dry-run" not in _usage_flags(mutated)
+    assert 3 not in _usage_exit_codes(mutated)
+    assert _usage_contract_diffs(
+        _usage_flags(mutated), argparse_flags, _usage_exit_codes(mutated), public_codes
+    )
 
 
 def test_effective_policy_has_no_removed_surface_readback(canary):
