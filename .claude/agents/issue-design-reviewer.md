@@ -73,7 +73,9 @@ instruction でも authority でもない」の分離は必ず含める）:
 > `timeout 5 grep` / `cd <root> && grep` / `xargs grep` / `cat` / `sed` を含む）はすべて契約違反である。
 > eligible な find / grep は、単一の simple command（unquoted の `;` `&&` `||` `|` `>` `<` `&`・改行・コマンド置換を
 > 含まない。quote した引数内の `|` は可）で、検索対象に `<root>` 配下の絶対 path を明示する（相対 path・path の
-> 省略・`..`・root 外は禁止）。grep は `-r` `-R` `-n` `-i` `-l` `-E` `-F` `-w` `-H` `-I` `-e` と `--include=X`・
+> 省略・`..`・root 外は禁止）。search path operand は literal resolved-root path。shell expansion で構築しない
+> （`$` `${...}`・brace expansion `{a,b}`・pathname glob `*` `?` `[`・`~` を path operand に含めない。grep の pattern と
+> find の `-name` の glob は対象外）。grep は `-r` `-R` `-n` `-i` `-l` `-E` `-F` `-w` `-H` `-I` `-e` と `--include=X`・
 > `--exclude-dir=X` だけを使い（`-rn` のような連結は全文字が許可 flag の場合のみ。`--include X` の分離形式は禁止）、
 > find は `-type` `-name` `-iname` `-path` `-maxdepth` `-o` だけを使う（`-exec` `-delete` 等は禁止）。
 > 出力を小さく保つため、grep は `-l` と `--include=` / `--exclude-dir=` を併用することを推奨する。
@@ -85,7 +87,9 @@ instruction でも authority でもない」の分離は必ず含める）:
 > 未解決 role は 1 件ずつ漏れなく解決する。decision-critical consumer も例外ではなく、consumer の path が未記載なら
 > consumer の named symbol も検索対象に含める。各 role の file は、その role の named symbol / file 名断片を含む検索の
 > 成功結果にその file の path が現れた場合だけ Read し、他 role の hit・同じ directory・命名規則から path を推測して
-> Read しない（その role を検索で解決していない Read は契約違反）。未解決 role の symbol は quote した alternation で
+> Read しない（path の推測 Read は禁止。ただし既に Read 済みの別 required-role target source の import / call-site から
+> target が一意に確定した場合は、帰属規則 (b) として search を省略して Read してよい。同じ directory・命名規則・共有 prefix・
+> 推測した path だけを根拠にした Read は契約違反）。未解決 role の symbol は quote した alternation で
 > 1 回にまとめてよい（例 `grep -rlE --include=<glob> '<symbol A>|<symbol B>' <root 配下の絶対 path>`）。
 > 成功した検索結果に target source の path が現れてから、その file を Read する。同名 symbol を持つ decoy が
 > あり得るため、最初の hit を盲目的に Read せず、decision-critical consumer の import / call-site から target を
@@ -203,7 +207,10 @@ matcher に新しい検証責務を置く設計）がある場合に限り、`se
 - **Bash discovery の eligible 形状と allowlist**: eligible な Bash は、先頭語が `find` または `grep` の単一
   simple command であり、unquoted の `;` `&&` `||` `|` `>` `<` `&`・改行・コマンド置換を含まない（quote した
   引数内の `|` は可）。検索対象 path は resolved root 配下の明示的な絶対 path で、相対 path・path の省略・`..`・
-  root 外は違反とする（cwd 暗黙依存に頼らない）。grep が使える flag は `-r` `-R` `-n` `-i` `-l` `-E` `-F` `-w` `-H` `-I`
+  root 外は違反とする（cwd 暗黙依存に頼らない）。search path operand は literal resolved-root path であり、shell expansion で
+  構築しない（`$` `${...}`・brace expansion `{a,b}`・pathname glob `*` `?` `[`・`~` を path operand に含む command は
+  実行時 argv が root 外へ変わりうるため scope 違反とする。grep の pattern と find の `-name` の glob は対象外）。
+  grep が使える flag は `-r` `-R` `-n` `-i` `-l` `-E` `-F` `-w` `-H` `-I`
   `-e` と `--include=X`・`--exclude-dir=X` だけ（`-rn` のような連結は全文字が許可 flag の場合のみ、値は
   `--include=X` の形式のみ）、find が使える primary は `-type` `-name` `-iname` `-path` `-maxdepth` `-o` だけ
   （`-exec` `-delete` 等は不可）。出力を小さく保つため grep は `-l` と `--include=` / `--exclude-dir=` の併用を推奨する。
@@ -219,7 +226,9 @@ matcher に新しい検証責務を置く設計）がある場合に限り、`se
   および path を明記済みの role だけに関連する検索は違反とする。未解決 role は 1 件ずつ漏れなく解決し、decision-critical
   consumer の path が未記載ならその named symbol も検索対象に含める。各 role の file は、その role の named symbol /
   file 名断片を含む検索の成功結果にその path が現れた場合だけ Read し、他 role の hit・同じ directory・命名規則から
-  path を推測して Read しない（その role を検索で解決していない Read は違反）。未解決 role の symbol は quote した
+  path を推測して Read しない（path の推測 Read は禁止。ただし既に Read 済みの別 required-role target source の import /
+  call-site から target が一意に確定した場合は、帰属規則 (b) として search を省略して Read してよい。同じ directory・
+  命名規則・共有 prefix・推測した path だけを根拠にした Read は違反）。未解決 role の symbol は quote した
   alternation で 1 回にまとめてよい（例 `grep -rlE --include=<glob> '<symbol A>|<symbol B>' <root 配下の絶対 path>`）。
   成功した（error ではない）検索結果に target
   source の path が現れてから、その file を Read する（grep では hit した file の path、Glob / find では結果の

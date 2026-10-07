@@ -193,10 +193,25 @@ def search_scope_violation(tool_use: dict[str, Any], resolved_root: str) -> str 
     return None
 
 
+# Bash の path operand に含まれていたら実行時 argv が変わりうる shell expansion の文字（fail closed）。
+# `$`（parameter / variable expansion）、`{` `}`（brace expansion / `${...}`）、`*` `?` `[`（pathname globbing）、
+# `~`（tilde expansion）。path operand のみに適用し、grep の pattern / `find -name` の glob には適用しない。
+_PATH_OPERAND_EXPANSION_CHARS = frozenset("${}*?[~")
+
+
+def _path_operand_has_expansion(path: str) -> bool:
+    return any(char in _PATH_OPERAND_EXPANSION_CHARS for char in path)
+
+
 def _path_operands_scope_violation(paths: list[str], resolved_root: str) -> str | None:
-    """Bash find / grep の path operand（resolved root 配下の明示的な絶対 path でなければ違反）。"""
+    """Bash find / grep の path operand（resolved root 配下の expansion-free な絶対 literal path でなければ違反）。
+
+    shlex は shell expansion 前の token を返すため、expansion を含みうる operand（実行時 argv が root 外へ変わりうる）は
+    字句判定を信用せず fail closed にする。"""
     if not paths:
         return "search_path_omitted"
+    if any(_path_operand_has_expansion(path) for path in paths):
+        return "search_path_shell_expansion"
     for path in paths:
         if not os.path.isabs(path):
             return "search_path_not_absolute"

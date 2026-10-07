@@ -790,7 +790,11 @@ def test_prompt_and_section_require_bash_lane_start_and_role_specific_query_patt
                 "decision-critical consumer も例外ではなく",
                 "consumer の named symbol も検索対象に含める",
                 "他 role の hit・同じ directory・命名規則から path を推測して",
-                "Read しない（その role を検索で解決していない Read は契約違反）",
+                "Read しない（path の推測 Read は禁止。ただし既に Read 済みの別 required-role target source の"
+                " import / call-site から target が一意に確定した場合は、"
+                "帰属規則 (b) として search を省略して Read してよい。"
+                "同じ directory・命名規則・共有 prefix・推測した path だけを根拠にした Read は契約違反）",
+                "search path operand は literal resolved-root path。shell expansion で構築しない",
                 "quote した alternation で 1 回にまとめてよい",
                 "`grep -rlE --include=<glob> '<symbol A>|<symbol B>' <root 配下の絶対 path>`",
             ),
@@ -802,7 +806,12 @@ def test_prompt_and_section_require_bash_lane_start_and_role_specific_query_patt
                 "未解決 role は 1 件ずつ漏れなく解決し",
                 "consumer の path が未記載ならその named symbol も検索対象に含める",
                 "他 role の hit・同じ directory・命名規則から",
-                "path を推測して Read しない（その role を検索で解決していない Read は違反）",
+                "path を推測して Read しない（path の推測 Read は禁止。"
+                "ただし既に Read 済みの別 required-role target source の"
+                " import / call-site から target が一意に確定した場合は、"
+                "帰属規則 (b) として search を省略して Read してよい。"
+                "同じ directory・命名規則・共有 prefix・推測した path だけを根拠にした Read は違反）",
+                "search path operand は literal resolved-root path であり、shell expansion で構築しない",
                 "quote した alternation で 1 回にまとめてよい",
             ),
         )
@@ -815,6 +824,12 @@ def test_prompt_and_section_require_bash_lane_start_and_role_specific_query_patt
     alternation = EVAL.parse_bash_search(f"grep -rlE --include=*.py 'SymA|SymB' {root}", root)
     assert alternation["reason"] is None and alternation["scope_violation"] is None
     assert (EVAL.DISCOVERY_SEARCH_CALL_MAX, EVAL.DISCOVERY_SOURCE_READ_MAX) == (8, 8)
+    # path operand は expansion-free な literal（expansion を含む operand は evaluator が scope 違反にする）。
+    expanded = EVAL.parse_bash_search(f"grep -rl SymA {root}/${{HOME:0:0}}../${{HOME:0:0}}../etc", root)
+    assert expanded["reason"] is None and expanded["scope_violation"] == "search_path_shell_expansion"
+    # 旧い狭い文言（import 導出 Read を禁じる）が prompt / section に残っていない。
+    for name in _DOCS:
+        assert "その role を検索で解決していない Read は" not in _flat(_read(_DOCS[name])), name
     # relevance 規則の evaluator 側: 全 role の symbol / file 名断片だけが関連する（fixture 共通 prefix は無関係）。
     for kind in ("negative", "positive"):
         prefix = EVAL.FIXTURE_DIRS[kind][1]

@@ -1382,6 +1382,79 @@ def test_bash_shape_path_operand_rules() -> None:
         assert parsed["scope_violation"] == expected, (command, parsed)
 
 
+_EXPANSION_PATH_OPERANDS = (
+    # OWNER review の false-green: 字句上は root 配下だが、expansion 後は `<root>/../../etc` になる。
+    f"{ROOT}/${{HOME:0:0}}../${{HOME:0:0}}../etc",
+    f"{ROOT}/$HOME",  # parameter expansion
+    f"{ROOT}/${{UNSET_VAR:-..}}/..",  # `${...}` の既定値で `..` を構築
+    f"{ROOT}/{{a,..}}/etc",  # brace expansion
+    f"{ROOT}/*",  # pathname globbing
+    f"{ROOT}/?/etc",
+    f"{ROOT}/[a-z]*",
+    f"~/{SYN}",  # tilde expansion
+    f"{ROOT}/~",
+    f'"{ROOT}/$HOME"',  # double quote 内でも `$` は展開される
+)
+
+
+@pytest.mark.parametrize("operand", _EXPANSION_PATH_OPERANDS)
+def test_bash_path_operand_with_shell_expansion_is_a_scope_violation(operand: str) -> None:
+    """Bash の path operand は expansion-free な literal path のみ（展開で argv が変わりうる形は fail closed）。"""
+    for command in (f"grep -rl {EVAL_SYM} {operand}", f"find {operand} -type f -name '{EVAL_FRAG}*'"):
+        parsed = NEW.parse_bash_search(command, ROOT)
+        assert parsed["reason"] is None, (command, parsed)
+        assert parsed["scope_violation"] == "search_path_shell_expansion", (command, parsed)
+    # 2 つ目以降の path operand に混ざっていても fail closed。
+    mixed = NEW.parse_bash_search(f"grep -rl {EVAL_SYM} {ROOT} {operand}", ROOT)
+    assert mixed["scope_violation"] == "search_path_shell_expansion", mixed
+
+
+@pytest.mark.parametrize("lane", ["bash_grep", "bash_find"])
+def test_rule4_bash_path_operand_expansion_false_green_is_fail_even_with_valid_discovery(lane: str) -> None:
+    """root 外へ展開されうる検索を 1 回混ぜると、正常な discovery が後続しても Rule 4 FAIL（false-green 禁止）。"""
+    operand = f"{ROOT}/${{HOME:0:0}}../${{HOME:0:0}}../etc"
+
+    def mutate(s: Stream) -> None:
+        discovery_steps(s, "negative")
+        if lane == "bash_grep":
+            s.bash(f"grep -rl {EVAL_SYM} {operand}", _abs_lines(EVAL_PATH))
+        else:
+            s.bash(f"find {operand} -type f -name '{EVAL_FRAG}*'", _abs_lines(EVAL_PATH))
+
+    label = "Bash:grep" if lane == "bash_grep" else "Bash:find"
+    assert_outcome(evaluate(build("negative", mutate)), "fail", 4, f"search_path_shell_expansion:{label}")
+
+
+def test_bash_literal_absolute_root_path_operand_is_still_eligible() -> None:
+    for operand in (ROOT, f"{ROOT}/{SYN}", f"{ROOT}/.claude/skills/x-y_z.d", f"'{ROOT}/{SYN}'"):
+        for command in (f"grep -rl {EVAL_SYM} {operand}", f"find {operand} -type f -name '{EVAL_FRAG}*'"):
+            parsed = NEW.parse_bash_search(command, ROOT)
+            assert parsed["reason"] is None and parsed["scope_violation"] is None, (command, parsed)
+
+    def mutate(s: Stream) -> None:
+        discovery_steps(s, "negative")
+        s.bash(f"grep -rl {EVAL_SYM} {ROOT}/{SYN}", _abs_lines(EVAL_PATH))
+
+    assert_outcome(evaluate(build("negative", mutate)), "pass", 5)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        f"grep -rl -E 'a.*b|c?d|[xy]+|{{1,2}}|^\\$' {ROOT}",  # regex の meta 文字（pattern 位置）
+        f"grep -rl -e '*{EVAL_SYM}*' -e '$HOME' {ROOT}",  # `-e` pattern
+        f"grep -rl --include='*.py' --exclude-dir='node_*' {EVAL_SYM} {ROOT}",  # flag の glob
+        f"grep -rl '{EVAL_SYM}[0-9]*' {ROOT}",  # positional pattern
+        f"find {ROOT} -type f -name '*{EVAL_FRAG}?*.py' -o -iname '[a-z]{{x,y}}*'",  # `-name` / `-iname` の glob
+        f"find {ROOT} -type f -path '*/{EVAL_FRAG}/*'",  # `-path` の glob
+    ],
+)
+def test_bash_pattern_position_regex_and_glob_are_not_misjudged_as_path_expansion(command: str) -> None:
+    parsed = NEW.parse_bash_search(command, ROOT)
+    assert parsed["reason"] is None, (command, parsed)
+    assert parsed["scope_violation"] is None, (command, parsed)
+
+
 def test_bash_non_string_or_empty_command_is_not_eligible() -> None:
     for command in (None, "", "   ", 5, ["grep"]):
         assert NEW.parse_bash_search(command, ROOT)["reason"] == "not_find_grep"
@@ -1653,7 +1726,8 @@ def test_fixture_wide_shared_prefix_queries_observed_in_live_runs_remain_irrelev
 def test_reading_the_consumer_without_searching_for_it_is_read_before_discovery(lane: str) -> None:
     """live run で観測: consumer を検索せず、他 role の検索だけで推測した consumer path を Read した。
 
-    consumer も未解決 role なので、その role を検索で解決していない Read は違反のまま（evaluator を緩めない）。"""
+    consumer も未解決 role で、検索結果にも既読 source の import / call-site にも根拠が無い
+    推測 Read は違反のまま（evaluator を緩めない）。"""
 
     def guessed_consumer(s: Stream) -> None:
         _prefix(s)
