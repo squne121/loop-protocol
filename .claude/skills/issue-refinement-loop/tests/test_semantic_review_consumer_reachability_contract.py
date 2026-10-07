@@ -240,6 +240,20 @@ def test_reviewer_contract_requires_producer_parser_evaluator_caller_trace_and_u
         ):
             assert needle in haystack, f"{doc_name}: {scope} lacks observation-procedure wording {needle!r}"
     assert "単独で実行" in prompt and "cross-contract な検証要求がある場合に限り" in prompt
+    # 必須 Read は producer・parser・evaluator / matcher・decision-critical consumer の 4 役すべて
+    # （evaluator / matcher の Read を省略できる 3 役契約に戻らないことを固定する）。
+    for scope, haystack in (("section", section), ("launch prompt", prompt)):
+        for needle in (
+            "pinned body が列挙する",
+            "producer・parser・evaluator / matcher・",
+            "decision-critical consumer",
+            "4 役すべての各 file を",
+            "evaluator / matcher の file",
+        ):
+            assert needle in haystack, f"{doc_name}: {scope} lacks 4-role mandatory Read wording {needle!r}"
+        assert "producer / parser / consumer の各 file" not in haystack, (
+            f"{doc_name}: {scope} still describes the 3-role Read contract (evaluator omitted)"
+        )
     # (2) 追跡順序: producer / parser -> evaluator signature -> decision-critical caller の具体引数
     _assert_in_order(
         section,

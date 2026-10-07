@@ -100,7 +100,7 @@ def _fixture_paths(kind: str) -> dict[str, str]:
     directory, prefix = _FIXTURES[kind]
     if kind == "simple":
         return {}
-    return {role: f"{_FIXTURES_RELATIVE}/{directory}/{prefix}_{role}.py" for role in ("producer", "parser", "consumer")}
+    return {role: f"{_FIXTURES_RELATIVE}/{directory}/{prefix}_{role}.py" for role in EVAL.SOURCE_ROLES}
 
 
 def _fixture_body(root: Path, kind: str) -> str:

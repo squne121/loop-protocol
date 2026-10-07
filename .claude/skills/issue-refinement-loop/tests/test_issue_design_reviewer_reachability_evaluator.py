@@ -42,6 +42,7 @@ PARENT = "toolu_parent_1"
 PATHS = {
     "producer": "fixtures/synthetic_case/synthetic_producer.py",
     "parser": "fixtures/synthetic_case/synthetic_parser.py",
+    "evaluator": "fixtures/synthetic_case/synthetic_evaluator.py",
     "consumer": "fixtures/synthetic_case/synthetic_consumer.py",
 }
 
@@ -199,6 +200,13 @@ class Stream:
     def read(self, role: str, **kw: Any) -> "Stream":
         return self.tool("Read", {"file_path": f"{ROOT}/{PATHS[role]}"}, kw.pop("output", "source"), **kw)
 
+    def read_sources(self, *, skip: tuple[str, ...] = ()) -> "Stream":
+        """producer / parser / evaluator / consumer の 4 役の Read（`skip` で一部を欠落させる）。"""
+        for role in PATHS:
+            if role not in skip:
+                self.read(role)
+        return self
+
     def handback(self, message: str) -> "Stream":
         return self.tool("SubagentHandback", {"message": message}, "ok", tool_use_id="toolu_hb")
 
@@ -210,7 +218,7 @@ def normal_stream(kind: str = "negative", result: Any = None, **overrides: Any) 
     """正常系: lifecycle 1 組 + 必須 tool 観測がすべて成功 + hand-back。"""
     s = Stream().init().agent_call().start()
     if kind != "simple":
-        s.root().head().read("producer").read("parser").read("consumer")
+        s.root().head().read_sources()
     else:
         s.tool("Read", {"file_path": f"{INV}/bundle.json"}, "{}")
     s.handback(json.dumps(result if result is not None else default_result(kind)))
@@ -230,6 +238,7 @@ def default_result(kind: str) -> dict[str, Any]:
                         f"HEAD {HEAD}",
                         f"{ROOT}/{PATHS['producer']}:7",
                         f"./{PATHS['parser']}",
+                        f"{PATHS['evaluator']}:5",
                         f"{PATHS['consumer']}:12 decide_vc_requirement",
                     ],
                     "recommended_fix": "配線を拡張する",
@@ -389,11 +398,11 @@ def test_rule3_stop_echo_without_reviewer_agent_type_is_missing_stop() -> None:
 
 
 def _with_tools_inline(stream: Stream) -> Stream:
-    return stream.root().head().read("producer").read("parser").read("consumer")
+    return stream.root().head().read_sources()
 
 
 def _with_tools(stream: Stream) -> Stream:
-    return stream.root().head().read("producer").read("parser").read("consumer")
+    return stream.root().head().read_sources()
 
 
 def test_rule3_lifecycle_start_missing_is_fail() -> None:
@@ -479,10 +488,10 @@ def test_rule3_zero_or_two_parent_agent_tool_uses_is_fail() -> None:
 def test_rule4_tool_use_outside_interval_is_not_counted() -> None:
     s = Stream().init().agent_call()
     s.root().head()  # Start より前（区間外）
-    s.start().read("producer").read("parser").read("consumer")
+    s.start().read_sources()
     s.stop().agent_result().final()
     assert_outcome(evaluate(s), "fail", 4)
-    after = Stream().init().agent_call().start().root().head().read("producer").read("parser")
+    after = Stream().init().agent_call().start().root().head().read_sources(skip=("consumer",))
     after.stop().read("consumer")  # Stop より後
     after.agent_result().final()
     assert_outcome(evaluate(after), "fail", 4)
@@ -490,7 +499,7 @@ def test_rule4_tool_use_outside_interval_is_not_counted() -> None:
 
 def test_rule4_tool_use_of_other_parent_inside_interval_is_not_counted() -> None:
     s = Stream().init().agent_call().start()
-    s.root().head().read("producer").read("parser")
+    s.root().head().read_sources(skip=("consumer",))
     s.read("consumer", parent="toolu_other_parent")
     s.stop().agent_result().final()
     assert_outcome(evaluate(s), "fail", 4)
@@ -498,41 +507,63 @@ def test_rule4_tool_use_of_other_parent_inside_interval_is_not_counted() -> None
 
 def test_rule4_non_permission_failures_are_fail_not_unavailable() -> None:
     root_failed = Stream().init().agent_call().start().root(is_error=True, output="fatal: not a git repository")
-    root_failed.head().read("producer").read("parser").read("consumer").stop().agent_result().final()
+    root_failed.head().read_sources().stop().agent_result().final()
     assert_outcome(evaluate(root_failed), "fail", 4)
     head_failed = Stream().init().agent_call().start().root().head(is_error=True, output="fatal: bad revision")
-    head_failed.read("producer").read("parser").read("consumer").stop().agent_result().final()
+    head_failed.read_sources().stop().agent_result().final()
     assert_outcome(evaluate(head_failed), "fail", 4)
-    file_missing = Stream().init().agent_call().start().root().head().read("producer").read("parser")
+    file_missing = Stream().init().agent_call().start().root().head().read_sources(skip=("consumer",))
     file_missing.read("consumer", is_error=True, output="File does not exist.").stop().agent_result().final()
     assert_outcome(evaluate(file_missing), "fail", 4)
 
 
 def test_rule4_root_stdout_must_match_resolved_root_and_head_must_match_tested_head() -> None:
     wrong_root = Stream().init().agent_call().start().root(output="/somewhere/else\n")
-    wrong_root.head().read("producer").read("parser").read("consumer").stop().agent_result().final()
+    wrong_root.head().read_sources().stop().agent_result().final()
     assert_outcome(evaluate(wrong_root), "fail", 4)
     wrong_head = Stream().init().agent_call().start().root().head(output=OTHER_HEAD + "\n")
-    wrong_head.read("producer").read("parser").read("consumer").stop().agent_result().final()
+    wrong_head.read_sources().stop().agent_result().final()
     assert_outcome(evaluate(wrong_head), "fail", 4)
 
 
-def test_rule4_only_one_of_three_source_reads_is_fail() -> None:
+def test_rule4_only_one_of_four_source_reads_is_fail() -> None:
     s = Stream().init().agent_call().start().root().head().read("consumer")
     s.handback(json.dumps(default_result("negative"))).stop().agent_result().final()
     outcome = evaluate(s)
     assert_outcome(outcome, "fail", 4)
-    assert "R-SRC:producer" in outcome["reason"] and "R-SRC:parser" in outcome["reason"]
+    for role in ("producer", "parser", "evaluator"):
+        assert f"R-SRC:{role}" in outcome["reason"]
+    assert "R-SRC:consumer" not in outcome["reason"]
+
+
+def test_rule4_missing_only_the_evaluator_read_is_fail_even_when_everything_else_is_normal() -> None:
+    """R-ROOT / R-HEAD / producer / parser / consumer は正常で evaluator の Read だけが欠落 -> 規則 4 の FAIL。"""
+    assert "evaluator" in EVAL.SOURCE_ROLES and set(EVAL.SOURCE_ROLES) == set(PATHS)
+    s = Stream().init().agent_call().start().root().head().read_sources(skip=("evaluator",))
+    s.handback(json.dumps(default_result("negative"))).stop().agent_result().final()
+    outcome = evaluate(s)
+    assert_outcome(outcome, "fail", 4)
+    observed = outcome["evidence"]["required_observations"]
+    assert observed["R-SRC:evaluator"] is False
+    assert [name for name, ok in observed.items() if not ok] == ["R-SRC:evaluator"]
+    # 対照: 同じ stream に evaluator の Read を足すと PASS する（欠落だけが原因）。
+    ok_stream = normal_stream("negative")
+    assert_outcome(evaluate(ok_stream), "pass", 5)
+    # evaluator の Read が permission 拒否以外で失敗した場合も規則 4 の FAIL。
+    failed = Stream().init().agent_call().start().root().head().read_sources(skip=("evaluator",))
+    failed.read("evaluator", is_error=True, output="File does not exist.")
+    failed.handback(json.dumps(default_result("negative"))).stop().agent_result().final()
+    assert_outcome(evaluate(failed), "fail", 4)
 
 
 def test_rule4_commands_must_match_exact_git_c_token_sequences() -> None:
     cwd_relative = Stream().init().agent_call().start()
     cwd_relative.tool("Bash", {"command": "git rev-parse --show-toplevel"}, ROOT + "\n")
-    cwd_relative.head().read("producer").read("parser").read("consumer").stop().agent_result().final()
+    cwd_relative.head().read_sources().stop().agent_result().final()
     assert_outcome(evaluate(cwd_relative), "fail", 4)
     wrong_dir = Stream().init().agent_call().start()
     wrong_dir.tool("Bash", {"command": f"git -C {ROOT}/other rev-parse --show-toplevel"}, ROOT + "\n")
-    wrong_dir.head().read("producer").read("parser").read("consumer").stop().agent_result().final()
+    wrong_dir.head().read_sources().stop().agent_result().final()
     assert_outcome(evaluate(wrong_dir), "fail", 4)
 
 
@@ -565,7 +596,7 @@ def test_rule5_negative_uses_union_of_high_blocker_evidence_refs() -> None:
         "assessment": "findings",
         "findings": [
             _finding("high", [f"{PATHS['producer']}:1", f"HEAD={HEAD}"]),
-            _finding("blocker", [f"{ROOT}/{PATHS['parser']}"]),
+            _finding("blocker", [f"{ROOT}/{PATHS['parser']}", PATHS["evaluator"]]),
             _finding("high", [f"./{PATHS['consumer']}:3"]),
         ],
     }
@@ -576,7 +607,7 @@ def test_rule5_negative_medium_low_refs_are_excluded_from_the_union() -> None:
     result = {
         "assessment": "findings",
         "findings": [
-            _finding("high", [f"{PATHS['producer']}", f"{PATHS['parser']}", HEAD]),
+            _finding("high", [f"{PATHS['producer']}", f"{PATHS['parser']}", PATHS["evaluator"], HEAD]),
             _finding("medium", [f"{PATHS['consumer']}"]),
             _finding("low", [f"{PATHS['consumer']}"]),
         ],
@@ -588,9 +619,25 @@ def test_rule5_negative_requires_exact_tested_head_sha_token() -> None:
     for refs_head in (OTHER_HEAD, HEAD[:39], HEAD[:-1] + "0", "no head here"):
         result = {
             "assessment": "findings",
-            "findings": [_finding("high", [PATHS["producer"], PATHS["parser"], PATHS["consumer"], refs_head])],
+            "findings": [_finding("high", [*PATHS.values(), refs_head])],
         }
         assert_outcome(evaluate(normal_stream("negative", result), result=result), "fail", 5)
+
+
+def test_rule5_negative_evidence_union_lacking_the_evaluator_path_is_fail() -> None:
+    """全 Read は正常でも、high|blocker evidence_refs の和集合が evaluator path を欠けば規則 5 の FAIL。"""
+    without_evaluator = [*(path for role, path in PATHS.items() if role != "evaluator"), HEAD]
+    result = {"assessment": "findings", "findings": [_finding("high", without_evaluator)]}
+    assert_outcome(evaluate(normal_stream("negative", result), result=result), "fail", 5)
+    # evaluator path が medium だけに現れる場合も和集合に含まれない。
+    split = {
+        "assessment": "findings",
+        "findings": [_finding("high", without_evaluator), _finding("medium", [PATHS["evaluator"]])],
+    }
+    assert_outcome(evaluate(normal_stream("negative", split), result=split), "fail", 5)
+    # 対照: evaluator path を high finding に含めれば PASS。
+    full = {"assessment": "findings", "findings": [_finding("high", [*PATHS.values(), HEAD])]}
+    assert_outcome(evaluate(normal_stream("negative", full), result=full), "pass", 5)
 
 
 def test_rule5_negative_clear_or_only_medium_findings_is_fail() -> None:
@@ -617,6 +664,9 @@ def test_rule5_positive_control_clear_or_non_citing_findings_pass_and_citing_hig
     assert_outcome(evaluate(normal_stream("positive", other), "positive", result=other), "pass", 5)
     citing = {"assessment": "findings", "findings": [_finding("high", [PATHS["consumer"]])]}
     assert_outcome(evaluate(normal_stream("positive", citing), "positive", result=citing), "fail", 5)
+    citing_evaluator = {"assessment": "findings", "findings": [_finding("high", [PATHS["evaluator"]])]}
+    stream = normal_stream("positive", citing_evaluator)
+    assert_outcome(evaluate(stream, "positive", result=citing_evaluator), "fail", 5)
     medium_only = {"assessment": "findings", "findings": [_finding("medium", [PATHS["consumer"]])]}
     assert_outcome(evaluate(normal_stream("positive", medium_only), "positive", result=medium_only), "pass", 5)
 

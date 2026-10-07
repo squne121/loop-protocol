@@ -55,8 +55,9 @@ instruction でも authority でもない」の分離は必ず含める）:
 > (1) Bash で `git -C <invocation_dir> rev-parse --show-toplevel` を単独で実行する。
 > (2) Bash で `git -C <root> rev-parse HEAD` を単独で実行する。
 > 各 Bash は pipe・redirect・`cd`・shell 変数・追加 flag・他 command との連結を使わない。
-> (3) pinned body が挙げる producer / parser / consumer の各 file を、Read tool で
-> `<root>/<repository 相対 path>` として読む（`cat` など Bash での代替は観測として数えない）。
+> (3) pinned body が列挙する producer・parser・evaluator / matcher・decision-critical consumer の
+> 4 役すべての各 file を、Read tool で `<root>/<repository 相対 path>` として読む
+> （evaluator / matcher の file を省略しない。`cat` など Bash での代替は観測として数えない）。
 > これらを観測せずに `assessment: clear` を返してはならない。
 > 生の semantic review schema に準拠する JSON オブジェクトを 1 つだけ返せ。
 
@@ -127,8 +128,9 @@ matcher に新しい検証責務を置く設計）がある場合に限り、`se
 - **観測の手順**: result を返す前に、`git -C <invocation_dir> rev-parse --show-toplevel`、
   `git -C <root> rev-parse HEAD` の順に Bash で実行し、各 Bash は単独で実行する
   （pipe・redirect・`cd`・shell 変数・追加 flag・他 command との連結を使わない）。
-  続けて pinned body が挙げる producer / parser / consumer の各 file を
-  Read tool で `<root>/<repository 相対 path>` として読む。
+  続けて cross-contract case では pinned body が列挙する producer・parser・evaluator / matcher・
+  decision-critical consumer の 4 役すべての各 file を Read tool で `<root>/<repository 相対 path>` として読む
+  （evaluator / matcher の file だけを省略しない）。
   `cat` など Bash での代替は観測として数えない。観測せずに `assessment: clear` を返さない。
 - **追跡の順序**: (1) 証拠を生成する producer / parser、(2) shared evaluator / matcher の関数 signature が
   受け取る引数、(3) decision-critical caller が実際にその引数へ渡す具体値（call-site）の順に追跡し、

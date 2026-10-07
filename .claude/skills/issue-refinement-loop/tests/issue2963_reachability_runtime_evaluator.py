@@ -4,7 +4,7 @@ Issue 本文「AC8 判定規則」だけを実装する。構造化 field のみ
 
 入力は harness が captured した stream-json の stdout 行そのもの（hermetic fixture も同じ行形式）、
 `tested_head`、`resolved_root`、`invocation_dir`、fixture 種別、repository 相対の producer / parser /
-consumer path、reviewer の raw result である。抽出は既存 helper だけを使う（変更せず、unique module 名の
+evaluator / consumer path、reviewer の raw result である。抽出は既存 helper だけを使う（変更せず、unique module 名の
 `importlib.util.spec_from_file_location` で読み込む）。
 
 - lifecycle: `extract_claude_hook_lifecycle_events`
@@ -29,6 +29,8 @@ from typing import Any
 
 REVIEWER_AGENT = "issue-design-reviewer"
 FIXTURE_KINDS = ("negative", "positive", "simple")
+# producer / parser / evaluator / consumer の 4 役（Issue AC8 判定規則。evaluator の Read 欠落も規則 4 の FAIL）。
+SOURCE_ROLES = ("producer", "parser", "evaluator", "consumer")
 EXIT_CODES = {"pass": 0, "fail": 1, "unavailable": 77}
 _HIGH_SEVERITIES = frozenset({"high", "blocker"})
 _SHA_RE = re.compile(r"(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])")
@@ -226,7 +228,7 @@ def _required_observations(
         },
         {"name": "R-HEAD", "matches": lambda tu: _is_head_command(tu, resolved_root), "stdout_ok": None},
     ]
-    for role in ("producer", "parser", "consumer"):
+    for role in SOURCE_ROLES:
         relative = (fixture_paths or {}).get(role)
         observations.append(
             {
@@ -519,27 +521,22 @@ def _evaluate_rules(
             return _verdict(
                 "fail", 5, "negative: expected assessment findings with at least one high|blocker finding", **evidence
             )
-        missing = [
-            role
-            for role in ("producer", "parser", "consumer")
-            if not any(paths.get(role, "\0") in ref for ref in normalized)
-        ]
+        missing = [role for role in SOURCE_ROLES if not any(paths.get(role, "\0") in ref for ref in normalized)]
         if missing:
             return _verdict("fail", 5, f"negative: high|blocker evidence_refs union lacks paths {missing}", **evidence)
         if tested_head not in {token for ref in union for token in _SHA_RE.findall(ref)}:
             return _verdict("fail", 5, "negative: high|blocker evidence_refs union lacks tested_head", **evidence)
         return _verdict(
-            "pass", 5, "negative: dataflow gap reported with HEAD and producer/parser/consumer refs", **evidence
+            "pass",
+            5,
+            "negative: dataflow gap reported with HEAD and producer/parser/evaluator/consumer refs",
+            **evidence,
         )
 
     if fixture_kind == "positive":
         if assessment == "clear":
             return _verdict("pass", 5, "positive: clear (observation verified by rule 4)", **evidence)
-        cited = [
-            role
-            for role in ("producer", "parser", "consumer")
-            if any(paths.get(role, "\0") in ref for ref in normalized)
-        ]
+        cited = [role for role in SOURCE_ROLES if any(paths.get(role, "\0") in ref for ref in normalized)]
         if cited:
             return _verdict(
                 "fail", 5, f"positive: high|blocker findings cite the working fixture paths {cited}", **evidence
