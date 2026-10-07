@@ -2870,21 +2870,52 @@ jobs:
             exit 1
           fi
           echo "negative_control_outcome=ok (mismatched as expected)"
+      # Issue #2969: the artifact name embeds `github.run_attempt` so that a
+      # re-run attempt can only ever download the artifact uploaded by its
+      # own attempt (a static name let attempt 2 adopt attempt 1's artifact).
+      # The download is retried at most 3 times (literal `sleep` steps, 15s
+      # total) as a best-effort mitigation of an upload->download
+      # `Artifact not found`; every attempt uses the same attempt-scoped name
+      # and the assert step below fails closed if nothing was downloaded.
       - name: Upload negative control attachments
         id: upload-negative-control-attachments
         if: ${{ always() }}
         uses: actions/upload-artifact@v6
         with:
-          name: component-vrt-negative-control-attachments
+          name: component-vrt-negative-control-attachments-${{ github.run_attempt }}
           path: .vitest-attachments/tests/component/__negative_control__/**
           if-no-files-found: error
           retention-days: 30
           include-hidden-files: true
       - name: Download negative control attachments (round-trip proof)
+        id: download-negative-control-attachments-1
         if: ${{ always() }}
+        continue-on-error: true
         uses: actions/download-artifact@v6
         with:
-          name: component-vrt-negative-control-attachments
+          name: component-vrt-negative-control-attachments-${{ github.run_attempt }}
+          path: negative-control-download
+      - name: Wait before negative control download retry 1
+        if: ${{ always() && steps.download-negative-control-attachments-1.outcome == 'failure' }}
+        run: sleep 5
+      - name: Download negative control attachments (round-trip proof, retry 1)
+        id: download-negative-control-attachments-2
+        if: ${{ always() && steps.download-negative-control-attachments-1.outcome == 'failure' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v6
+        with:
+          name: component-vrt-negative-control-attachments-${{ github.run_attempt }}
+          path: negative-control-download
+      - name: Wait before negative control download retry 2
+        if: ${{ always() && steps.download-negative-control-attachments-2.outcome == 'failure' }}
+        run: sleep 10
+      - name: Download negative control attachments (round-trip proof, retry 2)
+        id: download-negative-control-attachments-3
+        if: ${{ always() && steps.download-negative-control-attachments-2.outcome == 'failure' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v6
+        with:
+          name: component-vrt-negative-control-attachments-${{ github.run_attempt }}
           path: negative-control-download
       - name: Assert actual/diff PNGs survived the hidden-file upload round trip
         if: ${{ always() }}
@@ -2894,12 +2925,12 @@ jobs:
           actual_files=(negative-control-download/**/*-actual-*.png)
           diff_files=(negative-control-download/**/*-diff-*.png)
           if [ "${#actual_files[@]}" -eq 0 ]; then
-            echo "::error::no *-actual-*.png found in the downloaded component-vrt-negative-control-attachments artifact — the hidden .vitest-attachments upload is NOT working end to end."
+            echo "::error::no *-actual-*.png found in the downloaded attempt-scoped negative-control artifact — the hidden-file upload is NOT working end to end."
             find negative-control-download -type f
             exit 1
           fi
           if [ "${#diff_files[@]}" -eq 0 ]; then
-            echo "::error::no *-diff-*.png found in the downloaded component-vrt-negative-control-attachments artifact — the hidden .vitest-attachments upload is NOT working end to end."
+            echo "::error::no *-diff-*.png found in the downloaded attempt-scoped negative-control artifact — the hidden-file upload is NOT working end to end."
             find negative-control-download -type f
             exit 1
           fi
