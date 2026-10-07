@@ -131,6 +131,19 @@ _PUBLIC_EVIDENCE_SHA_LENGTHS = {
     ("named_subagent_resume", "launcher", "sha256"): 64,
     ("named_subagent_resume", "fixtures", "prompt_sha256"): 64,
     ("named_subagent_resume", "fixtures", "compat_note_sha256"): 64,
+    # Issue #2981: ``--skill-text-counterfactual-*`` mode の公開 identity (commit / blob
+    # hash と prompt の sha256)。field path を明示登録したものだけが ``<redacted>`` を免れる。
+    ("skill_text_counterfactual", "requested_base_ref"): 40,
+    ("skill_text_counterfactual", "resolved_base_commit_sha"): 40,
+    ("skill_text_counterfactual", "candidate_head_sha"): 40,
+    ("skill_text_counterfactual", "base_arm_commit_sha"): 40,
+    ("skill_text_counterfactual", "candidate_skill_blob_id"): 40,
+    ("skill_text_counterfactual", "base_skill_blob_id"): 40,
+    ("skill_text_counterfactual", "prompt_sha256", "expected"): 64,
+    ("skill_text_counterfactual", "prompt_sha256", "candidate"): 64,
+    ("skill_text_counterfactual", "prompt_sha256", "base"): 64,
+    ("skill_text_counterfactual", "arms", "candidate", "tested_head"): 40,
+    ("skill_text_counterfactual", "arms", "base", "tested_head"): 40,
 }
 
 # Issue #2421: ``resolved_executable`` must never persist a raw absolute
@@ -8295,6 +8308,722 @@ def _absolute_existing_file(value: str) -> str:
     return value
 
 
+# ---------------------------------------------------------------------------
+# Issue #2981: opt-in ``skill_text_counterfactual`` mode.
+#
+# 目的: skill-invocation smoke の PASS が「候補 SKILL.md の手順文が挙動を駆動した」ことの
+# 証拠になるよう、対象 SKILL.md 1 ファイルだけを treatment とする対照 (counterfactual)
+# 実行で discrimination を示す。runner は SKILL.md の意味を解釈しない。判定は既存 summary
+# field と ``evaluate_ordered_evidence_match()`` の literal 結果だけを使う closed mapping。
+#
+# 入力同一性 (candidate commit SHA / BASE commit SHA の pin / prompt / flags) と closed
+# classification と exit mapping だけが "deterministic" である。各 arm は LLM 1 sample
+# であり、1 sample の BASE failure は統計的・因果的証明ではない (``evidence_limitations``)。
+# ---------------------------------------------------------------------------
+
+CF_RESULT_SCHEMA = "SKILL_TEXT_COUNTERFACTUAL_RESULT_V1"
+CF_MODE = "skill_text_counterfactual"
+CF_VERDICT_DISCRIMINATIVE = "discriminative"
+CF_VERDICT_NON_DISCRIMINATIVE = "non_discriminative"
+CF_VERDICT_CONTROL_INVALID = "control_invalid"
+CF_VERDICT_CANDIDATE_FAIL = "candidate_fail"
+CF_VERDICT_CANDIDATE_SKIP = "candidate_skip"
+CF_VERDICT_PREFLIGHT_FAILED = "preflight_failed"
+CF_VERDICT_ISOLATION_VIOLATION = "isolation_violation"
+CF_VERDICT_CLEANUP_FAILED = "cleanup_failed"
+CF_VERDICT_RUNNER_ERROR = "runner_error"
+CF_VERDICT_EXIT_CODES = {
+    CF_VERDICT_DISCRIMINATIVE: EXIT_OK,
+    CF_VERDICT_NON_DISCRIMINATIVE: EXIT_FAIL,
+    CF_VERDICT_CONTROL_INVALID: EXIT_FAIL,
+    CF_VERDICT_CANDIDATE_FAIL: EXIT_FAIL,
+    CF_VERDICT_CANDIDATE_SKIP: EXIT_SKIP,
+    CF_VERDICT_PREFLIGHT_FAILED: EXIT_FAIL,
+    CF_VERDICT_ISOLATION_VIOLATION: EXIT_FAIL,
+    CF_VERDICT_CLEANUP_FAILED: EXIT_FAIL,
+    CF_VERDICT_RUNNER_ERROR: EXIT_FAIL,
+}
+CF_EVIDENCE_LIMITATIONS = (
+    "deterministic_scope: input identity, closed classification and exit mapping only",
+    "single_run_per_arm: one LLM sample per arm; a one-sample BASE failure is not statistical or causal proof",
+    "treatment_scope: exactly one SKILL.md blob; every other tracked file is identical across arms "
+    "and other repository files (e.g. production scripts) can still drive the marker",
+)
+CF_WORKTREE_NAME_PREFIX = "skill-text-cf-"
+CF_ARM_NAMES = ("candidate", "base")
+_CF_TARGET_PATH_RE = re.compile(r"\.claude/skills/[A-Za-z0-9][A-Za-z0-9._-]*/SKILL\.md")
+_CF_SKILL_BLOB_MODE = "100644"
+_CF_COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
+_CF_ORDERED_FAILURE_ERROR_PREFIX = "ordered evidence match failed"
+_CF_POSITIVE_CAPABILITY_DECISION = "runtime_outcome"
+_CF_ARM_TIMEOUT_MARGIN_SECONDS = 120.0
+# 決定論的な BASE arm commit のための固定 identity (runner-owned の ephemeral state であり、
+# どの ref にも到達しない)。
+_CF_BASE_ARM_GIT_ENV = {
+    "GIT_AUTHOR_NAME": "skill-text-counterfactual",
+    "GIT_AUTHOR_EMAIL": "skill-text-counterfactual@invalid",
+    "GIT_AUTHOR_DATE": "2000-01-01T00:00:00+0000",
+    "GIT_COMMITTER_NAME": "skill-text-counterfactual",
+    "GIT_COMMITTER_EMAIL": "skill-text-counterfactual@invalid",
+    "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+0000",
+}
+
+
+class CounterfactualPreflightError(Exception):
+    """fail-closed preflight / construction failure with a closed reason code."""
+
+    def __init__(self, reason_code: str, message: str = ""):
+        super().__init__(f"{reason_code}: {message}" if message else reason_code)
+        self.reason_code = reason_code
+        self.message = message
+
+
+def _cf_git(
+    repo: str, *git_args: str, env: dict[str, str] | None = None, timeout: float = 60.0
+) -> tuple[int | None, str, str]:
+    git = shutil.which("git")
+    if git is None:
+        return None, "", "git not found"
+    rc, out, err, timed_out = _run([git, "-C", repo, *git_args], timeout=timeout, env=env)
+    if timed_out:
+        return None, out, "git timed out"
+    return rc, out, err
+
+
+def validate_counterfactual_target_path(value: object) -> str | None:
+    """Return a closed reason code when ``value`` is not exactly one repo-relative
+    ``.claude/skills/<name>/SKILL.md`` path, else ``None``."""
+    if not isinstance(value, str) or not value:
+        return "target_path_empty"
+    if "\x00" in value or "\\" in value:
+        return "target_path_invalid_character"
+    if value.startswith("/") or re.match(r"^[A-Za-z]:", value):
+        return "target_path_absolute"
+    if any(part in ("", ".", "..") for part in value.split("/")):
+        return "target_path_not_normalized"
+    if not _CF_TARGET_PATH_RE.fullmatch(value):
+        return "target_path_not_skill_md"
+    return None
+
+
+def resolve_counterfactual_base_commit(repo: str, ref: str) -> str:
+    """Resolve the requested BASE ref ONCE to an immutable commit SHA (never
+    re-resolved afterwards)."""
+    if not isinstance(ref, str) or not ref or ref != ref.strip() or "\x00" in ref:
+        raise CounterfactualPreflightError("base_ref_invalid")
+    rc, out, _err = _cf_git(repo, "rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}")
+    sha = out.strip()
+    if rc != 0 or not _CF_COMMIT_SHA_RE.fullmatch(sha):
+        raise CounterfactualPreflightError("base_ref_unresolved")
+    return sha
+
+
+def read_counterfactual_skill_blob(repo: str, commit: str, target: str, label: str) -> str:
+    """Return the blob id of ``target`` at ``commit``. Fail closed when it is missing,
+    not a regular blob, a symlink / gitlink, or carries an unexpected mode."""
+    rc, out, _err = _cf_git(repo, "ls-tree", "-z", "--full-tree", commit, "--", target)
+    if rc != 0:
+        raise CounterfactualPreflightError(f"{label}_target_unreadable")
+    entries = [entry for entry in out.split("\x00") if entry]
+    if len(entries) != 1:
+        raise CounterfactualPreflightError(f"{label}_target_missing")
+    meta, _sep, name = entries[0].partition("\t")
+    fields = meta.split()
+    if len(fields) != 3 or name != target:
+        raise CounterfactualPreflightError(f"{label}_target_unexpected_entry")
+    mode, object_type, blob_id = fields
+    if object_type != "blob" or mode in ("120000", "160000"):
+        raise CounterfactualPreflightError(f"{label}_target_not_regular_file")
+    if mode != _CF_SKILL_BLOB_MODE:
+        raise CounterfactualPreflightError(f"{label}_target_unexpected_mode")
+    if not _CF_COMMIT_SHA_RE.fullmatch(blob_id):
+        raise CounterfactualPreflightError(f"{label}_target_unexpected_entry")
+    return blob_id
+
+
+def counterfactual_tree_difference(repo: str, left: str, right: str) -> list[str] | None:
+    """Paths whose content / mode differ between two commits (``None`` when the probe failed)."""
+    rc, out, _err = _cf_git(
+        repo, "diff-tree", "-r", "--no-renames", "--name-only", "-z", left, right
+    )
+    if rc != 0:
+        return None
+    return sorted(entry for entry in out.split("\x00") if entry)
+
+
+def _cf_is_owned_worktree_path(repo_root: str, path: str) -> bool:
+    prefix = os.path.join(os.path.realpath(repo_root), ".claude", "worktrees") + os.sep
+    return path.startswith(prefix) and os.path.basename(path).startswith(CF_WORKTREE_NAME_PREFIX)
+
+
+def _cf_relative(repo_root: str, path: str) -> str:
+    return os.path.relpath(path, os.path.realpath(repo_root))
+
+
+def _cf_registered_worktree_paths(repo_root: str) -> set[str] | None:
+    rc, out, _err = _cf_git(repo_root, "worktree", "list", "--porcelain")
+    if rc != 0:
+        return None
+    return {
+        os.path.realpath(line[len("worktree "):].strip())
+        for line in out.splitlines()
+        if line.startswith("worktree ")
+    }
+
+
+def _cf_create_arm_worktree(
+    repo_root: str, candidate_head: str, arm: str, created: list[dict]
+) -> str:
+    """Create a runner-owned detached linked worktree at ``candidate_head``. The exact
+    path is recorded in ``created`` BEFORE creation so cleanup always sees it."""
+    root_real = os.path.realpath(repo_root)
+    parent = os.path.join(root_real, ".claude", "worktrees")
+    path = os.path.join(parent, f"{CF_WORKTREE_NAME_PREFIX}{arm}-{uuid.uuid4().hex}")
+    created.append({"arm": arm, "path": path})
+    try:
+        os.makedirs(parent, exist_ok=True)
+    except OSError as exc:
+        raise CounterfactualPreflightError("control_worktree_create_failed", type(exc).__name__) from exc
+    rc, _out, err = _cf_git(
+        root_real, "worktree", "add", "--detach", "--quiet", path, candidate_head, timeout=300.0
+    )
+    if rc != 0:
+        raise CounterfactualPreflightError("control_worktree_create_failed", _redact(err[:200]))
+    try:
+        verified = verify_worktree_identity(path, root_real)
+    except IdentityError as exc:
+        raise CounterfactualPreflightError("control_worktree_identity_rejected", exc.message) from exc
+    if verified != os.path.realpath(path):
+        raise CounterfactualPreflightError("control_worktree_identity_rejected")
+    if _git_rev_parse(path, "HEAD") != candidate_head:
+        raise CounterfactualPreflightError("control_worktree_head_mismatch")
+    if _git_status_porcelain_all(path) != "":
+        raise CounterfactualPreflightError("control_worktree_not_clean")
+    return path
+
+
+def _cf_commit_base_blob(arm_path: str, candidate_head: str, target: str, base_blob_id: str) -> str:
+    """Make the BASE arm a runner-owned clean ephemeral Git state: stage ONLY the BASE
+    blob of ``target`` over the candidate tree, write a deterministic commit on top of
+    ``candidate_head`` (no ref is created) and move the detached HEAD to it."""
+    env = {**os.environ, **_CF_BASE_ARM_GIT_ENV}
+    rc, _out, _err = _cf_git(
+        arm_path, "update-index", "--cacheinfo", f"{_CF_SKILL_BLOB_MODE},{base_blob_id},{target}"
+    )
+    if rc != 0:
+        raise CounterfactualPreflightError("base_arm_stage_failed")
+    rc, out, _err = _cf_git(arm_path, "write-tree")
+    tree = out.strip()
+    if rc != 0 or not _CF_COMMIT_SHA_RE.fullmatch(tree):
+        raise CounterfactualPreflightError("base_arm_tree_failed")
+    rc, out, _err = _cf_git(
+        arm_path, "-c", "commit.gpgsign=false", "commit-tree", tree, "-p", candidate_head,
+        "-m", "skill_text_counterfactual BASE arm (single SKILL.md blob replaced)",
+        env=env,
+    )
+    commit = out.strip()
+    if rc != 0 or not _CF_COMMIT_SHA_RE.fullmatch(commit):
+        raise CounterfactualPreflightError("base_arm_commit_failed")
+    rc, _out, _err = _cf_git(arm_path, "reset", "--hard", "--quiet", commit)
+    if rc != 0:
+        raise CounterfactualPreflightError("base_arm_checkout_failed")
+    if _git_rev_parse(arm_path, "HEAD") != commit or _git_status_porcelain_all(arm_path) != "":
+        raise CounterfactualPreflightError("base_arm_not_clean")
+    return commit
+
+
+def _cf_cleanup_worktrees(repo_root: str, created: list[dict]) -> dict:
+    """Remove ONLY the exact worktree paths this run created and recorded. Never a
+    glob, never a foreign path, no global prune/GC. Failures are reported with a path
+    relative to the canonical root."""
+    removed: list[str] = []
+    failures: list[dict] = []
+    attempted: list[str] = []
+    for entry in reversed(created):
+        path = entry["path"]
+        rel = _cf_relative(repo_root, path)
+        attempted.append(rel)
+        try:
+            if not _cf_is_owned_worktree_path(repo_root, path):
+                failures.append({"path": rel, "reason": "refused_non_owned_path"})
+                continue
+            registered = _cf_registered_worktree_paths(repo_root)
+            present = os.path.lexists(path) or (registered is not None and path in registered)
+            if present:
+                _cf_git(repo_root, "worktree", "remove", "--force", path, timeout=300.0)
+            registered_after = _cf_registered_worktree_paths(repo_root)
+            if os.path.lexists(path):
+                failures.append({"path": rel, "reason": "path_still_exists"})
+            elif registered_after is None or path in registered_after:
+                failures.append({"path": rel, "reason": "worktree_still_registered"})
+            else:
+                removed.append(rel)
+        except Exception as exc:  # noqa: BLE001 - cleanup must never raise
+            failures.append({"path": rel, "reason": f"cleanup_error:{type(exc).__name__}"})
+    return {
+        "attempted": attempted,
+        "removed": removed,
+        "failures": failures,
+        "all_removed": not failures and len(removed) == len(created),
+    }
+
+
+def execute_counterfactual_arm(
+    arm_name: str, arm_argv: list[str], *, timeout_seconds: float
+) -> dict:
+    """Default arm executor: this same runner as a child process (injectable in tests)."""
+    del arm_name
+    rc, _out, err, timed_out = _run(
+        [sys.executable, str(Path(__file__).resolve()), *arm_argv], timeout=timeout_seconds
+    )
+    return {
+        "returncode": rc,
+        "timed_out": timed_out,
+        "stderr_excerpt": _bounded_redacted_lines(err, 20),
+    }
+
+
+def _cf_read_arm_evidence(path: str) -> tuple[dict | None, str | None]:
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, "evidence_json_missing"
+    except (OSError, ValueError):
+        return None, "evidence_json_unparsable"
+    if not isinstance(payload, dict):
+        return None, "evidence_json_not_object"
+    return payload, None
+
+
+def _cf_arm_environment_failures(
+    obs: dict, *, expected_head: str, expected: dict
+) -> list[str]:
+    """Closed POSITIVE predicate over existing summary fields: every reason returned is a
+    way the arm run is not an observable, attributable run. Empty list == valid."""
+    evidence = obs.get("evidence")
+    if not isinstance(evidence, dict):
+        return [obs.get("evidence_error") or "evidence_json_missing"]
+    reasons: list[str] = []
+    if evidence.get("schema") != SCHEMA:
+        reasons.append("evidence_schema_mismatch")
+    if evidence.get("tested_head") != expected_head:
+        reasons.append("evidence_not_bound_to_arm_head")
+    if evidence.get("prompt_sha256") != expected.get("prompt_sha256"):
+        reasons.append("prompt_sha256_mismatch")
+    if obs.get("returncode") == EXIT_SKIP or evidence.get("exit_code") == EXIT_SKIP:
+        reasons.append("arm_skipped")
+    if (
+        obs.get("timed_out") is not False
+        or evidence.get("timed_out") is not False
+        or obs.get("returncode") is None
+    ):
+        reasons.append("process_timed_out_or_not_exited")
+    elif evidence.get("process_exit_code") != 0:
+        reasons.append("process_exited_abnormally")
+    if evidence.get("terminal_event_observed") is not True:
+        reasons.append("terminal_event_not_observed")
+    if (
+        evidence.get("capability_decision") != _CF_POSITIVE_CAPABILITY_DECISION
+        or evidence.get("capability_error_classification") is not None
+    ):
+        reasons.append("runtime_or_capability_failure")
+    command = expected.get("expect_skill_command")
+    observed_commands = evidence.get("user_prompt_expansion_command_names")
+    if (
+        evidence.get("expect_skill_command_observed") is not True
+        or not isinstance(observed_commands, list)
+        or command not in observed_commands
+    ):
+        reasons.append("skill_invocation_not_observed")
+    denials = evidence.get("permission_denials")
+    if not isinstance(denials, list) or denials:
+        reasons.append("permission_denied_or_unknown")
+    if evidence.get("postcondition_unexpected_changes") != []:
+        reasons.append("clean_postcondition_not_satisfied")
+    ordered = evidence.get("ordered_evidence_match")
+    if (
+        not isinstance(ordered, dict)
+        or not isinstance(ordered.get("verified"), bool)
+        or ordered.get("expected_order") != expected.get("ordered_markers")
+    ):
+        reasons.append("ordered_assertion_missing")
+    if not isinstance(evidence.get("errors"), list):
+        reasons.append("errors_field_missing")
+    return reasons
+
+
+def _cf_arm_failed_solely_on_ordered_assertion(obs: dict) -> bool:
+    evidence = obs["evidence"]
+    errors = evidence.get("errors")
+    return (
+        obs.get("returncode") == EXIT_FAIL
+        and evidence.get("exit_code") == EXIT_FAIL
+        and evidence["ordered_evidence_match"]["verified"] is False
+        and isinstance(errors, list)
+        and len(errors) == 1
+        and isinstance(errors[0], str)
+        and errors[0].startswith(_CF_ORDERED_FAILURE_ERROR_PREFIX)
+    )
+
+
+def _cf_arm_passed_cleanly(obs: dict) -> bool:
+    evidence = obs["evidence"]
+    return (
+        obs.get("returncode") == EXIT_OK
+        and evidence.get("exit_code") == EXIT_OK
+        and evidence["ordered_evidence_match"]["verified"] is True
+        and evidence.get("errors") == []
+    )
+
+
+def classify_counterfactual_arms(
+    candidate_obs: dict, base_obs: dict | None, *, candidate_head: str, base_arm_commit: str,
+    expected: dict,
+) -> tuple[str, list[str]]:
+    """Closed mapping (no SKILL.md interpretation, no LLM). Returns ``(classification, reasons)``.
+
+    candidate not PASS            -> candidate_skip (exit 77) / candidate_fail
+    candidate PASS, BASE invalid  -> control_invalid
+    candidate PASS, BASE valid, ordered assertion fails (solely)  -> discriminative
+    candidate PASS, BASE valid, ordered assertion also holds      -> non_discriminative
+    """
+    candidate_env = _cf_arm_environment_failures(
+        candidate_obs, expected_head=candidate_head, expected=expected
+    )
+    candidate_returncode = candidate_obs.get("returncode")
+    candidate_evidence = candidate_obs.get("evidence")
+    if candidate_returncode == EXIT_SKIP or (
+        isinstance(candidate_evidence, dict) and candidate_evidence.get("exit_code") == EXIT_SKIP
+    ):
+        return CF_VERDICT_CANDIDATE_SKIP, ["candidate_arm_skipped"]
+    if candidate_env or not _cf_arm_passed_cleanly(candidate_obs):
+        return CF_VERDICT_CANDIDATE_FAIL, candidate_env or ["candidate_arm_not_passing"]
+    if base_obs is None:
+        return CF_VERDICT_CONTROL_INVALID, ["base_arm_not_executed"]
+    base_env = _cf_arm_environment_failures(base_obs, expected_head=base_arm_commit, expected=expected)
+    if not base_env:
+        # 同一 runtime executable / settings の arm 間束縛 (missing / mismatch は fail-closed)。
+        cand_ev, base_ev = candidate_obs["evidence"], base_obs["evidence"]
+        exe = cand_ev.get("resolved_executable_sha256")
+        if not isinstance(exe, str) or not exe or exe != base_ev.get("resolved_executable_sha256"):
+            base_env.append("arm_runtime_executable_mismatch")
+        if cand_ev.get("runtime_version") != base_ev.get("runtime_version"):
+            base_env.append("arm_runtime_version_mismatch")
+        cand_settings = (cand_ev.get("settings_provenance") or {}).get("digest_sha256")
+        base_settings = (base_ev.get("settings_provenance") or {}).get("digest_sha256")
+        if cand_settings != base_settings:
+            base_env.append("arm_settings_digest_mismatch")
+    if base_env:
+        return CF_VERDICT_CONTROL_INVALID, base_env
+    ordered_verified = base_obs["evidence"]["ordered_evidence_match"]["verified"]
+    if ordered_verified is False:
+        if _cf_arm_failed_solely_on_ordered_assertion(base_obs):
+            return CF_VERDICT_DISCRIMINATIVE, []
+        return CF_VERDICT_CONTROL_INVALID, ["base_failure_not_solely_ordered_assertion"]
+    if _cf_arm_passed_cleanly(base_obs):
+        return CF_VERDICT_NON_DISCRIMINATIVE, ["base_arm_also_satisfies_ordered_assertion"]
+    return CF_VERDICT_CONTROL_INVALID, ["base_pass_not_clean"]
+
+
+def _cf_namespace_to_argv(
+    parser: argparse.ArgumentParser, args: argparse.Namespace, *, exclude: set[str], overrides: dict
+) -> list[str]:
+    """Re-emit a parsed namespace as argv (``--flag=value`` form), so every arm receives the
+    SAME flags with the SAME meaning; only ``overrides`` differ."""
+    argv: list[str] = []
+    for action in parser._actions:  # noqa: SLF001 - generic namespace round-trip
+        if not action.option_strings or action.dest == "help" or action.dest in exclude:
+            continue
+        flag = max(action.option_strings, key=len)
+        value = overrides[action.dest] if action.dest in overrides else getattr(args, action.dest)
+        if value == action.default:
+            continue
+        if isinstance(action, argparse._StoreTrueAction):  # noqa: SLF001
+            if value:
+                argv.append(flag)
+        elif isinstance(action, argparse._AppendAction):  # noqa: SLF001
+            argv.extend(f"{flag}={item}" for item in value)
+        else:
+            argv.append(f"{flag}={value}")
+    return argv
+
+
+def _cf_arm_summary(repo_root: str, arm_path: str | None, obs: dict | None, execution: dict | None) -> dict | None:
+    if obs is None:
+        return None
+    evidence = obs.get("evidence") if isinstance(obs.get("evidence"), dict) else {}
+    return {
+        "worktree": _cf_relative(repo_root, arm_path) if arm_path else None,
+        "returncode": obs.get("returncode"),
+        "timed_out": obs.get("timed_out"),
+        "exit_code": evidence.get("exit_code"),
+        "process_exit_code": evidence.get("process_exit_code"),
+        "tested_head": evidence.get("tested_head"),
+        "evidence_error": obs.get("evidence_error"),
+        "errors": evidence.get("errors"),
+        "stderr_excerpt": (execution or {}).get("stderr_excerpt"),
+    }
+
+
+def run_skill_text_counterfactual(
+    *,
+    repo_root: str,
+    candidate_worktree: str,
+    base_ref: str,
+    target_paths: list[str],
+    arm_argv_factory,
+    output_dir: Path,
+    output_dir_rel: str | None,
+    timeout_seconds: float,
+    prompt_sha256: str,
+    expected_ordered_markers: list[str],
+    expect_skill_command: str,
+    run_id: str,
+) -> dict:
+    """Run the candidate arm and the BASE arm in runner-owned ephemeral linked worktrees
+    and return the full ``SKILL_TEXT_COUNTERFACTUAL_RESULT_V1`` summary (never raises)."""
+    cf: dict = {
+        "treatment": "single_skill_md_blob",
+        "requested_base_ref": base_ref,
+        "resolved_base_commit_sha": None,
+        "candidate_head_sha": None,
+        "target_skill_path": None,
+        "candidate_skill_blob_id": None,
+        "base_skill_blob_id": None,
+        "base_arm_commit_sha": None,
+        "prompt_sha256": {"expected": prompt_sha256, "candidate": None, "base": None, "identical": None},
+        "ordered_evidence_match": {"candidate": None, "base": None},
+        "arms": {"candidate": None, "base": None},
+        "tree_difference": {"candidate_arm": None, "base_arm": None},
+        "candidate_worktree_unchanged": None,
+        "classification": None,
+        "reasons": [],
+        "cleanup": {"attempted": [], "removed": [], "failures": [], "all_removed": True},
+        "evidence_limitations": list(CF_EVIDENCE_LIMITATIONS),
+    }
+    created: list[dict] = []
+    verdict = CF_VERDICT_RUNNER_ERROR
+    reasons: list[str] = []
+    try:
+        try:
+            verdict, reasons = _cf_run_arms(
+                cf, created,
+                repo_root=repo_root, candidate_worktree=candidate_worktree, base_ref=base_ref,
+                target_paths=target_paths, arm_argv_factory=arm_argv_factory,
+                output_dir=output_dir, output_dir_rel=output_dir_rel,
+                timeout_seconds=timeout_seconds, prompt_sha256=prompt_sha256,
+                expected_ordered_markers=expected_ordered_markers,
+                expect_skill_command=expect_skill_command,
+            )
+        except CounterfactualPreflightError as exc:
+            verdict, reasons = CF_VERDICT_PREFLIGHT_FAILED, [exc.reason_code]
+            if exc.message:
+                reasons.append(f"detail: {_redact(exc.message)[:200]}")
+        except _TerminateRequested as exc:
+            verdict, reasons = CF_VERDICT_RUNNER_ERROR, [f"runner terminated: {exc}"]
+        except Exception as exc:  # noqa: BLE001 - fail closed, still clean up
+            verdict, reasons = CF_VERDICT_RUNNER_ERROR, [f"unexpected_error:{type(exc).__name__}"]
+    finally:
+        cf["cleanup"] = _cf_cleanup_worktrees(repo_root, created)
+    cf["classification"] = verdict
+    exit_code = CF_VERDICT_EXIT_CODES[verdict]
+    if cf["cleanup"]["failures"]:
+        reasons = reasons + [
+            f"cleanup_failed:{item['path']}:{item['reason']}" for item in cf["cleanup"]["failures"]
+        ]
+        exit_code = EXIT_FAIL
+        if verdict == CF_VERDICT_DISCRIMINATIVE:
+            verdict = CF_VERDICT_CLEANUP_FAILED
+    cf["reasons"] = reasons
+    return {
+        "schema": CF_RESULT_SCHEMA,
+        "mode": CF_MODE,
+        "run_id": run_id,
+        "verdict": verdict,
+        "exit_code": exit_code,
+        "errors": [] if exit_code == EXIT_OK else [f"{verdict}: {', '.join(reasons) or 'no detail'}"],
+        "skill_text_counterfactual": cf,
+    }
+
+
+def _cf_run_arms(
+    cf: dict, created: list[dict], *, repo_root: str, candidate_worktree: str, base_ref: str,
+    target_paths: list[str], arm_argv_factory, output_dir: Path, output_dir_rel: str | None,
+    timeout_seconds: float, prompt_sha256: str, expected_ordered_markers: list[str],
+    expect_skill_command: str,
+) -> tuple[str, list[str]]:
+    if len(target_paths) != 1:
+        raise CounterfactualPreflightError("treatment_not_single_skill_md", f"count={len(target_paths)}")
+    target = target_paths[0]
+    path_problem = validate_counterfactual_target_path(target)
+    if path_problem:
+        raise CounterfactualPreflightError(path_problem)
+    cf["target_skill_path"] = target
+
+    rc, out, _err = _cf_git(candidate_worktree, "rev-parse", "--verify", "HEAD^{commit}")
+    candidate_head = out.strip()
+    if rc != 0 or not _CF_COMMIT_SHA_RE.fullmatch(candidate_head):
+        raise CounterfactualPreflightError("candidate_head_unresolved")
+    cf["candidate_head_sha"] = candidate_head
+    if _git_status_porcelain_all(candidate_worktree) != "":
+        raise CounterfactualPreflightError("candidate_worktree_dirty")
+
+    base_commit = resolve_counterfactual_base_commit(candidate_worktree, base_ref)
+    cf["resolved_base_commit_sha"] = base_commit
+    candidate_blob = read_counterfactual_skill_blob(candidate_worktree, candidate_head, target, "candidate")
+    cf["candidate_skill_blob_id"] = candidate_blob
+    base_blob = read_counterfactual_skill_blob(candidate_worktree, base_commit, target, "base")
+    cf["base_skill_blob_id"] = base_blob
+    if candidate_blob == base_blob:
+        raise CounterfactualPreflightError("no_treatment_difference")
+
+    before_fp = repo_fingerprint(candidate_worktree, output_dir_rel)
+    if before_fp is None:
+        raise CounterfactualPreflightError("candidate_fingerprint_unavailable")
+
+    # 両 arm を全て構築・証明してから (= LLM 実行コストを払う前に) 実行する。
+    arm_paths: dict[str, str] = {}
+    for arm in CF_ARM_NAMES:
+        arm_paths[arm] = _cf_create_arm_worktree(repo_root, candidate_head, arm, created)
+    base_arm_commit = _cf_commit_base_blob(arm_paths["base"], candidate_head, target, base_blob)
+    cf["base_arm_commit_sha"] = base_arm_commit
+    candidate_diff = counterfactual_tree_difference(
+        arm_paths["candidate"], candidate_head, _git_rev_parse(arm_paths["candidate"], "HEAD") or ""
+    )
+    base_diff = counterfactual_tree_difference(arm_paths["base"], candidate_head, base_arm_commit)
+    cf["tree_difference"] = {"candidate_arm": candidate_diff, "base_arm": base_diff}
+    if candidate_diff != [] or base_diff != [target]:
+        raise CounterfactualPreflightError("arm_trees_differ_beyond_target_skill_md")
+
+    arms_dir = output_dir / "arms"
+    arms_dir.mkdir(parents=True, exist_ok=True)
+    expected = {
+        "prompt_sha256": prompt_sha256,
+        "ordered_markers": list(expected_ordered_markers),
+        "expect_skill_command": expect_skill_command,
+    }
+    observations: dict[str, dict | None] = {"candidate": None, "base": None}
+    for arm in CF_ARM_NAMES:
+        # 候補 arm が PASS でなければ BASE arm は実行しない (判定は候補 FAIL/SKIP が優先)。
+        if arm == "base" and not _cf_candidate_passed(observations["candidate"], candidate_head, expected):
+            break
+        evidence_path = str(arms_dir / f"{arm}.evidence.json")
+        arm_argv = arm_argv_factory(arm, arm_paths[arm], str(arms_dir / arm), evidence_path)
+        execution = execute_counterfactual_arm(
+            arm, arm_argv, timeout_seconds=timeout_seconds + _CF_ARM_TIMEOUT_MARGIN_SECONDS
+        )
+        evidence, evidence_error = _cf_read_arm_evidence(evidence_path)
+        observations[arm] = {
+            "returncode": execution.get("returncode"),
+            "timed_out": execution.get("timed_out"),
+            "evidence": evidence,
+            "evidence_error": evidence_error,
+        }
+        cf["arms"][arm] = _cf_arm_summary(repo_root, arm_paths[arm], observations[arm], execution)
+        if evidence is not None:
+            cf["prompt_sha256"][arm] = evidence.get("prompt_sha256")
+            cf["ordered_evidence_match"][arm] = evidence.get("ordered_evidence_match")
+    cf["prompt_sha256"]["identical"] = (
+        cf["prompt_sha256"]["candidate"] == cf["prompt_sha256"]["base"] == prompt_sha256
+        if cf["prompt_sha256"]["base"] is not None
+        else None
+    )
+
+    after_fp = repo_fingerprint(candidate_worktree, output_dir_rel)
+    fp_diffs = diff_fingerprints(before_fp, after_fp)
+    cf["candidate_worktree_unchanged"] = not fp_diffs
+    if fp_diffs:
+        return CF_VERDICT_ISOLATION_VIOLATION, [f"candidate_worktree_changed: {d}" for d in fp_diffs]
+
+    return classify_counterfactual_arms(
+        observations["candidate"], observations["base"],
+        candidate_head=candidate_head, base_arm_commit=base_arm_commit, expected=expected,
+    )
+
+
+def _cf_candidate_passed(obs: dict | None, candidate_head: str, expected: dict) -> bool:
+    return (
+        obs is not None
+        and not _cf_arm_environment_failures(obs, expected_head=candidate_head, expected=expected)
+        and _cf_arm_passed_cleanly(obs)
+    )
+
+
+def write_counterfactual_evidence(output_dir: Path, summary: dict) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    redacted = _redact_evidence_value(summary)
+    lines = ["# Skill Text Counterfactual Summary", ""]
+    for key in sorted(redacted.keys()):
+        lines.append(f"- {key}: {redacted[key]}")
+    with open(output_dir / "summary.md", "x", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
+def _main_skill_text_counterfactual(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    *,
+    run_id: str,
+    repo_root: str,
+    worktree: str,
+    prompt: str,
+    output_dir: Path,
+    output_dir_rel: str | None,
+) -> int:
+    """main() delegate for the opt-in skill_text_counterfactual mode (Issue #2981)."""
+    exclude = {"skill_text_counterfactual_base_ref", "skill_text_counterfactual_skill"}
+
+    def arm_argv_factory(arm: str, arm_worktree: str, arm_output_dir: str, arm_evidence: str) -> list[str]:
+        del arm  # both arms get byte-identical flags; only the three paths below differ.
+        overrides = {
+            "worktree": arm_worktree,
+            "output_dir": arm_output_dir,
+            "evidence_json": arm_evidence,
+            "repo_root": repo_root,
+            "prompt_file": os.path.abspath(args.prompt_file),
+            "require_clean_postcondition": True,
+        }
+        return _cf_namespace_to_argv(parser, args, exclude=exclude, overrides=overrides)
+
+    summary = run_skill_text_counterfactual(
+        repo_root=repo_root,
+        candidate_worktree=worktree,
+        base_ref=args.skill_text_counterfactual_base_ref,
+        target_paths=list(args.skill_text_counterfactual_skill),
+        arm_argv_factory=arm_argv_factory,
+        output_dir=output_dir,
+        output_dir_rel=output_dir_rel,
+        timeout_seconds=float(args.timeout_seconds),
+        prompt_sha256=compute_prompt_sha256(prompt),
+        expected_ordered_markers=list(args.expect_ordered_marker),
+        expect_skill_command=args.expect_skill_command,
+        run_id=run_id,
+    )
+    exit_code = summary["exit_code"]
+    try:
+        write_counterfactual_evidence(output_dir, summary)
+    except OSError as exc:
+        print(f"[FAIL] could not write skill_text_counterfactual summary: {exc}", file=sys.stderr)
+        exit_code = EXIT_FAIL
+        summary["exit_code"] = exit_code
+    for error in summary["errors"]:
+        print(f"[FAIL] {error}" if exit_code == EXIT_FAIL else f"SKIP: {error}", file=sys.stderr)
+    if exit_code == EXIT_OK:
+        print(
+            f"OK: skill_text_counterfactual verdict={summary['verdict']}; "
+            f"evidence written to {output_dir}"
+        )
+    if args.evidence_json:
+        try:
+            Path(args.evidence_json).write_text(
+                json.dumps(_redact_evidence_value(summary), indent=2, sort_keys=True, default=str) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            print(f"[WARN] could not write --evidence-json to {args.evidence_json}: {exc}", file=sys.stderr)
+    return exit_code
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="worktree-agent-runtime-smoke runner")
     # Issue #2161 (native Codex CLI retirement): "codex" was removed from
@@ -8729,6 +9458,33 @@ def build_parser() -> argparse.ArgumentParser:
             "versions, booleans and event counts."
         ),
     )
+    parser.add_argument(
+        "--skill-text-counterfactual-base-ref",
+        default=None,
+        help=(
+            "Issue #2981: opt-in skill_text_counterfactual mode (paired with "
+            "--skill-text-counterfactual-skill, both or neither). The BASE ref is resolved "
+            "ONCE in preflight to an immutable commit SHA. The candidate arm and the BASE arm "
+            "run in runner-owned ephemeral linked worktrees under .claude/worktrees/ detached "
+            "at the captured candidate HEAD (--worktree must be clean and committed); only the "
+            "one target SKILL.md blob differs. The verdict (discriminative / non_discriminative "
+            "/ control_invalid / candidate FAIL) and exit code are closed mappings over existing "
+            "summary fields. Requires --runtime claude --mode structured --claude-adapter "
+            "native --expect-skill-command --expect-ordered-marker; both arms receive the same "
+            "flags and --require-clean-postcondition. Omitted by default, so every "
+            "pre-existing caller's argv, summary and exit code are unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--skill-text-counterfactual-skill",
+        action="append",
+        default=[],
+        help=(
+            "Issue #2981: the single repo-relative .claude/skills/<name>/SKILL.md treatment "
+            "path of the skill_text_counterfactual mode. Repeating it (multiple treatment "
+            "paths) or giving any other path is rejected fail-closed in preflight."
+        ),
+    )
     return parser
 
 
@@ -8917,6 +9673,36 @@ def main(argv: list[str] | None = None) -> int:
     if args.output_schema_path and args.mode != "structured":
         parser.error("--output-schema-path requires --mode structured")
 
+    # Issue #2981: opt-in skill_text_counterfactual mode. Usage errors (exit 2) for flag
+    # combinations that cannot express the closed control-validity predicate; every
+    # input-dependent failure (BASE ref / target path / dirty candidate / ...) is a
+    # fail-closed preflight result with a summary instead.
+    counterfactual_requested = bool(args.skill_text_counterfactual_base_ref) or bool(
+        args.skill_text_counterfactual_skill
+    )
+    if counterfactual_requested:
+        if not (args.skill_text_counterfactual_base_ref and args.skill_text_counterfactual_skill):
+            parser.error(
+                "--skill-text-counterfactual-base-ref and --skill-text-counterfactual-skill "
+                "must be given together (both or neither)"
+            )
+        if args.runtime != "claude" or args.mode != "structured" or args.claude_adapter != "native":
+            parser.error(
+                "skill_text_counterfactual requires --runtime claude --mode structured "
+                "--claude-adapter native"
+            )
+        if not args.expect_skill_command:
+            parser.error("skill_text_counterfactual requires --expect-skill-command")
+        if not args.expect_ordered_marker:
+            parser.error("skill_text_counterfactual requires --expect-ordered-marker")
+        for flag_name, enabled in (
+            ("--named-subagent-resume", bool(args.named_subagent_resume)),
+            ("--approval-profile", bool(args.approval_profile)),
+            ("--lifecycle-failure-evidence-json", bool(args.lifecycle_failure_evidence_json)),
+        ):
+            if enabled:
+                parser.error(f"skill_text_counterfactual cannot be combined with {flag_name}")
+
     # PR #2500 fix_delta P2-3 (OWNER REQUEST_CHANGES
     # https://github.com/squne121/loop-protocol/pull/2500#issuecomment-5549720805):
     # a structurally invalid --output-schema-path (one jsonschema.validate()
@@ -9001,6 +9787,12 @@ def main(argv: list[str] | None = None) -> int:
     if dir_error:
         print(f"[FAIL] {dir_error}", file=sys.stderr)
         return EXIT_FAIL
+
+    if counterfactual_requested:
+        return _main_skill_text_counterfactual(
+            parser, args, run_id=run_id, repo_root=repo_root, worktree=worktree, prompt=prompt,
+            output_dir=output_dir, output_dir_rel=output_dir_rel,
+        )
 
     # From this point on, worktree/prompt/output_dir are all confirmed
     # usable, so EVERY controlled exit below -- including the

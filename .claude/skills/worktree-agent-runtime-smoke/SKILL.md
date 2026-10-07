@@ -24,6 +24,9 @@ Skill preload 判定、context budget 評価、review verdict、merge readiness�
 - semantic な hook reason 分類・mutation deny 妥当性判定・context budget 数値評価を行う場合
   （本 Skill は runtime 起動・観測・証跡収集だけを所有する）
 - worktree の新規作成／削除、自動 Issue／PR mutation、自動 approval
+  （唯一の例外: opt-in の `skill_text_counterfactual` mode だけが、runner 自身の ephemeral な対照 arm 用 linked worktree を
+  作成し、runner が生成して記録した exact path に限って回収する。caller の worktree・foreign worktree・Issue／PR には触れない。
+  詳細は「Skill Text Counterfactual」節。この例外を他の mode へ広げない）
 
 ## Input（入力）
 
@@ -40,6 +43,7 @@ Skill preload 判定、context budget 評価、review verdict、merge readiness�
 - `--expect-marker-source main|subagent`（任意。既定 `subagent`。Issue #2498 AC3。`--expect-marker` 使用時の SubAgent causal-evidence 既定強制（Issue #2183 fix-delta）に対する additive な provenance 入力。`subagent`（既定）: 省略時の暗黙強制と完全に同一 — `--expect-marker` を指定する構造化 run は引き続き `causal_evidence_source == hook_id_correlated` を要求され、マーカー探索対象テキストも従来どおり captured stdout+stderr の結合ブロブ全体のまま変化しない。`main`: SubAgent 委譲のない direct Skill invocation を表明し、causal-evidence gate から opt out する。**加えて（PR #2500 fix_delta P1-1、OWNER REQUEST_CHANGES https://github.com/squne121/loop-protocol/pull/2500#issuecomment-5549720805）、`main` 選択時のみマーカー探索対象テキストを `extract_claude_main_output_text()`（`type: "assistant"` イベント自身の `message.content[].text` のみを emission 順に連結したもの）に限定する** — caller が prompt に書いた文字列（`UserPromptExpansion` hook 自身の stdin echo に含まれる `prompt`/`command_args` 等）や hook echo、stderr は一切含まない。これにより caller が prompt に書いただけの文字列がモデル自身の出力を経ずに marker 判定を satisfy することを防ぐ。`--expect-skill-command` との併用が**必須**（併用しない `main` 単独指定は起動前の usage error（parser.error）として拒否される — 無条件の causal-evidence opt-out に退化させないため）。`--require-subagent-causal-evidence`（明示的な独立要求）はこのフラグの値に関わらず有効のまま）
 - `--expect-skill-command <name>`（任意。Issue #2498 AC4。`--expect-marker-source main` との必須ペア。`--mode structured` + `--claude-adapter native` 限定。native `UserPromptExpansion` hook イベント（実機 Claude Code 2.1.261 で確認済み: `command:"cat"` hook がその hook 自身の stdin payload — `command_name`/`command_args`/`command_source` を含む — を echo する）の `command_name` フィールド一致によって direct Skill/slash-command invocation の発生を検証する（`extract_claude_user_prompt_expansion_command_names()`）。`command_source` の値域は公式ドキュメント上で列挙されていないため判定根拠にしない。指定時は structured lane の `--settings` に `UserPromptExpansion` hook 登録を追加した拡張版 JSON（`_CLAUDE_SPAWN_HOOK_OBSERVABILITY_WITH_USER_PROMPT_EXPANSION_SETTINGS_JSON`）を使う — 未指定の既存呼び出しは元の `_CLAUDE_SPAWN_HOOK_OBSERVABILITY_SETTINGS_JSON`（`{"SubagentStart", "SubagentStop"}` のみ）のまま変化しない）
 - `--require-clean-postcondition`（任意）
+- `--skill-text-counterfactual-base-ref <ref>` / `--skill-text-counterfactual-skill <.claude/skills/<name>/SKILL.md>`（任意、両方または両方なし。Issue #2981。opt-in の `skill_text_counterfactual` mode。`--runtime claude --mode structured --claude-adapter native --expect-skill-command --expect-ordered-marker` が必須。省略時は既存の argv・summary・exit code が一切変わらない。詳細は「Skill Text Counterfactual」節）
 - `--require-hook-chain-evidence`（任意。既定 off。`--runtime claude --mode structured --claude-adapter native` 限定。Issue #2663。generic hook-chain evidence capability — 詳細は下記「Generic Hook-Chain Evidence（AC2/AC3、Issue #2663）」節を参照)
 - `--task-context-scope <value>` / `--task-context-state-root <absolute path>`（任意。既定 None。Issue #2568 In Scope。structured/interactive 両 lane で、子 runtime プロセス／isolated herdr session へ `LOOP_TASK_CONTEXT_SCOPE`/`LOOP_TASK_CONTEXT_STATE_ROOT` を verbatim で additive に forward する env/carrier passthrough のみ。本 runner はこの値を一切解釈・検証しない — Task Context 固有の semantic（`task-contextctl smoke seed` の scope gate 等）は `scripts/task-context/task_contextctl.py` / `scripts/task-context/task_context_runtime_smoke_verifier.py` 側の責務であり、本 runner には一切埋め込まない。**Issue #2744 normative MUST**: Task Context 自身の runtime 検証を行う場合、caller は本 runner をこれら 2 フラグ付きで direct に unscoped 起動してはならない。generic runner を直接 unscoped で呼ばず、必ず canonical entrypoint（`scripts/task-context/task_context_runtime_smoke_verifier.py::orchestrate_runtime_smoke()`）を経由すること。`orchestrate_runtime_smoke()` は本 runner を呼び出す唯一の canonical 呼び出し元であり、常に `--task-context-scope runtime_smoke` と run-scoped isolated `--task-context-state-root` の両方を自動で付与する。これは、Task Context の acceptance/runtime-verification 手順が本 canonical entrypoint を経由せず generic runner を直接 unscoped で起動した結果、production canonical Task Context DB へ余分な行が書き込まれた実際の事故（Issue #2569、#2570 AC8 検証時に発見）の再発を防ぐための誤用防止規定である。**PR #2745 OWNER レビュー F4**: `orchestrate_runtime_smoke()` の `canonical_task_id`/`canonical_activity_id` は必須引数であり、caller は自身が既に保持している既存の current Task/Activity（例: 呼び出し元セッション自身の `query current` projection から得られる id）をそのまま渡すこと。人間に UUID を手入力させる設計にしない。synthetic な Task を canonical 側へ新規作成・import して帳尻を合わせる実装は行わない）
 - `--inspect-session-log-metadata` / `--require-session-log-metadata`（任意。既定では session log を読まない）
@@ -777,6 +781,66 @@ evidence は、対象変更を commit した HEAD に対してのみ成立する
 3 点を確認する。`before == after` の fingerprint 一致だけを「開始時点で HEAD
 と一致していた」の意味として扱わない。
 
+## Skill Text Counterfactual（SKILL.md の手順文が挙動を駆動したかを確かめる対照実行、opt-in、Issue #2981）
+
+`--expect-ordered-marker` の PASS だけでは、候補 SKILL.md の手順文が挙動を駆動したことは示せない（SKILL.md を変更前へ
+戻しても、同一 worktree の production script をモデルが探索して marker に到達すると PASS する。#2971 / PR #2976 の観測）。
+`skill_text_counterfactual` mode は、対象 SKILL.md **1 ファイルの blob だけ**を treatment とする対照実行で discrimination を示す。
+
+```bash
+uv run --locked python3 scripts/agent-ops/run_worktree_agent_runtime_smoke.py \
+  --runtime claude --mode structured --claude-adapter native \
+  --worktree "$WORKTREE" --prompt-file <prompt file> --output-dir artifacts/runtime-smoke/cf \
+  --expect-skill-command <skill 名> --expect-ordered-marker <marker1> --expect-ordered-marker <marker2> \
+  --skill-text-counterfactual-base-ref origin/main \
+  --skill-text-counterfactual-skill .claude/skills/<skill 名>/SKILL.md
+```
+
+### 実行契約（Safety Boundary の例外を含む）
+
+- `--worktree` は clean で commit 済みであること。runner は candidate HEAD の commit SHA を capture し、BASE ref を
+  `git rev-parse --verify --end-of-options <ref>^{commit}` で**一度だけ** immutable な commit SHA へ resolve する（以降は再解決しない）。
+- 候補 arm と BASE arm は、その SHA を `--detach` で checkout した runner 所有の ephemeral linked worktree
+  （`.claude/worktrees/skill-text-cf-<arm>-<高エントロピー>`、`verify_worktree_identity()` を満たす）で実行する。plain filesystem copy は使わない。
+  BASE arm は runner 所有の clean な ephemeral Git state として、対象 SKILL.md の blob だけを BASE 版へ差し替えた commit を checkout する。
+  summary には両 arm の tree 差分が対象 SKILL.md のみであることを記録する。元の `--worktree` の HEAD と `git status --porcelain` は不変でなければならない。
+- treatment は単一の `.claude/skills/<name>/SKILL.md` に限る。絶対 path・`..`・複数 path・reference file・script・symlink・
+  通常 file 以外・想定外 mode・candidate または BASE に存在しない path・両者で blob が同一の path は fail-closed で拒否する。
+- 両 arm は同一 prompt（`prompt_sha256` 一致）・同一 `--expect-skill-command`・同一 `--expect-ordered-marker`・同一の観測 flag
+  （`--require-clean-postcondition` は mode が両 arm に強制する）・同一 runtime executable／settings で実行する。
+- ephemeral worktree の回収は、runner が生成して記録した exact path だけを成功・失敗・例外の全経路で試みる。foreign worktree・
+  glob・global GC には触れない。回収失敗は summary に caller root 相対 path で記録し、判定が `discriminative` でも全体を非 PASS（exit 1）にする。
+- summary と evidence は ephemeral worktree の外（`--output-dir`）に保存する。
+
+### 判定の所有（verdict ownership）
+
+この mode が所有するのは、既存 summary field と `evaluate_ordered_evidence_match()` の literal 結果に対する **closed classification と exit mapping だけ**
+である。SKILL.md の意味解釈・LLM による判定・新しい registry／ledger は持たず、semantic verdict（手順文が妥当か等）は引き続き caller が所有する。
+
+### 判定表
+
+| 判定 | 条件 | exit code |
+|---|---|---|
+| `discriminative` | 候補 PASS、BASE control valid、BASE は ordered assertion のみ不成立 | 0 |
+| `non_discriminative` | 候補 PASS、BASE control valid、BASE も ordered assertion 成立 | 1 |
+| `control_invalid` | 候補 PASS だが BASE が timeout・terminal event 欠落・Skill invocation 未観測・permission／runtime error・postcondition failure・SKIP・evidence 欠落などで valid control でない | 1 |
+| 候補 FAIL | 候補 arm が PASS でない。BASE arm は実行しない（候補 SKIP は exit 77 で PASS へ昇格しない） | 1（SKIP は 77） |
+
+preflight 失敗（`preflight_failed`）・candidate worktree の変化（`isolation_violation`）・cleanup 失敗（`cleanup_failed`）は fail-closed で exit 1 である。
+
+BASE control valid の条件（閉じた positive predicate）: process が timeout せず正常終了し、terminal event を観測し、`--expect-skill-command` の
+Skill invocation を観測し、permission denial と runtime／capability failure が無く、clean postcondition が成立し、evidence JSON が存在して
+その arm の head・prompt hash に束縛され、`ordered_evidence_match.verified == false` かつ失敗が ordered assertion のみに起因すること。
+field 欠落・timeout・turn limit・permission denial・evidence 欠落・SKIP はすべて `control_invalid` である。
+
+### 限界
+
+- 対象 SKILL.md 以外の repo 内 production script は BASE に戻らない。それで marker に到達できる場合は `non_discriminative` になり得る。
+  treatment を複数 path へ広げた結果は `skill_text_counterfactual` の根拠にしない。
+- "deterministic" が指すのは入力同一性・closed classification・exit mapping だけである。各 arm は LLM の 1 sample であり、1 sample の BASE failure は
+  統計的・因果的証明ではない。N 回実行の harness は提供しない。この限界は summary の `evidence_limitations` にも記録される。
+- fixture skill による live 証跡は対照実行の分類が成立することの検証であり、`worktree-agent-runtime-smoke/SKILL.md` 自身の手順文が挙動を駆動したことの因果的証明ではない。
+
 ## 手順
 
 1. **worktree identity を確認する**（root checkout・別 repository・cwd mismatch を実行前に拒否する。runner が自動で検証する）
@@ -807,6 +871,8 @@ evidence は、対象変更を commit した HEAD に対してのみ成立する
   その session だけを stop／delete し、両 command の成功と launcher process termination を
   確認できない場合は exit 1 とする（`--keep-pane` 相当の opt-out は存在しない）
 - SIGINT／SIGTERM を含む全ての終了経路で isolated session cleanup を実行する
+- opt-in の `skill_text_counterfactual` mode だけは、runner 自身が ephemeral な対照 arm 用 linked worktree を `.claude/worktrees/skill-text-cf-*` に作成し、
+  記録した exact path のみを回収する（上記「Non-trigger」の worktree 作成／削除禁止に対する唯一の例外。foreign worktree・global GC・lock／registry は持たない）
 - 新しい schema、digest、receipt、publisher、state store、semantic verdict classifier を追加しない（Issue #2046 で `main_agent_identity` / `agent_definition` / `skill_evidence` / `mutation_boundary` / `settings_provenance` の 5 フィールドが Issue 契約に基づき追加済み — この制約は Issue 契約に基づかない追加の schema/digest/receipt 拡張を禁じるものであり、既存の Issue 契約で明示的に要求された追加を遡って禁止するものではない。Issue #2840 の `--named-subagent-resume` scenario 専用の public-safe evidence JSON も、同 Issue 契約（AC2〜AC4・AC8・AC9）が明示的に要求した追加であり、scenario flag が無い既定 smoke の出力には現れない）
 
 ## Reference Map（参照資料の一覧）
