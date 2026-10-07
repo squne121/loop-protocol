@@ -259,7 +259,13 @@ def test_reviewer_contract_requires_producer_parser_evaluator_caller_trace_and_u
         section,
         ["producer / parser", "関数 signature", "decision-critical caller", "call-site"],
     )
-    # (3) finding の evidence_refs
+    # (3) finding の evidence_refs（file は basename ではなく repository 相対 path。4 役すべてを列挙）
+    for needle in (
+        "basename だけにせず、repository root からの repository 相対 path",
+        "`<repo 相対 path>:<function>`",
+        "producer / parser / evaluator / consumer の 4 役すべてを、観測した repository 相対 path のまま列挙する",
+    ):
+        assert needle in section, f"{doc_name}: evidence_refs path-form contract lacks {needle!r}"
     for needle in (
         "high 以上の各 finding の `evidence_refs`",
         "repository HEAD",

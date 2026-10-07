@@ -110,6 +110,9 @@ matcher に新しい検証責務を置く設計）がある場合に限り、`se
 - **finding の evidence_refs**: finding を返す場合、high 以上の各 finding の `evidence_refs` に、検証した
   repository HEAD（`git -C <root> rev-parse HEAD` の値）と、確認した file / function / call-site を残す。
   この HEAD は advisory な audit trail であり、transport / `freshness_valid` は検証も bind もしない。
+  evidence_refs の file は basename だけにせず、repository root からの repository 相対 path
+  （例 `<repo 相対 path>:<function>`）で書く。producer / parser / evaluator / consumer の 4 役すべてを、
+  観測した repository 相対 path のまま列挙する。
 - **観測不能は clear にしない**: 必要な source を観測できなかった場合（root / HEAD の解決失敗を含む）は
   `assessment: clear` にせず、high 以上の finding にする。その `evidence_refs` に観測できなかった
   path と理由を残す。
