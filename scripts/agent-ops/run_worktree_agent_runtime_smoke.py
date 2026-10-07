@@ -242,8 +242,89 @@ def _install_signal_handlers() -> None:
     signal.signal(signal.SIGTERM, _handler)
 
 
+# Issue #2981 (F2): bounded waits used when ``_run`` is interrupted (SIGTERM / SIGINT) while a
+# child is running.  The child process group first receives SIGTERM (a nested arm runner uses
+# that window to stop its OWN runtime group through this same path), then SIGKILL.
+_INTERRUPT_TERM_GRACE_SECONDS = 5.0
+_INTERRUPT_POLL_INTERVAL_SECONDS = 0.05
+_REAP_WAIT_SECONDS = 1.0
+
+
+def _process_group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _kill_group_reap_and_close(proc: subprocess.Popen[str]) -> None:
+    """SIGKILL our own process group, reap the direct child and close the pipes.
+
+    Never calls ``communicate()``: a descendant that escaped the process group may retain the
+    pipe FDs, which would make ``communicate`` wait indefinitely for EOF."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        proc.wait(timeout=_REAP_WAIT_SECONDS)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=_REAP_WAIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+    for stream in (proc.stdout, proc.stderr, proc.stdin):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+def _terminate_interrupted_group(proc: subprocess.Popen[str], *, term_grace: float) -> None:
+    """Stop the process group of OUR OWN ``Popen`` after a non-timeout interruption.
+
+    SIGTERM -> bounded wait for the group to disappear -> SIGKILL only if it remains -> reap
+    and close the pipes.  Runs before the interrupting exception is re-raised so any caller
+    ``finally`` (e.g. worktree cleanup) only runs after the child has stopped."""
+    pgid = proc.pid
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    deadline = time.monotonic() + term_grace
+    gone = False
+    while True:
+        proc.poll()  # reaps the direct child so it does not keep the group "alive" as a zombie
+        if not _process_group_alive(pgid):
+            gone = True
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(_INTERRUPT_POLL_INTERVAL_SECONDS)
+    if gone:
+        # Group fully gone (pgid is not signalled again: it could be reused).  Still reap + close.
+        try:
+            proc.wait(timeout=_REAP_WAIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        for stream in (proc.stdout, proc.stderr, proc.stdin):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        return
+    _kill_group_reap_and_close(proc)
+
+
 def _run(argv: list[str], *, cwd: str | None = None, timeout: float,
-          input_text: str | None = None, env: dict[str, str] | None = None) -> tuple[int | None, str, str, bool]:
+          input_text: str | None = None, env: dict[str, str] | None = None,
+          term_grace: float = _INTERRUPT_TERM_GRACE_SECONDS) -> tuple[int | None, str, str, bool]:
     """Run argv with shell=False. Returns (returncode, stdout, stderr, timed_out)."""
     proc: subprocess.Popen[str] | None = None
     try:
@@ -267,28 +348,14 @@ def _run(argv: list[str], *, cwd: str | None = None, timeout: float,
         return proc.returncode, stdout, stderr, False
     except subprocess.TimeoutExpired as exc:
         if proc is not None:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
             # Do not call ``communicate()`` after a timeout. A descendant
             # that escaped the process group can retain the pipe FDs, making
             # communicate wait indefinitely for EOF even though the direct
             # runtime process was killed. The partial bytes already supplied
             # by TimeoutExpired are sufficient for a SKIP receipt.
-            try:
-                proc.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-            if proc.stdout is not None:
-                proc.stdout.close()
-            if proc.stderr is not None:
-                proc.stderr.close()
-            stdout = exc.stdout or ""
-            stderr = exc.stderr or ""
-        else:
-            stdout = exc.stdout or ""
-            stderr = exc.stderr or ""
+            _kill_group_reap_and_close(proc)
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
         if isinstance(stdout, bytes):
             stdout = stdout.decode("utf-8", "replace")
         if isinstance(stderr, bytes):
@@ -296,6 +363,13 @@ def _run(argv: list[str], *, cwd: str | None = None, timeout: float,
         return None, stdout, stderr, True
     except OSError as exc:
         return None, "", str(exc), False
+    except BaseException:
+        # SIGTERM (``_TerminateRequested``) / SIGINT (``KeyboardInterrupt``) while ``communicate()``
+        # is waiting: Python does NOT stop the child on its own.  Stop our own child group before
+        # the original exception propagates (Issue #2981 F2).
+        if proc is not None:
+            _terminate_interrupted_group(proc, term_grace=term_grace)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +483,25 @@ def prepare_output_dir(output_dir: Path) -> str | None:
         return f"output directory must not be a symlink: {_redact(str(output_dir))}"
     if output_dir.exists():
         return f"output directory already exists (exclusive create required): {_redact(str(output_dir))}"
+    return None
+
+
+def claim_counterfactual_output_dir(output_dir: Path) -> str | None:
+    """Atomically take ownership of ``output_dir`` for a ``skill_text_counterfactual`` run.
+
+    ``prepare_output_dir`` is a check-then-act pair; two runs sharing one ``--output-dir`` could
+    both pass it and then share the fixed ``arms/*.evidence.json`` names.  ``os.mkdir`` is the
+    single atomic exclusive create: exactly one run succeeds, every other run (existing
+    directory, existing file, symlink -- even a dangling one -- or a concurrent winner) gets
+    ``FileExistsError`` and must stop before touching any evidence, worktree or runtime.
+    Returns an error message when the directory could not be claimed (nothing is removed)."""
+    try:
+        output_dir.parent.mkdir(parents=True, exist_ok=True)
+        os.mkdir(output_dir)
+    except FileExistsError:
+        return f"output directory already exists (exclusive create required): {_redact(str(output_dir))}"
+    except OSError as exc:
+        return f"could not exclusively create output directory {_redact(str(output_dir))}: {_redact(str(exc))}"
     return None
 
 
@@ -8361,6 +8454,9 @@ _CF_COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
 _CF_ORDERED_FAILURE_ERROR_PREFIX = "ordered evidence match failed"
 _CF_POSITIVE_CAPABILITY_DECISION = "runtime_outcome"
 _CF_ARM_TIMEOUT_MARGIN_SECONDS = 120.0
+# arm runner は中断時に自身の runtime group を ``_INTERRUPT_TERM_GRACE_SECONDS`` + reap まで待つ。
+# 親はそれより長く待ってから SIGKILL する (孫の runtime を残さないため)。
+_CF_ARM_INTERRUPT_GRACE_SECONDS = _INTERRUPT_TERM_GRACE_SECONDS + 2 * _REAP_WAIT_SECONDS + 5.0
 # 決定論的な BASE arm commit のための固定 identity (runner-owned の ephemeral state であり、
 # どの ref にも到達しない)。
 _CF_BASE_ARM_GIT_ENV = {
@@ -8578,7 +8674,8 @@ def execute_counterfactual_arm(
     """Default arm executor: this same runner as a child process (injectable in tests)."""
     del arm_name
     rc, _out, err, timed_out = _run(
-        [sys.executable, str(Path(__file__).resolve()), *arm_argv], timeout=timeout_seconds
+        [sys.executable, str(Path(__file__).resolve()), *arm_argv], timeout=timeout_seconds,
+        term_grace=_CF_ARM_INTERRUPT_GRACE_SECONDS,
     )
     return {
         "returncode": rc,
@@ -8829,11 +8926,13 @@ def run_skill_text_counterfactual(
                 reasons.append(f"detail: {_redact(exc.message)[:200]}")
         except _TerminateRequested as exc:
             verdict, reasons = CF_VERDICT_RUNNER_ERROR, [f"runner terminated: {exc}"]
+        except KeyboardInterrupt:
+            # SIGINT: ``_run`` has already stopped the arm process group before re-raising.
+            verdict, reasons = CF_VERDICT_RUNNER_ERROR, ["runner terminated: interrupted (SIGINT)"]
         except Exception as exc:  # noqa: BLE001 - fail closed, still clean up
             verdict, reasons = CF_VERDICT_RUNNER_ERROR, [f"unexpected_error:{type(exc).__name__}"]
     finally:
         cf["cleanup"] = _cf_cleanup_worktrees(repo_root, created)
-    cf["classification"] = verdict
     exit_code = CF_VERDICT_EXIT_CODES[verdict]
     if cf["cleanup"]["failures"]:
         reasons = reasons + [
@@ -8842,6 +8941,9 @@ def run_skill_text_counterfactual(
         exit_code = EXIT_FAIL
         if verdict == CF_VERDICT_DISCRIMINATIVE:
             verdict = CF_VERDICT_CLEANUP_FAILED
+    # classification / verdict / exit_code / errors / reasons all describe the SAME final verdict
+    # (assigned only after the cleanup outcome has been folded in).
+    cf["classification"] = verdict
     cf["reasons"] = reasons
     return {
         "schema": CF_RESULT_SCHEMA,
@@ -8904,7 +9006,9 @@ def _cf_run_arms(
         raise CounterfactualPreflightError("arm_trees_differ_beyond_target_skill_md")
 
     arms_dir = output_dir / "arms"
-    arms_dir.mkdir(parents=True, exist_ok=True)
+    # ``output_dir`` was exclusively claimed by this run; a pre-existing ``arms`` would be
+    # another run's evidence, so it is never reused (FileExistsError -> runner_error).
+    arms_dir.mkdir(parents=True, exist_ok=False)
     expected = {
         "prompt_sha256": prompt_sha256,
         "ordered_markers": list(expected_ordered_markers),
@@ -9797,6 +9901,12 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_FAIL
 
     if counterfactual_requested:
+        # Issue #2981 F1: the check above is only a fast path.  Ownership of the output dir is
+        # established here atomically, BEFORE any arm worktree / runtime / evidence access.
+        claim_error = claim_counterfactual_output_dir(output_dir)
+        if claim_error:
+            print(f"[FAIL] {claim_error}", file=sys.stderr)
+            return EXIT_FAIL
         return _main_skill_text_counterfactual(
             parser, args, run_id=run_id, repo_root=repo_root, worktree=worktree, prompt=prompt,
             output_dir=output_dir, output_dir_rel=output_dir_rel,

@@ -811,6 +811,10 @@ uv run --locked python3 scripts/agent-ops/run_worktree_agent_runtime_smoke.py \
 - ephemeral worktree の回収は、runner が生成して記録した exact path だけを成功・失敗・例外の全経路で試みる。foreign worktree・
   glob・global GC には触れない。回収失敗は summary に caller root 相対 path で記録し、判定が `discriminative` でも全体を非 PASS（exit 1）にする。
 - summary と evidence は ephemeral worktree の外（`--output-dir`）に保存する。
+- この mode は arm 実行前に `--output-dir` を atomic な exclusive create（`os.mkdir`）で取得する。同じ `--output-dir` を共有する並列実行の
+  負けた側は evidence の読み書き・worktree 作成・runtime 起動を行わず exit 1 で終了し、既存 dir や他 run の evidence を cleanup しない。
+- SIGTERM／SIGINT で中断された場合は、arm の process group を停止（SIGTERM、残れば SIGKILL）してから ephemeral worktree を回収し、
+  `runner_error`（非 PASS）で summary を残す。
 
 ### 判定の所有（verdict ownership）
 

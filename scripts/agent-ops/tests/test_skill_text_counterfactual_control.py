@@ -24,6 +24,9 @@ import signal
 import stat
 import subprocess
 import sys
+import textwrap
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -618,6 +621,113 @@ def test_fail_closed_control_worktree_construction_failure(cf_repo, monkeypatch)
     _assert_fail_closed(returncode, summary, executor, "control_worktree_create_failed")
 
 
+def test_fail_closed_concurrent_runs_sharing_one_output_dir_let_exactly_one_run_proceed(
+    cf_repo, monkeypatch, capsys
+):
+    """TOCTOU: both runs pass the ``prepare_output_dir`` check before either creates the dir."""
+    monkeypatch.setattr(smoke, "_install_signal_handlers", lambda: None)  # main thread only
+    # The runner's lazy sibling-module loader is not thread-safe (production concurrency is
+    # cross-process); warm it so the two in-process threads exercise only the output-dir race.
+    smoke._load_approval_contract()
+    barrier = threading.Barrier(2)
+    original_prepare = smoke.prepare_output_dir
+    checked: list[str] = []
+
+    def synced_prepare(output_dir):
+        result = original_prepare(output_dir)
+        assert result is None, "both runs must pass the check-only fast path"
+        checked.append(threading.current_thread().name)
+        barrier.wait(timeout=30)  # both passed the check; now race for the actual create
+        return result
+
+    monkeypatch.setattr(smoke, "prepare_output_dir", synced_prepare)
+    owners: list[str] = []
+
+    def arm_with_run_token(call):
+        token = f"tok-{threading.current_thread().name}"
+        owners.append(token)
+        return {"returncode": 0, "evidence": make_evidence(call, ordered_verified=True, runtime_version=token)}
+
+    def base_with_run_token(call):
+        token = f"tok-{threading.current_thread().name}"
+        owners.append(token)
+        return {
+            "returncode": 1,
+            "evidence": make_evidence(call, ordered_verified=False, runtime_version=token),
+        }
+
+    executor = Executor({"candidate": arm_with_run_token, "base": base_with_run_token})
+    monkeypatch.setattr(smoke, "execute_counterfactual_arm", executor)
+    results: dict[str, object] = {}
+
+    def run(name: str) -> None:
+        try:
+            results[name] = smoke.main(cf_repo.argv())
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the assertions below
+            results[name] = exc
+
+    threads = [threading.Thread(target=run, args=(name,), name=name) for name in ("runA", "runB")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=120)
+    assert not any(thread.is_alive() for thread in threads), "a run hung"
+    assert sorted(checked) == ["runA", "runB"], ("both runs passed the check before racing", results)
+    assert set(results) == {"runA", "runB"}
+    assert not any(isinstance(v, BaseException) for v in results.values()), results
+    winners = [name for name, rc in results.items() if rc == 0]
+    losers = [name for name, rc in results.items() if rc == smoke.EXIT_FAIL]
+    assert len(winners) == 1 and len(losers) == 1, results
+    winner, loser = winners[0], losers[0]
+    # only the winner reached arm execution (one run's worth of arms), the loser never did
+    assert [c["arm"] for c in executor.calls] == ["candidate", "base"]
+    assert set(owners) == {f"tok-{winner}"} and f"tok-{loser}" not in owners
+    err = capsys.readouterr().err
+    assert "output directory already exists" in err
+    # the winner's evidence/summary is composed of its own run only
+    summary = json.loads(cf_repo.evidence.read_text(encoding="utf-8"))
+    cf = summary["skill_text_counterfactual"]
+    assert summary["verdict"] == cf["classification"] == "discriminative"
+    for arm in ("candidate", "base"):
+        assert cf["arms"][arm]["runtime_version"] == f"tok-{winner}"
+    assert f"tok-{loser}" not in cf_repo.evidence.read_text(encoding="utf-8")
+    assert f"tok-{loser}" not in (cf_repo.out_dir / "summary.md").read_text(encoding="utf-8")
+    assert cf_repo.arm_worktrees() == []
+
+
+def test_fail_closed_claim_refuses_existing_dir_file_and_symlink_without_touching_them(tmp_path):
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    (existing / "keep.txt").write_text("keep", encoding="utf-8")
+    file_target = tmp_path / "file"
+    file_target.write_text("keep", encoding="utf-8")
+    dangling = tmp_path / "dangling"
+    dangling.symlink_to(tmp_path / "does-not-exist")
+    to_dir = tmp_path / "to-dir"
+    to_dir.symlink_to(existing)
+    for target in (existing, file_target, dangling, to_dir):
+        error = smoke.claim_counterfactual_output_dir(target)
+        assert error and "already exists" in error, target
+    assert (existing / "keep.txt").read_text(encoding="utf-8") == "keep"
+    assert file_target.read_text(encoding="utf-8") == "keep"
+    assert dangling.is_symlink() and not dangling.exists()
+    assert to_dir.is_symlink()
+    fresh = tmp_path / "nested" / "fresh"
+    assert smoke.claim_counterfactual_output_dir(fresh) is None and fresh.is_dir()
+    assert smoke.claim_counterfactual_output_dir(fresh) is not None
+
+
+def test_fail_closed_preexisting_output_dir_stops_before_any_arm_or_evidence_access(cf_repo, monkeypatch):
+    cf_repo.out_dir.mkdir()
+    (cf_repo.out_dir / "arms").mkdir()
+    stale = cf_repo.out_dir / "arms" / "base.evidence.json"
+    stale.write_text("{}", encoding="utf-8")
+    returncode, summary, _cf, executor = run_cf(cf_repo, monkeypatch, DISCRIMINATIVE_PLAN)
+    assert returncode == smoke.EXIT_FAIL and summary is None
+    assert executor.calls == [] and cf_repo.arm_worktrees() == []
+    assert stale.read_text(encoding="utf-8") == "{}"
+
+
 def test_fail_closed_base_arm_execution_failure_is_not_pass(cf_repo, monkeypatch):
     returncode, summary, _cf, _executor = run_cf(
         cf_repo, monkeypatch, {"candidate": arm_pass, "base": OSError("cannot spawn")}
@@ -893,7 +1003,7 @@ def test_cleanup_failure_is_recorded_with_relative_paths_and_blocks_a_passing_ve
     returncode, summary, cf, _executor = run_cf(cf_repo, monkeypatch, DISCRIMINATIVE_PLAN)
     assert returncode != 0
     assert summary["verdict"] == "cleanup_failed"
-    assert cf["classification"] == "discriminative"
+    assert cf["classification"] == "cleanup_failed"
     failures = cf["cleanup"]["failures"]
     assert len(failures) == 2
     for failure in failures:
@@ -912,6 +1022,59 @@ def test_cleanup_failure_is_recorded_with_relative_paths_and_blocks_a_passing_ve
         git(cf_repo.root, "worktree", "remove", "--force", str(cf_repo.worktrees_dir / name))
 
 
+def test_cleanup_failure_after_passing_arms_makes_verdict_classification_exit_and_errors_agree(
+    cf_repo, monkeypatch
+):
+    original_git = smoke._cf_git
+
+    def refuse_remove(repo, *git_args, **kwargs):
+        if git_args[:2] == ("worktree", "remove"):
+            return 1, "", "simulated remove failure"
+        return original_git(repo, *git_args, **kwargs)
+
+    monkeypatch.setattr(smoke, "_cf_git", refuse_remove)
+    returncode, summary, cf, executor = run_cf(cf_repo, monkeypatch, DISCRIMINATIVE_PLAN)
+    # both arms really produced a passing/ordered-failing discriminative observation ...
+    assert [c["arm"] for c in executor.calls] == ["candidate", "base"]
+    assert cf["ordered_evidence_match"]["candidate"]["verified"] is True
+    assert cf["ordered_evidence_match"]["base"]["verified"] is False
+    # ... yet every final-decision field reports the SAME non-pass verdict (no contradiction)
+    assert summary["verdict"] == cf["classification"] == "cleanup_failed"
+    assert returncode == summary["exit_code"] == 1
+    cleanup_reasons = [r for r in cf["reasons"] if r.startswith("cleanup_failed:")]
+    assert len(cleanup_reasons) == 2 == len(cf["cleanup"]["failures"])
+    for failure in cf["cleanup"]["failures"]:
+        assert any(failure["path"] in reason for reason in cleanup_reasons)
+    assert len(summary["errors"]) == 1
+    assert summary["errors"][0].startswith("cleanup_failed: ")
+    assert all(failure["path"] in summary["errors"][0] for failure in cf["cleanup"]["failures"])
+    persisted = json.loads(cf_repo.evidence.read_text(encoding="utf-8"))
+    assert persisted["verdict"] == persisted["skill_text_counterfactual"]["classification"] == "cleanup_failed"
+    monkeypatch.undo()
+    for name in cf_repo.arm_worktrees():
+        git(cf_repo.root, "worktree", "remove", "--force", str(cf_repo.worktrees_dir / name))
+
+
+def test_cleanup_failure_keeps_the_other_verdicts_unchanged_and_exit_non_zero(cf_repo, monkeypatch):
+    original_git = smoke._cf_git
+
+    def refuse_remove(repo, *git_args, **kwargs):
+        if git_args[:2] == ("worktree", "remove"):
+            return 1, "", "simulated remove failure"
+        return original_git(repo, *git_args, **kwargs)
+
+    monkeypatch.setattr(smoke, "_cf_git", refuse_remove)
+    returncode, summary, cf, _executor = run_cf(
+        cf_repo, monkeypatch, {"candidate": arm_pass, "base": arm_pass}
+    )
+    assert returncode == 1
+    assert summary["verdict"] == cf["classification"] == "non_discriminative"
+    assert any(r.startswith("cleanup_failed:") for r in cf["reasons"])
+    monkeypatch.undo()
+    for name in cf_repo.arm_worktrees():
+        git(cf_repo.root, "worktree", "remove", "--force", str(cf_repo.worktrees_dir / name))
+
+
 def test_cleanup_refuses_paths_that_the_runner_does_not_own(cf_repo):
     foreign = _make_foreign_worktrees(cf_repo)
     created = [
@@ -924,6 +1087,277 @@ def test_cleanup_refuses_paths_that_the_runner_does_not_own(cf_repo):
     assert [f["reason"] for f in outcome["failures"]] == ["refused_non_owned_path"] * 3
     _assert_foreign_untouched(foreign, cf_repo)
     assert cf_repo.root.is_dir() and (cf_repo.candidate / SKILL_PATH).exists()
+
+
+# ---------------------------------------------------------------------------
+# AC7 (cleanup, F2): an interrupted run stops its children BEFORE worktree cleanup
+# ---------------------------------------------------------------------------
+
+
+def _pid_gone(pid: int, *, strict: bool = False) -> bool:
+    """True when ``pid`` no longer runs.  A zombie still answers ``kill(pid, 0)`` (it is only
+    waiting for its parent / init to reap it), so non-strict mode accepts state ``Z``."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    if strict:
+        return False
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return False
+    return state == "Z"
+
+
+def _wait_until(predicate, *, timeout: float = 30.0, interval: float = 0.05) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
+def _read_pid(path: Path) -> int | None:
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _kill_leftover_pids(piddir: Path) -> None:
+    """Test-owned safety net: never leave a sleeping fake process behind if an assertion fails."""
+    for name in ("child", "same_group", "other_session"):
+        pid = _read_pid(piddir / f"{name}.pid")
+        if pid:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+FAKE_TREE_CHILD = textwrap.dedent(
+    r"""
+    import os, signal, subprocess, sys, time
+    piddir = sys.argv[1]
+    cooperative = sys.argv[2] == "cooperative"
+    sleeper = "import os,sys,time; open(sys.argv[1],'w').write(str(os.getpid())); time.sleep(600)"
+    same_group = subprocess.Popen([sys.executable, "-c", sleeper, os.path.join(piddir, "same_group.pid")])
+    other_session = subprocess.Popen(
+        [sys.executable, "-c", sleeper, os.path.join(piddir, "other_session.pid")],
+        start_new_session=True,
+    )
+    if cooperative:
+        # models the arm runner: on SIGTERM it stops the runtime it started in another session
+        def on_term(signum, frame):
+            other_session.kill()
+            os._exit(0)
+        signal.signal(signal.SIGTERM, on_term)
+    else:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    open(os.path.join(piddir, "child.pid"), "w").write(str(os.getpid()))
+    time.sleep(600)
+    """
+)
+
+
+@pytest.mark.parametrize(
+    "sig,exception,behavior",
+    [
+        (signal.SIGTERM, smoke._TerminateRequested, "cooperative"),
+        (signal.SIGINT, KeyboardInterrupt, "cooperative"),
+        (signal.SIGTERM, smoke._TerminateRequested, "ignores_sigterm"),
+        (signal.SIGINT, KeyboardInterrupt, "ignores_sigterm"),
+    ],
+    ids=["sigterm_cooperative", "sigint_cooperative", "sigterm_stubborn", "sigint_stubborn"],
+)
+def test_cleanup_interrupted_run_stops_the_child_group_and_its_descendants_then_reraises(
+    tmp_path, sig, exception, behavior
+):
+    smoke._install_signal_handlers()
+    piddir = tmp_path / "pids"
+    piddir.mkdir()
+    names = ("child", "same_group", "other_session")
+
+    def send_when_running():
+        if _wait_until(lambda: all(_read_pid(piddir / f"{n}.pid") for n in names), timeout=30):
+            os.kill(os.getpid(), sig)
+
+    sender = threading.Thread(target=send_when_running, daemon=True)
+    sender.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(exception):
+            smoke._run(
+                [sys.executable, "-c", FAKE_TREE_CHILD, str(piddir), behavior],
+                timeout=120.0, term_grace=1.0,
+            )
+    finally:
+        sender.join(timeout=5)
+        pids = {n: _read_pid(piddir / f"{n}.pid") for n in names}
+    try:
+        assert all(pids.values()), pids
+        assert time.monotonic() - started < 60
+        # the direct child was reaped (strict), its group descendants are gone
+        assert _pid_gone(pids["child"], strict=True), "the direct child must be reaped"
+        assert _pid_gone(pids["same_group"])
+        if behavior == "cooperative":
+            assert _pid_gone(pids["other_session"]), "the cooperating child stopped its own session"
+    finally:
+        _kill_leftover_pids(piddir)  # also reclaims the stubborn case's escaped-session sleeper
+
+
+def test_cleanup_interrupted_run_reaps_the_direct_child_without_leaving_a_zombie(tmp_path):
+    smoke._install_signal_handlers()
+    piddir = tmp_path / "pids"
+    piddir.mkdir()
+    names = ("child", "same_group", "other_session")
+
+    def send_when_running():
+        if _wait_until(lambda: all(_read_pid(piddir / f"{n}.pid") for n in names), timeout=30):
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    sender = threading.Thread(target=send_when_running, daemon=True)
+    sender.start()
+    try:
+        with pytest.raises(smoke._TerminateRequested):
+            smoke._run([sys.executable, "-c", FAKE_TREE_CHILD, str(piddir), "cooperative"], timeout=120.0)
+        sender.join(timeout=5)
+        child = _read_pid(piddir / "child.pid")
+        assert child is not None
+        assert _pid_gone(child, strict=True), "direct child must be fully reaped, not left as a zombie"
+        for name in ("same_group", "other_session"):
+            assert _wait_until(lambda n=name: _pid_gone(_read_pid(piddir / f"{n}.pid")), timeout=15), name
+    finally:
+        _kill_leftover_pids(piddir)
+
+
+def test_cleanup_timeout_path_still_kills_the_group_and_reports_timed_out(tmp_path):
+    piddir = tmp_path / "pids"
+    piddir.mkdir()
+    try:
+        rc, _out, _err, timed_out = smoke._run(
+            [sys.executable, "-c", FAKE_TREE_CHILD, str(piddir), "cooperative"], timeout=2.0
+        )
+        assert timed_out is True and rc is None
+        child = _read_pid(piddir / "child.pid")
+        assert child is not None and _pid_gone(child, strict=True)
+        same_group = _read_pid(piddir / "same_group.pid")
+        assert same_group is not None and _wait_until(lambda: _pid_gone(same_group), timeout=15)
+    finally:
+        # an escaped-session descendant is outside the timeout contract: reclaim it ourselves
+        _kill_leftover_pids(piddir)
+
+
+def test_cleanup_keyboard_interrupt_is_runner_error_never_a_passing_verdict(cf_repo, monkeypatch):
+    foreign = _make_foreign_worktrees(cf_repo)
+    returncode, summary, cf, executor = run_cf(
+        cf_repo, monkeypatch, {"candidate": KeyboardInterrupt(), "base": arm_pass}
+    )
+    assert returncode == 1
+    assert summary["verdict"] == cf["classification"] == "runner_error"
+    assert any("interrupted" in r for r in cf["reasons"])
+    assert [c["arm"] for c in executor.calls] == ["candidate"]
+    assert _own_arm_leftovers(cf_repo, foreign) == []
+    _assert_foreign_untouched(foreign, cf_repo)
+    assert cf["cleanup"]["all_removed"] is True
+    assert (cf_repo.out_dir / "summary.md").exists()
+
+
+BLOCKING_FAKE_CLAUDE = r"""#!/usr/bin/env python3
+import json, os, sys, time
+if "-p" in sys.argv:
+    sys.stdin.read()
+skill = os.path.join(os.getcwd(), ".claude", "skills", "fixture-skill", "SKILL.md")
+try:
+    text = open(skill, encoding="utf-8").read()
+except OSError:
+    text = ""
+if "-p" in sys.argv and "BLOCK-FOREVER" in text:
+    piddir = "__PIDDIR__"
+    for name, value in (("claude", os.getpid()), ("arm_runner", os.getppid())):
+        tmp = os.path.join(piddir, name + ".tmp")
+        open(tmp, "w").write(str(value))
+        os.replace(tmp, os.path.join(piddir, name + ".pid"))
+    while True:
+        time.sleep(1)
+expansion = json.dumps({"hook_event_name": "UserPromptExpansion", "command_name": "fixture-skill",
+                        "command_args": "", "prompt": "/fixture-skill"})
+for event in (
+    {"type": "system", "subtype": "init"},
+    {"type": "system", "subtype": "hook_response", "hook_event": "UserPromptExpansion",
+     "hook_name": "UserPromptExpansion", "stdout": expansion, "output": expansion},
+    {"type": "assistant", "message": {"content": [{"type": "text", "text": "nothing"}]}},
+    {"type": "result", "subtype": "success", "result": "nothing"},
+):
+    print(json.dumps(event))
+"""
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT], ids=["sigterm", "sigint"])
+def test_cleanup_interrupting_the_top_level_runner_stops_arm_runner_and_runtime_before_worktree_removal(
+    tmp_path, monkeypatch, sig
+):
+    piddir = tmp_path / "pids"
+    piddir.mkdir()
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    exe = bin_dir / "claude"
+    exe.write_text(BLOCKING_FAKE_CLAUDE.replace("__PIDDIR__", str(piddir)), encoding="utf-8")
+    exe.chmod(exe.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    repo = CfRepo(tmp_path)
+    _commit_skill_texts(repo, "BASE: nothing.\n", "CANDIDATE: BLOCK-FOREVER.\n")
+    foreign = _make_foreign_worktrees(repo)
+    candidate_head = git(repo.candidate, "rev-parse", "HEAD")
+    proc = subprocess.Popen(
+        [sys.executable, str(SCRIPT), *repo.argv()],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=str(repo.root),
+    )
+    claude_pid = arm_runner_pid = None
+    try:
+        assert _wait_until(
+            lambda: _read_pid(piddir / "claude.pid") and _read_pid(piddir / "arm_runner.pid"), timeout=90
+        ), "the blocking fake claude never started"
+        claude_pid = _read_pid(piddir / "claude.pid")
+        arm_runner_pid = _read_pid(piddir / "arm_runner.pid")
+        assert claude_pid and arm_runner_pid and not _pid_gone(claude_pid) and not _pid_gone(arm_runner_pid)
+        # the arm worktree exists while the runtime is blocked: cleanup must wait for the stop
+        assert len(_own_arm_leftovers(repo, foreign)) == 2
+        proc.send_signal(sig)
+        stdout, stderr = proc.communicate(timeout=90)
+        # judged BEFORE the safety net below can hide a leak
+        claude_stopped = _wait_until(lambda: _pid_gone(claude_pid), timeout=15)
+        arm_runner_stopped = _wait_until(lambda: _pid_gone(arm_runner_pid), timeout=15)
+        arm_worktrees_after_exit = _own_arm_leftovers(repo, foreign)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+        for pid in (claude_pid, arm_runner_pid):
+            if pid and not _pid_gone(pid):
+                os.kill(pid, signal.SIGKILL)  # test-owned safety net only
+    # (iv) non-zero exit, never a passing classification; (v) summary written
+    assert proc.returncode not in (0, None), (stdout, stderr)
+    summary = json.loads(repo.evidence.read_text(encoding="utf-8"))
+    cf = summary["skill_text_counterfactual"]
+    assert summary["verdict"] == cf["classification"] == "runner_error"
+    assert summary["exit_code"] == proc.returncode
+    assert (repo.out_dir / "summary.md").exists()
+    # (i) neither the runtime nor the arm runner survives
+    assert claude_stopped, "the fake claude runtime survived the interruption"
+    assert arm_runner_stopped, "the arm runner survived the interruption"
+    # (ii) runner-owned arm worktrees were reclaimed, (iii) foreign worktrees are untouched
+    assert arm_worktrees_after_exit == [] == _own_arm_leftovers(repo, foreign)
+    own_registered = [Path(p).name for p in repo.registered_worktrees() if Path(p).name.startswith("skill-text-cf-")]
+    assert own_registered == [foreign["lookalike_registered"].name]
+    assert cf["cleanup"]["failures"] == [] and cf["cleanup"]["all_removed"] is True
+    _assert_foreign_untouched(foreign, repo)
+    assert git(repo.candidate, "rev-parse", "HEAD") == candidate_head
+    assert git(repo.candidate, "status", "--porcelain", "--untracked-files=all") == ""
 
 
 # ---------------------------------------------------------------------------
