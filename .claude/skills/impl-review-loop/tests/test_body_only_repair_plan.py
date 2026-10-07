@@ -1,11 +1,10 @@
-"""Issue #2971: body-only repair lane の production 判断関数・契約文書・統合 regression。
+"""Issue #2971: body-only repair lane の production 判断関数・production CLI・契約文書・統合 regression。
 
-全ての test は production 関数（``body_only_repair_plan``）を直接呼ぶか、実
-``adjudicate_vc_result.py`` CLI（``step4-adjudicate --reuse-stored`` /
-``step5-terminal-gate``）を subprocess で呼ぶ。skip / xfail は使わない。
-test 名の接頭辞 ``test_ac1_`` / ``test_ac2_`` / ``test_ac3_`` / ``test_ac4_`` /
-``test_ac5_`` / ``test_ac7_`` は Issue の Verification Commands の ``-k`` 選択と
-一致させている。
+全ての test は production 関数（``body_only_repair_plan``）を直接呼ぶか、production CLI
+（``plan`` / ``record`` / ``guard`` / ``ci-freshness``）および実 ``adjudicate_vc_result.py`` CLI
+（``step4-adjudicate --reuse-stored`` / ``step5-terminal-gate``）を subprocess で呼ぶ。skip / xfail は使わない。
+test 名の接頭辞 ``test_ac1_`` ... ``test_ac7_`` / ``test_ac10_`` / ``test_ac11_`` は対応 AC を示し、
+meta test（``test_ac*_meta_*``）が接頭辞ごとに 1 件以上存在することを ``ast`` で検査する。
 """
 
 from __future__ import annotations
@@ -15,6 +14,7 @@ import copy
 import importlib.util
 import inspect
 import json
+import os
 import re
 import subprocess
 import sys
@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[4]
 SKILL_DIR = ROOT / ".claude" / "skills" / "impl-review-loop"
@@ -55,7 +56,7 @@ BODY = (
 )
 RUNTIME_BLOCKER = "PR 本文に Runtime Verification Evidence（AC8）が無い"
 STALE_BLOCKER = "PR 本文の evaluator 件数が 39 件のまま（head では 47 件）"
-PENDING_BLOCKER = "PR 本文の AC8 が 未実施 のまま"
+PENDING_BLOCKER = "PR 本文に「未実施」が残っている"
 RUNTIME_VALUE = "### AC8\n- Result: PASS（tested_head aaaaaaaa）\n- artifact: artifacts/runtime-verification.json"
 COMPLETED_STATUS = "PASS（commit 済み HEAD で実施済み）"
 
@@ -180,7 +181,6 @@ def test_ac1_closed_pattern_constants_are_fixed() -> None:
     assert mod.EVIDENCE_KINDS == ("runtime_evidence", "test_count", "completed_status")
     assert mod.EVIDENCE_REF_KEYS == ("kind", "value", "source", "head_sha")
     assert mod.PENDING_WORDS == ("未実施", "実施する予定", "pending")
-    assert mod.MISSING_WORDS == ("無い", "欠落", "missing", "未記載")
     assert mod.DENY_WORDS == (
         "Allowed Paths",
         "Issue 本文",
@@ -192,17 +192,60 @@ def test_ac1_closed_pattern_constants_are_fixed() -> None:
         "実装修正",
     )
     assert mod.RUNTIME_EVIDENCE_HEADING == "## Runtime Verification Evidence"
+    assert set(mod.GRAMMAR_SOURCES) == set(mod.BLOCKER_KINDS) == set(mod.BLOCKER_GRAMMARS)
+    for kind, source in mod.GRAMMAR_SOURCES.items():
+        assert mod.BLOCKER_GRAMMARS[kind].pattern == source
+        assert ".*" not in source and ".+" not in source, f"{kind} grammar must not contain an open wildcard"
 
 
-def test_ac1_module_is_pure_no_io_network_time_or_subprocess_imports() -> None:
-    tree = ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
-    imported: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported.update(alias.name.split(".")[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            imported.add(node.module.split(".")[0])
-    assert imported <= {"__future__", "argparse", "hashlib", "json", "re", "sys", "typing"}, imported
+def test_ac1_module_pure_layer_has_no_io_network_time_or_environment_access() -> None:
+    """pure 層（``# --- CLI layer`` より前の全 def）は I/O・時刻・乱数・環境変数を参照しない。"""
+    source = MODULE_PATH.read_text(encoding="utf-8")
+    sentinel_line = next(
+        number for number, line in enumerate(source.splitlines(), start=1) if line.startswith("# --- CLI layer")
+    )
+    tree = ast.parse(source)
+    forbidden = {
+        "open",
+        "print",
+        "input",
+        "subprocess",
+        "os",
+        "sys",
+        "tempfile",
+        "Path",
+        "shutil",
+        "time",
+        "random",
+        "yaml",
+        "importlib",
+        "environ",
+        "getenv",
+        "urllib",
+        "socket",
+    }
+    pure_defs = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.lineno < sentinel_line]
+    assert {node.name for node in pure_defs} >= {
+        "decide_body_only_repair",
+        "check_body_freshness",
+        "verify_body_readback",
+        "canonicalize_body",
+        "body_sha256",
+        "apply_record",
+        "evaluate_ci_freshness",
+        "bind_test_count_row",
+        "build_evidence_refs",
+        "guard_decision",
+    }
+    for node in pure_defs:
+        used = {
+            child.id if isinstance(child, ast.Name) else child.attr
+            for child in ast.walk(node)
+            if isinstance(child, (ast.Name, ast.Attribute))
+        }
+        assert not (used & forbidden), f"{node.name} touches {sorted(used & forbidden)}"
+    # datetime は parse_timestamp / evaluate 内の値型としてだけ使い、now() 等の時刻取得は持たない。
+    assert "now(" not in source and "utcnow(" not in source and "time.time(" not in source
 
 
 def test_ac1_decision_is_deterministic_and_does_not_mutate_inputs() -> None:
@@ -253,22 +296,32 @@ def test_ac2_deny_list_takes_precedence_over_kind_detection() -> None:
     assert "blocker_ambiguous_kind" not in result["reason_codes"]
 
 
-def test_ac2_bare_code_and_test_words_are_not_deny_tokens() -> None:
+def test_ac2_bare_code_and_test_words_do_not_make_a_blocker_body_only_either() -> None:
+    # grammar は blocker 全文を消費する。状況説明の前置きが付いた blocker は eligibility の根拠にならない。
     blocker = "コード / テスト は PASS。PR 本文に Runtime Verification Evidence が無い"
 
-    assert _decide([blocker])["eligible"] is True
+    _assert_ineligible(_decide([blocker]), "blocker_unclassifiable")
 
 
-def test_ac2_ambiguous_blocker_matching_two_kinds_is_ineligible() -> None:
+def test_ac2_blocker_naming_two_kinds_in_one_sentence_is_unclassifiable() -> None:
     blocker = "PR 本文に Runtime Verification Evidence が無く、件数も 39 件のまま（head では 47 件）"
 
-    _assert_ineligible(_decide([blocker]), "blocker_ambiguous_kind")
+    _assert_ineligible(_decide([blocker]), "blocker_unclassifiable")
 
 
-def test_ac2_pending_blocker_naming_two_words_is_ambiguous() -> None:
-    blocker = "本文が「未実施 / 実施する予定」のまま"
+def test_ac2_overlapping_grammars_are_reported_as_ambiguous(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 実 grammar は構造上排他的だが、複数 grammar に一致した場合の fail-closed 経路は固定しておく。
+    monkeypatch.setitem(
+        mod.BLOCKER_GRAMMARS, "pending_wording", re.compile(mod.GRAMMAR_SOURCES["runtime_evidence_section_missing"])
+    )
 
-    _assert_ineligible(_decide([blocker]), "blocker_ambiguous_kind")
+    _assert_ineligible(_decide([RUNTIME_BLOCKER]), "blocker_ambiguous_kind")
+
+
+def test_ac2_pending_blocker_naming_two_words_is_unclassifiable() -> None:
+    blocker = "PR 本文に「未実施 / 実施する予定」が残っている"
+
+    _assert_ineligible(_decide([blocker]), "blocker_unclassifiable")
 
 
 @pytest.mark.parametrize("blocker", ["もっと分かりやすくしてほしい", "AC8 の説明が弱い", "", "   "])
@@ -387,7 +440,7 @@ def test_ac2_runtime_section_already_present_means_blocker_is_not_body_only() ->
 
 
 def test_ac2_two_runtime_blockers_do_not_append_the_section_twice() -> None:
-    result = _decide([RUNTIME_BLOCKER, "Runtime Verification Evidence が欠落している"])
+    result = _decide([RUNTIME_BLOCKER, "PR 本文に Runtime Verification Evidence が欠落している"])
 
     _assert_ineligible(result, "duplicate_runtime_evidence_blocker")
 
@@ -1021,7 +1074,10 @@ def test_ac7_dry_run_cli_markers_come_from_the_production_decision_on_the_same_f
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.splitlines() == ["BODY_ONLY_LANE_INELIGIBLE:blocker_deny_list_hit"]
+    assert completed.stdout.splitlines() == [
+        "BODY_ONLY_LANE_INELIGIBLE:blocker_unclassifiable",
+        "BODY_ONLY_LANE_INELIGIBLE:blocker_deny_list_hit",
+    ]
 
 
 def test_ac7_dry_run_cli_rejects_unreadable_or_non_object_fixture(tmp_path: Path) -> None:
@@ -1042,3 +1098,1453 @@ def test_ac7_dry_run_cli_rejects_unreadable_or_non_object_fixture(tmp_path: Path
 
     assert missing.returncode == 2 and not missing.stdout
     assert bad.returncode == 2 and not bad.stdout
+
+
+# --- AC2 (whole-blocker closed grammar) -------------------------------------------
+
+SUBSTANTIVE_FAILURE_CLASSES = [
+    # (id, blocker): 2 回目レビューの 3 failure class（blocker 全文を grammar が消費できない）。
+    ("stale_count_plus_unknown", "PR 本文の evaluator 件数が 39 件のまま（head では 47 件）。API の返却値も直すこと"),
+    ("runtime_evidence_plus_unknown", "Runtime Verification Evidence が無い。判定ロジックも直すこと"),
+    (
+        "runtime_evidence_with_prefix_plus_unknown",
+        "PR 本文に Runtime Verification Evidence が無い。判定ロジックも直すこと",
+    ),
+    (
+        "body_only_phrase_plus_unknown_clause",
+        "PR 本文に「未実施」が残っている。あわせて retry 回数の既定値も見直すこと",
+    ),
+    ("prefix_text_before_grammar", "全体的に良いが、PR 本文に Runtime Verification Evidence が無い"),
+    ("suffix_text_after_grammar", "PR 本文に Runtime Verification Evidence が無い ので追記すること"),
+]
+
+
+@pytest.mark.parametrize(
+    "blocker", [b for _, b in SUBSTANTIVE_FAILURE_CLASSES], ids=[i for i, _ in SUBSTANTIVE_FAILURE_CLASSES]
+)
+def test_ac2_residual_substantive_clause_makes_the_blocker_unclassifiable(blocker: str) -> None:
+    result = _decide([blocker])
+
+    _assert_ineligible(result, "blocker_unclassifiable")
+
+
+def test_ac2_residual_substantive_clause_poisons_the_incident_fixture() -> None:
+    for _, blocker in SUBSTANTIVE_FAILURE_CLASSES:
+        fixture = _incident()
+        fixture["reviewer_result"]["blockers"].append(blocker)
+
+        _expect_ineligible(fixture, "blocker_unclassifiable")
+
+
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        "PR 本文に Runtime Verification Evidence が無い",
+        "PR 本文に Runtime Verification Evidence（AC8, tested_head aa9e247e）が無い",
+        "PR 本文にRuntime Verification Evidence（AC8, tested_head aa9e247e）が無い",
+        "PR body には Runtime Verification Evidence section が欠落している。",
+        "PR 本文に Runtime Verification Evidence セクションが missing",
+        "PR 本文に Runtime Verification Evidence（AC1, AC2, head 1234567）はない.",
+        "PR 本文に Runtime Verification Evidence 未記載",
+        "  PR 本文に Runtime Verification Evidence が欠落  ",
+    ],
+)
+def test_ac2_runtime_grammar_accepts_the_closed_phrasings(blocker: str) -> None:
+    kind, _info = mod._classify_blocker(blocker)
+
+    assert kind == "runtime_evidence_section_missing"
+
+
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        "PR 本文に Runtime Verification Evidence（AC1,AC2）が無い",  # 区切りは `, ` のみ
+        "PR 本文に Runtime Verification Evidence（AC）が無い",
+        "PR 本文に Runtime Verification Evidence（head 123456）が無い",  # 7 桁未満
+        "PR 本文に Runtime Verification Evidence（head ABCDEF1）が無い",  # 大文字 hex
+        "PR 本文に Runtime Verification Evidence (AC8) が無い",  # 半角括弧
+        "PR 本文に Runtime Verification Evidence が無い\n追記すること",
+        "PR 本文で Runtime Verification Evidence が無い",
+        "PR 本文に runtime verification evidence が無い",
+        "PR 本文に Runtime Verification Evidence が不足している",
+        "PR 本文に Runtime Verification Evidence が無いため追記",
+    ],
+)
+def test_ac2_runtime_grammar_rejects_anything_outside_the_closed_set(blocker: str) -> None:
+    kind, info = mod._classify_blocker(blocker)
+
+    assert kind is None
+    assert info["reason"] == "blocker_unclassifiable"
+
+
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        "PR 本文の evaluator 件数が 39 件のまま（head では 47 件）",
+        "PR body の evaluator 件数が 39件のまま（current head では 47件）",
+        "PR 本文の evaluator 件数が 39 件のまま（current head では 47 件）。",
+        "PR 本文の test_foo.py 件数が 3 件のまま（head では 4 件）",
+        "PR 本文のevaluator 件数が 39 件のまま（head では 47 件）",
+    ],
+)
+def test_ac2_stale_count_grammar_accepts_the_closed_phrasings(blocker: str) -> None:
+    kind, info = mod._classify_blocker(blocker)
+
+    assert kind == "stale_count", info
+
+
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        "PR 本文の evaluator 件数が 39 件のまま（head では 39 件）",  # 旧 == 新
+        "PR 本文の evaluator 件数が 39 件のまま（head では 47 件",
+        "PR 本文の 評価器 件数が 39 件のまま（head では 47 件）",  # SUBJECT は ASCII のみ
+        "PR 本文の evaluator 件数が 39 個のまま（head では 47 個）",
+        "PR 本文の evaluator 件数が 39 件のまま（HEAD では 47 件）",
+    ],
+)
+def test_ac2_stale_count_grammar_rejects_anything_outside_the_closed_set(blocker: str) -> None:
+    kind, info = mod._classify_blocker(blocker)
+
+    assert kind is None
+    assert info["reason"] == "blocker_unclassifiable"
+
+
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        "PR 本文に「未実施」が残っている",
+        "PR 本文に未実施が残っている",
+        "PR 本文の「pending」のまま",
+        "PR 本文に 「実施する予定」 が残存している",
+        "PR body の実施する予定のまま。",
+    ],
+)
+def test_ac2_pending_grammar_accepts_the_closed_phrasings(blocker: str) -> None:
+    kind, info = mod._classify_blocker(blocker)
+
+    assert kind == "pending_wording", info
+    assert len(info["pending_words"]) == 1
+
+
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        "PR 本文の AC8 が 未実施 のまま",  # 旧 grammar の語順（AC8 が）は closed set に無い
+        "PR 本文に「未完了」が残っている",
+        "PR 本文に「未実施」が残っているので直すこと",
+        "「未実施」が残っている",
+    ],
+)
+def test_ac2_pending_grammar_rejects_anything_outside_the_closed_set(blocker: str) -> None:
+    kind, _info = mod._classify_blocker(blocker)
+
+    assert kind is None
+
+
+def test_ac2_stale_count_requires_the_old_literal_on_a_line_that_names_the_subject() -> None:
+    body = "- evaluator の hermetic test（39 件）が PASS\n- 別集計: 39 件 を処理\n"
+
+    plan = _decide([STALE_BLOCKER], body=body)["body_plan"]
+
+    assert plan["completed_body_text"] == body.replace(
+        "evaluator の hermetic test（39 件）", "evaluator の hermetic test（47 件）"
+    )
+
+
+def test_ac2_stale_count_in_a_line_without_the_subject_token_is_not_a_target() -> None:
+    body = "- 件数は 39 件 でした\n- evaluator の説明のみ\n"
+
+    _assert_ineligible(_decide([STALE_BLOCKER], body=body), "replacement_target_count_invalid")
+
+
+def test_ac2_stale_count_two_subject_lines_with_the_old_literal_is_ineligible() -> None:
+    body = "- evaluator の件数 39 件\n- evaluator の別表 39 件\n"
+
+    _assert_ineligible(_decide([STALE_BLOCKER], body=body), "replacement_target_count_invalid")
+
+
+def test_ac2_stale_count_subject_tokens_must_all_appear_on_the_target_line() -> None:
+    # SUBJECT `evaluator helper`（token {evaluator, helper}）は、`helper` を含まない行を対象にしない。
+    blocker = "PR 本文の evaluator helper 件数が 39 件のまま（head では 47 件）"
+
+    _assert_ineligible(_decide([blocker], body="- evaluator の件数 39 件\n"), "replacement_target_count_invalid")
+    plan = _decide([blocker], body="- evaluator_helper の件数 39 件\n")["body_plan"]
+    assert plan["completed_body_text"] == "- evaluator_helper の件数 47 件\n"
+
+
+NEGATIVE_MUTATION_CORPUS = [blocker for _, blocker in SUBSTANTIVE_FAILURE_CLASSES]
+
+
+def test_ac2_mutation_partial_match_grammar_would_make_the_negative_corpus_eligible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """grammar を ``fullmatch`` から partial match（``search``）へ緩めると、negative corpus は全て
+    eligible に化ける。つまり上の negative test は grammar の全文消費に依存しており、false-green ではない。"""
+    for blocker in NEGATIVE_MUTATION_CORPUS:
+        assert _decide([blocker])["eligible"] is False
+
+    monkeypatch.setattr(mod, "_consume", lambda pattern, text: pattern.search(text))
+
+    escaped = [blocker for blocker in NEGATIVE_MUTATION_CORPUS if _decide([blocker])["eligible"]]
+    # PREFIX（`PR 本文` / `PR body`）を欠く blocker は partial match でも grammar に入れないので漏れない。
+    assert escaped == [blocker for blocker in NEGATIVE_MUTATION_CORPUS if blocker.count("PR 本文")]
+    assert len(escaped) >= 5
+
+
+def test_ac2_mutation_prefix_only_match_still_leaks_suffix_clauses(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(mod, "_consume", lambda pattern, text: pattern.match(text))
+
+    leaked = [
+        blocker
+        for _, blocker in SUBSTANTIVE_FAILURE_CLASSES
+        if blocker.startswith("PR 本文") and _decide([blocker])["eligible"]
+    ]
+    assert leaked, "prefix match must leak at least the suffix-clause cases"
+
+
+def test_ac2_grammar_is_the_only_eligibility_basis_not_a_deny_list() -> None:
+    # deny 語を一切含まない substantive 句でも grammar が消費できなければ ineligible。
+    blocker = "PR 本文に Runtime Verification Evidence が無い。判定ロジックも直すこと"
+    assert not mod._deny_hit(blocker)
+
+    result = _decide([blocker])
+
+    _assert_ineligible(result, "blocker_unclassifiable")
+    assert "blocker_deny_list_hit" not in result["reason_codes"]
+
+
+def test_ac2_grammar_non_matching_blocker_with_a_deny_word_reports_both_reasons() -> None:
+    result = _decide(["PR 本文に Runtime Verification Evidence が無い。branch も直すこと"])
+
+    assert result["reason_codes"][:2] == ["blocker_unclassifiable", "blocker_deny_list_hit"]
+
+
+# --- AC6 (wrapper-only mutation / no edit of protected scripts) ---------------------
+
+PROTECTED_SCRIPTS = (
+    ".claude/skills/open-pr/scripts/update_pr.py",
+    ".claude/skills/impl-review-loop/scripts/route_loop_verdict_v2.py",
+    ".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py",
+    ".claude/skills/impl-review-loop/scripts/wait_ci_checks.py",
+)
+
+
+def _git(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True, check=False)
+
+
+def test_ac6_protected_scripts_are_not_modified_relative_to_the_base() -> None:
+    base = next(
+        (ref for ref in ("origin/main", "main") if _git("rev-parse", "--verify", "--quiet", ref).returncode == 0),
+        "HEAD",
+    )
+
+    completed = _git("diff", "--exit-code", base, "--", *PROTECTED_SCRIPTS)
+
+    assert completed.returncode == 0, completed.stdout
+
+
+def test_ac6_production_module_never_edits_a_pr_body_directly() -> None:
+    """PR body mutation は ``update_pr.py`` wrapper 経由のみ。production CLI は ``gh pr edit`` / REST PATCH の
+    argv を一切構築せず、gh は ``pr view`` / ``issue view``（read-only）だけを呼ぶ。"""
+    tree = ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
+    strings = {node.value for node in ast.walk(tree) if isinstance(node, ast.Constant) and isinstance(node.value, str)}
+
+    assert "edit" not in strings  # gh pr edit の argv を組み立てない
+    assert not any("--method" in value or re.search(r"\bPATCH\b", value) for value in strings)
+    assert "view" in strings
+
+
+def test_ac6_cli_calls_only_read_only_gh_subcommands(tmp_path: Path) -> None:
+    env = PlanEnv(tmp_path)
+
+    rc, payload = env.plan()
+    assert rc == 0, payload
+    rc, _payload = env.guard()
+    assert rc == 0
+
+    calls = env.gh_calls()
+    assert calls, "fake gh was never invoked"
+    assert all(call[:2] in (["pr", "view"], ["issue", "view"]) for call in calls), calls
+
+
+# --- AC10 (production CLI integration, subprocess) --------------------------------------
+
+
+def _run_cli(argv: list[str], *, env: dict[str, str] | None = None) -> tuple[int, dict[str, Any], str]:
+    completed = subprocess.run(
+        [sys.executable, str(MODULE_PATH), *argv], capture_output=True, text=True, check=False, env=env
+    )
+    lines = [line for line in completed.stdout.splitlines() if line.strip()]
+    assert len(lines) == 1, (
+        f"stdout must be exactly one JSON: rc={completed.returncode} out={completed.stdout!r} err={completed.stderr}"
+    )
+    return completed.returncode, json.loads(lines[0]), completed.stderr
+
+
+FAKE_GH_SOURCE = """#!__PYTHON__
+import json, os, sys
+
+state = json.load(open(os.environ["FAKE_GH_STATE"], encoding="utf-8"))
+with open(os.environ["FAKE_GH_LOG"], "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(sys.argv[1:]) + "\\n")
+args = sys.argv[1:]
+if args[:2] == ["pr", "view"]:
+    updated = state.get("updated_at", "2026-10-07T00:00:00Z")
+    print(json.dumps({"headRefOid": state["head"], "body": state["body"], "updatedAt": updated}))
+elif args[:2] == ["issue", "view"]:
+    print(json.dumps({"body": state.get("issue_body", "")}))
+else:
+    sys.stderr.write("unexpected gh invocation: " + " ".join(args))
+    sys.exit(1)
+"""
+
+RUNTIME_SUMMARY = (
+    "### AC8: 実 Skill を dry-run で起動し、判定結果と順序を確認する\n\n"
+    "- Result: PASS（最終 acceptance は commit 済み HEAD 上の 1 試行）\n"
+    "- artifact: artifacts/runtime-smoke/summary.md\n"
+)
+EVALUATOR_COMMAND = "uv run --locked pytest .claude/skills/x/tests/test_foo_reachability_evaluator.py -q"
+EVALUATOR_SUBJECT = ".claude/skills/x/tests/test_foo_reachability_evaluator.py"
+WHOLE_SUITE_COMMAND = "uv run --locked pytest .claude/skills/x/tests/ -q"
+
+
+def _git_run(cwd: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return completed.stdout.strip()
+
+
+def _ci_check(
+    name: str, workflow: str, *, started: str, completed: str = "2026-10-07T00:10:00Z", bucket: str = "pass"
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "bucket": bucket,
+        "state": "SUCCESS" if bucket == "pass" else "FAILURE",
+        "workflow": workflow,
+        "link": f"https://example.invalid/{name}",
+        "startedAt": started,
+        "completedAt": completed,
+    }
+
+
+def _ci_wait_line(
+    head: str, checks: list[dict[str, Any]], *, status: str = "passed", current_head: str | None = None
+) -> str:
+    payload = {
+        "schema": "CI_WAIT_RESULT_V1",
+        "status": status,
+        "repo": "o/r",
+        "pr_number": 7,
+        "head_sha": head,
+        "current_head_sha": current_head or head,
+        "required_only": True,
+        "checks": checks,
+        "elapsed_seconds": 1,
+        "interval_seconds": 15,
+        "timeout_seconds": 1800,
+        "error_code": None,
+        "message": None,
+    }
+    return "noise before\nCI_WAIT_RESULT_V1_JSON=" + json.dumps(payload, ensure_ascii=True) + "\n"
+
+
+class PlanEnv:
+    """tmp の git worktree・fake gh・実 ``step4-adjudicate`` で persist した LOOP_STATE を持つ plan 用環境。"""
+
+    def __init__(self, tmp_path: Path, *, live_body: str | None = None) -> None:
+        self.root = tmp_path
+        self.repo = tmp_path / "wt"
+        self.repo.mkdir()
+        _git_run(self.repo, "init", "-q", "-b", "main")
+        (self.repo / "README.md").write_text("base\n", encoding="utf-8")
+        _git_run(self.repo, "add", "-A")
+        _git_run(self.repo, "commit", "-q", "-m", "base")
+        _git_run(self.repo, "checkout", "-q", "-b", "feature")
+        (self.repo / "feature.txt").write_text("feature\n", encoding="utf-8")
+        _git_run(self.repo, "add", "-A")
+        _git_run(self.repo, "commit", "-q", "-m", "feature")
+        self.head = _git_run(self.repo, "rev-parse", "HEAD")
+
+        self.fixture = _incident()
+        self.live_body = live_body if live_body is not None else self.fixture["live_pr_body"]
+        self.blockers = list(self.fixture["reviewer_result"]["blockers"])
+
+        self.bin = tmp_path / "bin"
+        self.bin.mkdir()
+        gh = self.bin / "gh"
+        gh.write_text(FAKE_GH_SOURCE.replace("__PYTHON__", sys.executable), encoding="utf-8")
+        gh.chmod(0o755)
+        self.gh_state = tmp_path / "gh_state.json"
+        self.gh_log = tmp_path / "gh_log.jsonl"
+        self.set_live(self.head, self.live_body)
+
+        self.ws = harness.Workspace(tmp_path / "ws")
+        self.ws.dir.mkdir()
+        self.verdict = self.verdict_report(self.head)
+        rc, payload = self.ws.adjudicate(head=self.head, verdict=self.verdict)
+        assert rc == 0, payload
+        self.hashes = list(harness._hashes(False))
+        self.hashes_file = self.write("expected_hashes.json", self.hashes)
+        self.verdict_file = self.write("verdict.json", self.verdict)
+        self.reviewer_file = self.write("reviewer.json", self.reviewer())
+        self.wait_ci_file = self.write(
+            "wait_ci.txt", _ci_wait_line(self.head, [_ci_check("test", "ci", started="2026-10-07T00:01:00Z")])
+        )
+        self.summary_file = self.write("summary.md", RUNTIME_SUMMARY)
+        self.body_out = tmp_path / "completed_body.md"
+
+    # -- builders ------------------------------------------------------------
+
+    def write(self, name: str, value: Any) -> str:
+        path = self.root / name
+        path.write_text(value if isinstance(value, str) else json.dumps(value), encoding="utf-8")
+        return str(path)
+
+    def verdict_report(
+        self,
+        head: str,
+        *,
+        result: str = "PASS",
+        evaluator_passed: int = 47,
+        extra_evaluator_row: bool = False,
+        evaluator_status: str = "pass",
+        notes_only: bool = False,
+    ) -> dict[str, Any]:
+        report = harness._test_verdict(head, harness.BODY_A, False, result=result)
+        rows = report["runtime_ac_results"]
+        rows[0]["command"] = EVALUATOR_COMMAND
+        rows[0]["status"] = evaluator_status
+        if notes_only:
+            rows[0]["notes"] = f"{evaluator_passed} passed"
+        else:
+            rows[0]["test_count"] = {"subject": EVALUATOR_SUBJECT, "passed": evaluator_passed}
+        rows[1]["command"] = WHOLE_SUITE_COMMAND
+        rows[1]["test_count"] = {"subject": ".claude/skills/x/tests/", "passed": 47}
+        if extra_evaluator_row:
+            rows[1]["command"] = EVALUATOR_COMMAND + " --maxfail=1"
+            rows[1]["test_count"] = {"subject": EVALUATOR_SUBJECT, "passed": 47}
+        return report
+
+    def reviewer(self, *, blockers: list[str] | None = None, head: str | None = None) -> dict[str, Any]:
+        return {
+            "verdict": "REQUEST_CHANGES",
+            "reviewed_head_sha": head or self.head,
+            "blockers": blockers if blockers is not None else self.blockers,
+            "warnings": [],
+        }
+
+    def set_live(self, head: str, body: str, updated_at: str = "2026-10-07T00:00:00Z") -> None:
+        self.gh_state.write_text(
+            json.dumps(
+                {
+                    "head": head,
+                    "body": body,
+                    "updated_at": updated_at,
+                    "issue_body": "## 概要\n日本語の Issue 本文です。\n",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def gh_calls(self) -> list[list[str]]:
+        if not self.gh_log.exists():
+            return []
+        return [json.loads(line) for line in self.gh_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    def environment(self) -> dict[str, str]:
+        return {
+            **os.environ,
+            "PATH": f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}",
+            "FAKE_GH_STATE": str(self.gh_state),
+            "FAKE_GH_LOG": str(self.gh_log),
+        }
+
+    # -- production CLI wrappers -----------------------------------------------
+
+    def plan(self, **overrides: Any) -> tuple[int, dict[str, Any]]:
+        values: dict[str, Any] = {
+            "--repo": "o/r",
+            "--pr-number": "7",
+            "--issue-number": "2963",  # 本文が参照する linked Issue（validator の LP057 と整合）
+            "--worktree": str(self.repo),
+            "--reviewer-result-file": self.reviewer_file,
+            "--test-verdict-file": self.verdict_file,
+            "--wait-ci-output": self.wait_ci_file,
+            "--runtime-summary-file": self.summary_file,
+            "--loop-state-file": str(self.ws.loop_state),
+            "--expected-contract-body-sha256": harness.BODY_A,
+            "--expected-command-hashes-file": self.hashes_file,
+            "--body-out": str(self.body_out),
+        }
+        values.update(overrides)
+        argv = ["plan"]
+        for flag, value in values.items():
+            if value is not None:
+                argv += [flag, str(value)]
+        rc, payload, _err = _run_cli(argv, env=self.environment())
+        return rc, payload
+
+    def record(self, state: str) -> tuple[int, dict[str, Any]]:
+        rc, payload, _err = _run_cli(
+            ["record", "--loop-state-file", str(self.ws.loop_state), "--state", state], env=self.environment()
+        )
+        return rc, payload
+
+    def guard(self, **overrides: Any) -> tuple[int, dict[str, Any]]:
+        plan_rc, plan = self.plan_cached()
+        values: dict[str, Any] = {
+            "--repo": "o/r",
+            "--pr-number": "7",
+            "--expected-head-sha": plan["expected_head_sha"],
+            "--expected-live-body-sha256": plan["expected_live_body_sha256"],
+            "--body-file": plan["body_file_path"],
+            "--body-file-sha256": plan["body_file_sha256"],
+        }
+        values.update(overrides)
+        argv = ["guard"]
+        for flag, value in values.items():
+            argv += [flag, str(value)]
+        rc, payload, _err = _run_cli(argv, env=self.environment())
+        return rc, payload
+
+    def plan_cached(self) -> tuple[int, dict[str, Any]]:
+        if not hasattr(self, "_plan"):
+            self._plan = self.plan()
+        return self._plan
+
+
+def test_ac10_plan_materializes_current_head_evidence_and_writes_the_completed_body(tmp_path: Path) -> None:
+    env = PlanEnv(tmp_path)
+
+    rc, payload = env.plan()
+
+    assert rc == 0, payload
+    assert payload["eligible"] is True and payload["reason_codes"] == []
+    assert payload["expected_head_sha"] == env.head
+    assert payload["expected_live_body_sha256"] == mod.body_sha256(env.live_body)
+    body_text = Path(payload["body_file_path"]).read_text(encoding="utf-8")
+    assert Path(payload["body_file_path"]) == env.body_out.resolve()
+    assert payload["body_file_sha256"] == mod.body_sha256(body_text)
+    assert "## Runtime Verification Evidence\n" + RUNTIME_SUMMARY.strip("\n") in body_text
+    assert "39 件" not in body_text and "47 件" in body_text
+    # 同一 fixture を production 関数に直接通した結果（refs を手で渡した場合）と completed body が一致する。
+    expected = mod.decide_body_only_repair(
+        env.reviewer(),
+        env.head,
+        True,
+        True,
+        env.live_body,
+        [
+            {"kind": "runtime_evidence", "value": RUNTIME_SUMMARY.strip("\n"), "source": "s", "head_sha": env.head},
+            {"kind": "test_count", "value": "47", "source": "s", "head_sha": env.head},
+        ],
+        0,
+    )
+    assert expected["eligible"] is True
+    assert body_text == expected["body_plan"]["completed_body_text"]
+    # 全 edge が read-only の gh 呼出し（pr view / issue view）で完結している。
+    assert all(call[:2] in (["pr", "view"], ["issue", "view"]) for call in env.gh_calls())
+
+
+def test_ac10_plan_exit_codes_and_single_json_for_ineligible_and_runtime_errors(tmp_path: Path) -> None:
+    env = PlanEnv(tmp_path)
+
+    rc, payload = env.plan(
+        **{"--reviewer-result-file": env.write("rv.json", env.reviewer(blockers=["API の返却値も直すこと"]))}
+    )
+    assert rc == 1 and payload["eligible"] is False
+    assert "blocker_unclassifiable" in payload["reason_codes"]
+    assert payload["body_file_path"] is None and not env.body_out.exists()
+
+    rc, payload = env.plan(**{"--reviewer-result-file": str(tmp_path / "missing.json")})
+    assert rc == 2 and "error" in payload
+
+
+def test_ac10_plan_head_mismatch_between_reviewer_and_live_is_ineligible(tmp_path: Path) -> None:
+    env = PlanEnv(tmp_path)
+    env.set_live("f" * 40, env.live_body)
+
+    rc, payload = env.plan()
+
+    assert rc == 1
+    assert "reviewed_head_sha_mismatch" in payload["reason_codes"]
+    assert not env.body_out.exists()
+
+
+def test_ac10_plan_artifact_head_mismatch_and_non_pass_test_verdict_are_ineligible(tmp_path: Path) -> None:
+    env = PlanEnv(tmp_path)
+
+    rc, payload = env.plan(**{"--test-verdict-file": env.write("v_head.json", env.verdict_report("e" * 40))})
+    assert rc == 1 and "test_verdict_head_mismatch" in payload["reason_codes"]
+
+    rc, payload = env.plan(
+        **{"--test-verdict-file": env.write("v_fail.json", env.verdict_report(env.head, result="FAIL"))}
+    )
+    assert rc == 1 and "test_verdict_not_pass" in payload["reason_codes"]
+    assert not env.body_out.exists()
+
+
+def test_ac10_plan_ci_not_passed_or_other_head_is_ineligible(tmp_path: Path) -> None:
+    env = PlanEnv(tmp_path)
+    checks = [_ci_check("test", "ci", started="2026-10-07T00:01:00Z")]
+
+    rc, payload = env.plan(
+        **{"--wait-ci-output": env.write("pending.txt", _ci_wait_line(env.head, checks, status="pending_timeout"))}
+    )
+    assert rc == 1 and "required_ci_invalid" in payload["reason_codes"]
+
+    rc, payload = env.plan(**{"--wait-ci-output": env.write("other.txt", _ci_wait_line("c" * 40, checks))})
+    assert rc == 1 and "required_ci_invalid" in payload["reason_codes"]
+
+    rc, payload = env.plan(
+        **{"--wait-ci-output": env.write("two.txt", _ci_wait_line(env.head, checks) + _ci_wait_line(env.head, checks))}
+    )
+    assert rc == 1 and "required_ci_invalid" in payload["reason_codes"]
+
+    rc, payload = env.plan(**{"--wait-ci-output": env.write("garbage.txt", "no result line\n")})
+    assert rc == 1 and "required_ci_invalid" in payload["reason_codes"]
+
+
+def test_ac10_plan_vc_binding_is_re_derived_by_the_existing_step4_gate(tmp_path: Path) -> None:
+    env = PlanEnv(tmp_path)
+
+    rc, payload = env.plan(**{"--expected-contract-body-sha256": harness.BODY_B})
+    assert rc == 1 and "vc_current_head_invalid" in payload["reason_codes"]
+
+    rc, payload = env.plan(**{"--expected-command-hashes-file": env.write("other_hashes.json", ["sha256:" + "9" * 64])})
+    assert rc == 1 and "vc_current_head_invalid" in payload["reason_codes"]
+
+    rc, payload = env.plan(**{"--loop-state-file": env.write("empty_state.json", {})})
+    assert rc == 1 and "vc_current_head_invalid" in payload["reason_codes"]
+    assert not env.body_out.exists()
+
+
+def test_ac10_plan_runtime_summary_without_provenance_does_not_become_evidence(tmp_path: Path) -> None:
+    env = PlanEnv(tmp_path)
+    # mtime が commit 時刻より前の artifact は来歴 pre-filter で落とす。
+    os.utime(env.summary_file, (1, 1))
+
+    rc, payload = env.plan()
+
+    assert rc == 1
+    assert "runtime_summary_provenance_unverified" in payload["reason_codes"]
+    assert "evidence_ref_missing" in payload["reason_codes"]
+
+
+def test_ac10_plan_missing_runtime_summary_is_ineligible_for_a_runtime_blocker(tmp_path: Path) -> None:
+    env = PlanEnv(tmp_path)
+
+    rc, payload = env.plan(**{"--runtime-summary-file": None})
+
+    assert rc == 1 and "evidence_ref_missing" in payload["reason_codes"]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_reason"),
+    [
+        ({"evaluator_passed": 46}, "evidence_ref_value_mismatch"),
+        ({"extra_evaluator_row": True}, "test_count_subject_ambiguous"),
+        ({"evaluator_status": "fail"}, "test_count_subject_unbound"),
+        ({"notes_only": True}, "test_count_subject_unbound"),
+    ],
+    ids=["value_mismatch", "two_rows_match", "status_not_pass", "count_only_in_notes"],
+)
+def test_ac10_plan_test_count_ref_is_not_created_without_exact_row_binding(
+    tmp_path: Path, kwargs: dict[str, Any], expected_reason: str
+) -> None:
+    env = PlanEnv(tmp_path)
+
+    rc, payload = env.plan(**{"--test-verdict-file": env.write("v.json", env.verdict_report(env.head, **kwargs))})
+
+    assert rc == 1, payload
+    assert expected_reason in payload["reason_codes"]
+    assert not env.body_out.exists()
+
+
+def test_ac10_plan_does_not_bind_a_suite_wide_count_that_happens_to_equal_the_new_value(tmp_path: Path) -> None:
+    env = PlanEnv(tmp_path)
+    report = env.verdict_report(env.head)
+    del report["runtime_ac_results"][0]["test_count"]  # evaluator 行から件数を外す（suite 全体の 47 は残る）
+
+    rc, payload = env.plan(**{"--test-verdict-file": env.write("v.json", report)})
+
+    assert rc == 1 and "test_count_subject_unbound" in payload["reason_codes"]
+
+
+def test_ac10_plan_test_count_row_with_command_hash_outside_the_adjudicated_binding_is_not_used(tmp_path: Path) -> None:
+    env = PlanEnv(tmp_path)
+    report = env.verdict_report(env.head)
+    report["runtime_ac_results"][0]["command_hash"] = "sha256:" + "7" * 64
+
+    rc, payload = env.plan(**{"--test-verdict-file": env.write("v.json", report)})
+
+    assert rc == 1 and "test_count_subject_unbound" in payload["reason_codes"]
+
+
+def test_ac10_plan_runs_the_update_pr_validators_and_a_validator_failure_is_ineligible(tmp_path: Path) -> None:
+    env = PlanEnv(tmp_path)
+    # 日本語を含まない prose block は update_pr.py と同一の Japanese content validator で fail する。
+    Path(env.summary_file).write_text("### AC8\n\nResult: PASS\nall checks are green on this head\n", encoding="utf-8")
+
+    rc, payload = env.plan()
+
+    assert rc == 1, payload
+    assert payload["reason_codes"] == ["completed_body_validator_failed"]
+    assert "validate_japanese_content" in payload["validator_failures"]
+    assert not env.body_out.exists()
+
+
+def test_ac10_plan_validator_inputs_are_identical_to_a_real_update_pr_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = PlanEnv(tmp_path)
+    upd = mod._load_update_pr()
+    calls: list[tuple[str, Any]] = []
+
+    def recording_validator(
+        body_text: str, changed_paths: Any, linked_issue: Any, linked_issue_body: Any = None
+    ) -> dict[str, Any]:
+        calls.append(("pr_body", (body_text, changed_paths, linked_issue, linked_issue_body)))
+        return {"status": "pass", "errors": []}
+
+    monkeypatch.setattr(upd, "_run_pr_body_validator", recording_validator)
+    monkeypatch.setattr(
+        upd,
+        "_run_japanese_content_validator",
+        lambda body_text, threshold=0.1: calls.append(("ja", body_text)) or {"status": "pass"},
+    )
+    monkeypatch.setattr(upd, "get_linked_issue_body", lambda repo, issue_number: f"ISSUE#{issue_number}@{repo}")
+    monkeypatch.setattr(upd, "update_pr", lambda repo, pr_number, body_text: True)
+    body_file = tmp_path / "b.md"
+    body_file.write_text("## 概要\n本文です。\n", encoding="utf-8")
+
+    monkeypatch.chdir(env.repo)
+    assert upd.main(["--pr-number", "7", "--body-file", str(body_file), "--repo", "o/r", "--linked-issue", "2971"]) == 0
+    real_calls, calls[:] = list(calls), []
+
+    monkeypatch.chdir(tmp_path)
+    failures = mod.run_completed_body_validators(
+        body_file.read_text(encoding="utf-8"),
+        repo="o/r",
+        issue_number=2971,
+        worktree=str(env.repo),
+        update_pr_module=upd,
+    )
+
+    assert failures == []
+    assert calls == real_calls
+    assert calls[0][1][1] == ["feature.txt"] and calls[0][1][3] == "ISSUE#2971@o/r"
+    assert Path.cwd() == tmp_path  # worktree への chdir は復元される
+
+
+def test_ac10_plan_validator_failure_is_reported_per_validator(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    upd = mod._load_update_pr()
+    monkeypatch.setattr(upd, "resolve_changed_paths", lambda provided=None: ["x.py"])
+    monkeypatch.setattr(upd, "get_linked_issue_body", lambda repo, issue_number: None)
+    monkeypatch.setattr(
+        upd, "_run_pr_body_validator", lambda body, paths, issue, linked=None: {"status": "fail", "errors": []}
+    )
+    monkeypatch.setattr(upd, "_run_japanese_content_validator", lambda body, threshold=0.1: {"status": "internal"})
+
+    failures = mod.run_completed_body_validators(
+        "x", repo="o/r", issue_number=1, worktree=str(tmp_path), update_pr_module=upd
+    )
+
+    assert failures == ["validate_pr_body", "validate_japanese_content"]
+
+
+def test_ac10_guard_proceeds_only_when_head_live_body_and_body_file_all_match(tmp_path: Path) -> None:
+    env = PlanEnv(tmp_path)
+
+    rc, payload = env.guard()
+
+    assert rc == 0, payload
+    assert payload["result"] == "proceed" and payload["reason_code"] is None
+    assert payload["live_head_sha"] == env.head
+    # guard は live {head, body} を CLI 自身が取得している（worker が gh を即興しない）。
+    assert ["pr", "view", "7", "--repo", "o/r", "--json", "headRefOid,body,updatedAt"] in env.gh_calls()
+
+
+def test_ac10_guard_head_mismatch_returns_non_zero_with_expected_head_sha_mismatch(tmp_path: Path) -> None:
+    env = PlanEnv(tmp_path)
+    env.plan_cached()
+    env.set_live("d" * 40, env.live_body)
+
+    rc, payload = env.guard()
+
+    assert rc == 1
+    assert payload["result"] == "ineligible_head_changed" and payload["reason_code"] == "expected_head_sha_mismatch"
+
+
+def test_ac10_guard_live_body_hash_mismatch_returns_non_zero(tmp_path: Path) -> None:
+    env = PlanEnv(tmp_path)
+    env.plan_cached()
+    env.set_live(env.head, env.live_body + "\n他の actor が追記した行\n")
+
+    rc, payload = env.guard()
+
+    assert rc == 1
+    assert payload["result"] == "stale_body_rebuild_required" and payload["reason_code"] == "live_body_hash_mismatch"
+
+
+def test_ac10_guard_body_file_hash_mismatch_returns_non_zero(tmp_path: Path) -> None:
+    env = PlanEnv(tmp_path)
+    plan_rc, plan = env.plan_cached()
+    assert plan_rc == 0
+    Path(plan["body_file_path"]).write_text("改変された completed body\n", encoding="utf-8")
+
+    rc, payload = env.guard()
+
+    assert rc == 1
+    assert payload["result"] == "body_file_hash_mismatch" and payload["reason_code"] == "live_body_hash_mismatch"
+
+
+def test_ac10_guard_stale_expected_live_body_sha256_is_rejected_and_gh_failure_is_a_runtime_error(
+    tmp_path: Path,
+) -> None:
+    env = PlanEnv(tmp_path)
+
+    rc, payload = env.guard(**{"--expected-live-body-sha256": "0" * 64})
+    assert rc == 1 and payload["reason_code"] == "live_body_hash_mismatch"
+
+    rc, payload = env.guard(**{"--body-file": str(tmp_path / "missing.md")})
+    assert rc == 2 and "error" in payload
+
+    gh = env.bin / "gh"
+    gh.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    rc, payload = env.guard()
+    assert rc == 2 and "error" in payload
+
+
+def test_ac10_guard_decision_function_is_pure_and_reuses_check_body_freshness() -> None:
+    body_file = "completed\n"
+    base = (HEAD, mod.body_sha256(BODY), body_file, mod.body_sha256(body_file))
+
+    ok = mod.guard_decision(HEAD, BODY, *base)
+    assert ok == {"result": "proceed", "reason_code": None}
+    assert mod.guard_decision(HEAD, BODY.replace("\n", "\r\n") + "\n", *base)["result"] == "proceed"
+    assert mod.guard_decision(OTHER_HEAD, BODY, *base)["reason_code"] == "expected_head_sha_mismatch"
+    assert mod.guard_decision(HEAD, BODY + "x", *base)["reason_code"] == "live_body_hash_mismatch"
+    assert mod.guard_decision(HEAD, BODY, HEAD, base[1], body_file, "0" * 64)["result"] == "body_file_hash_mismatch"
+    assert mod.guard_decision(HEAD, None, *base)["result"] == "stale_body_rebuild_required"
+
+
+def test_ac10_fetch_live_pr_accepts_an_injected_runner_and_never_calls_gh(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str]) -> tuple[int, str, str]:
+        calls.append(argv)
+        return 0, json.dumps({"headRefOid": HEAD, "body": BODY, "updatedAt": "2026-10-07T00:00:00Z"}), ""
+
+    monkeypatch.setattr(mod, "run_gh", lambda argv: (_ for _ in ()).throw(AssertionError("real gh must not be called")))
+
+    live = mod.fetch_live_pr("o/r", 7, runner)
+
+    assert live == {"head": HEAD, "body": BODY, "updated_at": "2026-10-07T00:00:00Z"}
+    assert calls == [["pr", "view", "7", "--repo", "o/r", "--json", "headRefOid,body,updatedAt"]]
+    for bad in ((1, "", "boom"), (0, "not json", ""), (0, json.dumps({"headRefOid": "", "body": "x"}), "")):
+        with pytest.raises(mod.CliError):
+            mod.fetch_live_pr("o/r", 7, lambda argv, bad=bad: bad)
+
+
+# -- record (lane consumption writer) --
+
+
+def test_ac10_record_writes_two_stage_entries_atomically_and_preserves_existing_keys(tmp_path: Path) -> None:
+    env = PlanEnv(tmp_path)
+    before = env.ws.state()
+    before_keys = set(before)
+
+    rc, payload = env.record("dispatched")
+    assert rc == 0 and payload["lane_entries"] == {"consumed": 1, "no_mutation": 0, "dispatched": 1}
+    state = env.ws.state()
+    assert state["blockers_history"] == [{"lane": "body_only_repair", "outcome": "dispatched"}]
+    assert before_keys <= set(state)
+    assert state["vc_adjudication"] == before["vc_adjudication"] and state["dispatch"] == before["dispatch"]
+    assert [
+        path.name for path in env.ws.dir.iterdir() if path.name.startswith(".") and path.name.endswith(".tmp")
+    ] == []
+
+    rc, payload = env.record("no_mutation")
+    assert rc == 0 and payload["lane_entries"] == {"consumed": 0, "no_mutation": 1, "dispatched": 0}
+    assert env.ws.state()["blockers_history"] == [{"lane": "body_only_repair", "outcome": "no_mutation"}]
+
+
+def test_ac10_record_preserves_unrelated_history_entries_and_closed_entry_fields(tmp_path: Path) -> None:
+    env = PlanEnv(tmp_path)
+    state = env.ws.state()
+    state["blockers_history"] = ["古い blocker 文面", {"iteration": 1, "blockers": ["x"]}]
+    env.ws.write_state(state)
+
+    assert env.record("dispatched")[0] == 0
+    history = env.ws.state()["blockers_history"]
+
+    assert history[:2] == ["古い blocker 文面", {"iteration": 1, "blockers": ["x"]}]
+    assert history[2] == {"lane": "body_only_repair", "outcome": "dispatched"}
+    assert set(history[2]) == {"lane", "outcome"}
+
+
+def test_ac10_record_enforces_the_one_dispatch_and_one_reevaluation_budget(tmp_path: Path) -> None:
+    env = PlanEnv(tmp_path)
+
+    assert env.record("no_mutation")[0] == 1  # dispatched entry が無い
+    assert env.record("dispatched")[0] == 0
+    rc, payload = env.record("dispatched")  # 消費済み（dispatched のまま）の lane は 2 回目を起動できない
+    assert rc == 1 and payload["reason_code"] == "lane_already_consumed"
+    assert env.record("no_mutation")[0] == 0
+    assert env.record("dispatched")[0] == 0  # no_mutation が 1 件の間だけ 1 回の再 dispatch が許される
+    assert env.record("no_mutation")[0] == 0
+    rc, payload = env.record("dispatched")  # no_mutation が 2 件 → lane 終了
+    assert rc == 1 and payload["reason_code"] == "lane_ended"
+    history = env.ws.state()["blockers_history"]
+    assert history == [{"lane": "body_only_repair", "outcome": "no_mutation"}] * 2
+
+
+def test_ac10_record_rejects_a_malformed_loop_state_without_writing(tmp_path: Path) -> None:
+    env = PlanEnv(tmp_path)
+    state = env.ws.state()
+    state["blockers_history"] = "not-a-list"
+    env.ws.write_state(state)
+    before = env.ws.loop_state.read_text(encoding="utf-8")
+
+    rc, payload = env.record("dispatched")
+
+    assert rc == 1 and payload["reason_code"] == "blockers_history_not_list"
+    assert env.ws.loop_state.read_text(encoding="utf-8") == before
+
+
+def test_ac10_record_is_the_only_writer_and_state_reload_restores_the_count(tmp_path: Path) -> None:
+    """``--loop-state-file`` を disk から再読込（compaction / resume を模す）しても件数が復元され、
+    2 回目の lane は起動せず、no_mutation がちょうど 1 件の間だけ再評価される。"""
+    env = PlanEnv(tmp_path)
+    assert env.plan()[0] == 0
+
+    assert env.record("dispatched")[0] == 0
+    rc, payload = env.plan()  # dispatched のまま残った entry は消費済み
+    assert rc == 1 and "body_only_repair_already_used" in payload["reason_codes"]
+
+    assert env.record("no_mutation")[0] == 0
+    rc, payload = env.plan()  # no_mutation が 1 件 → 1 回だけ再評価できる
+    assert rc == 0 and payload["eligible"] is True
+
+    assert env.record("dispatched")[0] == 0 and env.record("no_mutation")[0] == 0
+    rc, payload = env.plan()  # no_mutation が 2 件 → lane 終了
+    assert rc == 1 and "body_only_lane_ended" in payload["reason_codes"]
+
+    state = env.ws.state()
+    assert [entry["outcome"] for entry in state["blockers_history"]] == ["no_mutation", "no_mutation"]
+
+
+def test_ac10_apply_record_is_pure_and_does_not_mutate_its_input() -> None:
+    state = {"blockers_history": [], "iteration": 3}
+    snapshot = copy.deepcopy(state)
+
+    new_state, error = mod.apply_record(state, "dispatched")
+
+    assert error is None and state == snapshot
+    assert new_state == {"blockers_history": [{"lane": "body_only_repair", "outcome": "dispatched"}], "iteration": 3}
+    assert mod.apply_record({}, "dispatched")[0] == {
+        "blockers_history": [{"lane": "body_only_repair", "outcome": "dispatched"}]
+    }
+    assert mod.apply_record({}, "bogus") == (None, "invalid_state")
+    assert mod.apply_record([], "dispatched") == (None, "loop_state_not_object")
+
+
+# -- ci-freshness --
+
+WORKFLOW_DIR = ROOT / ".github" / "workflows"
+WATERMARK = "2026-10-07T01:00:00Z"
+
+
+def _ci_freshness(
+    tmp_path: Path,
+    checks: list[dict[str, Any]],
+    *,
+    status: str = "passed",
+    head: str = HEAD,
+    workflow_dir: Path = WORKFLOW_DIR,
+    watermark: str = WATERMARK,
+    extra: list[str] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    wait_file = tmp_path / "wait.txt"
+    wait_file.write_text(_ci_wait_line(head, checks, status=status), encoding="utf-8")
+    rc, payload, _err = _run_cli(
+        [
+            "ci-freshness",
+            "--wait-ci-output",
+            str(wait_file),
+            "--body-edit-updated-at",
+            watermark,
+            "--workflow-dir",
+            str(workflow_dir),
+            *(extra or []),
+        ]
+    )
+    return rc, payload
+
+
+def test_ac10_ci_freshness_real_workflows_edited_and_non_edited_classification(tmp_path: Path) -> None:
+    ci_workflow = mod.workflow_trigger_info(yaml.safe_load((WORKFLOW_DIR / "ci.yml").read_text(encoding="utf-8")), "x")
+    manifest_workflow = mod.workflow_trigger_info(
+        yaml.safe_load((WORKFLOW_DIR / "session-manifest.yml").read_text(encoding="utf-8")), "x"
+    )
+    assert ci_workflow[0] == "ci" and "edited" in ci_workflow[1]
+    assert manifest_workflow[0] == "agent-session-manifest" and "edited" not in manifest_workflow[1]
+
+    checks = [
+        _ci_check("typecheck", "ci", started="2026-10-07T01:00:30Z"),
+        _ci_check("python-test", "ci", started="2026-10-07T01:05:00Z"),
+        # edited を含まない workflow は旧 run の pass でも body に依存しないため head_bound として受理する。
+        _ci_check("validate-generated-artifact", "agent-session-manifest", started="2026-10-07T00:00:00Z"),
+    ]
+
+    rc, payload = _ci_freshness(tmp_path, checks)
+
+    assert rc == 0, payload
+    assert payload["fresh"] is True and payload["reason_codes"] == []
+    assert {check["name"]: check["classification"] for check in payload["checks"]} == {
+        "typecheck": "fresh",
+        "python-test": "fresh",
+        "validate-generated-artifact": "head_bound",
+    }
+
+
+def test_ac10_ci_freshness_pre_edit_pass_is_stale_pre_edit_not_fresh(tmp_path: Path) -> None:
+    checks = [_ci_check("test", "ci", started="2026-10-07T00:59:59Z")]
+
+    rc, payload = _ci_freshness(tmp_path, checks)
+
+    assert rc == 1 and payload["fresh"] is False
+    assert payload["checks"] == [{"name": "test", "classification": "stale_pre_edit"}]
+    assert payload["reason_codes"] == ["stale_pre_edit"] and payload["retryable"] is True
+
+
+def test_ac10_ci_freshness_same_second_as_the_watermark_is_accepted(tmp_path: Path) -> None:
+    checks = [_ci_check("test", "ci", started=WATERMARK)]
+
+    rc, payload = _ci_freshness(tmp_path, checks)
+
+    assert rc == 0 and payload["checks"][0]["classification"] == "fresh"
+
+
+def test_ac10_ci_freshness_unknown_workflow_fails_closed(tmp_path: Path) -> None:
+    for workflow in ("no-such-workflow", "", None):
+        checks = [_ci_check("mystery", workflow, started="2026-10-07T02:00:00Z")]  # type: ignore[arg-type]
+
+        rc, payload = _ci_freshness(tmp_path, checks)
+
+        assert rc == 1, workflow
+        assert payload["checks"][0]["classification"] == "unknown_workflow"
+        assert payload["retryable"] is False
+
+
+def test_ac10_ci_freshness_one_stale_check_blocks_even_when_the_others_are_fresh(tmp_path: Path) -> None:
+    checks = [
+        _ci_check("lint", "ci", started="2026-10-07T02:00:00Z"),
+        _ci_check("build", "ci", started="2026-10-07T00:00:00Z"),
+    ]
+
+    rc, payload = _ci_freshness(tmp_path, checks)
+
+    assert rc == 1 and payload["reason_codes"] == ["stale_pre_edit"]
+
+
+def test_ac10_ci_freshness_not_passed_wait_status_or_failed_bucket_never_fresh(tmp_path: Path) -> None:
+    rc, payload = _ci_freshness(tmp_path, [_ci_check("test", "ci", started=WATERMARK)], status="pending_timeout")
+    assert rc == 1 and "ci_not_passed" in payload["reason_codes"]
+
+    rc, payload = _ci_freshness(tmp_path, [_ci_check("test", "ci", started=WATERMARK, bucket="fail")], status="failed")
+    assert rc == 1 and "not_passed" in payload["reason_codes"]
+
+    rc, payload = _ci_freshness(
+        tmp_path, [_ci_check("test", "ci", started=WATERMARK, completed="0001-01-01T00:00:00Z")]
+    )
+    assert rc == 1 and payload["checks"][0]["classification"] == "not_completed"
+
+    rc, payload = _ci_freshness(tmp_path, [_ci_check("test", "ci", started="garbage")])
+    assert rc == 1 and payload["checks"][0]["classification"] == "invalid_timestamp"
+
+
+def test_ac10_ci_freshness_head_binding_is_enforced(tmp_path: Path) -> None:
+    checks = [_ci_check("test", "ci", started=WATERMARK)]
+    wait_file = tmp_path / "wait.txt"
+    wait_file.write_text(_ci_wait_line(HEAD, checks, current_head=OTHER_HEAD), encoding="utf-8")
+
+    rc, payload, _err = _run_cli(
+        [
+            "ci-freshness",
+            "--wait-ci-output",
+            str(wait_file),
+            "--body-edit-updated-at",
+            WATERMARK,
+            "--workflow-dir",
+            str(WORKFLOW_DIR),
+        ]
+    )
+    assert rc == 1 and "ci_head_mismatch" in payload["reason_codes"]
+
+    rc, payload = _ci_freshness(tmp_path, checks, extra=["--expected-head-sha", OTHER_HEAD])
+    assert rc == 1 and "ci_head_mismatch" in payload["reason_codes"]
+
+
+def test_ac10_ci_freshness_runtime_errors_exit_two(tmp_path: Path) -> None:
+    wait_file = tmp_path / "wait.txt"
+    wait_file.write_text(_ci_wait_line(HEAD, [_ci_check("test", "ci", started=WATERMARK)]), encoding="utf-8")
+
+    rc, payload, _ = _run_cli(
+        [
+            "ci-freshness",
+            "--wait-ci-output",
+            str(wait_file),
+            "--body-edit-updated-at",
+            "not-a-time",
+            "--workflow-dir",
+            str(WORKFLOW_DIR),
+        ]
+    )
+    assert rc == 2 and "error" in payload
+    rc, payload, _ = _run_cli(
+        [
+            "ci-freshness",
+            "--wait-ci-output",
+            str(wait_file),
+            "--body-edit-updated-at",
+            WATERMARK,
+            "--workflow-dir",
+            str(tmp_path / "nope"),
+        ]
+    )
+    assert rc == 2 and "error" in payload
+    rc, payload, _ = _run_cli(
+        [
+            "ci-freshness",
+            "--wait-ci-output",
+            str(tmp_path / "nope.txt"),
+            "--body-edit-updated-at",
+            WATERMARK,
+            "--workflow-dir",
+            str(WORKFLOW_DIR),
+        ]
+    )
+    assert rc == 2 and "error" in payload
+
+
+def test_ac10_ci_freshness_workflow_without_pull_request_trigger_or_duplicate_name_is_unknown(tmp_path: Path) -> None:
+    wf_dir = tmp_path / "workflows"
+    wf_dir.mkdir()
+    (wf_dir / "push_only.yml").write_text(
+        "name: push-only\non:\n  push:\n    branches: [main]\njobs: {}\n", encoding="utf-8"
+    )
+    (wf_dir / "dup_a.yml").write_text(
+        "name: dup\non:\n  pull_request:\n    types: [edited]\njobs: {}\n", encoding="utf-8"
+    )
+    (wf_dir / "dup_b.yml").write_text("name: dup\non:\n  pull_request:\njobs: {}\n", encoding="utf-8")
+    (wf_dir / "broken.yml").write_text("name: [unclosed\n", encoding="utf-8")
+    for workflow in ("push-only", "dup"):
+        rc, payload = _ci_freshness(
+            tmp_path, [_ci_check("x", workflow, started="2026-10-07T02:00:00Z")], workflow_dir=wf_dir
+        )
+
+        assert rc == 1 and payload["checks"][0]["classification"] == "unknown_workflow", workflow
+
+
+def test_ac10_workflow_trigger_info_handles_the_pyyaml_boolean_on_key_and_defaults() -> None:
+    document = yaml.safe_load("name: wf\non:\n  pull_request:\n    types: [opened, edited]\n")
+    assert True in document and "on" not in document  # PyYAML は `on` を True として読む
+    assert mod.workflow_trigger_info(document, "fb") == ("wf", frozenset({"opened", "edited"}))
+
+    quoted = yaml.safe_load('name: wf\n"on":\n  pull_request:\n    types: [edited]\n')
+    assert "on" in quoted
+    assert mod.workflow_trigger_info(quoted, "fb")[1] == frozenset({"edited"})
+
+    defaults = {
+        "on: pull_request": "name: a\non: pull_request\n",
+        "on: [push, pull_request]": "name: a\non: [push, pull_request]\n",
+        "pull_request: null": "name: a\non:\n  pull_request:\n",
+        "pull_request: no types": "name: a\non:\n  pull_request:\n    branches: [main]\n",
+    }
+    for label, text in defaults.items():
+        assert mod.workflow_trigger_info(yaml.safe_load(text), "fb") == ("a", mod.DEFAULT_PULL_REQUEST_TYPES), label
+    assert mod.workflow_trigger_info(yaml.safe_load("on:\n  push:\n"), "fallback.yml") == ("fallback.yml", None)
+    assert mod.workflow_trigger_info(yaml.safe_load("name: s\non:\n  pull_request:\n    types: edited\n"), "fb")[
+        1
+    ] == frozenset({"edited"})
+    assert mod.workflow_trigger_info(None, "fb") == ("fb", None)
+
+
+def test_ac10_parse_timestamp_handles_z_offsets_and_rejects_the_zero_time() -> None:
+    assert mod.parse_timestamp("2026-10-07T01:00:00Z") == mod.parse_timestamp("2026-10-07T10:00:00+09:00")
+    assert mod.parse_timestamp("2026-10-07T01:00:00") == mod.parse_timestamp("2026-10-07T01:00:00Z")
+    for bad in ("0001-01-01T00:00:00Z", "", None, "yesterday", 5):
+        assert mod.parse_timestamp(bad) is None
+
+
+# -- dispatch of the CLI entry --
+
+
+def test_ac10_dry_run_and_production_entrypoints_are_separate(tmp_path: Path) -> None:
+    rc, payload, _err = _run_cli(
+        ["record", "--loop-state-file", str(tmp_path / "missing.json"), "--state", "dispatched"]
+    )
+    assert rc == 2 and "error" in payload
+
+    completed = subprocess.run([sys.executable, str(MODULE_PATH), "plan"], capture_output=True, text=True, check=False)
+    assert completed.returncode == 2 and not completed.stdout.strip()
+    completed = subprocess.run([sys.executable, str(MODULE_PATH)], capture_output=True, text=True, check=False)
+    assert completed.returncode == 2 and "--dry-run-fixture" in completed.stderr
+
+    # dry-run は gh を一切実行しない: gh が PATH に無くても、fake gh が記録を残さなくても marker を出力する。
+    env = PlanEnv(tmp_path)
+    completed = subprocess.run(
+        [sys.executable, str(MODULE_PATH), "--dry-run-fixture", str(INCIDENT_FIXTURE)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env.environment(),
+    )
+    assert completed.returncode == 0 and completed.stdout.splitlines()[0] == "BODY_ONLY_LANE_ELIGIBLE"
+    assert env.gh_calls() == []
+
+
+def test_ac10_pure_helpers_for_ci_wait_output_and_loop_state_counts() -> None:
+    line = _ci_wait_line(HEAD, [_ci_check("t", "ci", started=WATERMARK)])
+    payload, error = mod.parse_ci_wait_output(line)
+    assert error is None and mod.required_ci_valid_for_head(payload, HEAD) is True
+    assert mod.required_ci_valid_for_head(payload, OTHER_HEAD) is False
+    assert mod.required_ci_valid_for_head({**payload, "status": "failed"}, HEAD) is False
+    assert mod.required_ci_valid_for_head({**payload, "checks": []}, HEAD) is False
+    assert mod.required_ci_valid_for_head(None, HEAD) is False
+    assert mod.parse_ci_wait_output("")[1] == "ci_wait_result_line_count_invalid"
+    assert mod.parse_ci_wait_output("CI_WAIT_RESULT_V1_JSON=nope")[1] == "ci_wait_result_not_json"
+    assert mod.parse_ci_wait_output('CI_WAIT_RESULT_V1_JSON={"schema":"x"}')[1] == "ci_wait_result_schema_invalid"
+
+    counts, error = mod.lane_history_counts(
+        {
+            "blockers_history": [
+                "x",
+                {"lane": "body_only_repair", "outcome": "dispatched"},
+                {"lane": "body_only_repair", "outcome": "no_mutation"},
+                {"lane": "other"},
+            ]
+        }
+    )
+    assert error is None and counts == {"consumed": 1, "no_mutation": 1, "dispatched": 1}
+    assert mod.lane_history_counts({}) == ({"consumed": 0, "no_mutation": 0, "dispatched": 0}, None)
+    assert mod.lane_history_counts({"blockers_history": 3})[1] == "blockers_history_not_list"
+
+
+# -- test_count subject binding (pure) --
+
+
+def _row(
+    command: str,
+    subject: str,
+    passed: Any = 47,
+    *,
+    command_hash: str = "sha256:h1",
+    status: str = "pass",
+    exit_code: Any = 0,
+) -> dict[str, Any]:
+    return {
+        "ac": "AC1",
+        "command": command,
+        "command_hash": command_hash,
+        "exit_code": exit_code,
+        "status": status,
+        "test_count": {"subject": subject, "passed": passed},
+    }
+
+
+def test_ac10_subject_tokens_split_on_non_alphanumerics_and_underscore() -> None:
+    assert mod.subject_tokens("test_Foo_reachability_evaluator.py") == {
+        "test",
+        "foo",
+        "reachability",
+        "evaluator",
+        "py",
+    }
+    assert mod.subject_tokens("evaluator") <= mod.subject_tokens(".claude/x/tests/test_foo_reachability_evaluator.py")
+    assert not mod.subject_tokens("evaluator") <= mod.subject_tokens("evaluatorhelper")
+    assert mod.subject_tokens("evaluator_helper") == {"evaluator", "helper"}
+    assert mod.subject_tokens("___ ... ") == frozenset()
+
+
+def test_ac10_bind_test_count_row_requires_the_subject_in_both_command_and_subject_and_exactly_one_row() -> None:
+    hashes = ["sha256:h1"]
+    evaluator = _row("pytest tests/test_x_evaluator.py -q", "tests/test_x_evaluator.py")
+    helper = _row("pytest tests/test_x_evaluator_helper.py -q", "tests/test_x_evaluator_helper.py")
+    suite = _row("pytest tests/ -q", "tests/")
+
+    row, error = mod.bind_test_count_row("evaluator", [suite, evaluator], hashes)
+    assert (row, error) == (evaluator, None)
+    # `evaluator` は `evaluator_helper` にも token として含まれるため 2 行一致 → ambiguous。
+    assert mod.bind_test_count_row("evaluator", [evaluator, helper], hashes)[1] == "test_count_subject_ambiguous"
+    assert mod.bind_test_count_row("evaluator helper", [evaluator, helper], hashes)[0] == helper
+    assert mod.bind_test_count_row("evaluator", [suite], hashes) == (None, "test_count_subject_unbound")
+    # command には含むが test_count.subject に含まない行 / その逆は束縛しない。
+    assert mod.bind_test_count_row("evaluator", [_row("pytest tests/test_x_evaluator.py", "tests/")], hashes)[0] is None
+    assert mod.bind_test_count_row("evaluator", [_row("pytest tests/", "tests/test_x_evaluator.py")], hashes)[0] is None
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        _row("pytest t_evaluator.py", "t_evaluator.py", status="fail"),
+        _row("pytest t_evaluator.py", "t_evaluator.py", exit_code=1),
+        _row("pytest t_evaluator.py", "t_evaluator.py", exit_code=False),
+        _row("pytest t_evaluator.py", "t_evaluator.py", command_hash="sha256:other"),
+        _row("pytest t_evaluator.py", "t_evaluator.py", passed=-1),
+        _row("pytest t_evaluator.py", "t_evaluator.py", passed="47"),
+        _row("pytest t_evaluator.py", "t_evaluator.py", passed=True),
+        {
+            "command": "pytest t_evaluator.py",
+            "command_hash": "sha256:h1",
+            "status": "pass",
+            "exit_code": 0,
+            "notes": "47 passed",
+        },
+        "not-a-row",
+    ],
+    ids=[
+        "status_fail",
+        "exit_code_1",
+        "exit_code_bool",
+        "hash_outside_binding",
+        "negative",
+        "string_count",
+        "bool_count",
+        "notes_only",
+        "non_dict",
+    ],
+)
+def test_ac10_bind_test_count_row_ignores_rows_that_do_not_meet_every_condition(row: Any) -> None:
+    assert mod.bind_test_count_row("evaluator", [row], ["sha256:h1"])[0] is None
+
+
+def test_ac10_build_evidence_refs_materializes_only_current_head_bound_refs() -> None:
+    report = {
+        "TEST_VERDICT": {
+            "schema": "TEST_VERDICT_MACHINE/v2",
+            "head_sha": HEAD,
+            "reviewed_head_sha": HEAD,
+            "result": "PASS",
+            "runtime_ac_results": [_row("pytest t_evaluator.py", "t_evaluator.py")],
+        }
+    }
+    refs, extra = mod.build_evidence_refs(
+        live_head_sha=HEAD,
+        blockers=[STALE_BLOCKER, PENDING_BLOCKER],
+        test_verdict_report=report,
+        test_verdict_source="v.json",
+        expected_command_hashes=["sha256:h1"],
+        runtime_summary_text=None,
+        runtime_summary_source=None,
+        runtime_summary_provenance_ok=False,
+    )
+    assert extra == []
+    assert {ref["kind"] for ref in refs} == {"test_count", "completed_status"}
+    assert all(ref["head_sha"] == HEAD and ref["source"] == "v.json" for ref in refs)
+    status_ref = next(ref for ref in refs if ref["kind"] == "completed_status")
+    assert status_ref["value"] == f"実施済み（TEST_VERDICT_MACHINE/v2 result: PASS, head {HEAD[:7]}）"
+    assert not any(word in status_ref["value"] for word in mod.PENDING_WORDS)
+
+    refs, extra = mod.build_evidence_refs(
+        live_head_sha=OTHER_HEAD,
+        blockers=[STALE_BLOCKER],
+        test_verdict_report=report,
+        test_verdict_source="v.json",
+        expected_command_hashes=["sha256:h1"],
+        runtime_summary_text="x\n",
+        runtime_summary_source="s.md",
+        runtime_summary_provenance_ok=True,
+    )
+    assert extra == ["test_verdict_head_mismatch"]
+    assert [ref["kind"] for ref in refs] == ["runtime_evidence"]
+    assert mod.build_evidence_refs(
+        live_head_sha=HEAD,
+        blockers=[],
+        test_verdict_report="garbage",
+        test_verdict_source="v.json",
+        expected_command_hashes=[],
+        runtime_summary_text=None,
+        runtime_summary_source=None,
+        runtime_summary_provenance_ok=False,
+    ) == ([], ["test_verdict_malformed"])
+
+
+# --- AC11 (test_count carrier is ignored by the existing adapter) -------------------------
+
+
+def test_ac11_existing_adapter_accepts_a_report_that_carries_the_optional_test_count_field() -> None:
+    adjudicator = harness.mod
+    plain = harness._test_verdict(harness.HEAD_A, harness.BODY_A, False)
+    carrying = copy.deepcopy(plain)
+    for row in carrying["runtime_ac_results"]:
+        row["test_count"] = {"subject": "tests/test_x.py", "passed": 12}
+
+    converted_plain, errors_plain = adjudicator.adapt_test_verdict_to_current_vc_result(plain)
+    converted_carrying, errors_carrying = adjudicator.adapt_test_verdict_to_current_vc_result(carrying)
+
+    assert converted_plain is not None and converted_carrying is not None
+    assert errors_plain == errors_carrying == []
+    assert converted_carrying == converted_plain  # 行の既知 field の判定が不変（未知 field は無視）
+
+
+def test_ac11_real_step4_adjudicate_cli_accepts_the_test_count_carrier_and_dispatches(tmp_path: Path) -> None:
+    ws = harness.Workspace(tmp_path)
+    verdict = harness._test_verdict(harness.HEAD_A, harness.BODY_A, False)
+    for row in verdict["runtime_ac_results"]:
+        row["test_count"] = {"subject": "tests/test_x.py", "passed": 12}
+
+    rc, payload = ws.adjudicate(verdict=verdict)
+
+    assert rc == 0, payload
+    assert payload["invoke_pr_reviewer"] is True and payload["seq"] == 1
+
+
+def test_ac11_plan_reads_the_raw_report_row_because_the_adapter_discards_test_count() -> None:
+    adjudicator = harness.mod
+    report = harness._test_verdict(harness.HEAD_A, harness.BODY_A, False)
+    report["runtime_ac_results"][0]["test_count"] = {"subject": "tests/test_x_evaluator.py", "passed": 12}
+    report["runtime_ac_results"][0]["command"] = "pytest tests/test_x_evaluator.py"
+
+    converted, _errors = adjudicator.adapt_test_verdict_to_current_vc_result(report)
+    assert "test_count" not in json.dumps(converted)
+
+    row, error = mod.bind_test_count_row("evaluator", report["runtime_ac_results"], [harness.H_AC1])
+    assert error is None and row["test_count"]["passed"] == 12
+
+
+# --- meta: every AC prefix has at least one test (no vacuous AC) ---------------------------
+
+REQUIRED_AC_PREFIXES = (
+    "test_ac1_",
+    "test_ac2_",
+    "test_ac3_",
+    "test_ac4_",
+    "test_ac5_",
+    "test_ac6_",
+    "test_ac7_",
+    "test_ac10_",
+    "test_ac11_",
+)
+
+
+def test_ac7_meta_every_required_ac_prefix_has_at_least_one_test() -> None:
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    names = [node.name for node in tree.body if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")]
+
+    missing = [prefix for prefix in REQUIRED_AC_PREFIXES if not any(name.startswith(prefix) for name in names)]
+
+    assert not missing, f"AC prefixes without a test: {missing}"
+    # 全ての test は接頭辞で対応 AC を示す（接頭辞の無い test を置かない）。
+    unprefixed = [name for name in names if not any(name.startswith(prefix) for prefix in REQUIRED_AC_PREFIXES)]
+    assert not unprefixed, unprefixed
