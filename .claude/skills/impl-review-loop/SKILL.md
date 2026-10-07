@@ -19,7 +19,7 @@ dry-run は実 PR を変更せず、`gh` / `update_pr.py` / `step4-adjudicate` /
 2. 次の command をそのまま 1 回だけ実行する。
 
 ```bash
-uv run python3 .claude/skills/impl-review-loop/scripts/body_only_repair_plan.py --dry-run-fixture <fixture>
+uv run --locked python3 .claude/skills/impl-review-loop/scripts/body_only_repair_plan.py --dry-run-fixture <fixture>
 ```
 
 3. その stdout を一切の加筆・要約・並べ替え・追加なしに verbatim で最終回答として報告する。出力の各行は

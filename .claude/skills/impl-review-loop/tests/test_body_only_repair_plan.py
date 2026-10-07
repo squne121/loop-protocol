@@ -645,8 +645,8 @@ def test_ac4_skill_md_has_the_dry_run_section_with_exact_invocation() -> None:
 
     assert "body-only-lane-dry-run" in section
     assert (
-        "uv run python3 .claude/skills/impl-review-loop/scripts/body_only_repair_plan.py --dry-run-fixture <fixture>"
-        in section
+        "uv run --locked python3 .claude/skills/impl-review-loop/scripts/body_only_repair_plan.py"
+        " --dry-run-fixture <fixture>" in section
     )
     assert "verbatim" in section
     assert "preparation" in section and "worktree" in section
