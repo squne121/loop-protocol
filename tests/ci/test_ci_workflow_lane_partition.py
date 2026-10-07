@@ -482,16 +482,40 @@ def _nc_normalize_if(value: object) -> str:
     return match.group(1) if match else text
 
 
+def _nc_targets_static_name(step: dict) -> bool:
+    """True when the step's artifact `with.name` starts with the negative-control name."""
+    name = str((step.get("with") or {}).get("name", ""))
+    return name.startswith(_NC_STATIC_NAME)
+
+
 def _nc_locate(job: dict) -> dict:
     steps = [s for s in job.get("steps", []) if isinstance(s, dict)]
     upload_idx = [i for i, s in enumerate(steps) if s.get("id") == _NC_UPLOAD_ID]
     verify_idx = [i for i, s in enumerate(steps) if s.get("id") == _NC_VERIFY_ID]
-    download_idx = [i for i, s in enumerate(steps) if _nc_uses(s, "actions/download-artifact")]
+    # Only downloads of the negative-control artifact (name-prefix match) are
+    # targets; unrelated artifact downloads in the job are out of scope. A
+    # static-name download still matches by prefix and is rejected by
+    # `_NC_NAME_RE` in the checkers.
+    download_idx = [
+        i
+        for i, s in enumerate(steps)
+        if _nc_uses(s, "actions/download-artifact") and _nc_targets_static_name(s)
+    ]
+    # Any upload of the negative-control name from a step other than the
+    # canonical upload id is rogue (e.g. a static-name upload under a new id).
+    rogue_upload_idx = [
+        i
+        for i, s in enumerate(steps)
+        if _nc_uses(s, "actions/upload-artifact")
+        and s.get("id") != _NC_UPLOAD_ID
+        and _nc_targets_static_name(s)
+    ]
     return {
         "steps": steps,
         "upload": upload_idx,
         "verify": verify_idx,
         "downloads": download_idx,
+        "rogue_uploads": rogue_upload_idx,
     }
 
 
@@ -526,6 +550,9 @@ def _nc_check_artifact_name_is_attempt_scoped(job: dict) -> list[str]:
     upload_name = str((upload.get("with") or {}).get("name", ""))
     if not _NC_NAME_RE.fullmatch(upload_name):
         violations.append(f"upload name is not attempt-scoped: {upload_name!r}")
+    for idx in loc["rogue_uploads"]:
+        rogue_name = str((steps[idx].get("with") or {}).get("name", ""))
+        violations.append(f"rogue upload step {idx} (id={steps[idx].get('id')!r}) uploads {rogue_name!r}")
     if not loc["downloads"]:
         violations.append("no download-artifact step found")
     for idx in loc["downloads"]:
@@ -677,6 +704,42 @@ def test_component_vrt_negative_control_artifact_name_is_attempt_scoped():
     # mutated copy 5: upload / download names diverge
     m = copy.deepcopy(job)
     _step(m, "download")[0]["with"]["name"] = f"{_NC_STATIC_NAME}-${{{{ github.run_attempt }}}}-x"
+    assert _nc_check_artifact_name_is_attempt_scoped(m)
+    # mutated copy 6: rogue static-name upload under a different step id
+    m = copy.deepcopy(job)
+    m["steps"].append(
+        {
+            "name": "rogue static upload",
+            "id": "upload-rogue-static",
+            "uses": "actions/upload-artifact@v6",
+            "with": {"name": _NC_STATIC_NAME, "path": "rogue-dir"},
+        }
+    )
+    assert any("rogue upload" in v for v in _nc_check_artifact_name_is_attempt_scoped(m))
+    # allowed: an unrelated download (other name/path) outside the negative-control
+    # block must not make any of the three checkers false-fail.
+    m = copy.deepcopy(job)
+    m["steps"].append(
+        {
+            "name": "unrelated download",
+            "id": "download-some-unrelated-artifact",
+            "uses": "actions/download-artifact@v6",
+            "with": {"name": "some-unrelated-artifact", "path": "unrelated-dir"},
+        }
+    )
+    assert _nc_check_artifact_name_is_attempt_scoped(m) == []
+    assert _nc_check_roundtrip_is_bounded(m) == []
+    assert _nc_check_hidden_file_proof(m) == []
+    # a static-name download is still a target (prefix match) and is rejected
+    m = copy.deepcopy(job)
+    m["steps"].append(
+        {
+            "name": "static download",
+            "id": "download-static",
+            "uses": "actions/download-artifact@v6",
+            "with": {"name": _NC_STATIC_NAME, "path": "negative-control-download"},
+        }
+    )
     assert _nc_check_artifact_name_is_attempt_scoped(m)
 
 
