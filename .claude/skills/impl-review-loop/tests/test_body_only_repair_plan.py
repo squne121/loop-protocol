@@ -795,6 +795,16 @@ def test_ac4_each_file_expresses_the_readback_equivalently_with_guard_on_the_bod
 
 
 @pytest.mark.parametrize("path", DOC_FILES)
+def test_ac4_each_file_states_the_contract_body_sha256_prefix_rule(path: Path) -> None:
+    order = _order_part(_lane_section(path.read_text(encoding="utf-8")))
+
+    assert "`--expected-contract-body-sha256` には" in order
+    assert "`sha256:` 付き（`sha256:<64 桁 hex>`）" in order
+    # plan が返す hash は `sha256:` なしの hex で、contract body hash とは別の値。
+    assert "`expected_live_body_sha256` / `body_file_sha256` は `sha256:` なしの hex" in order
+
+
+@pytest.mark.parametrize("path", DOC_FILES)
 def test_ac4_each_file_documents_the_worker_request_body_file_fields(path: Path) -> None:
     section = _lane_section(path.read_text(encoding="utf-8"))
     request = re.search(r"IMPLEMENTATION_WORKER_REQUEST_V2:\n(.*?)```", section, re.S)
@@ -1817,7 +1827,7 @@ def test_ac10_plan_materializes_current_head_evidence_and_writes_the_completed_b
     body_text = Path(payload["body_file_path"]).read_text(encoding="utf-8")
     assert Path(payload["body_file_path"]) == env.body_out.resolve()
     assert payload["body_file_sha256"] == mod.body_sha256(body_text)
-    assert "## Runtime Verification Evidence\n" + RUNTIME_SUMMARY.strip("\n") in body_text
+    assert "## Runtime Verification Evidence\n" + mod.runtime_evidence_value(RUNTIME_SUMMARY) in body_text
     assert "39 件" not in body_text and "47 件" in body_text
     # 同一 fixture を production 関数に直接通した結果（refs を手で渡した場合）と completed body が一致する。
     expected = mod.decide_body_only_repair(
@@ -1827,7 +1837,12 @@ def test_ac10_plan_materializes_current_head_evidence_and_writes_the_completed_b
         True,
         env.live_body,
         [
-            {"kind": "runtime_evidence", "value": RUNTIME_SUMMARY.strip("\n"), "source": "s", "head_sha": env.head},
+            {
+                "kind": "runtime_evidence",
+                "value": mod.runtime_evidence_value(RUNTIME_SUMMARY),
+                "source": "s",
+                "head_sha": env.head,
+            },
             {"kind": "test_count", "value": "47", "source": "s", "head_sha": env.head},
         ],
         0,
@@ -1974,9 +1989,9 @@ def test_ac10_plan_test_count_row_with_command_hash_outside_the_adjudicated_bind
 
 
 def test_ac10_plan_runs_the_update_pr_validators_and_a_validator_failure_is_ineligible(tmp_path: Path) -> None:
-    env = PlanEnv(tmp_path)
     # 日本語を含まない prose block は update_pr.py と同一の Japanese content validator で fail する。
-    Path(env.summary_file).write_text("### AC8\n\nResult: PASS\nall checks are green on this head\n", encoding="utf-8")
+    english_block = "\n\nThis paragraph is written only in English and has no Japanese text at all.\n"
+    env = PlanEnv(tmp_path, live_body=_incident()["live_pr_body"] + english_block)
 
     rc, payload = env.plan()
 
@@ -2662,6 +2677,122 @@ def test_ac10_build_evidence_refs_materializes_only_current_head_bound_refs() ->
         runtime_summary_source=None,
         runtime_summary_provenance_ok=False,
     ) == ([], ["test_verdict_malformed"])
+
+
+REAL_FORMAT_SUMMARY = FIXTURE_DIR / "runtime_smoke_summary_real_format_issue_2971.txt"
+
+
+def test_ac10_plan_real_runtime_smoke_summary_format_passes_the_real_validators(tmp_path: Path) -> None:
+    """実 ``run_worktree_agent_runtime_smoke.py`` の summary.md（英語の ``key: value`` 列）でも eligible になる。"""
+    env = PlanEnv(tmp_path)
+    real = REAL_FORMAT_SUMMARY.read_text(encoding="utf-8")
+    assert real.startswith("# Runtime Smoke Summary\n") and "- tested_head: " in real
+    # fixture の tested_head だけをこの環境の live head に差し替える（それ以外は実物の内容のまま）。
+    real = re.sub(r"(?m)^- tested_head: [0-9a-f]+$", f"- tested_head: {env.head}", real)
+    Path(env.summary_file).write_text(real, encoding="utf-8")
+
+    rc, payload = env.plan()
+
+    assert rc == 0, payload
+    assert payload["eligible"] is True and payload["reason_codes"] == []
+    body_text = Path(payload["body_file_path"]).read_text(encoding="utf-8")
+    section = body_text[body_text.index("## Runtime Verification Evidence") :]
+    lines = section.split("\n")
+    # 見出しの直後が日本語の導入行（同一 prose block）で、summary 本文は text fence の中に verbatim で入る。
+    assert lines[0] == "## Runtime Verification Evidence"
+    assert lines[1] == mod.RUNTIME_EVIDENCE_INTRO
+    assert f"tested_head は {env.head} です" in lines[2]
+    assert lines[3] == "" and lines[4] == "```text"
+    assert real.strip("\n") in section
+    assert section.rstrip("\n").endswith("```")
+    # 実 update_pr.py の validator と同一入力で通っている（plan が内部で実行済みで、ここでも直接確認する）。
+    upd = mod._load_update_pr()
+    assert upd._run_japanese_content_validator(body_text).get("status") == "pass"
+
+
+def test_ac10_runtime_evidence_value_is_a_deterministic_template_with_a_safe_fence() -> None:
+    summary = "# Runtime Smoke Summary\n\n- tested_head: " + "a" * 40 + "\n- note: ```inner``` fence\n"
+
+    value = mod.runtime_evidence_value(summary)
+
+    assert value == mod.runtime_evidence_value(summary)  # 決定論的
+    assert value.startswith(mod.RUNTIME_EVIDENCE_INTRO + "\n")
+    assert "a" * 40 in value.split("\n\n")[0]  # tested_head は summary から機械的に写す
+    assert "\n````text\n" in value and value.endswith("\n````")  # 内部の ``` より長い fence
+    assert summary.strip("\n") in value
+    # tested_head 行が無い summary には tested_head の導入行を作らない。
+    plain = mod.runtime_evidence_value("# Runtime Smoke Summary\n- mode: structured\n")
+    assert "tested_head" not in plain.split("\n\n")[0]
+    assert not any(word in mod.RUNTIME_EVIDENCE_INTRO for word in mod.PENDING_WORDS)
+
+
+# #2963 incident の実 VC command 群（AC1 / AC3 / AC8 相当）。node id 内の token（evaluator）に束縛しない。
+INCIDENT_TESTS_DIR = ".claude/skills/issue-refinement-loop/tests/"
+INCIDENT_AC1_PATH = INCIDENT_TESTS_DIR + "test_semantic_review_consumer_reachability_contract.py"
+INCIDENT_AC3_SELECTOR = (
+    INCIDENT_AC1_PATH + "::test_reviewer_contract_requires_producer_parser_evaluator_caller_trace_and_unobservable"
+)
+INCIDENT_AC8_PATH = INCIDENT_TESTS_DIR + "test_issue_design_reviewer_reachability_evaluator.py"
+
+
+def _incident_row(ac: str, command: str, subject: str, passed: int, command_hash: str) -> dict[str, Any]:
+    return {
+        "ac": ac,
+        "command": command,
+        "command_hash": command_hash,
+        "exit_code": 0,
+        "status": "pass",
+        "test_count": {"subject": subject, "passed": passed},
+    }
+
+
+def _incident_rows() -> list[dict[str, Any]]:
+    run = "uv run --locked pytest "
+    return [
+        _incident_row("AC1", run + INCIDENT_AC1_PATH + "::test_reviewer_contract_x", INCIDENT_AC1_PATH, 1, "sha256:1"),
+        _incident_row("AC3", run + INCIDENT_AC3_SELECTOR, INCIDENT_AC3_SELECTOR, 1, "sha256:3"),
+        _incident_row("AC8", run + INCIDENT_AC8_PATH + " -q", INCIDENT_AC8_PATH, 47, "sha256:8"),
+    ]
+
+
+def test_ac10_bind_test_count_row_ignores_tokens_that_only_appear_in_a_pytest_node_id() -> None:
+    rows = _incident_rows()
+    hashes = ["sha256:1", "sha256:3", "sha256:8"]
+
+    row, error = mod.bind_test_count_row("evaluator", rows, hashes)
+
+    assert error is None, error  # AC3 の node id 内の evaluator には束縛せず、AC8 の行だけに束縛する
+    assert row["ac"] == "AC8" and row["test_count"]["passed"] == 47
+    # SUBJECT が node id にしか現れない行（AC3 のみ）には束縛しない（fail-closed で 0 行）。
+    assert mod.bind_test_count_row("evaluator", [rows[1]], ["sha256:3"]) == (None, "test_count_subject_unbound")
+    assert mod.bind_test_count_row("trace", rows, hashes) == (None, "test_count_subject_unbound")
+    # file basename・directory・-k 式の token は対象。
+    assert mod.bind_test_count_row("reachability", [rows[2]], ["sha256:8"])[0]["ac"] == "AC8"
+    k_row = _incident_rows()[2]
+    k_row["command"] = "uv run --locked pytest tests/test_x.py -k alpha_beta -q"
+    k_row["test_count"]["subject"] = "tests/test_x.py -k alpha_beta"
+    assert mod.bind_test_count_row("alpha", [k_row], ["sha256:8"])[0] is k_row
+    # evaluator は evaluator_helper には束縛しない（既存の negative を維持）。
+    helper = _incident_rows()[2]
+    helper["command"] = "uv run --locked pytest tests/test_evaluator_helper.py -q"
+    helper["test_count"]["subject"] = "tests/test_evaluator_helper.py"
+    assert mod.bind_test_count_row("evaluator_x", [helper], ["sha256:8"])[1] == "test_count_subject_unbound"
+    assert mod.strip_node_id("a/b.py::test_x[param] -q") == "a/b.py -q"
+    # command 側の node id だけにある token も、subject 側の path にだけある token も、片側だけでは束縛しない。
+    split = _incident_row(
+        "AC3", "uv run --locked pytest tests/test_a.py::test_evaluator_x", "tests/test_evaluator_b.py", 1, "sha256:3"
+    )
+    assert mod.bind_test_count_row("evaluator", [split], ["sha256:3"]) == (None, "test_count_subject_unbound")
+
+
+def test_ac2_pending_literal_inside_an_english_word_is_not_counted_as_the_target() -> None:
+    # 「pending」は単語としてだけ数える（depending / expending の部分文字列は対象外）。
+    assert mod._count_literal("depending and expending", "pending", False) == 0
+    assert mod._count_literal("status pending now", "pending", False) == 1
+    assert mod._count_literal("（pending）と未実施", "pending", False) == 1
+    assert mod._count_literal("pendingX", "pending", False) == 0
+    assert mod._count_literal("未実施のまま", "未実施", False) == 1  # 日本語 literal は従来どおり
+    assert mod._replace_once("depending / pending", "pending", "done", False) == "depending / done"
 
 
 # --- AC11 (test_count carrier is ignored by the existing adapter) -------------------------

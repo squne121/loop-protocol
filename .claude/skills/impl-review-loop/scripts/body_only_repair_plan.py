@@ -300,6 +300,14 @@ def subject_tokens(text: str) -> frozenset[str]:
     return frozenset(token for token in TOKEN_SPLIT_PATTERN.split(text.lower()) if token)
 
 
+NODE_ID_PATTERN = re.compile(r"::\S*")
+
+
+def strip_node_id(text: str) -> str:
+    """pytest の node id 部分（``::`` 以降、空白まで）を除く。test 関数名の token を subject 束縛に使わない。"""
+    return NODE_ID_PATTERN.sub("", text)
+
+
 def _normalize_blocker(blocker: str) -> str:
     """前後空白除去、行末の ``。`` / ``.`` 除去（1 個）。"""
     text = blocker.strip()
@@ -365,7 +373,12 @@ def _classify_blocker(blocker: Any) -> tuple[str | None, dict[str, Any]]:
 def _literal_pattern(literal: str, is_count: bool) -> re.Pattern[str]:
     """count literal は先行数字を持たない（`139 件` を `39 件` と誤認しない）。"""
     escaped = re.escape(literal)
-    return re.compile((r"(?<!\d)" + escaped) if is_count else escaped)
+    if is_count:
+        return re.compile(r"(?<!\d)" + escaped)
+    # 英字で始まる / 終わる literal（``pending`` 等）は英字に隣接する出現（``depending`` 等）を数えない。
+    before = r"(?<![A-Za-z])" if literal[:1].isascii() and literal[:1].isalpha() else ""
+    after = r"(?![A-Za-z])" if literal[-1:].isascii() and literal[-1:].isalpha() else ""
+    return re.compile(before + escaped + after)
 
 
 def _count_literal(body: str, literal: str, is_count: bool, scope_tokens: frozenset[str] | None = None) -> int:
@@ -767,7 +780,10 @@ def bind_test_count_row(
         command = row.get("command")
         if not isinstance(command, str):
             continue
-        if tokens <= subject_tokens(command) and tokens <= subject_tokens(count["subject"]):
+        # token 比較は node id（``::`` 以降）を除いた path / ``-k`` 式部分だけで行う。
+        if tokens <= subject_tokens(strip_node_id(command)) and tokens <= subject_tokens(
+            strip_node_id(count["subject"])
+        ):
             bound.append(row)
     if not bound:
         return None, "test_count_subject_unbound"
@@ -786,6 +802,28 @@ def stale_count_requirements(blockers: Any) -> list[tuple[str, str]]:
         if kind == KIND_STALE_COUNT:
             found.append((info["subject"], info["new_count"]))
     return found
+
+
+RUNTIME_EVIDENCE_INTRO = "実 runtime smoke の summary.md（allowlist-only・redacted）を、決定論的に逐語で引用します。"
+RUNTIME_EVIDENCE_TESTED_HEAD_INTRO = "引用元 summary に記載された tested_head は {tested_head} です。"
+TESTED_HEAD_LINE_PATTERN = re.compile(r"(?m)^- tested_head: ([0-9a-f]{7,40})\s*$")
+
+
+def runtime_evidence_value(summary_text: str) -> str:
+    """runtime summary から ``## Runtime Verification Evidence`` 直下に置く固定 template の本文を組み立てる。
+
+    見出しと同じ prose block に日本語の導入行を置き（実 summary は英語の ``key: value`` 列で、そのまま追記すると
+    Japanese validator に落ちる）、summary 本文は ``text`` fence で verbatim に引用する。tested_head は summary から
+    機械的に写すだけで、free-form な作文はしない。fence は summary 内の backtick 列より長くして閉じ損ねない。
+    """
+    body = summary_text.strip("\n")
+    lines = [RUNTIME_EVIDENCE_INTRO]
+    match = TESTED_HEAD_LINE_PATTERN.search(body)
+    if match:
+        lines.append(RUNTIME_EVIDENCE_TESTED_HEAD_INTRO.format(tested_head=match.group(1)))
+    longest = max((len(run) for run in re.findall(r"`+", body)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return "\n".join(lines) + "\n\n" + fence + "text\n" + body + "\n" + fence
 
 
 def build_evidence_refs(
@@ -852,7 +890,7 @@ def build_evidence_refs(
             refs.append(
                 {
                     "kind": EVIDENCE_KIND_RUNTIME,
-                    "value": runtime_summary_text.strip("\n"),
+                    "value": runtime_evidence_value(runtime_summary_text),
                     "source": runtime_summary_source or "",
                     "head_sha": live_head_sha,
                 }
