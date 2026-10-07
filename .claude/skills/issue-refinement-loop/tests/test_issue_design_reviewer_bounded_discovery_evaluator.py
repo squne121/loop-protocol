@@ -1593,6 +1593,7 @@ def test_artifact_records_per_tool_use_lane_classification_and_rule() -> None:
     assert grep_record["classification"] == "dedicated_lane_discovery" and grep_record["result_is_error"] is True
     assert grep_record["attribution_eligible"] is False and grep_record["counted_as_search"] is True
     assert errored_outcome["evidence"]["discovery"]["search_calls"] == 2
+    assert errored_outcome["evidence"]["discovery"]["lanes_used"] == ["bash"]  # error の Grep は lane の根拠にしない
     # 判定が規則 4 以前で確定する stream でも、reviewer 帰属の tool_use の分類を残す（診断用）。
     early = Stream().init(["Read", "Bash"]).agent_call().start()
     early.bash_grep(EVAL_SYM, _abs_lines(EVAL_PATH))

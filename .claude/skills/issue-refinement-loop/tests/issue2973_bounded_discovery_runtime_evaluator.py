@@ -860,13 +860,8 @@ def _evaluate_discovery_observations(
         "source_reads": len(source_reads),
         "search_call_max": DISCOVERY_SEARCH_CALL_MAX,
         "source_read_max": DISCOVERY_SOURCE_READ_MAX,
-        "lanes_used": sorted(
-            {
-                record["lane"]
-                for record in classified
-                if record["classification"] in ("dedicated_lane_discovery", "bash_lane_discovery")
-            }
-        ),
+        # attribution に使われた（非 error の）eligible discovery の lane。error の call は bound に算入されるだけ。
+        "lanes_used": sorted({item["record"]["lane"] for item in attributing}),
         "roles": {
             name: {"listed": s["listed"], "satisfied": s["satisfied"], "via": s["via"]}
             for name, s in role_state.items()
