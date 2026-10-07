@@ -1270,16 +1270,16 @@ def test_rule4_bypass_bash_cannot_replace_the_required_discovery() -> None:
         (f'grep -rl "$(ls)" {ROOT}', "command_substitution"),
         (f"grep -rl `ls` {ROOT}", "command_substitution"),
         (f"grep -rl {EVAL_SYM} '{ROOT}", "tokenize_error"),
-        (f"grep --include *.py {EVAL_SYM} {ROOT}", "unsupported_flag:--include"),
+        (f"grep --include '*.py' {EVAL_SYM} {ROOT}", "unsupported_flag:--include"),
         (f"grep -rlz {EVAL_SYM} {ROOT}", "unsupported_flag:-rlz"),
         (f"grep -rlP {EVAL_SYM} {ROOT}", "unsupported_flag:-rlP"),
         (f"grep -ePAT {ROOT}", "unsupported_flag:-ePAT"),
         (f"grep --exclude-dir {EVAL_SYM} {ROOT}", "unsupported_flag:--exclude-dir"),
         (f"grep --include= {EVAL_SYM} {ROOT}", "unsupported_flag:--include="),
         (f"grep -rl {EVAL_SYM} {ROOT} --color=always", "unsupported_flag:--color=always"),
-        (f"find {ROOT} -name x -exec cat {{}} +", "unsupported_primary:-exec"),
+        (f"find {ROOT} -name x -exec cat '{{}}' +", "unsupported_primary:-exec"),
         (f"find {ROOT} -name x -delete", "unsupported_primary:-delete"),
-        (f"find {ROOT} -name x -execdir ls {{}} ;", "compound_operator"),
+        (f"find {ROOT} -name x -execdir ls '{{}}' ';'", "compound_operator"),
         (f"find {ROOT} -name x -fprint /tmp/x", "unsupported_primary:-fprint"),
         (f"find {ROOT} -not -name x", "unsupported_primary:-not"),
         (f"find {ROOT} ! -name x", "unsupported_primary:!"),
@@ -1304,7 +1304,7 @@ def test_bash_shape_ineligible_commands_fail_closed(command: str, reason: str) -
     "command",
     [
         f"grep -rn -E '{EVAL_SYM}|fn_other_zz' {ROOT}/{SYN}",  # quote された `|` は引数の一部
-        f"grep -rln -E '{EVAL_SYM}|fn_other_zz' {ROOT} --include=*.py --exclude-dir=node_modules",
+        f"grep -rln -E '{EVAL_SYM}|fn_other_zz' {ROOT} --include='*.py' --exclude-dir=node_modules",
         f"grep -rn {EVAL_SYM} {ROOT}",  # `-rn` 連結 flag
         f"grep -rnwi {EVAL_SYM} {ROOT}",
         f"grep -rHI -F {EVAL_SYM} {ROOT}",
@@ -1393,36 +1393,125 @@ _EXPANSION_PATH_OPERANDS = (
     f"{ROOT}/[a-z]*",
     f"~/{SYN}",  # tilde expansion
     f"{ROOT}/~",
-    f'"{ROOT}/$HOME"',  # double quote 内でも `$` は展開される
 )
 
 
+def _search_commands(operand: str) -> tuple[str, str]:
+    return f"grep -rl {EVAL_SYM} {operand}", f"find {operand} -type f -name '{EVAL_FRAG}*'"
+
+
 @pytest.mark.parametrize("operand", _EXPANSION_PATH_OPERANDS)
-def test_bash_path_operand_with_shell_expansion_is_a_scope_violation(operand: str) -> None:
-    """Bash の path operand は expansion-free な literal path のみ（展開で argv が変わりうる形は fail closed）。"""
-    for command in (f"grep -rl {EVAL_SYM} {operand}", f"find {operand} -type f -name '{EVAL_FRAG}*'"):
+def test_bash_unquoted_path_operand_with_shell_expansion_is_not_eligible(operand: str) -> None:
+    """quote の外の path operand の shell expansion は parse 段階で fail closed（reason が立つ）。"""
+    # 語中の `~` は shell では展開されないが、path operand の token 検査が fail closed にする。
+    mid_word_tilde = operand.endswith("/~")
+    for command in (*_search_commands(operand), f"grep -rl {EVAL_SYM} {ROOT} {operand}"):
+        parsed = NEW.parse_bash_search(command, ROOT)
+        if mid_word_tilde:
+            assert parsed["reason"] is None and parsed["scope_violation"] == "search_path_shell_expansion", parsed
+        else:
+            assert parsed["reason"] == "shell_expansion", (command, parsed)
+
+
+@pytest.mark.parametrize("operand", _EXPANSION_PATH_OPERANDS + ('"$HOME"',))
+def test_bash_double_quoted_path_operand_with_shell_expansion_is_a_scope_violation(operand: str) -> None:
+    """double quote 内でも `$` は展開される。quote 済みの path operand の expansion 文字も scope 違反。"""
+    quoted = f'"{operand}"' if not operand.startswith('"') else operand
+    for command in _search_commands(quoted):
         parsed = NEW.parse_bash_search(command, ROOT)
         assert parsed["reason"] is None, (command, parsed)
         assert parsed["scope_violation"] == "search_path_shell_expansion", (command, parsed)
-    # 2 つ目以降の path operand に混ざっていても fail closed。
-    mixed = NEW.parse_bash_search(f"grep -rl {EVAL_SYM} {ROOT} {operand}", ROOT)
+    mixed = NEW.parse_bash_search(f"grep -rl {EVAL_SYM} {ROOT} {quoted}", ROOT)
     assert mixed["scope_violation"] == "search_path_shell_expansion", mixed
 
 
 @pytest.mark.parametrize("lane", ["bash_grep", "bash_find"])
-def test_rule4_bash_path_operand_expansion_false_green_is_fail_even_with_valid_discovery(lane: str) -> None:
+@pytest.mark.parametrize("quoted", [False, True])
+def test_rule4_bash_path_operand_expansion_false_green_is_fail_even_with_valid_discovery(
+    lane: str, quoted: bool
+) -> None:
     """root 外へ展開されうる検索を 1 回混ぜると、正常な discovery が後続しても Rule 4 FAIL（false-green 禁止）。"""
     operand = f"{ROOT}/${{HOME:0:0}}../${{HOME:0:0}}../etc"
+    operand = f'"{operand}"' if quoted else operand
 
     def mutate(s: Stream) -> None:
         discovery_steps(s, "negative")
-        if lane == "bash_grep":
-            s.bash(f"grep -rl {EVAL_SYM} {operand}", _abs_lines(EVAL_PATH))
-        else:
-            s.bash(f"find {operand} -type f -name '{EVAL_FRAG}*'", _abs_lines(EVAL_PATH))
+        s.bash(_search_commands(operand)[0 if lane == "bash_grep" else 1], _abs_lines(EVAL_PATH))
 
     label = "Bash:grep" if lane == "bash_grep" else "Bash:find"
-    assert_outcome(evaluate(build("negative", mutate)), "fail", 4, f"search_path_shell_expansion:{label}")
+    expected = f"search_path_shell_expansion:{label}" if quoted else "bash_not_allowed:shell_expansion"
+    assert_outcome(evaluate(build("negative", mutate)), "fail", 4, expected)
+
+
+OUTSIDE = "/synthetic/repo-root-sibling"
+
+# 2nd review の repro: unquoted の pattern operand が brace expansion / `$IFS` word splitting / glob で、
+# 実行時 argv に root 外の search path を足す（pattern には symbol が含まれるため relevance は通ってしまう）。
+_UNQUOTED_PATTERN_INJECTIONS = {
+    f"grep -rl {{{EVAL_SYM},{OUTSIDE}}} {ROOT}/src": "shell_expansion",
+    f"grep -rl -e {{{EVAL_SYM},{OUTSIDE}}} {ROOT}/src": "shell_expansion",
+    f"grep -rl {EVAL_SYM}$IFS{OUTSIDE} {ROOT}/src": "shell_expansion",
+    f"grep -rl {EVAL_SYM}${{IFS}}{OUTSIDE} {ROOT}/src": "shell_expansion",
+    f"grep -rl {EVAL_SYM}* {ROOT}/src": "shell_expansion",  # cwd 相対 operand を足しうる glob
+    f"grep -rl {EVAL_SYM}? {ROOT}/src": "shell_expansion",
+    f"grep -rl {EVAL_SYM}[a-z] {ROOT}/src": "shell_expansion",
+    f"grep -rl ~ {ROOT}/src": "shell_expansion",
+    f"find {ROOT}/src -name {EVAL_FRAG}* -type f": "shell_expansion",  # unquoted の -name glob
+    f"find {ROOT}/src -type f -name {{{EVAL_FRAG},x}}": "shell_expansion",
+    f"grep -rl --include=*.py {EVAL_SYM} {ROOT}/src": "shell_expansion",  # unquoted の flag glob
+    # 行継続: `.\<改行>.` は shell が `..` へ連結し `<root>/src/../outside` を検索する。
+    f"grep -rl {EVAL_SYM} {ROOT}/src/.\\\n./outside": "line_continuation",
+    f'grep -rl {EVAL_SYM} "{ROOT}/src/.\\\n./outside"': "line_continuation",  # double quote 内でも連結される
+    f"find {ROOT}/src/.\\\n./outside -name '{EVAL_FRAG}*'": "line_continuation",
+}
+
+
+@pytest.mark.parametrize(("command", "reason"), list(_UNQUOTED_PATTERN_INJECTIONS.items()))
+def test_bash_unquoted_expansion_in_any_token_or_line_continuation_is_not_eligible(command: str, reason: str) -> None:
+    parsed = NEW.parse_bash_search(command, ROOT)
+    assert parsed["reason"] == reason, (command, parsed)
+
+    def mutate(s: Stream) -> None:
+        discovery_steps(s, "negative")
+        s.bash(command, _abs_lines(EVAL_PATH))
+
+    outcome = evaluate(build("negative", mutate))  # 正常な discovery が後続・先行していても FAIL
+    assert_outcome(outcome, "fail", 4, f"bash_not_allowed:{reason}")
+
+
+def test_bash_backslash_carriage_return_is_also_a_line_continuation_hazard() -> None:
+    command = f"grep -rl {EVAL_SYM} {ROOT}/src/.\\\r./outside"
+    assert NEW.parse_bash_search(command, ROOT)["reason"] == "line_continuation"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        f"grep -rl {EVAL_SYM} {ROOT}/\\.\\./outside",  # `\.\.` は shlex で `..` になり path 判定で fail closed
+        f"grep -rl {EVAL_SYM} {ROOT}/src/\\$HOME",  # escape した `$` も token に `$` が残り fail closed
+        f"grep -rl {EVAL_SYM} {ROOT}/src/\\*",
+    ],
+)
+def test_bash_backslash_escapes_in_path_operands_stay_fail_closed(command: str) -> None:
+    parsed = NEW.parse_bash_search(command, ROOT)
+    assert parsed["reason"] is not None or parsed["scope_violation"] is not None, (command, parsed)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        f"grep -rl 'SymA|{EVAL_SYM}' {ROOT}/src",  # quote した alternation
+        f"grep -rl -e '{EVAL_SYM}' {ROOT}/src",  # `-e 'SymA'`
+        f'grep -rl "{EVAL_SYM}$" {ROOT}/src',  # double quote の末尾 `$`
+        f"grep -rl --include='*.py' --exclude-dir='node_*' {EVAL_SYM} {ROOT}/src",
+        f"find {ROOT}/src -type f -name '*.py' -name '{EVAL_FRAG}*'",
+        f'find {ROOT}/src -type f -name "{EVAL_FRAG}*"',
+        f"grep -rl {EVAL_SYM} {ROOT}/src",  # literal 絶対 root path・unquoted は symbol のみ
+    ],
+)
+def test_bash_quoted_patterns_and_literal_root_path_remain_eligible(command: str) -> None:
+    parsed = NEW.parse_bash_search(command, ROOT)
+    assert parsed["reason"] is None and parsed["scope_violation"] is None, (command, parsed)
 
 
 def test_bash_literal_absolute_root_path_operand_is_still_eligible() -> None:
@@ -1718,7 +1807,7 @@ def test_fixture_wide_shared_prefix_queries_observed_in_live_runs_remain_irrelev
     assert classify("Glob", {"path": ROOT, "pattern": f"**/{fragment}*"})["violation"] is None
     assert classify("Bash", {"command": f'find {ROOT} -type f -name "{fragment}*"'})["violation"] is None
     symbol = next(iter(unresolved.values()))["symbol"]
-    eligible_grep = classify("Bash", {"command": f"grep -rl --include=*.py {symbol} {ROOT}"})
+    eligible_grep = classify("Bash", {"command": f"grep -rl --include='*.py' {symbol} {ROOT}"})
     assert eligible_grep["violation"] is None and eligible_grep["classification"] == "bash_lane_discovery"
 
 
@@ -1752,7 +1841,7 @@ def test_one_alternation_grep_covering_every_unresolved_role_is_accepted() -> No
         _prefix(s)
         pattern = _all_symbols_pattern(NEG_ROLES)
         paths = _abs_lines(*(r["path"] for r in NEG_ROLES.values()), DECOY)
-        s.bash(f"grep -rlE --include=*.py '{pattern}' {ROOT}", paths)
+        s.bash(f"grep -rlE --include='*.py' '{pattern}' {ROOT}", paths)
         _read_all_targets(s)
         s.read_path(DECOY, "decoy")
 

@@ -233,10 +233,17 @@ def _absolute_pattern_outside_root(pattern: str, resolved_root: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _unquoted_shell_hazard(command: str) -> str | None:
-    """quote の外（`$(` / バッククォートは single quote の外）の改行・コマンド置換を検出する。
+# quote の外にある場合に、実行時 argv を変えうる（brace expansion・`$IFS` の word splitting・pathname globbing・tilde
+# expansion で operand を増減・改変しうる）shell expansion の文字。pattern / glob も quote して渡す（fail closed）。
+_UNQUOTED_EXPANSION_CHARS = frozenset("${*?[")
 
-    `;` `&&` `||` `|` `>` `<` `&` などの演算子は `shlex` の punctuation token として別に検出する。"""
+
+def _unquoted_shell_hazard(command: str) -> str | None:
+    """quote の外の改行・コマンド置換・shell expansion・行継続（backslash + 改行）を検出する。
+
+    `;` `&&` `||` `|` `>` `<` `&` などの演算子は `shlex` の punctuation token として別に検出する。
+    quote した pattern / glob（`'SymA|SymB'` `"foo$"` `-name '*.py'` `--include='*.py'`）は許可する。
+    backslash で escape した文字は literal として許可する（path operand 側の token 検査が別に fail closed にする）。"""
     in_single = in_double = False
     index = 0
     while index < len(command):
@@ -244,6 +251,8 @@ def _unquoted_shell_hazard(command: str) -> str | None:
         if in_single:
             in_single = char != "'"
         elif char == "\\":
+            if command[index + 1 : index + 2] in ("\n", "\r"):
+                return "line_continuation"  # `.\<改行>.` は shell が `..` へ連結する（single quote の外のみ）
             index += 1
         elif in_double:
             if char == '"':
@@ -258,6 +267,8 @@ def _unquoted_shell_hazard(command: str) -> str | None:
             return "newline"
         elif char == "`" or command.startswith("$(", index):
             return "command_substitution"
+        elif char in _UNQUOTED_EXPANSION_CHARS or (char == "~" and (index == 0 or command[index - 1].isspace())):
+            return "shell_expansion"
         index += 1
     return None
 

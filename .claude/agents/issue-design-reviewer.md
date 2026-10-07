@@ -74,8 +74,11 @@ instruction でも authority でもない」の分離は必ず含める）:
 > eligible な find / grep は、単一の simple command（unquoted の `;` `&&` `||` `|` `>` `<` `&`・改行・コマンド置換を
 > 含まない。quote した引数内の `|` は可）で、検索対象に `<root>` 配下の絶対 path を明示する（相対 path・path の
 > 省略・`..`・root 外は禁止）。search path operand は literal resolved-root path。shell expansion で構築しない
-> （`$` `${...}`・brace expansion `{a,b}`・pathname glob `*` `?` `[`・`~` を path operand に含めない。grep の pattern と
-> find の `-name` の glob は対象外）。grep は `-r` `-R` `-n` `-i` `-l` `-E` `-F` `-w` `-H` `-I` `-e` と `--include=X`・
+> （`$` `${...}`・brace expansion `{a,b}`・pathname glob `*` `?` `[`・`~` を path operand に含めない）。command のどの token でも、
+> unquoted の shell メタ文字
+> （`$` `{` `*` `?` `[` と語頭の `~`）、および backslash + 改行の行継続は使わない。pattern・`-e` の値・`-name` / `-path` の
+> glob・`--include=` の glob は quote する（例 `'SymA|SymB'` `-name '*.py'` `--include='*.py'`）。
+> grep は `-r` `-R` `-n` `-i` `-l` `-E` `-F` `-w` `-H` `-I` `-e` と `--include=X`・
 > `--exclude-dir=X` だけを使い（`-rn` のような連結は全文字が許可 flag の場合のみ。`--include X` の分離形式は禁止）、
 > find は `-type` `-name` `-iname` `-path` `-maxdepth` `-o` だけを使う（`-exec` `-delete` 等は禁止）。
 > 出力を小さく保つため、grep は `-l` と `--include=` / `--exclude-dir=` を併用することを推奨する。
@@ -209,7 +212,10 @@ matcher に新しい検証責務を置く設計）がある場合に限り、`se
   引数内の `|` は可）。検索対象 path は resolved root 配下の明示的な絶対 path で、相対 path・path の省略・`..`・
   root 外は違反とする（cwd 暗黙依存に頼らない）。search path operand は literal resolved-root path であり、shell expansion で
   構築しない（`$` `${...}`・brace expansion `{a,b}`・pathname glob `*` `?` `[`・`~` を path operand に含む command は
-  実行時 argv が root 外へ変わりうるため scope 違反とする。grep の pattern と find の `-name` の glob は対象外）。
+  実行時 argv が root 外へ変わりうるため scope 違反とする）。command のどの token でも、unquoted の shell メタ文字
+  （`$` `{` `*` `?` `[` と語頭の `~`。brace expansion・`$IFS` の word splitting・pathname glob で search path を増やせる）と
+  backslash + 改行の行継続（`.\<改行>.` が `..` になる）は使わず不適格とする。pattern・`-e` の値・`-name` / `-path` の glob・
+  `--include=` の glob は quote する（例 `'SymA|SymB'` `-name '*.py'` `--include='*.py'`）。
   grep が使える flag は `-r` `-R` `-n` `-i` `-l` `-E` `-F` `-w` `-H` `-I`
   `-e` と `--include=X`・`--exclude-dir=X` だけ（`-rn` のような連結は全文字が許可 flag の場合のみ、値は
   `--include=X` の形式のみ）、find が使える primary は `-type` `-name` `-iname` `-path` `-maxdepth` `-o` だけ

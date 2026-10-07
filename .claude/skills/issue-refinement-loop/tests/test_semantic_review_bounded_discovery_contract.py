@@ -250,7 +250,7 @@ def test_prompt_allowlist_wording_matches_evaluator_shape_one_to_one() -> None:
     # prompt が許可する shape を evaluator が実際に受理し、禁止例は違反として扱う（文言だけの一致で終わらせない）。
     root = "/synthetic/root"
     eligible = (
-        f"grep -rln --include=*.py SymA {root}",
+        f"grep -rln --include='*.py' SymA {root}",
         f"grep -rn -E 'SymA|SymB' {root}/dir",
         f"grep -rne SymA {root}",
         f"find {root} -type f -name 'frag*' -o -iname 'FRAG*'",
@@ -272,7 +272,7 @@ def test_prompt_allowlist_wording_matches_evaluator_shape_one_to_one() -> None:
         f"sed -n 1,5p {root}/x.py",
         f"grep SymA {root}; ls",
         f"grep SymA {root}|cat",
-        f"grep --include *.py SymA {root}",
+        f"grep --include '*.py' SymA {root}",
         f"find {root} -name x -exec cat {{}} +",
     )
     for command in forbidden:
@@ -795,6 +795,9 @@ def test_prompt_and_section_require_bash_lane_start_and_role_specific_query_patt
                 "帰属規則 (b) として search を省略して Read してよい。"
                 "同じ directory・命名規則・共有 prefix・推測した path だけを根拠にした Read は契約違反）",
                 "search path operand は literal resolved-root path。shell expansion で構築しない",
+                "unquoted の shell メタ文字",
+                "backslash + 改行の行継続は使わない",
+                "pattern・`-e` の値・`-name` / `-path` の glob・`--include=` の glob は quote する",
                 "quote した alternation で 1 回にまとめてよい",
                 "`grep -rlE --include=<glob> '<symbol A>|<symbol B>' <root 配下の絶対 path>`",
             ),
@@ -812,6 +815,9 @@ def test_prompt_and_section_require_bash_lane_start_and_role_specific_query_patt
                 "帰属規則 (b) として search を省略して Read してよい。"
                 "同じ directory・命名規則・共有 prefix・推測した path だけを根拠にした Read は違反）",
                 "search path operand は literal resolved-root path であり、shell expansion で構築しない",
+                "unquoted の shell メタ文字",
+                "backslash + 改行の行継続",
+                "`--include=` の glob は quote する",
                 "quote した alternation で 1 回にまとめてよい",
             ),
         )
@@ -819,14 +825,23 @@ def test_prompt_and_section_require_bash_lane_start_and_role_specific_query_patt
         assert _flat(_read(_DOCS[name])).count("観測できなかった path と理由") == 1, name
     # 推奨例の command は eligible 形状として evaluator が実際に受理し、固定 bound は 8 / 8 のまま。
     root = "/synthetic/root"
-    parsed = EVAL.parse_bash_search(f"grep -rl --include=*.py SymA {root}", root)
+    parsed = EVAL.parse_bash_search(f"grep -rl --include='*.py' SymA {root}", root)
     assert parsed["reason"] is None and parsed["scope_violation"] is None and parsed["cmd"] == "grep"
-    alternation = EVAL.parse_bash_search(f"grep -rlE --include=*.py 'SymA|SymB' {root}", root)
+    alternation = EVAL.parse_bash_search(f"grep -rlE --include='*.py' 'SymA|SymB' {root}", root)
     assert alternation["reason"] is None and alternation["scope_violation"] is None
     assert (EVAL.DISCOVERY_SEARCH_CALL_MAX, EVAL.DISCOVERY_SOURCE_READ_MAX) == (8, 8)
     # path operand は expansion-free な literal（expansion を含む operand は evaluator が scope 違反にする）。
     expanded = EVAL.parse_bash_search(f"grep -rl SymA {root}/${{HOME:0:0}}../${{HOME:0:0}}../etc", root)
-    assert expanded["reason"] is None and expanded["scope_violation"] == "search_path_shell_expansion"
+    assert expanded["reason"] == "shell_expansion"
+    # unquoted の shell メタ文字（pattern / glob 位置を含む）と行継続は不適格、quote した pattern / glob は適格。
+    for hazardous, reason in (
+        (f"grep -rl {{SymA,/synthetic/outside}} {root}/src", "shell_expansion"),
+        (f"grep -rl SymA$IFS/synthetic/outside {root}/src", "shell_expansion"),
+        (f"grep -rl SymA {root}/src/.\\\n./outside", "line_continuation"),
+    ):
+        assert EVAL.parse_bash_search(hazardous, root)["reason"] == reason, hazardous
+    quoted = EVAL.parse_bash_search(f"grep -rl -e 'SymA' --include='*.py' {root}/src", root)
+    assert quoted["reason"] is None and quoted["scope_violation"] is None
     # 旧い狭い文言（import 導出 Read を禁じる）が prompt / section に残っていない。
     for name in _DOCS:
         assert "その role を検索で解決していない Read は" not in _flat(_read(_DOCS[name])), name
