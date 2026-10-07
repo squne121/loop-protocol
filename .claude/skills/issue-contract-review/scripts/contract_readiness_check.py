@@ -1573,6 +1573,27 @@ def _load_extension_surface_policy_matcher():
     return module
 
 
+def _ac_vc_commands_for_body(evaluator, body: str):
+    """Issue #2961: ``ac_vc_commands`` (AC digit -> VC command bodies) for the
+    shared exemption helper. Uses this module's own canonical VC section
+    extractor + the same ``_parse_vc_section`` canonical parser the binding
+    coverage check uses, then the shared evaluator's pure
+    ``build_ac_vc_commands``. Transport only: no judgement logic here."""
+    vc_section = _extract_section_by_canonical_name(body, "Verification Commands")
+    vc_section_text = vc_section[0] if vc_section is not None else ""
+    return _build_ac_vc_commands(evaluator, _parse_vc_section(vc_section_text))
+
+
+def _build_ac_vc_commands(evaluator, parse_result):
+    """Shared-helper call with a fail-closed guard: an evaluator without
+    ``build_ac_vc_commands`` (e.g. a minimal test stub) yields ``None`` (no
+    exemption) instead of raising."""
+    build = getattr(evaluator, "build_ac_vc_commands", None)
+    if build is None:
+        return None
+    return build(parse_result.commands)
+
+
 def check_extension_surface_risk_trigger(body: str) -> list[dict]:
     """Issue #2290: declared Allowed Paths vs. extension-surface risk-trigger policy.
 
@@ -1607,11 +1628,17 @@ def check_extension_surface_risk_trigger(body: str) -> list[dict]:
     if evaluator is None:
         return []
 
+    ac_section = _extract_ac_section(body)
+    ac_section_text = ac_section[0] if ac_section is not None else ""
+    ac_vc_commands = _ac_vc_commands_for_body(evaluator, body)
+
     try:
         verdict = evaluator.evaluate_issue_risk_trigger(
             allowed_path_entries=allowed_path_entries,
             declared_decision=declared_decision,
             rva_section_text=rva_section_text,
+            ac_section_text=ac_section_text,
+            ac_vc_commands=ac_vc_commands,
         )
     except evaluator.PolicyLoadError as exc:
         # Issue #2290 P1-2 fix delta (PR #2335 OWNER review): distinguishable
@@ -1688,10 +1715,81 @@ def check_extension_surface_risk_trigger(body: str) -> list[dict]:
 # non-blocking category: a pure classification carrier that follows the same
 # EXTSURF003 precedent (kept out of every status-driving error list).
 _RUNTIME_ASSERTION_DISPOSITION_CARRIER_CATEGORY = "runtime_assertion_disposition_classification"
+#
+# Issue #2961: `extension_surface_issue_time_exemption_applied` (info severity)
+# is the third non-blocking category -- the carrier for an APPLIED comment-only
+# exemption (`check_extension_surface_issue_time_exemption()`).
+_EXTENSION_SURFACE_ISSUE_TIME_EXEMPTION_CATEGORY = "extension_surface_issue_time_exemption_applied"
 _NON_BLOCKING_READINESS_ERROR_CATEGORIES = {
     "extension_surface_candidate_advisory",
     _RUNTIME_ASSERTION_DISPOSITION_CARRIER_CATEGORY,
+    _EXTENSION_SURFACE_ISSUE_TIME_EXEMPTION_CATEGORY,
 }
+
+
+def check_extension_surface_issue_time_exemption(body: str) -> list[dict]:
+    """Issue #2961: non-blocking info carrier for an APPLIED comment-only
+    exemption (EXTSURF004, category
+    ``extension_surface_issue_time_exemption_applied``).
+
+    Companion to ``check_extension_surface_risk_trigger()``: this function's
+    return value MUST NOT be passed into any status-driving error list in
+    ``run_contract_readiness_check()`` (it is displayed / merge-routed only,
+    like EXTSURF003 / RUNTIMEASSERT003). It transcribes the shared
+    evaluator's ``issue_time_exemptions`` verbatim (via the shared
+    formatter); it adds no judgement logic. Returns ``[]`` when no exemption
+    was applied or the policy is unavailable (EXTSURF002 already reports
+    that).
+    """
+    if not _is_canonical_implementation_issue(body):
+        return []
+    allowed_path_entries = _extract_allowed_paths(body)
+    if not allowed_path_entries:
+        return []
+
+    section = _extract_rva_section(body)
+    rva_section_text = section[0] if section is not None else ""
+    decision_match = re.search(r"decision:\s*(\S+)", rva_section_text)
+    declared_decision = decision_match.group(1).strip() if decision_match else None
+
+    evaluator = _load_extension_surface_policy_matcher()
+    if evaluator is None:
+        return []
+    ac_section = _extract_ac_section(body)
+    ac_section_text = ac_section[0] if ac_section is not None else ""
+    try:
+        verdict = evaluator.evaluate_issue_risk_trigger(
+            allowed_path_entries=allowed_path_entries,
+            declared_decision=declared_decision,
+            rva_section_text=rva_section_text,
+            ac_section_text=ac_section_text,
+            ac_vc_commands=_ac_vc_commands_for_body(evaluator, body),
+        )
+    except evaluator.PolicyLoadError:
+        return []
+
+    exemptions = verdict.get("issue_time_exemptions") or []
+    if not exemptions:
+        return []
+    return [
+        {
+            "rule_id": "EXTSURF004",
+            "severity": "info",
+            "source_check": "contract_readiness_check",
+            "category": _EXTENSION_SURFACE_ISSUE_TIME_EXEMPTION_CATEGORY,
+            "section": "Runtime Verification Applicability",
+            "line_start": section[1] if section is not None else 0,
+            "line_end": section[2] if section is not None else 0,
+            "minimal_context": evaluator.format_issue_time_exemption_lines(exemptions),
+            "fix_hint": (
+                "Non-blocking: a comment-only exemption declaration "
+                "(executable_semantics_unchanged) was structurally accepted. The matcher verifies "
+                "structure only; that executable semantics are actually unchanged is evidenced by "
+                "the PR-time VC execution and review."
+            ),
+            "autofixable": False,
+        }
+    ]
 
 
 def check_extension_surface_advisory(body: str) -> list[dict]:
@@ -1878,6 +1976,8 @@ def _evaluate_runtime_assertion_binding_coverage_for_body(body: str):
             rva_section_text=rva_section_text,
             ac_section_text=ac_section_text,
             ac_vc_refs=ac_vc_refs,
+            # Issue #2961: reuse the parse result above (no second parse).
+            ac_vc_commands=_build_ac_vc_commands(evaluator, vc_parse_result),
         )
     except evaluator.PolicyLoadError as exc:
         return None, exc, section_start_line, section_end_line
@@ -2336,6 +2436,9 @@ def build_result(
     # `ext_surface_errors` (the escalation-gating variable below) --
     # included in `all_errors` for display only.
     ext_surface_advisory_errors = check_extension_surface_advisory(body)
+    # Issue #2961: non-blocking info carrier for an applied comment-only
+    # exemption (EXTSURF004). Same display-only handling as EXTSURF003.
+    ext_surface_exemption_errors = check_extension_surface_issue_time_exemption(body)
     runtime_assertion_binding_errors = check_runtime_assertion_binding_coverage(body)
     # Issue #2852: non-blocking disposition classification carrier
     # (RUNTIMEASSERT003). Kept OUT of `runtime_assertion_binding_errors` (the
@@ -2365,6 +2468,7 @@ def build_result(
         + rdr_errors
         + ext_surface_errors
         + ext_surface_advisory_errors
+        + ext_surface_exemption_errors
         + runtime_assertion_binding_errors
         + runtime_assertion_disposition_advisory_errors
         + static_vc_errors
