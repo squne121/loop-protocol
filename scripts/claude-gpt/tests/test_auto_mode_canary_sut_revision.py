@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 CHECKOUT_HEAD_FIELD = "checkout_head_sha"
-LEGACY_FIELD = "main" + "_sha"  # 旧 field 名。literal を test 本体にも固定しない
+LEGACY_FIELD = "main_sha"  # 旧 field 名（deprecated-key negative assertion 用。runtime consumer ではない）
 
 TESTS_DIR = Path(__file__).resolve().parent
 SCRIPT_DIR = TESTS_DIR.parent
