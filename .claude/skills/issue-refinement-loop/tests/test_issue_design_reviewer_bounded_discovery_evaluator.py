@@ -1575,6 +1575,24 @@ def test_artifact_records_per_tool_use_lane_classification_and_rule() -> None:
     assert by_rule["bash_exact_root_command"][0]["classification"] == "non_discovery"
     assert by_rule["bash_exact_head_command"][0]["counted_as_search"] is False
     assert by_rule["read_exempt_bundle_or_body"] and by_rule["read_repository_source"]
+    # error の eligible call（session に無い専用 Grep の `No such tool available` 等）は attribution_eligible: false。
+    assert by_rule["dedicated_grep_glob_tool"][0]["attribution_eligible"] is True
+    assert by_rule["bash_find_grep_eligible_shape"][0]["attribution_eligible"] is True
+    assert by_rule["bash_not_allowlisted:not_find_grep"][0]["attribution_eligible"] is False
+    errored = Stream().init(["Read", "Bash", "Agent"]).agent_call().start()
+    _prefix(errored)
+    errored.grep(
+        _all_symbols_pattern(NEG_ROLES), "<tool_use_error>No such tool available: Grep</tool_use_error>", is_error=True
+    )
+    do_search(errored, "bash_grep", NEG_ROLES, [r["path"] for r in NEG_ROLES.values()])
+    _read_all_targets(errored)
+    errored.handback(json.dumps(default_result("negative"))).stop().agent_result().final()
+    errored_outcome = evaluate(errored)
+    assert_outcome(errored_outcome, "pass", 5)  # 専用 Grep が使えず Bash lane で続行した場合も PASS しうる
+    grep_record = next(r for r in errored_outcome["evidence"]["tool_use_classification"] if r["name"] == "Grep")
+    assert grep_record["classification"] == "dedicated_lane_discovery" and grep_record["result_is_error"] is True
+    assert grep_record["attribution_eligible"] is False and grep_record["counted_as_search"] is True
+    assert errored_outcome["evidence"]["discovery"]["search_calls"] == 2
     # 判定が規則 4 以前で確定する stream でも、reviewer 帰属の tool_use の分類を残す（診断用）。
     early = Stream().init(["Read", "Bash"]).agent_call().start()
     early.bash_grep(EVAL_SYM, _abs_lines(EVAL_PATH))

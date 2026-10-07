@@ -880,12 +880,24 @@ def _evaluate_discovery_observations(
 # ---------------------------------------------------------------------------
 
 
-def _public_classification(record: dict[str, Any]) -> dict[str, Any]:
-    """artifact 用: tool_use ごとの lane / 分類 / 認定した規則（`query` の中身は含めない）。"""
-    return {
+def _public_classification(record: dict[str, Any], results: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """artifact 用: tool_use ごとの lane / 分類 / 認定した規則（`query` の中身は含めない）。
+
+    `classification` は eligible な検索 call としての認定であり、result が error の call（例: session に無い専用
+    Grep の `No such tool available`、grep の no match）は `attribution_eligible: false`（bound には算入されるが
+    discovery attribution には使われない）として区別する。"""
+    public = {
         key: record[key]
         for key in ("id", "name", "stream_index", "lane", "classification", "rule", "counted_as_search", "violation")
     }
+    result = results.get(record["id"])
+    public["result_is_error"] = None if result is None else result["is_error"]
+    public["attribution_eligible"] = (
+        record["classification"] in ("dedicated_lane_discovery", "bash_lane_discovery")
+        and result is not None
+        and not result["is_error"]
+    )
+    return public
 
 
 def evaluate_bounded_discovery(
@@ -957,7 +969,7 @@ def evaluate_bounded_discovery(
         "interval_tool_uses": [
             {"id": tu["id"], "name": tu["name"], "stream_index": tu["stream_index"]} for tu in interval
         ],
-        "tool_use_classification": [_public_classification(record) for record in classified],
+        "tool_use_classification": [_public_classification(record, results) for record in classified],
         "discovery": observation,
         "violations": violations,
     }
@@ -1057,7 +1069,7 @@ def summarize_tool_uses(
         record["result_is_error"] = None if result is None else result["is_error"]
         if tu["id"] in classification:
             tool_input = tu["input"]
-            record["classification"] = _public_classification(classification[tu["id"]])
+            record["classification"] = _public_classification(classification[tu["id"]], results)
             if tu["name"] == "Bash" and isinstance(tool_input.get("command"), str):
                 record["input_summary"] = sanitize_text(tool_input["command"], resolved_root, invocation_dir)
                 if result is not None:
