@@ -177,3 +177,29 @@ def test_policy_doc_states_declaration_rules_and_invariants(policy):
         "#2841",
     ):
         assert token in section, token
+
+
+def test_policy_doc_states_comment_only_exemption_spec_and_residual_risk(policy):
+    """GIVEN the runtime-verification-policy.md assertion binding section
+    WHEN read
+    THEN it documents the #2961 comment-only exemption (declaration key,
+    structure-only verification, PR-time VC execution as the real guarantee)
+    while keeping the `#2775` / `evaluate_issue_risk_trigger()` tokens."""
+    start = policy.index("### profile の assertion binding における完全性の確認")
+    end = policy.index("## 12. live runtime verification")
+    section = policy[start:end]
+    for token in (
+        "comment-only 免除",
+        "executable_semantics_unchanged",
+        "issue_time_exemption",
+        "issue_time_exemptions",
+        "構造のみ",
+        "PR 時の VC 実行",
+        "ac_vc_commands",
+        "fail-closed",
+        "`git` `diff`",
+        "extension_surface_issue_time_exemption_applied",
+        "evaluate_issue_risk_trigger()",
+        "#2775",
+    ):
+        assert token in section, token
