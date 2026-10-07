@@ -27,9 +27,7 @@ import jsonschema
 from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT202012
 
-_GEMINI_SCRIPTS_DIR = (
-    Path(__file__).resolve().parents[2] / "gemini-cli-headless-delegation" / "scripts"
-)
+_GEMINI_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "gemini-cli-headless-delegation" / "scripts"
 if str(_GEMINI_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_GEMINI_SCRIPTS_DIR))
 
@@ -106,9 +104,7 @@ def _validate_semantic_consistency(envelope: dict) -> list[str]:
     attempts = envelope.get("attempts", [])
     for attempt in attempts:
         if attempt.get("route_id") not in route_ids:
-            errors.append(
-                f"attempt route_id '{attempt.get('route_id')}' is not present in route_plan"
-            )
+            errors.append(f"attempt route_id '{attempt.get('route_id')}' is not present in route_plan")
     cross_lane_attempts = [a for a in attempts if a.get("cross_lane_recovery")]
     if cross_lane_attempts and len(attempts) < 2:
         errors.append("cross_lane_recovery attempt present without a preceding primary attempt")
@@ -158,14 +154,11 @@ def validate_envelope(
         return {"ok": False, "errors": errors}
 
     if expected_claim_id is not None and claim.get("claim_id") != expected_claim_id:
-        errors.append(
-            f"claim_id binding mismatch: expected '{expected_claim_id}', got '{claim.get('claim_id')}'"
-        )
+        errors.append(f"claim_id binding mismatch: expected '{expected_claim_id}', got '{claim.get('claim_id')}'")
 
     if expected_evidence_kind is not None and claim.get("evidence_kind") != expected_evidence_kind:
         errors.append(
-            "evidence_kind binding mismatch: expected "
-            f"'{expected_evidence_kind}', got '{claim.get('evidence_kind')}'"
+            f"evidence_kind binding mismatch: expected '{expected_evidence_kind}', got '{claim.get('evidence_kind')}'"
         )
 
     if expected_baseline is not None:
@@ -242,4 +235,105 @@ def decide_routing_action(envelope: dict) -> dict:
         "action": "human_review",
         "claim_id": claim_id,
         "reason": terminal_artifact.get("unresolved_reason", "unresolved"),
+    }
+
+
+# This overlay belongs to Step 1, not the producer or the pure base router.
+# The caller must independently pin the baseline, main ref and C1 target before
+# invoking it; evidence and an operator receipt are never semantic authority by
+# themselves. Keep the C1 restriction explicit instead of making a generic
+# approval/evaluator framework out of the source-evidence router.
+C1_REPO = "squne121/loop-protocol"
+C1_PATH = ".claude/skills/impl-review-loop/scripts/route_loop_verdict_v2.py"
+C1_CLAIM = (
+    "latest_main_net_diff の path が Allowed Paths 外なら現行 production 条件は allowed_paths_conflict と分類する"
+)
+
+
+def c1_baseline(*, issue_body: str, main_sha: str) -> dict:
+    return {
+        "claim_text_sha256": hashlib.sha256(C1_CLAIM.encode("utf-8")).hexdigest(),
+        "issue_body_sha256": hashlib.sha256(issue_body.encode("utf-8")).hexdigest(),
+        "current_main_sha": main_sha,
+    }
+
+
+def decide_effective_step1_action(
+    envelope: dict,
+    *,
+    expected_baseline: dict,
+    target: dict,
+    repo_root: Path,
+    operator_decision: dict,
+    run_id: str,
+    envelope_sha256: str,
+) -> dict:
+    """Validate independently pinned C1 evidence and post-acquisition decision.
+
+    Returns a separate effective action; never changes the envelope or base
+    `decide_routing_action`. The operator snapshot/readback provenance and the
+    initial result/state byte pins are verified by the CLI before this call.
+    """
+    from validate_repo_evidence_ref import validate_repo_evidence_ref  # noqa: PLC0415
+
+    errors: list[str] = []
+    validation = validate_envelope(
+        envelope,
+        expected_claim_id="C1",
+        expected_evidence_kind="repo_blob_at_commit",
+        expected_baseline=expected_baseline,
+    )
+    errors.extend(validation["errors"])
+    if envelope.get("semantic_verdict") != "not_evaluated" or envelope.get("disposition") != "human_review":
+        errors.append("initial producer verdict/disposition must remain not_evaluated/human_review")
+    if decide_routing_action(envelope).get("action") != "human_review":
+        errors.append("base router must remain human_review")
+    refs = envelope.get("evidence_refs", [])
+    if not isinstance(refs, list) or len(refs) != 1:
+        errors.append("exactly one verified C1 evidence ref required")
+    else:
+        ref = refs[0]
+        if not isinstance(ref, dict):
+            errors.append("invalid evidence ref")
+        else:
+            expected = {
+                "commit_sha": expected_baseline["current_main_sha"],
+                "path": C1_PATH,
+                "start_line": target["start_line"],
+                "end_line": target["end_line"],
+            }
+            if any(ref.get(key) != value for key, value in expected.items()):
+                errors.append("evidence ref does not match independent canonical C1 target")
+            if ref.get("verification_status") != "verified":
+                errors.append("evidence ref is not verified")
+            if ref.get("permalink") != (
+                f"https://github.com/{C1_REPO}/blob/{expected_baseline['current_main_sha']}/"
+                f"{C1_PATH}#L{target['start_line']}-L{target['end_line']}"
+            ):
+                errors.append("evidence ref repository/permalink mismatch")
+            check = validate_repo_evidence_ref(ref, repo_root=repo_root)
+            if check["status"] != "verified" or not check["ok"]:
+                errors.append("independent pinned Git evidence verification failed")
+            expected_tuple = {
+                "repo": C1_REPO,
+                "commit_sha": expected_baseline["current_main_sha"],
+                "path": C1_PATH,
+                "start_line": target["start_line"],
+                "end_line": target["end_line"],
+                "excerpt_sha256": ref.get("excerpt_sha256"),
+            }
+            if operator_decision.get("evidence") != expected_tuple:
+                errors.append("operator decision does not identify verified canonical C1 tuple")
+    if operator_decision.get("run_id") != run_id or operator_decision.get("claim_id") != "C1":
+        errors.append("operator decision run/claim mismatch")
+    if operator_decision.get("envelope_sha256") != envelope_sha256:
+        errors.append("operator decision initial envelope digest mismatch")
+    if operator_decision.get("canonical_main_sha") != expected_baseline["current_main_sha"]:
+        errors.append("operator decision canonical main mismatch")
+    if operator_decision.get("decision") != "supported":
+        errors.append("operator decision not supported or unknown")
+    return {
+        "effective_step1_action": "proceed" if not errors else "human_review",
+        "claim_resolution": "supported" if not errors else "unresolved",
+        "errors": errors,
     }
