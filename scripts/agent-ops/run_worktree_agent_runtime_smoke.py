@@ -7251,6 +7251,28 @@ def _nr_hook_decision(event: dict) -> str:
     return "none"
 
 
+def extract_main_session_init_permission_mode(stdout: str | None) -> str | None:
+    """Issue #2935: ``permissionMode`` reported by the FIRST ``system/init`` event.
+
+    Only the very first ``type == "system" && subtype == "init"`` stream-json
+    event is consulted (independent of ``session_id`` presence). A later init
+    is never adopted when the first one lacks a valid mode. The value is valid
+    only when it is a non-empty ``str`` that is a member of
+    ``_PERMISSION_MODE_VALUES`` (case-sensitive); anything else yields ``None``.
+    It is never backfilled from argv / receipt / settings / declaration /
+    worker self-report / SubagentStop. This only proves the runtime reported
+    that mode at init, not effective behavior."""
+    if not isinstance(stdout, str):
+        return None
+    for event in _iter_claude_stream_events(stdout):
+        if event.get("type") == "system" and event.get("subtype") == "init":
+            mode = event.get("permissionMode")
+            if isinstance(mode, str) and mode and mode in _PERMISSION_MODE_VALUES:
+                return mode
+            return None
+    return None
+
+
 def extract_named_subagent_resume_observations(stdout: str) -> dict:
     """Generic, ordered observations from a captured stream-json stdout.
 
@@ -9133,6 +9155,10 @@ def main(argv: list[str] | None = None) -> int:
         # never gated behind --hermetic-agent-definition, never touches
         # mutation_boundary.
         "permission_denials": extract_claude_permission_denials(None),
+        # Issue #2935: main-session init permissionMode (string | null). Always
+        # emitted; overwritten from the first system/init event once stdout is
+        # captured. Never backfilled from argv / receipt / SubagentStop.
+        "permission_mode_observed": None,
         "settings_provenance": build_settings_provenance(worktree, hermetic_active, hermetic_settings_digest),
         # Issue #2046 AC10: #1881 (production settings lane, pr-reviewer
         # persona safe Read/mutation-deny boundary) remains separately OPEN.
@@ -9309,6 +9335,8 @@ def main(argv: list[str] | None = None) -> int:
                 # additive field, independent of mutation_boundary/hermetic
                 # gating above.
                 schema_summary["permission_denials"] = extract_claude_permission_denials(out)
+                # Issue #2935: first system/init permissionMode only.
+                schema_summary["permission_mode_observed"] = extract_main_session_init_permission_mode(out)
                 denied_peer_tools = {
                     str(denial.get("tool_name"))
                     for denial in schema_summary["permission_denials"]

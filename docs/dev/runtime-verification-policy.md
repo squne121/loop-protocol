@@ -906,6 +906,17 @@ fail-closed 規約: 抽出できなかった場合に推測・補完・fake fixt
 | field はあるが parser 不成立 | payload に `permission_mode` はあるが、native 形の候補で型不正・列挙外・channel / event 間の矛盾がある（reason: `invalid_or_conflicting_value`）。`agent_id` 欠落・`hook_event_name` 不一致・前置き付き出力は候補にならず無視するため `field_absent` になる。raw stream の値と parser の判定を突き合わせる |
 | parser と観測が一致 | 採用基準を満たす値が `observed_runtime_fields` に記録され、raw stream の値と一致する |
 
+## 16. Runtime Observation: permission_mode_observed（main-session init から観測する値の扱い、Issue #2935）
+
+`scripts/agent-ops/run_worktree_agent_runtime_smoke.py` の structured 実行は、`--evidence-json` が書き出す `schema_summary`（`WORKTREE_AGENT_RUNTIME_SMOKE_RESULT_V1`、schema の値は変更しない）の top-level に `permission_mode_observed` を常に出力する。
+
+- source: stream-json の最初の `type == "system"` かつ `subtype == "init"` の event（main-session の init。`session_id` の有無には依存しない）の `permissionMode` だけである。2 件目以降の init は、最初の init に有効値が無くても採用しない。
+- 型: `string | null`。値が非空の文字列で、かつ既存の閉集合 `_PERMISSION_MODE_VALUES`（`default` / `plan` / `acceptEdits` / `auto` / `dontAsk` / `bypassPermissions`、大文字小文字を区別する）に含まれるときだけ、その値をそのまま出力する。
+- 未観測の規約: init event が無い、`permissionMode` が無い、非文字列、空文字、閉集合外の場合は `null` とする。consumer は key が無い場合も `null` と同じく未観測として扱う。launcher の argv、receipt、settings、declaration、worker の自己申告、`SubagentStop` 由来の値から補完しない。未観測であること自体は exit code を変えず、新しい exit 77 の経路も作らない。
+- 証明する範囲: runtime が init の時点で、その mode を報告したことだけである。個々の action の effective behavior、argv で要求した mode との一致、`effective_permission_profile` は証明しない。
+- 区別: 本節の値は main-session の init 由来であり、第 15 節の `--require-observed-runtime-field permission_mode`（`SubagentStop` の payload 由来、`observed_runtime_fields`）とは別の field である。両者を混同・合成せず、一方の観測でもう一方を満たしたものとして扱わない。nested の `named_subagent_resume.permission_mode_observed` とも別の surface である。
+- 観測値が `null` の実機 smoke は、その version / 起動経路では `unconfirmed` と記録する。`unconfirmed` は PASS ではない。
+
 ## 関連ドキュメント
 
 - `docs/dev/session-recording-policy.md` — session 記録 Kill Switch policy（`session_recording_policy/v1` SSOT）。`secrets_mode` 遷移時の session 記録制御・Kill Switch 手順・checkpoint visibility 検証を定める
