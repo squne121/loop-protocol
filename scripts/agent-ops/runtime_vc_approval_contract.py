@@ -17,8 +17,11 @@ closed enum の profile registry と、materialize できない VC 契約を決�
   文字列・JSON・path を渡す入口を持たない (generic settings passthrough 不在)。
   ``build_approval_overlay_json()`` が受け取るのは ``profile_id`` と runner の
   固定 base overlay 定数だけである。
-- overlay の ``autoMode.allow`` は ``"$defaults"`` と、exact command・fixture
-  installer・fixture home (永続的な install 先) を名指しする固定 rule の 2 要素だけを持つ。broad allow は
+- overlay の ``autoMode.allow`` は ``"$defaults"`` と、固定 rule の 2 要素だけを持つ。rule が許可する
+  action は exact な 2 つだけである: (1) exact command・fixture installer・fixture home
+  (永続的な install 先) を名指しする repair command、(2) repository-tracked の
+  ``classify_runtime_migration.py`` の read-only な ``pre-repair-check`` subcommand (flag は 2 つに固定。
+  Issue #2810 の operator decision)。broad allow は
   含めず、``soft_deny`` / ``hard_deny`` / ``environment`` の key も overlay に含めない。
   base overlay の ``permissions.deny`` と hooks はそのまま保持する。
 - carrier が与える authority は、repository でレビューされた registry 定数と Issue の
@@ -74,15 +77,36 @@ class ApprovalProfile:
     allow_rule: str
 
 
+# repair 前に worker が必須とする read-only な identity 確認 (Issue #2810)。classifier script の
+# repository-tracked path と subcommand、許可する flag は固定定数で、caller が差し替える入口は無い。
+PRE_REPAIR_CHECK_SCRIPT_RELPATH = ".claude/skills/impl-review-loop/scripts/classify_runtime_migration.py"
+PRE_REPAIR_CHECK_SUBCOMMAND = "pre-repair-check"
+PRE_REPAIR_CHECK_COMMAND_PREFIX = (
+    f"uv run --locked python3 {PRE_REPAIR_CHECK_SCRIPT_RELPATH} {PRE_REPAIR_CHECK_SUBCOMMAND}"
+)
+PRE_REPAIR_CHECK_FLAGS = ("--expected-claude-gpt-home", "--pre-repair-evidence-json")
+
 _REPAIR_PROXY_ALLOW_RULE = (
-    "Running the exact command `bash scripts/claude-gpt/repair_proxy.sh` is allowed in this "
-    "verification session. It executes only the repository-tracked local fixture installer "
+    "Exactly two actions are allowed in this verification session. "
+    "Action 1: running the exact command `bash scripts/claude-gpt/repair_proxy.sh`. "
+    "It executes only the repository-tracked local fixture installer "
     "`.claude/skills/impl-review-loop/tests/fixtures/fake_proxy_installer.sh` through a file:// URL "
     "(it is not a download-and-execute of an external URL) and it uses no network installer. "
     "The persistent install destination is limited to the fixture directory that CLAUDE_GPT_HOME "
     "points at inside artifacts/runtime-smoke/ of this worktree; while repairing, the script also "
     "creates and removes local temporary files and directories and verifies the result locally. "
-    "The real ~/.claude-gpt is never modified."
+    "The real ~/.claude-gpt is never modified. "
+    f"Action 2: running the read-only `{PRE_REPAIR_CHECK_SUBCOMMAND}` subcommand of the repository-tracked "
+    f"`{PRE_REPAIR_CHECK_SCRIPT_RELPATH}` as "
+    f"`{PRE_REPAIR_CHECK_COMMAND_PREFIX}` "
+    f"with exactly the two flags `{PRE_REPAIR_CHECK_FLAGS[0]}` (the absolute path of the fixture home "
+    "directory that CLAUDE_GPT_HOME points at inside artifacts/runtime-smoke/ of this worktree) and "
+    f"`{PRE_REPAIR_CHECK_FLAGS[1]}` (inline JSON holding claude_gpt_home_absolute_path and repo_head). "
+    "This action is read-only: it only reads the effective CLAUDE_GPT_HOME and the output of "
+    "`git rev-parse HEAD`, creates or changes no files, uses no network, and performs no install. "
+    "Nothing else is allowed by this rule: no other subcommand of that script, no other script, "
+    "no other uv or python invocation, no other shell command, no shell chaining, "
+    "no listing of environment variables, and no additional file or system mutation."
 )
 
 # closed enum。profile を増やすには別 Issue で registry と test を更新する。

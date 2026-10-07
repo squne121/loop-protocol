@@ -168,6 +168,59 @@ fixture semantics AC の PASS は canonical runtime acceptance AC の代替に�
 
 fixture / mock server に向けた check-only の evidence（`ANTHROPIC_BASE_URL` を fixture / mock server へ向けた結果や、PATH 上の binary の path / version のみを記載した evidence）は、canonical runtime acceptance AC の充足として **明示的に不十分** である。catalog / connected-server AC は `ANTHROPIC_BASE_URL` を fixture / mock server へ向けない current-head production `scripts/claude-gpt/launch.sh --check-only`（接続先 server の `connected_server` 診断。catalog 不足は `reason: model_alias_not_resolved` / `cause: connected_server_model_catalog_incomplete`）を canonical acceptance の最低限とし、`connected_server.model_catalog_ok` は `/v1/models` に required model が列挙されていることだけを示す（実 ChatGPT subscription request の受理や provider fallback の不在の証明ではない）。`CLAUDE_GPT_PROXY_BIN` は補助 binary path の解決にのみ影響し接続先 server の authority ではないため、fake `CLAUDE_GPT_PROXY_BIN` の有無を connected-server AC の充足判定に使わない。authenticated request / transport の意味論自体を AC が要求する場合に限り `scripts/claude-gpt/runtime_smoke_test.sh` の full smoke を追加要求する。full smoke の認証不足 SKIP は catalog-only AC を failure 扱いしないが、authenticated request / transport AC 自体を PASS にはしない。canonical runtime evidence の取得には、新しい harness を作らず既存の `scripts/claude-gpt/launch.sh --check-only` / `scripts/claude-gpt/runtime_smoke_test.sh` のような current-head production 実行資産を参照する。
 
+### ランタイム依存 migration の ownership 明記規則（Issue #2810）
+
+AC が actual/canonical runtime acceptance を要求し、その受け入れが **local runtime
+state migration**（対象 runtime host 上の dependency/proxy/binary 等の repair・
+更新）を必要とする場合、Issue は migration ownership と human-action boundary を
+明示する。「repository code が merge された」ことと「target runtime が実際に
+migration/acceptance を完了した」ことは別の完了条件であり、両者を混同しない
+（`docs/dev/runtime-verification-policy.md` の「runtime dependency migration の
+one-shot ownership」参照）。
+
+**具体例（#2772 -> #2801）**: #2772 は Claude-GPT の既定 model を更新して merge
+されたが、自動 updater / normal launch 時の upgrade を明示的に Out of Scope と
+していた。#2801 は repair path（`scripts/claude-gpt/repair_proxy.sh`）を実装した
+が、「structured failure が出た後、誰が repair を実行して再検証するか」という
+migration ownership を定義しないまま Out of Scope とした。このように repository
+policy が local runtime capability より先行して変わるケースでは、migration
+ownership を明示しない Issue は「code は正しいが target runtime が追従していない」
+未完了状態を merge 完了として扱ってしまう。
+
+**migration action と runtime verification VC の混同禁止**: read-only であるべき
+verifier（例: test-runner 相当の検証専用 role）に mutation を押し込んではならない。
+migration action（実際に runtime state を変更する repair 実行）は mutation-capable
+な実装ロールが担い、runtime verification VC は変更後の状態を観測するのみに留める。
+
+Issue に migration ownership を明記する場合、次を含める:
+
+- 誰が migration を実行するか（agent-executable な bounded repair か、human
+  operator による手動対応か）
+- agent が実行してよい条件（repository-owned の exact command であること、
+  secret/privilege/destructive mutation を要求しないこと、target が writable
+  かつ到達可能であること、live Issue が明示的に許可していること 等）
+- repair 後にどの evidence を fresh に再検証するか（pre-repair の evidence を
+  再利用しない）
+- human intervention が必要になる具体的な条件（credential 操作、sudo/privilege
+  escalation、destructive/global mutation、target host 到達不能、agent
+  execution が policy/hook で拒否されている 等）と、必要になった場合の停止
+  report に含める項目（`reason` / `required_human_action` / `target_environment` /
+  `verification_command` / `resume_condition`）
+
+**agent 実行許可の機械判定述語（#2810 追加ガイダンス）**: agent-executable な bounded repair を
+許可する Issue は、許可を **1 行で明示**する。`impl-review-loop` の root
+（`classify_runtime_migration.py materialize`）は、Issue 本文の code fence 外の 1 行に
+literal `bash scripts/claude-gpt/repair_proxy.sh`（引数追加・suffix 連結なし）と agent 実行の
+許可 marker（`agent-executable` / `agent が実行してよい` 等）が同居し、かつ当該 literal を含む
+どの行にも禁止・曖昧 marker（`禁止` / `手動` / `human operator` / `Out of Scope` 等）が無い場合に
+限り `live_issue_authorizes_migration: true` とする（それ以外は fail-closed で false）。記載例:
+
+```markdown
+- migration 実行者: agent-executable bounded repair として `bash scripts/claude-gpt/repair_proxy.sh` を agent が実行してよい
+```
+
+VC の code block 内に literal を置いただけの記述、または許可 marker の無い言及は許可として扱われない。
+
 ### 実行時検証プロファイルの assertion binding 記法（`runtime_assertion_bindings`, Issue #2771）
 
 `docs/dev/extension-surface-runtime-policy.yaml` の risk-trigger rule に **hard** で一致する Allowed Paths を宣言した Issue は、その rule が要求する `verification_profile` の `assertions[]`（証明すべき postcondition）を、どの runtime AC が担うかを `runtime_assertion_bindings` として明示する。`enforcement == advisory` のみで到達した profile / assertion は required set に含まれない（PR #2370 の advisory non-blocking 方針を継続する）。
