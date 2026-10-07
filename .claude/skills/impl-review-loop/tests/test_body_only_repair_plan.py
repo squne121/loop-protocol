@@ -2679,13 +2679,85 @@ def test_ac10_build_evidence_refs_materializes_only_current_head_bound_refs() ->
     ) == ([], ["test_verdict_malformed"])
 
 
-REAL_FORMAT_SUMMARY = FIXTURE_DIR / "runtime_smoke_summary_real_format_issue_2971.txt"
+# 実 ``run_worktree_agent_runtime_smoke.py`` の summary.md 形式（英語の ``key: value`` 列）の実出力そのまま。
+# git-ignored の artifact は commit せず、live Issue の Allowed Paths に合わせて test 内の定数として持つ。
+REAL_FORMAT_SUMMARY = """\
+# Runtime Smoke Summary
+
+- agent_definition: {'intended_repo_path': None, 'intended_sha256': None, 'binding_mode': None, 'status': 'unavailable'}
+- agent_spawn_completion_observed: True
+- agent_type_identity_verified: False
+- capability_decision: runtime_outcome
+- capability_error_classification: None
+- child_agent_id: a179d8bd4bcacab02
+- child_agent_type_observed: implementation-worker
+- child_agent_type_source: tool_use_result
+- child_completion_observed: True
+- child_completion_source: tool_use_result_status_completed
+- child_launch_mode: completed
+- child_session_id: a179d8bd4bcacab02
+- child_spawn_event_count: 1
+- child_spawn_launch_mode: completed
+- child_spawn_observed: True
+- child_spawn_source: tool_use_result
+- child_terminal_status: completed
+- claude_adapter: native
+- claude_gpt_launcher_receipt: None
+- claude_gpt_proxy_cleanup_independent: None
+- claude_gpt_proxy_sidechannel: None
+- completion_elapsed_sec: None
+- cross_session_inbound_configured_refuse: True
+- direct_web_tool_event_count: 0
+- effective_agent_type: implementation-worker
+- errors: []
+- exit_code: 0
+- expect_marker_source: subagent
+- expected_markers_missing: []
+- herdr_namespace_isolated: None
+- loaded_skills: None
+- loaded_skills_source: None
+- main_agent_identity: {'requested': {'agent_name': None, 'source': 'runner_argv'}, 'observed': {'agent_type': None, 'source': None, 'status': 'unavailable'}, 'matched': False, 'status': 'unavailable'}
+- mode: structured
+- multi_child_lifecycle: {'verified': True, 'spawned_agent_ids': ['a179d8bd4bcacab02'], 'completed_agent_ids': ['a179d8bd4bcacab02'], 'paired_agent_ids': ['a179d8bd4bcacab02'], 'orphan_starts': [], 'unknown_children': [], 'duplicate_completions': []}
+- mutation_boundary: {'settings_source': None, 'settings_digest_sha256': None, 'effective_argv': None, 'mutation_capable_tool_events': [], 'mutation_capable_tool_event_count': None, 'status': 'unavailable'}
+- native_event_count: 64
+- native_spawn_event_observed: False
+- orchestration_action_count: 0
+- outbound_peer_tools_absent: None
+- parent_session_id: 11646adf-aea5-4bac-9d8c-9d8a5c657258
+- peer_policy_configured: True
+- permission_denials: []
+- preexisting_herdr_preserved: None
+- process_exit_code: 0
+- production_settings_lane: deferred_to_#1881: hermetic mutation_boundary/settings_provenance evidence in this run is not a production_settings_lane result and must not be promoted to a production settings/permission claim until #1881 (pr-reviewer persona safe Read/mutation-deny boundary) merges
+- prompt_sha256: a56ed011e4c8b2e71c346e4298f591d8a145f5d4a45db05ea7cec0532e618721
+- requested_agent_type: unspecified
+- resolved_executable: <redacted>
+- resolved_executable_sha256: a967e7b1d8b4e47ee421d5433027880347952b0c0857abf880e2c942a4ec93b3
+- run_id: 159dfc366ae2
+- runtime: claude
+- runtime_version: 2.1.292 (Claude Code)
+- schema: WORKTREE_AGENT_RUNTIME_SMOKE_RESULT_V1
+- self_restart_event_count: 0
+- settings_provenance: {'source': 'project_default', 'digest_sha256': '4a754e1f04a4a1301ab38012b9740197562f6ada057bd49d88314b110461ef32', 'status': 'declared'}
+- skill_evidence: {'declaration': {'skills': None, 'source': 'agent_frontmatter', 'status': 'unavailable'}, 'preload': {'status': 'unavailable', 'source': None}, 'canonical_read': {'expected_repo_relative_path': None, 'expected_sha256': None, 'observed_repo_relative_path': None, 'tool_name': None, 'tool_use_id': None, 'read_result_status': None, 'status': 'unavailable'}}
+- spawn_elapsed_sec: None
+- spawn_events: [{'runtime': 'claude', 'tool': 'Agent'}]
+- subagent_causal_evidence: {'agent_id': 'a179d8bd4bcacab02', 'subagent_start_observed': True, 'subagent_stop_observed': True, 'agent_transcript_path': '<redacted>', 'agent_transcript_verified': False, 'tool_invocation_id_correlated': True, 'marker_provenance_verified': True, 'marker_provenance_transcript_fallback_used': False, 'causal_evidence_source': 'hook_id_correlated', 'causal_evidence_ambiguous_candidate_count': None, 'marker_provenance_handback_report_used': True}
+- task_context_carrier_configured: False
+- terminal_event_observed: True
+- tested_head: b88b0533aa9e704a9dd68c41720c018bdf32030a
+- timed_out: False
+- timeout_seconds: 600
+- transport: direct
+- worktree: .claude/worktrees/issue-2971-body-only-evidence-sync
+"""  # noqa: E501
 
 
 def test_ac10_plan_real_runtime_smoke_summary_format_passes_the_real_validators(tmp_path: Path) -> None:
     """実 ``run_worktree_agent_runtime_smoke.py`` の summary.md（英語の ``key: value`` 列）でも eligible になる。"""
     env = PlanEnv(tmp_path)
-    real = REAL_FORMAT_SUMMARY.read_text(encoding="utf-8")
+    real = REAL_FORMAT_SUMMARY
     assert real.startswith("# Runtime Smoke Summary\n") and "- tested_head: " in real
     # fixture の tested_head だけをこの環境の live head に差し替える（それ以外は実物の内容のまま）。
     real = re.sub(r"(?m)^- tested_head: [0-9a-f]+$", f"- tested_head: {env.head}", real)
