@@ -18,9 +18,12 @@
   同条件で 1 回だけ再実行する。verdict が規則に合わないことを理由とする再試行はしない。
 - 結果 JSON は `artifacts/runtime-verification-2973-<head8>.json`（git-ignored、commit しない）。
 - claude 実行ファイル / 認証が利用不能、permission 拒否、または session の tool pool（`system init` の `tools`）に
-  discovery tool（Grep / Glob）が存在しない場合は exit 77（SKIP、PASS ではない）。Claude Code の native build は
-  Grep / Glob を既定の tool pool から外す場合があり、その runtime では reviewer が discovery を実行できない。
-  harness 側で `--tools` を足して tool を後付けすることはしない（production の session と乖離するため）。
+  supported discovery lane（Bash、または専用 Grep / Glob）が一つも存在しない場合は exit 77（SKIP、PASS ではない）。
+  Claude Code の native build は専用 Grep / Glob を既定の tool pool から外す（discovery は Bash の find / grep）が、
+  専用 Grep / Glob が無いことだけでは unavailable にしない（reviewer は Bash lane で続行し、その結果で判定する）。
+  harness 側で `--tools` を足して tool を後付けすることはしない（production-default runtime を検証するため）。
+- artifact には fixture ごとに、session init の tools と、reviewer 区間の各 tool_use が dedicated lane の discovery /
+  Bash lane の discovery / 非 discovery のどれに認定されたか（認定した規則つき）を構造的に残す。
 """
 
 from __future__ import annotations
@@ -240,7 +243,18 @@ def test_main_session_prompt_embeds_committed_launch_prompt_with_discovery_claus
     assert "git -C /x/inv rev-parse --show-toplevel" in prompt
     assert 'subagent_type "issue-design-reviewer"' in prompt
     assert "DISCOVERY_SEARCH_CALL_MAX: 8" in prompt and "DISCOVERY_SOURCE_READ_MAX: 8" in prompt
-    assert "named symbol を query にした bounded discovery" in prompt.replace("\n", "")
+    flat = prompt.replace("\n", "")
+    assert "named symbol を query にした bounded discovery" in flat
+    # 2 lane（専用 Grep / Glob と root 束縛の Bash find / grep）と Bash allowlist、`-l` の推奨が launch prompt に載る。
+    squashed = re.sub(r"\s+", "", prompt)  # 折り返し位置に依存させない
+    for needle in (
+        "Bash の `find` / `grep` で discovery する",
+        "eligible な find / grep の 3 種類だけである",
+        "はすべて契約違反である",
+        "`-l` と `--include=` / `--exclude-dir=` を併用することを推奨する",
+    ):
+        assert re.sub(r"\s+", "", needle) in squashed, needle
+    assert "--tools" not in prompt
 
 
 @pytest.mark.parametrize("kind", _FIXTURE_KINDS)
@@ -356,14 +370,9 @@ def test_real_issue_design_reviewer_bounded_discovery_four_fixture_runtime_smoke
             terminal_incomplete=incomplete,
         )
         permission_modes[kind] = runner.extract_claude_subagentstop_permission_mode(stdout)
-        init_tools = next(
-            (
-                e.get("tools")
-                for e in EVAL.iter_stream_events(stdout)
-                if e.get("type") == "system" and e.get("subtype") == "init" and isinstance(e.get("tools"), list)
-            ),
-            None,
-        )
+        classification = [
+            record["classification"] for record in (outcome.get("tool_use_records") or []) if "classification" in record
+        ]
         results[kind] = {
             "bundle_invocation_dir": str(invocation_dir.relative_to(root)),
             "body_sha256": bundle["body_sha256"],
@@ -371,7 +380,8 @@ def test_real_issue_design_reviewer_bounded_discovery_four_fixture_runtime_smoke
             "claude_exit_code": returncode,
             "timed_out": timed_out,
             "terminal_incomplete": incomplete,
-            "session_tools": None if init_tools is None else [x for x in init_tools if not x.startswith("mcp__")],
+            "session_tools": outcome.get("session_tools"),
+            "reviewer_tool_use_classification": classification,
             "verdict": outcome["verdict"],
             "rule": outcome["rule"],
             "reason": outcome["reason"],

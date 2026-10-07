@@ -142,7 +142,7 @@ def _assert_needles(label: str, haystack: str, needles: tuple[str, ...]) -> None
 
 
 def test_reviewer_contract_requires_role_scoped_bounded_discovery_when_paths_unlisted() -> None:
-    """AC1: required role 単位の discovery（path を解決できる role は直接 Read、未解決 role だけ Grep / Glob）。"""
+    """AC1: required role 単位の discovery（path を解決できる role は直接 Read、未解決 role だけ 2 lane で発見）。"""
     for name in _DOCS:
         scopes = _scopes(name)
         _assert_needles(
@@ -154,8 +154,12 @@ def test_reviewer_contract_requires_role_scoped_bounded_discovery_when_paths_unl
                 "explicit path を持つ role を再探索しない",
                 "path の記載がない、または一意に解決できない role だけ",
                 "named symbol / evaluator / caller 名を query にして",
-                "repository root 配下に限定した Grep / Glob",
+                "repository root 配下に限定した Grep / Glob（専用 lane）または root 束縛の Bash find / grep",
+                "（Bash lane）で候補を発見し",
                 "Read で確認してから audit を続ける",
+                "lane は session の effective tool pool に従う",
+                "frontmatter の `tools` 宣言は effective tool pool を保証しない",
+                "専用 Grep / Glob があれば専用 lane、無ければ Bash lane で discovery し",
             ),
         )
         _assert_needles(
@@ -166,10 +170,13 @@ def test_reviewer_contract_requires_role_scoped_bounded_discovery_when_paths_unl
                 "named symbol を query にした bounded discovery",
                 "path を列挙している role は検索せず直接読む",
                 "explicit path を持つ role を再探索しない",
-                "Grep / Glob tool だけを使い",
+                "discovery の lane は session で実際に使える tool に従う",
+                "専用の Grep / Glob tool が使えるなら、それだけを使い",
                 "`path` に `<root>` 配下の絶対 path を明示する",
-                "Grep の `pattern` は未解決 role の named symbol を",
-                "Glob の `pattern` は未解決 role の file 名断片を含める",
+                "専用の Grep / Glob が使えない（`No such tool available` になる）場合は、",
+                "Bash の `find` / `grep` で discovery する",
+                "Grep / grep では未解決 role の named symbol を",
+                "Glob / find（`-name` / `-iname` / `-path`）では未解決 role の file 名断片を含める",
             ),
         )
     # 起動 prompt は両 document で同一内容のまま。
@@ -186,11 +193,98 @@ def test_reviewer_contract_requires_role_scoped_bounded_discovery_when_paths_unl
         assert _flat(_read(path)).count("観測できなかった path と理由") == 1, name
 
 
+_FORBIDDEN_BASH_EXAMPLES = (
+    "rg",
+    "ugrep",
+    "git grep",
+    "git ls-files",
+    "ls -R",
+    "env grep",
+    "timeout 5 grep",
+    "cd <root> && grep",
+    "xargs grep",
+    "cat",
+    "sed",
+)
+
+
+def _backticked(segment: str) -> list[str]:
+    return re.findall(r"`([^`]+)`", segment)
+
+
+def test_prompt_allowlist_wording_matches_evaluator_shape_one_to_one() -> None:
+    """起動 prompt の Bash allowlist 文言と evaluator の narrowly supported shape が一対一に対応する（AC1 / AC2）。"""
+    for name in _DOCS:
+        prompt = _scopes(name)["prompt"]
+        section = _scopes(name)["section"]
+        # ONLY Bash: exact root / exact HEAD / eligible find / grep だけ。それ以外はすべて契約違反。
+        _assert_needles(
+            f"{name} prompt",
+            prompt,
+            (
+                "reviewer 区間で許される Bash は、(1) の root 解決 command、(2) の HEAD 解決 command、"
+                "eligible な find / grep の 3 種類だけである",
+                "これ以外の Bash",
+                "はすべて契約違反である",
+                "単一の simple command",
+                "`<root>` 配下の絶対 path を明示する（相対 path・path の省略・`..`・root 外は禁止）",
+                "`--include X` の分離形式は禁止",
+                "`-l` と `--include=` / `--exclude-dir=` を併用することを推奨する",
+            ),
+        )
+        for example in _FORBIDDEN_BASH_EXAMPLES:
+            assert example in prompt, f"{name} prompt: forbidden Bash example {example!r} is not listed"
+            assert example in section, f"{name} section: forbidden Bash example {example!r} is not listed"
+        grep_segment = prompt.split("grep は ", 1)[1].split("だけを使い", 1)[0]
+        grep_tokens = _backticked(grep_segment)
+        short = {token[1:] for token in grep_tokens if re.fullmatch(r"-[A-Za-z]", token)}
+        long_prefixes = {token.split("X")[0] for token in grep_tokens if token.startswith("--")}
+        assert short == set(EVAL.GREP_SHORT_FLAGS), f"{name}: grep flags in the prompt differ from the evaluator"
+        assert long_prefixes == set(EVAL.GREP_LONG_FLAG_PREFIXES)
+        find_segment = prompt.split("find は ", 1)[1].split("だけを使う", 1)[0]
+        assert set(_backticked(find_segment)) == {*EVAL.FIND_VALUE_PRIMARIES, *EVAL.FIND_FLAG_PRIMARIES}
+        # 同じ flag 集合を section 側でも列挙している。
+        section_grep = section.split("grep が使える flag は ", 1)[1].split(" だけ", 1)[0]
+        section_short = {t[1:] for t in _backticked(section_grep) if re.fullmatch(r"-[A-Za-z]", t)}
+        assert section_short == set(EVAL.GREP_SHORT_FLAGS)
+    # prompt が許可する shape を evaluator が実際に受理し、禁止例は違反として扱う（文言だけの一致で終わらせない）。
+    root = "/synthetic/root"
+    eligible = (
+        f"grep -rln --include=*.py SymA {root}",
+        f"grep -rn -E 'SymA|SymB' {root}/dir",
+        f"grep -rne SymA {root}",
+        f"find {root} -type f -name 'frag*' -o -iname 'FRAG*'",
+        f"find {root}/d -maxdepth 3 -path '*/frag*'",
+    )
+    for command in eligible:
+        parsed = EVAL.parse_bash_search(command, root)
+        assert parsed["reason"] is None and parsed["scope_violation"] is None, command
+    forbidden = (
+        f"rg -n SymA {root}",
+        "git grep SymA",
+        "git ls-files",
+        f"ls -R {root}",
+        f"env grep SymA {root}",
+        f"timeout 5 grep SymA {root}",
+        f"cd {root} && grep SymA {root}",
+        f"xargs grep SymA {root}",
+        f"cat {root}/x.py",
+        f"sed -n 1,5p {root}/x.py",
+        f"grep SymA {root}; ls",
+        f"grep SymA {root}|cat",
+        f"grep --include *.py SymA {root}",
+        f"find {root} -name x -exec cat {{}} +",
+    )
+    for command in forbidden:
+        assert EVAL.parse_bash_search(command, root)["reason"] is not None, command
+
+
 def test_discovery_bounds_match_evaluator_constants_and_no_new_analyzer_or_registry() -> None:
     """AC2: 文書中の bound の数値が evaluator 定数と同一（3 箇所: 文書 / evaluator / 本 test）で、新機構を足さない。"""
     # Issue 本文「固定する bound の値」（実装側の都合で変更しない）。
     assert (EVAL.DISCOVERY_SEARCH_CALL_MAX, EVAL.DISCOVERY_SOURCE_READ_MAX) == (8, 8)
     assert EVAL.SEARCH_SCOPE == "repository_root_only" and EVAL.DISCOVERY_TOOLS == ("Grep", "Glob")
+    assert EVAL.DISCOVERY_BASH_LANE == ("find", "grep")
     for name in _DOCS:
         scopes = _scopes(name)
         for scope, haystack in scopes.items():
@@ -206,18 +300,26 @@ def test_discovery_bounds_match_evaluator_constants_and_no_new_analyzer_or_regis
                 "`DISCOVERY_SOURCE_READ_MAX: 8`",
                 "`SEARCH_SCOPE: repository_root_only`",
                 "`DISCOVERY_TOOLS: [Grep, Glob]`",
-                "Grep と Glob の tool_use の合計",
+                "`DISCOVERY_BASH_LANE: [find, grep]`",
+                "専用 Grep / Glob の tool_use 1 件、または eligible な Bash find / grep 1 件を 1 search call と数え",
                 "成功・失敗を問わず数える",
+                "専用 lane と Bash lane の混在は合算する",
                 "`bundle.json` と `body_file` を除く repository file の Read の合計",
-                "`path` の省略・root 外 path・`..` による脱出・root 外を指す絶対 pattern は違反",
-                "Bash の rg / grep / find は discovery として数えない",
-                "新しい analyzer / schema / registry / approval layer は追加しない",
+                "`path` の省略・相対 path・root 外 path・`..` による脱出・root 外を指す絶対 pattern は違反",
+                "任意の Bash は discovery として数えない",
+                "それ以外の Bash",
+                "search call として数えたうえで違反とする",
+                "root / HEAD の解決 command は non-discovery であり search bound に算入しない",
+                "新しい analyzer / generic shell parser / schema / registry / approval layer は追加しない",
             ),
         )
         _assert_needles(
             f"{name} prompt",
             scopes["prompt"],
-            ("Grep と Glob の合計 8 回以内", "`bundle.json` と `body_file` 以外の Read は 8 回以内"),
+            (
+                "専用 Grep / Glob と eligible な Bash find / grep の合計 8 回以内",
+                "`bundle.json` と `body_file` 以外の Read は 8 回以内",
+            ),
         )
     # evaluator は #2963 の scanner / helper を import して再利用する（複製しない）。
     for helper in (
@@ -237,19 +339,23 @@ def test_discovery_bounds_match_evaluator_constants_and_no_new_analyzer_or_regis
 
 
 def test_unlisted_path_alone_is_not_high_and_unobservable_after_discovery_is_not_clear() -> None:
-    """AC3: path 未記載それ自体は high にしない / 因果 / decoy / 発見できない場合に限り high 以上。"""
+    """AC3: path 未記載 / 専用 tool 不在それ自体は high にしない / 因果 / decoy / 発見できない場合に限り high 以上。"""
     for name in _DOCS:
         scopes = _scopes(name)
         _assert_needles(
             f"{name} section",
             scopes["section"],
             (
-                "path が未記載であること自体を理由に high にしない",
+                "path が未記載であること自体、および専用 Grep / Glob が session tool pool に無いこと自体を",
+                "理由に high にしない",
+                "Bash lane で続行する",
                 "成功した（error ではない）検索結果に target source の path が現れてから、その file を Read する",
+                "grep では hit した file の path、Glob / find では結果の path 行として現れることを要する",
+                "error の eligible call は bound に算入されるが discovery の根拠には使わない",
                 "body・test・evaluator 内の自己参照 literal hit だけでは discovery 成功としない",
                 "同名 symbol を持つ decoy があり得るため、最初の hit を盲目的に Read せず",
                 "decision-critical consumer の import / call-site から decoy ではない target を確定する",
-                "bounded discovery を尽くしても必要な source を発見・観測できなかった場合に限り",
+                "bounded discovery（いずれの lane でも）を尽くしても必要な source を発見・観測できなかった場合に限り",
                 "`assessment: clear` にせず",
                 "観測できなかった symbol と試行した検索を `evidence_refs` に残して high 以上の finding にする",
                 "「観測不能は clear にしない」と整合する",
@@ -259,6 +365,7 @@ def test_unlisted_path_alone_is_not_high_and_unobservable_after_discovery_is_not
             f"{name} prompt",
             scopes["prompt"],
             (
+                "専用 Grep / Glob が無いこと自体を理由に high にしない",
                 "path が未記載であること自体を理由に high にしない",
                 "成功した検索結果に target source の path が現れてから、その file を Read する",
                 "最初の hit を盲目的に Read せず",
@@ -268,9 +375,10 @@ def test_unlisted_path_alone_is_not_high_and_unobservable_after_discovery_is_not
             ),
         )
         # 順序: 「発見・観測できなかった場合に限り」の後に「観測できなかった symbol と試行した検索」が来る。
-        for haystack in scopes.values():
-            first = haystack.index("bounded discovery を尽くしても必要な source を発見・観測できなかった場合に限り")
-            assert haystack.index("観測できなかった symbol と試行した検索", first) > first
+        for scope, haystack in scopes.items():
+            marker = "発見・観測できなかった場合に限り"
+            first = haystack.index(marker)
+            assert haystack.index("観測できなかった symbol と試行した検索", first) > first, f"{name} {scope}"
         # 既存の義務文言（観測できなかった path と理由）は別の文として 1 回だけ残り、置換されていない。
         assert _flat(_read(_DOCS[name])).count("観測できなかった path と理由") == 1
         for scope, haystack in scopes.items():  # section と launch prompt に 1 回ずつ
@@ -296,6 +404,7 @@ def test_single_audit_section_and_authority_separation_preserved() -> None:
         for obligation in (
             "path 未列挙 role の bounded discovery（#2973）",
             "discovery の bound（固定値）",
+            "Bash discovery の eligible 形状と allowlist",
             "検索の関連性と因果",
             "path 未記載それ自体は high にしない",
         ):
@@ -320,7 +429,8 @@ def test_single_audit_section_and_authority_separation_preserved() -> None:
             flat_section,
             (
                 "単純な docs-only / local-only Issue",
-                "単純な docs-only Issue に discovery（Grep / Glob）や repository source の Read を一律に要求しない",
+                "単純な docs-only Issue に discovery（専用 Grep / Glob、Bash find / grep のどちらも）や "
+                "repository source の Read を一律に要求しない",
                 "blanket stop / approval も追加しない",
             ),
         )
@@ -330,6 +440,8 @@ def test_single_audit_section_and_authority_separation_preserved() -> None:
             ("cross-contract な検証要求を持たない単純な docs-only Issue では discovery を行わない",),
         )
         assert not re.search(r"必ず(人間|Owner)?.{0,6}(停止|承認)", text), f"{name}: blanket stop wording found"
+        # `--tools` passthrough 等の session plumbing を解決手段にしない（OWNER directive）。
+        assert "--tools" not in text, f"{name}: must not rely on a --tools passthrough"
 
 
 # ---------------------------------------------------------------------------
@@ -404,28 +516,34 @@ def _evaluator_parameters(path: Path, symbol: str) -> list[str]:
 
 
 def _load_decide(kind: str) -> Any:
-    """fixture consumer を unique module 名で読み込む（fixture 内 sibling module は終了後に除去する）。"""
+    """fixture consumer を unique module 名で読み込む（#2963 と同じ prefix-unique 方式）。
+
+    fixture 内の sibling module は `<prefix>_` 接頭辞の bare 名で import される。統合 pytest session で同名の別
+    module と sys.modules 上で衝突しないよう、読み込み前に同接頭辞の既存 entry を退避し、終了後に接頭辞一致の
+    entry を全て除去して元へ戻す。"""
     directory = str(_fixture_dir(kind))
     prefix = EVAL.FIXTURE_DIRS[kind][1]
     roles = EVAL.fixture_roles(kind)
+    unique = f"issue2973_fixture_{prefix}_consumer"
+    stashed = {name: mod for name, mod in sys.modules.items() if name.startswith(f"{prefix}_") or name == unique}
+    for name in stashed:
+        sys.modules.pop(name, None)
     sys.path.insert(0, directory)
-    before = set(sys.modules)
     previous = sys.dont_write_bytecode
-    sys.dont_write_bytecode = True
+    sys.dont_write_bytecode = True  # fixture directory に __pycache__ を作らない
     try:
-        name = f"issue2973_fixture_{prefix}_consumer"
-        spec = importlib.util.spec_from_file_location(name, _REPO_ROOT / roles["consumer"]["path"])
+        spec = importlib.util.spec_from_file_location(unique, _REPO_ROOT / roles["consumer"]["path"])
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
+        sys.modules[unique] = module
         spec.loader.exec_module(module)
         return getattr(module, roles["consumer"]["symbol"])
     finally:
         sys.dont_write_bytecode = previous
         sys.path.remove(directory)
-        for added in set(sys.modules) - before:
-            sys.modules.pop(added, None)
-        sys.modules.pop(f"issue2973_fixture_{prefix}_consumer", None)
+        for name in [m for m in sys.modules if m.startswith(f"{prefix}_") or m == unique]:
+            sys.modules.pop(name, None)
+        sys.modules.update(stashed)
 
 
 _BODY_WITHOUT_GIT_DIFF = "# AC1\n$ uv run --locked pytest tests/test_x.py\n"

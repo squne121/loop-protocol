@@ -5,12 +5,22 @@
 構造化 field（tool_use の `name` / `input`、tool_result の `is_error` / `content`、lifecycle record）だけで判定し、
 自由文は解釈せず、LLM judge を使わない。新しい汎用 parser / runner / analyzer は持たない。
 
+discovery lane は 2 つ（effective runtime tool pool に従う。frontmatter の tool 宣言は effective pool を保証しない）。
+
+- dedicated lane: 専用 `Grep` / `Glob`。
+- Bash lane: root 束縛の read-only な Bash `find` / `grep`（narrowly supported shape を `shlex` で判定する。
+  汎用 shell parser ではなく、許可する単一 simple command の形だけを受理し、それ以外は fail closed）。
+
+reviewer 区間の Bash は allowlist で判定する: exact な root 解決 command、exact な HEAD 解決 command、eligible な
+find / grep だけが許可される。それ以外の Bash は discovery と認めず、search call として数えて違反とする。
+
 判定規則（最初に該当した規則で確定する）:
 
 1. stream-json が得られない（unavailable）。
-2. reviewer 区間の必須 tool 呼び出し（root / HEAD / target source の Read / discovery の Grep・Glob）または
-   親 Agent tool_use が permission 拒否された、または session の tool pool に discovery tool（Grep / Glob）が
-   存在しない（unavailable。構造化 permission_denials と `system init` の `tools` だけで判定する）。
+2. reviewer 区間の必須 tool 呼び出し（root / HEAD / target source の Read / eligible な discovery）または
+   親 Agent tool_use が permission 拒否された、または session の tool pool に supported discovery lane が
+   一つも存在しない（Bash も専用 Grep / Glob も無い。unavailable。構造化 permission_denials と `system init` の
+   `tools` だけで判定する）。専用 Grep / Glob が無いことだけでは unavailable にしない（Bash lane で続行できる）。
 3. lifecycle / reviewer 区間 / terminal completion（fail）。#2963 の規則 3 と同一判定。
 4. 必須 tool 観測と bound（fail）。root -> HEAD -> role 単位の（direct Read | discovery -> target Read）。
 5. verdict（fail / pass）。fixture 種別ごと。
@@ -21,6 +31,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -29,10 +40,20 @@ from typing import Any
 # Issue 本文「固定する bound の値」（実装側の都合で変更しない。contract / static test と同一値）
 # ---------------------------------------------------------------------------
 
-DISCOVERY_SEARCH_CALL_MAX = 8  # reviewer 区間の Grep + Glob tool_use の合計（成功・失敗を問わず数える）
+# reviewer 区間の eligible な discovery tool_use（専用 Grep / Glob 1 件、または eligible な Bash find / grep 1 件を
+# 1 call と数える）と、eligible 形状を満たさない Bash の合計（成功・失敗を問わず数える）。
+DISCOVERY_SEARCH_CALL_MAX = 8
 DISCOVERY_SOURCE_READ_MAX = 8  # reviewer 区間の Read のうち bundle.json と body_file 以外の合計
 SEARCH_SCOPE = "repository_root_only"
-DISCOVERY_TOOLS = ("Grep", "Glob")
+DISCOVERY_TOOLS = ("Grep", "Glob")  # dedicated lane
+DISCOVERY_BASH_LANE = ("find", "grep")  # Bash lane（eligible 形状のみ discovery として数える）
+
+# Bash lane の narrowly supported shape（起動 prompt の文言と一対一に対応する。拡張しない）。
+GREP_SHORT_FLAGS = frozenset("rRnilEFwHIe")  # `-e` は次 token を pattern として消費する（連結時は末尾のみ）
+GREP_LONG_FLAG_PREFIXES = ("--include=", "--exclude-dir=")  # 値は `--flag=X` 形式のみ（分離形式は不適格）
+FIND_VALUE_PRIMARIES = ("-type", "-name", "-iname", "-path", "-maxdepth")
+FIND_FLAG_PRIMARIES = ("-o",)
+_SHELL_PUNCTUATION = frozenset("();<>|&")
 
 FIXTURE_KINDS = ("negative", "positive", "hybrid", "simple")
 SOURCE_ROLES = ("producer", "parser", "evaluator", "consumer")
@@ -155,7 +176,7 @@ def _read_path_is(tool_use: dict[str, Any], resolved_root: str, repo_relative: s
 
 
 def search_scope_violation(tool_use: dict[str, Any], resolved_root: str) -> str | None:
-    """Grep / Glob の search scope 違反（`path` 省略・相対 path・root 外・`..` 脱出・root 外 pattern）の理由。"""
+    """専用 Grep / Glob の search scope 違反（`path` 省略・相対 path・root 外・`..` 脱出・root 外 pattern）の理由。"""
     path = tool_use["input"].get("path")
     if not isinstance(path, str) or not path.strip():
         return "search_path_omitted"
@@ -172,26 +193,193 @@ def search_scope_violation(tool_use: dict[str, Any], resolved_root: str) -> str 
     return None
 
 
-def _query_text(tool_use: dict[str, Any]) -> str:
+def _path_operands_scope_violation(paths: list[str], resolved_root: str) -> str | None:
+    """Bash find / grep の path operand（resolved root 配下の明示的な絶対 path でなければ違反）。"""
+    if not paths:
+        return "search_path_omitted"
+    for path in paths:
+        if not os.path.isabs(path):
+            return "search_path_not_absolute"
+        if ".." in Path(path).parts or not _under_root(path, resolved_root):
+            return "search_outside_root"
+    return None
+
+
+def _absolute_pattern_outside_root(pattern: str, resolved_root: str) -> bool:
+    """`find -path` の絶対 pattern が root 外（または `..` を含む）を指すか。glob 文字より前の literal 部分で判定。"""
+    if not pattern.startswith("/"):
+        return False
+    literal = re.split(r"[*?\[]", pattern, maxsplit=1)[0]
+    return ".." in Path(literal).parts or not _under_root(literal.rstrip("/") or "/", resolved_root)
+
+
+# ---------------------------------------------------------------------------
+# Bash lane: narrowly supported shape（汎用 shell parser ではない。形を外れたら fail closed）
+# ---------------------------------------------------------------------------
+
+
+def _unquoted_shell_hazard(command: str) -> str | None:
+    """quote の外（`$(` / バッククォートは single quote の外）の改行・コマンド置換を検出する。
+
+    `;` `&&` `||` `|` `>` `<` `&` などの演算子は `shlex` の punctuation token として別に検出する。"""
+    in_single = in_double = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if in_single:
+            in_single = char != "'"
+        elif char == "\\":
+            index += 1
+        elif in_double:
+            if char == '"':
+                in_double = False
+            elif char == "`" or command.startswith("$(", index):
+                return "command_substitution"
+        elif char == "'":
+            in_single = True
+        elif char == '"':
+            in_double = True
+        elif char in "\n\r":
+            return "newline"
+        elif char == "`" or command.startswith("$(", index):
+            return "command_substitution"
+        index += 1
+    return None
+
+
+def _tokenize_command(command: str) -> list[str]:
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    return list(lexer)
+
+
+def _parse_grep(tokens: list[str]) -> dict[str, Any]:
+    patterns: list[str] = []
+    positionals: list[str] = []
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token.startswith("--"):
+            prefix = next((p for p in GREP_LONG_FLAG_PREFIXES if token.startswith(p)), None)
+            if prefix is None or not token[len(prefix) :]:
+                return {"reason": f"unsupported_flag:{token}"}
+        elif token.startswith("-") and len(token) > 1:
+            letters = token[1:]
+            if not all(letter in GREP_SHORT_FLAGS for letter in letters):
+                return {"reason": f"unsupported_flag:{token}"}
+            if "e" in letters:
+                if letters.index("e") != len(letters) - 1 or index + 1 >= len(tokens):
+                    return {"reason": f"unsupported_flag:{token}"}
+                index += 1
+                patterns.append(tokens[index])
+        else:
+            positionals.append(token)
+        index += 1
+    if not patterns:
+        if not positionals:
+            return {"reason": "no_pattern"}
+        patterns.append(positionals.pop(0))
+    return {"reason": None, "texts": patterns, "kind": "symbol", "hit_mode": "grep", "paths": positionals}
+
+
+def _parse_find(tokens: list[str], resolved_root: str) -> dict[str, Any]:
+    index = 1
+    paths: list[str] = []
+    while index < len(tokens) and not tokens[index].startswith("-"):
+        if tokens[index] == "!":
+            return {"reason": "unsupported_primary:!"}
+        paths.append(tokens[index])
+        index += 1
+    fragments: list[str] = []
+    outside_pattern = False
+    while index < len(tokens):
+        token = tokens[index]
+        if token in FIND_FLAG_PRIMARIES:
+            index += 1
+        elif token in FIND_VALUE_PRIMARIES and index + 1 < len(tokens):
+            value = tokens[index + 1]
+            if token == "-maxdepth" and not value.isdigit():
+                return {"reason": f"unsupported_primary:{token}"}
+            if token in ("-name", "-iname", "-path"):
+                fragments.append(value)
+            if token == "-path" and _absolute_pattern_outside_root(value, resolved_root):
+                outside_pattern = True
+            index += 2
+        else:
+            return {"reason": f"unsupported_primary:{token}"}
+    return {
+        "reason": None,
+        "texts": fragments,
+        "kind": "fragment",
+        "hit_mode": "path",
+        "paths": paths,
+        "outside_pattern": outside_pattern,
+    }
+
+
+def parse_bash_search(command: Any, resolved_root: str) -> dict[str, Any]:
+    """Bash command を、許可する narrowly supported shape（単一 simple command の find / grep）として分解する。
+
+    `reason` が None でない場合は eligible 形状を満たさない（fail closed）。`reason` が None の場合も、path operand の
+    scope と関連性は別に判定する（`scope_violation` を返す）。"""
+    if not isinstance(command, str) or not command.strip():
+        return {"reason": "not_find_grep", "cmd": None}
+    hazard = _unquoted_shell_hazard(command)
+    if hazard:
+        return {"reason": hazard, "cmd": None}
+    try:
+        tokens = _tokenize_command(command)
+    except ValueError:
+        return {"reason": "tokenize_error", "cmd": None}
+    # 空白なしの `a;b` / `a&&b` を含む unquoted の演算子は、punctuation だけからなる独立 token になる（fail closed）。
+    if any(token and all(char in _SHELL_PUNCTUATION for char in token) for token in tokens):
+        return {"reason": "compound_operator", "cmd": None}
+    cmd = tokens[0] if tokens else None
+    if cmd not in DISCOVERY_BASH_LANE:
+        return {"reason": "not_find_grep", "cmd": None}
+    parsed = _parse_grep(tokens) if cmd == "grep" else _parse_find(tokens, resolved_root)
+    parsed["cmd"] = cmd
+    if parsed["reason"] is None:
+        parsed["scope_violation"] = (
+            "search_outside_root"
+            if parsed.get("outside_pattern")
+            else _path_operands_scope_violation(parsed["paths"], resolved_root)
+        )
+    return parsed
+
+
+# ---------------------------------------------------------------------------
+# 検索の関連性・帰属
+# ---------------------------------------------------------------------------
+
+
+def _dedicated_query(tool_use: dict[str, Any]) -> dict[str, Any]:
     pattern = tool_use["input"].get("pattern")
-    return pattern if isinstance(pattern, str) else ""
+    is_grep = tool_use["name"] == "Grep"
+    return {
+        "kind": "symbol" if is_grep else "fragment",
+        "texts": [pattern] if isinstance(pattern, str) else [],
+        "hit_mode": "grep" if is_grep else "path",
+    }
 
 
-def _query_matches_role(tool_use: dict[str, Any], role: dict[str, Any]) -> bool:
-    """Grep は named symbol、Glob は file 名断片を `pattern` に含むこと（その role に関連する検索）。"""
-    key = "symbol" if tool_use["name"] == "Grep" else "file_fragment"
-    needle = role.get(key)
-    return bool(needle) and needle in _query_text(tool_use)
+def _query_matches_role(query: dict[str, Any], role: dict[str, Any]) -> bool:
+    """grep 系は named symbol、Glob / find は file 名断片を query に含むこと（その role に関連する検索）。"""
+    needle = role.get("symbol" if query["kind"] == "symbol" else "file_fragment")
+    return bool(needle) and any(needle in text for text in query["texts"])
 
 
-def result_lists_path(text: str, resolved_root: str, repo_relative: str) -> bool:
-    """検索結果 text に `repo_relative` が「hit した file の path」として現れるか。
+def result_lists_path(text: str, resolved_root: str, repo_relative: str, mode: str = "grep") -> bool:
+    """検索結果 text に `repo_relative` が「hit した file の path」として構造的に現れるか。
 
-    path で始まる行（Grep の files_with_matches / `path:line:content` / count、Glob の path 一覧。root からの
-    相対でも絶対でもよい）だけを数える。他 file の本文中に literal として現れる（body・test・evaluator の自己参照）
-    だけの行は数えない。"""
+    先頭が path の行だけを数える（root からの相対でも絶対でもよい）。`mode="grep"` では `<path>` 単独の行（`-l` /
+    files_with_matches）と `<path>:` で始まる行（`-n` / content / count）、`mode="path"`（Glob / find）では
+    `<path>` 単独の行だけを数える。他 file の本文や metadata が matched content として P_R を含むだけの行
+    （body・test・evaluator 内の自己参照 literal hit）は、行頭が P_R でないため数えない。"""
     root_prefix = resolved_root.rstrip("/") + "/"
-    pattern = re.compile(re.escape(repo_relative) + r"(?:$|[:\-\s])")
+    tail = r"(?:$|:)" if mode == "grep" else r"$"
+    pattern = re.compile(re.escape(repo_relative) + tail)
     for raw in (text or "").splitlines():
         line = raw.strip()
         if line.startswith(root_prefix):
@@ -215,24 +403,143 @@ def text_mentions_module(text: str, repo_relative: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# tool_use の分類（lane / discovery か否か / 認定した規則）
+# ---------------------------------------------------------------------------
+
+
+def classify_interval_tool_use(
+    tool_use: dict[str, Any],
+    *,
+    resolved_root: str,
+    invocation_dir: str,
+    body_file: str,
+    unresolved_roles: dict[str, dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """reviewer 区間の 1 tool_use を分類する。
+
+    `classification` は `dedicated_lane_discovery` / `bash_lane_discovery` / `non_discovery`、`rule` は認定した規則。
+    `counted_as_search` は search bound に算入するか（専用 Grep / Glob と、root / HEAD 以外の全 Bash）。`violation` は
+    contract 違反の code（`unresolved_roles` が None の場合は関連性を判定しない）。discovery と認定されるのは違反が
+    無い eligible な検索だけである。"""
+    name = tool_use["name"]
+    record: dict[str, Any] = {
+        "id": tool_use["id"],
+        "name": name,
+        "stream_index": tool_use["stream_index"],
+        "lane": None,
+        "classification": "non_discovery",
+        "rule": "other_tool",
+        "counted_as_search": False,
+        "violation": None,
+        "cmd": None,
+        "query": None,
+    }
+
+    def relevance_violation(query: dict[str, Any]) -> bool:
+        return unresolved_roles is not None and not any(
+            _query_matches_role(query, role) for role in unresolved_roles.values()
+        )
+
+    if name in DISCOVERY_TOOLS:
+        query = _dedicated_query(tool_use)
+        record.update(lane="dedicated", counted_as_search=True, query=query, cmd=name.lower())
+        scope = search_scope_violation(tool_use, resolved_root)
+        if scope:
+            record.update(violation=f"{scope}:{name}", rule=f"dedicated_{name.lower()}:{scope}")
+        elif relevance_violation(query):
+            record.update(violation=f"irrelevant_query:{name}", rule=f"dedicated_{name.lower()}:irrelevant_query")
+        else:
+            record.update(classification="dedicated_lane_discovery", rule="dedicated_grep_glob_tool")
+        return record
+    if name == "Bash":
+        if _is_root_command(tool_use, invocation_dir):
+            record["rule"] = "bash_exact_root_command"
+            return record
+        if _is_head_command(tool_use, resolved_root):
+            record["rule"] = "bash_exact_head_command"
+            return record
+        parsed = parse_bash_search(tool_use["input"].get("command"), resolved_root)
+        record.update(lane="bash", counted_as_search=True, cmd=parsed.get("cmd"))
+        if parsed["reason"]:
+            record.update(
+                violation=f"bash_not_allowed:{parsed['reason']}", rule=f"bash_not_allowlisted:{parsed['reason']}"
+            )
+            return record
+        label = f"Bash:{parsed['cmd']}"
+        query = {"kind": parsed["kind"], "texts": parsed["texts"], "hit_mode": parsed["hit_mode"]}
+        record["query"] = query
+        if parsed["scope_violation"]:
+            record.update(
+                violation=f"{parsed['scope_violation']}:{label}",
+                rule=f"bash_{parsed['cmd']}:{parsed['scope_violation']}",
+            )
+        elif relevance_violation(query):
+            record.update(violation=f"irrelevant_query:{label}", rule=f"bash_{parsed['cmd']}:irrelevant_query")
+        else:
+            record.update(classification="bash_lane_discovery", rule="bash_find_grep_eligible_shape")
+        return record
+    if name == "Read":
+        record["rule"] = (
+            "read_exempt_bundle_or_body"
+            if _exempt_read(tool_use, invocation_dir, body_file)
+            else "read_repository_source"
+        )
+    return record
+
+
+def classify_tool_uses(
+    tool_uses: list[dict[str, Any]],
+    *,
+    resolved_root: str,
+    invocation_dir: str,
+    body_file: str,
+    unresolved_roles: dict[str, dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    return [
+        classify_interval_tool_use(
+            tu,
+            resolved_root=resolved_root,
+            invocation_dir=invocation_dir,
+            body_file=body_file,
+            unresolved_roles=unresolved_roles,
+        )
+        for tu in sorted(tool_uses, key=lambda item: item["stream_index"])
+    ]
+
+
+# ---------------------------------------------------------------------------
+# session の tool pool（`system init` の `tools`）
+# ---------------------------------------------------------------------------
+
+
+def session_tools(events: list[dict[str, Any]]) -> list[str] | None:
+    """`system init` event の `tools`（構造化 field）。`init` に `tools` が無い stream では None（判定しない）。"""
+    for event in events:
+        if event.get("type") == "system" and event.get("subtype") == "init" and isinstance(event.get("tools"), list):
+            return [tool for tool in event["tools"] if isinstance(tool, str)]
+    return None
+
+
+def supported_discovery_lanes(tools: list[str]) -> list[str]:
+    """session tool pool が提供する discovery lane（dedicated: Grep / Glob のいずれか、bash: Bash）。
+
+    Claude Code の native build は専用 Grep / Glob を既定の tool pool から外し、discovery を Bash 経由の
+    `find` / `grep` で行う。専用 lane が無いこと自体は unavailable ではない（Bash lane が使える）。"""
+    lanes = []
+    if any(tool in tools for tool in DISCOVERY_TOOLS):
+        lanes.append("dedicated")
+    if "Bash" in tools:
+        lanes.append("bash")
+    return lanes
+
+
+# ---------------------------------------------------------------------------
 # 規則 1-3（#2963 の規則 1-3 と同一判定。drift は parity test が検出する）
 # ---------------------------------------------------------------------------
 
 
 def _required_read_paths(fixture_roles: dict[str, dict[str, Any]] | None) -> list[str]:
     return [role["path"] for role in (fixture_roles or {}).values() if role.get("path")]
-
-
-def missing_discovery_tools(events: list[dict[str, Any]]) -> list[str]:
-    """session の `system init` event の `tools`（構造化 field）に存在しない discovery tool。
-
-    `init` に `tools` が無い stream では判定できないため空（= 判定しない）を返す。Claude Code の native build は
-    Grep / Glob を既定の tool pool から外し、embedded な bfs / ugrep を Bash 経由で提供する場合がある。その
-    runtime では reviewer が Grep / Glob を呼べず、discovery は検証不能（unavailable であり PASS ではない）。"""
-    for event in events:
-        if event.get("type") == "system" and event.get("subtype") == "init" and isinstance(event.get("tools"), list):
-            return [tool for tool in DISCOVERY_TOOLS if tool not in event["tools"]]
-    return []
 
 
 def evaluate_rules_1_3(
@@ -244,22 +551,23 @@ def evaluate_rules_1_3(
     fixture_roles: dict[str, dict[str, Any]] | None,
     claude_unavailable_reason: str | None = None,
     terminal_incomplete_reason: str | None = None,
-    require_discovery_tools: bool = False,
+    require_discovery_lane: bool = False,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """規則 1-3 を評価する。(確定した outcome | None, 規則 4 以降が使う context) を返す。"""
     events = iter_stream_events(stdout)
     if claude_unavailable_reason or not events:
         return _verdict("unavailable", 1, claude_unavailable_reason or "no stream-json events captured"), {}
 
-    if require_discovery_tools:
-        missing_tools = missing_discovery_tools(events)
-        if missing_tools:
+    if require_discovery_lane:
+        tools = session_tools(events)
+        if tools is not None and not supported_discovery_lanes(tools):
             return (
                 _verdict(
                     "unavailable",
                     2,
-                    f"discovery tool(s) {missing_tools} are absent from the session tool pool (system init `tools`)",
-                    missing_discovery_tools=missing_tools,
+                    "no supported discovery lane in the session tool pool (system init `tools` has neither Bash "
+                    "nor dedicated Grep / Glob)",
+                    session_tools=[tool for tool in tools if not tool.startswith("mcp__")],
                 ),
                 {},
             )
@@ -298,6 +606,8 @@ def evaluate_rules_1_3(
             return True
         if tool_use["name"] in DISCOVERY_TOOLS:
             return True
+        if tool_use["name"] == "Bash":  # eligible 形状の find / grep だけが discovery（他の Bash は必須観測ではない）
+            return parse_bash_search(tool_use["input"].get("command"), resolved_root)["reason"] is None
         return any(_read_path_is(tool_use, resolved_root, rel) for rel in required_reads)
 
     def _denied(tool_use: dict[str, Any]) -> bool:
@@ -392,17 +702,22 @@ def _unresolved_roles(fixture_roles: dict[str, dict[str, Any]]) -> dict[str, dic
 
 def _evaluate_simple_observations(
     *,
+    classified: list[dict[str, Any]],
     interval: list[dict[str, Any]],
     resolved_root: str,
     invocation_dir: str,
     body_file: str,
     allowed_read_paths: list[str],
 ) -> list[str]:
+    """simple は discovery（専用 Grep / Glob と Bash の find / grep）、許可されない Bash、source Read を持たない。"""
     violations: list[str] = []
+    for record in classified:
+        if record["name"] in DISCOVERY_TOOLS:
+            violations.append(f"simple_discovery:{record['name']}")
+        elif record["name"] == "Bash" and record["counted_as_search"]:
+            violations.append("simple_discovery:Bash" if record["cmd"] else "simple_bash_not_allowed")
     for tool_use in interval:
-        if tool_use["name"] in DISCOVERY_TOOLS:
-            violations.append(f"simple_discovery:{tool_use['name']}")
-        elif tool_use["name"] == "Read" and not _exempt_read(tool_use, invocation_dir, body_file):
+        if tool_use["name"] == "Read" and not _exempt_read(tool_use, invocation_dir, body_file):
             if not any(_read_path_is(tool_use, resolved_root, rel) for rel in allowed_read_paths):
                 violations.append("simple_source_read")
     return violations
@@ -410,6 +725,7 @@ def _evaluate_simple_observations(
 
 def _evaluate_discovery_observations(
     *,
+    classified: list[dict[str, Any]],
     interval: list[dict[str, Any]],
     results: dict[str, dict[str, Any]],
     tested_head: str,
@@ -453,28 +769,42 @@ def _evaluate_discovery_observations(
         else:
             violations.append("head_before_root")
 
-    # --- bound / scope / query 関連性 -------------------------------------------------------------------------
-    searches = [tu for tu in by_index if tu["name"] in DISCOVERY_TOOLS]
+    # --- bound / scope / query 関連性 / allowlist --------------------------------------------------------------
+    searches = [record for record in classified if record["counted_as_search"]]
     source_reads = [tu for tu in by_index if tu["name"] == "Read" and not _exempt_read(tu, invocation_dir, body_file)]
     if len(searches) > DISCOVERY_SEARCH_CALL_MAX:
         violations.append(f"search_bound_exceeded:{len(searches)}>{DISCOVERY_SEARCH_CALL_MAX}")
     if len(source_reads) > DISCOVERY_SOURCE_READ_MAX:
         violations.append(f"read_bound_exceeded:{len(source_reads)}>{DISCOVERY_SOURCE_READ_MAX}")
+    violations.extend(record["violation"] for record in searches if record["violation"])
     unresolved = _unresolved_roles(fixture_roles)
-    for tool_use in searches:
-        scope = search_scope_violation(tool_use, resolved_root)
-        if scope:
-            violations.append(f"{scope}:{tool_use['name']}")
-        if not any(_query_matches_role(tool_use, role) for role in unresolved.values()):
-            violations.append(f"irrelevant_query:{tool_use['name']}")
     if head_use_index is not None:
-        for tool_use in [*searches, *source_reads]:
-            if tool_use["stream_index"] <= head_use_index:
-                violations.append(f"before_head:{tool_use['name']}")
+        for stream_index, name in [
+            *((record["stream_index"], record["name"]) for record in searches),
+            *((tu["stream_index"], tu["name"]) for tu in source_reads),
+        ]:
+            if stream_index <= head_use_index:
+                violations.append(f"before_head:{name}")
                 break
 
-    # --- role 単位の帰属（direct Read | (a) 成功した discovery の hit | (b) import 由来） -----------------------
-    successful_searches = _ok_results(lambda tu: tu["name"] in DISCOVERY_TOOLS)
+    # --- role 単位の帰属（direct Read | (a) 成功した eligible discovery の hit | (b) import 由来） -------------------
+    # is_error の eligible call は bound に算入されるが、discovery attribution には使わない。
+    attributing = []
+    for record in classified:
+        result = results.get(record["id"])
+        if (
+            record["classification"] in ("dedicated_lane_discovery", "bash_lane_discovery")
+            and result is not None
+            and not result["is_error"]
+        ):
+            attributing.append({"record": record, "result": result})
+
+    def _discovery_hits(item: dict[str, Any], role: dict[str, Any]) -> bool:
+        query = item["record"]["query"]
+        return _query_matches_role(query, role) and result_lists_path(
+            item["result"]["text"], resolved_root, role["path"], query["hit_mode"]
+        )
+
     role_state: dict[str, dict[str, Any]] = {}
     read_texts: list[tuple[int, str]] = []  # (result stream_index, text) of successfully Read target sources
     discovered: dict[str, bool] = {}
@@ -482,12 +812,7 @@ def _evaluate_discovery_observations(
         reads = [tu for tu in by_index if _read_path_is(tu, resolved_root, role["path"])]
         state = {"listed": bool(role.get("listed")), "read_attempts": len(reads), "satisfied": False, "via": None}
         role_state[name] = state
-        discovered[name] = any(
-            _query_matches_role(item["tool_use"], role)
-            and result_lists_path(item["result"]["text"], resolved_root, role["path"])
-            for item in successful_searches
-        )
-    # Read を stream 順に処理し、(b) 用の text を積み上げる。
+        discovered[name] = any(_discovery_hits(item, role) for item in attributing)
     all_target_reads = sorted(
         (
             (tu["stream_index"], name, tu)
@@ -505,12 +830,8 @@ def _evaluate_discovery_observations(
             justified, via = True, "direct_read"
         else:
             via = None
-            for item in successful_searches:
-                if (
-                    item["result"]["stream_index"] < read_index
-                    and _query_matches_role(item["tool_use"], role)
-                    and result_lists_path(item["result"]["text"], resolved_root, role["path"])
-                ):
+            for item in attributing:
+                if item["result"]["stream_index"] < read_index and _discovery_hits(item, role):
                     via = "discovery"
                     break
             if via is None:
@@ -539,6 +860,13 @@ def _evaluate_discovery_observations(
         "source_reads": len(source_reads),
         "search_call_max": DISCOVERY_SEARCH_CALL_MAX,
         "source_read_max": DISCOVERY_SOURCE_READ_MAX,
+        "lanes_used": sorted(
+            {
+                record["lane"]
+                for record in classified
+                if record["classification"] in ("dedicated_lane_discovery", "bash_lane_discovery")
+            }
+        ),
         "roles": {
             name: {"listed": s["listed"], "satisfied": s["satisfied"], "via": s["via"]}
             for name, s in role_state.items()
@@ -550,6 +878,14 @@ def _evaluate_discovery_observations(
 # ---------------------------------------------------------------------------
 # 判定
 # ---------------------------------------------------------------------------
+
+
+def _public_classification(record: dict[str, Any]) -> dict[str, Any]:
+    """artifact 用: tool_use ごとの lane / 分類 / 認定した規則（`query` の中身は含めない）。"""
+    return {
+        key: record[key]
+        for key in ("id", "name", "stream_index", "lane", "classification", "rule", "counted_as_search", "violation")
+    }
 
 
 def evaluate_bounded_discovery(
@@ -580,7 +916,7 @@ def evaluate_bounded_discovery(
         fixture_roles=fixture_roles,
         claude_unavailable_reason=claude_unavailable_reason,
         terminal_incomplete_reason=terminal_incomplete,
-        require_discovery_tools=fixture_kind != "simple",
+        require_discovery_lane=fixture_kind != "simple",
     )
     if outcome is not None:
         return outcome
@@ -588,19 +924,26 @@ def evaluate_bounded_discovery(
     interval = context["interval"]
     results = context["results"]
     roles = fixture_roles or {}
+    classified = classify_tool_uses(
+        interval,
+        resolved_root=resolved_root,
+        invocation_dir=invocation_dir,
+        body_file=body_file,
+        unresolved_roles=None if fixture_kind == "simple" else _unresolved_roles(roles),
+    )
     if fixture_kind == "simple":
         violations = _evaluate_simple_observations(
+            classified=classified,
             interval=interval,
             resolved_root=resolved_root,
             invocation_dir=invocation_dir,
             body_file=body_file,
             allowed_read_paths=list(allowed_read_paths or []),
         )
-        observation: dict[str, Any] = {
-            "search_calls": sum(1 for tu in interval if tu["name"] in DISCOVERY_TOOLS),
-        }
+        observation: dict[str, Any] = {"search_calls": sum(1 for r in classified if r["counted_as_search"])}
     else:
         violations, observation = _evaluate_discovery_observations(
+            classified=classified,
             interval=interval,
             results=results,
             tested_head=tested_head,
@@ -614,6 +957,7 @@ def evaluate_bounded_discovery(
         "interval_tool_uses": [
             {"id": tu["id"], "name": tu["name"], "stream_index": tu["stream_index"]} for tu in interval
         ],
+        "tool_use_classification": [_public_classification(record) for record in classified],
         "discovery": observation,
         "violations": violations,
     }
@@ -674,10 +1018,33 @@ def evaluate_bounded_discovery(
 # ---------------------------------------------------------------------------
 
 
-def summarize_tool_uses(stdout: str, resolved_root: str = "", invocation_dir: str = "") -> list[dict[str, Any]]:
-    """tool_use の sanitized な要約。reviewer 帰属の Bash / Read / Grep / Glob は input を sanitized で添える。"""
+def summarize_tool_uses(
+    stdout: str,
+    resolved_root: str = "",
+    invocation_dir: str = "",
+    *,
+    fixture_roles: dict[str, dict[str, Any]] | None = None,
+    fixture_kind: str = "negative",
+    body_file: str = "body.md",
+) -> list[dict[str, Any]]:
+    """tool_use の sanitized な要約。reviewer 帰属の tool_use には lane / 分類 / 認定した規則を付ける。
+
+    reviewer 帰属の Bash / Read / Grep / Glob は input を sanitized で添える。分類は診断用であり、
+    判定は `evaluate_bounded_discovery` が reviewer 区間（SubagentStart / Stop の間）で行う。"""
     tool_uses, results = scan_tool_records(iter_stream_events(stdout))
     reviewer_agent_ids = _reviewer_agent_tool_use_ids(tool_uses)
+    attributed = [tu for tu in tool_uses if tu["parent_tool_use_id"] in reviewer_agent_ids]
+    unresolved = None if fixture_kind == "simple" else _unresolved_roles(fixture_roles or {})
+    classification = {
+        record["id"]: record
+        for record in classify_tool_uses(
+            attributed,
+            resolved_root=resolved_root,
+            invocation_dir=invocation_dir,
+            body_file=body_file,
+            unresolved_roles=unresolved,
+        )
+    }
     summary: list[dict[str, Any]] = []
     for tu in tool_uses:
         record: dict[str, Any] = {
@@ -688,8 +1055,9 @@ def summarize_tool_uses(stdout: str, resolved_root: str = "", invocation_dir: st
         }
         result = results.get(tu["id"])
         record["result_is_error"] = None if result is None else result["is_error"]
-        if tu["parent_tool_use_id"] in reviewer_agent_ids:
+        if tu["id"] in classification:
             tool_input = tu["input"]
+            record["classification"] = _public_classification(classification[tu["id"]])
             if tu["name"] == "Bash" and isinstance(tool_input.get("command"), str):
                 record["input_summary"] = sanitize_text(tool_input["command"], resolved_root, invocation_dir)
                 if result is not None:
@@ -708,12 +1076,20 @@ def summarize_tool_uses(stdout: str, resolved_root: str = "", invocation_dir: st
 
 
 def evaluate_bounded_discovery_runtime(**kwargs: Any) -> dict[str, Any]:
-    """判定に、診断用の sanitized な lifecycle / tool_use 要約を添えて返す。"""
+    """判定に、診断用の sanitized な session tools / lifecycle / tool_use 要約を添えて返す。"""
     outcome = evaluate_bounded_discovery(**kwargs)
     stdout = kwargs.get("stdout") or ""
-    if iter_stream_events(stdout):
+    events = iter_stream_events(stdout)
+    if events:
+        tools = session_tools(events)
+        outcome["session_tools"] = None if tools is None else [t for t in tools if not t.startswith("mcp__")]
         outcome["lifecycle_records"] = summarize_lifecycle_records(stdout)
         outcome["tool_use_records"] = summarize_tool_uses(
-            stdout, kwargs.get("resolved_root") or "", kwargs.get("invocation_dir") or ""
+            stdout,
+            kwargs.get("resolved_root") or "",
+            kwargs.get("invocation_dir") or "",
+            fixture_roles=kwargs.get("fixture_roles"),
+            fixture_kind=kwargs.get("fixture_kind") or "negative",
+            body_file=kwargs.get("body_file") or "body.md",
         )
     return outcome
