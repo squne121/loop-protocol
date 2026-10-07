@@ -382,16 +382,46 @@ def test_probe_bypasses_ambient_proxy_and_reaches_the_loopback_target(tmp_path, 
     assert proxy.hits == [], f"probe was diverted through the ambient proxy: {proxy.hits}"
 
 
-def test_probe_ignores_default_curlrc_proxy_and_reaches_the_loopback_target(tmp_path):
+# default curlrc の探索 lane。各 lane test は 1 lane だけに config を materialize し、他 lane の候補は
+# 存在しないことを plain-curl control の前に exact に assert する（片方が壊れても他方で green になる
+# false-green を避ける）。`CURL_HOME` は設定しない。
+def _curlrc_candidates(child_env: dict) -> dict:
+    xdg = Path(child_env["XDG_CONFIG_HOME"])
+    return {"home": [Path(child_env["HOME"]) / ".curlrc"], "xdg": [xdg / "curlrc", xdg / ".curlrc"]}
+
+
+def _write_curlrc_lane(child_env: dict, lane: str, text: str) -> None:
+    """`lane` の候補だけに default config を書き、candidate set を exact に assert する。
+
+    XDG lane（`$XDG_CONFIG_HOME/curlrc` と `$XDG_CONFIG_HOME/.curlrc`）について:
+    (a) manpage 上の XDG 候補は dot なしの `$XDG_CONFIG_HOME/curlrc` である。
+    (b) XDG_CONFIG_HOME 探索自体は curl 7.73.0 で導入され
+        （7.73.0 以上 8.10.0 未満は `$XDG_CONFIG_HOME/.curlrc` を読む）、
+        dot なし `curlrc` の lookup は 8.10.0 で追加された（観測: 8.5.0 は `.curlrc` のみ）。
+        XDG lane の runtime prerequisite は curl >= 7.73.0。
+    (c) よって 8.10.0 の前後どちらでも curlrc が読まれるよう、両 filename を XDG 配下のみに置き、
+        HOME 側（`$HOME/.curlrc`）には置かない。HOME lane は `$HOME/.curlrc` の 1 file のみ。"""
+    assert "CURL_HOME" not in child_env, "CURL_HOME must be unset so only HOME / XDG lanes are searched"
+    candidates = _curlrc_candidates(child_env)
+    assert lane in candidates
+    for path in candidates[lane]:
+        path.write_text(text, encoding="utf-8")
+    for name, paths in candidates.items():
+        for path in paths:
+            if name == lane:
+                assert path.is_file(), f"{lane} lane candidate must exist: {path.name}"
+            else:
+                assert not path.exists(), f"{name} lane candidate must not exist in the {lane} lane case: {path}"
+
+
+def _assert_probe_ignores_curlrc_proxy(tmp_path, lane: str) -> None:
     with _RecordingServer(("gpt-6-sol", "gpt-6-luna")) as target, _RecordingServer(("not-the-target",)) as proxy:
         child_env = H.base_env(tmp_path, ANTHROPIC_BASE_URL=target.url)
-        # curl 8.5 searches $CURL_HOME, $XDG_CONFIG_HOME/.curlrc, then $HOME/.curlrc. Write the same
-        # .curlrc to every candidate so it is read whichever one this curl prefers.
-        for directory in (Path(child_env["HOME"]), Path(child_env["XDG_CONFIG_HOME"])):
-            (directory / ".curlrc").write_text(f'proxy = "{proxy.url}"\n', encoding="utf-8")
-        # control: the .curlrc really diverts a plain curl run with this environment.
+        _write_curlrc_lane(child_env, lane, f'proxy = "{proxy.url}"\n')
+        # control: その lane の .curlrc だけで plain curl が proxy に迂回される。
         _plain_curl_get(child_env, target.url)
-        assert proxy.hits, "control failed: .curlrc proxy was not honoured; test would be a false PASS"
+        assert proxy.hits, f"control failed: {lane} lane .curlrc proxy was not honoured; test would be a false PASS"
+        assert not target.hits, f"control failed: plain curl reached the target directly in the {lane} lane"
         proxy.hits.clear()
         target.hits.clear()
 
@@ -400,22 +430,22 @@ def test_probe_ignores_default_curlrc_proxy_and_reaches_the_loopback_target(tmp_
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     assert json.loads(proc.stdout)["connected_server"]["model_catalog_ok"] is True
     assert "/v1/models" in target.hits, "target never received /v1/models"
-    assert proxy.hits == [], f".curlrc proxy diverted the probe: {proxy.hits}"
+    assert proxy.hits == [], f"{lane} lane .curlrc proxy diverted the probe: {proxy.hits}"
 
 
-def test_probe_ignores_default_curlrc_connect_to_and_reaches_the_loopback_target(tmp_path):
+def _assert_probe_ignores_curlrc_connect_to(tmp_path, lane: str) -> None:
     """`proxy` 指令は `--noproxy '*'` でも無効化されるため、`-q` を固定できない。
 
     `connect-to` は `--noproxy` では無効化されず `-q`（.curlrc を読まない）でのみ無効化される
     routing 指令なので、これで lib.sh の `-q` を個別に固定する。"""
     with _RecordingServer(("gpt-6-sol", "gpt-6-luna")) as target, _RecordingServer(("decoy-only",)) as decoy:
         child_env = H.base_env(tmp_path, ANTHROPIC_BASE_URL=target.url)
-        rc_line = f'connect-to = "127.0.0.1:{target.port}:127.0.0.1:{decoy.port}"\n'
-        for directory in (Path(child_env["HOME"]), Path(child_env["XDG_CONFIG_HOME"])):
-            (directory / ".curlrc").write_text(rc_line, encoding="utf-8")
-        # control: 同じ子 env の素の curl は .curlrc の connect-to で decoy に流れる。
+        _write_curlrc_lane(child_env, lane, f'connect-to = "127.0.0.1:{target.port}:127.0.0.1:{decoy.port}"\n')
+        # control: 同じ子 env の素の curl は、その lane の .curlrc の connect-to で decoy に流れる。
         _plain_curl_get(child_env, target.url)
-        assert decoy.hits and not target.hits, "control failed: .curlrc connect-to was not honoured by plain curl"
+        assert decoy.hits and not target.hits, (
+            f"control failed: {lane} lane .curlrc connect-to was not honoured by plain curl"
+        )
         # `--noproxy '*'` だけでは無効化されないことも確認（-q 固定の必要性の根拠）。
         decoy.hits.clear()
         subprocess.run(
@@ -434,7 +464,37 @@ def test_probe_ignores_default_curlrc_connect_to_and_reaches_the_loopback_target
     connected = json.loads(proc.stdout)["connected_server"]
     assert connected["model_catalog_ok"] is True and connected["missing_models"] == []
     assert "/v1/models" in target.hits, "target never received /v1/models"
-    assert decoy.hits == [], f".curlrc connect-to diverted the probe to the decoy: {decoy.hits}"
+    assert decoy.hits == [], f"{lane} lane .curlrc connect-to diverted the probe to the decoy: {decoy.hits}"
+
+
+def test_probe_ignores_home_curlrc_proxy_lane_and_reaches_the_loopback_target(tmp_path):
+    """HOME lane: `$HOME/.curlrc` のみ materialize。`$XDG_CONFIG_HOME/{curlrc,.curlrc}` は存在しない。"""
+    _assert_probe_ignores_curlrc_proxy(tmp_path, "home")
+
+
+def test_probe_ignores_xdg_curlrc_proxy_lane_and_reaches_the_loopback_target(tmp_path):
+    """XDG lane: `$XDG_CONFIG_HOME/{curlrc,.curlrc}` のみ materialize。`$HOME/.curlrc` は存在しない。
+
+    manpage 上の XDG 候補は dot なしの `$XDG_CONFIG_HOME/curlrc` だが、XDG_CONFIG_HOME 探索自体は curl 7.73.0 で導入され
+    （7.73.0 以上 8.10.0 未満は `$XDG_CONFIG_HOME/.curlrc` を読む）、dot なし curlrc の lookup は 8.10.0 で追加された
+    （観測: 8.5.0 は `.curlrc` のみ）。XDG lane の runtime prerequisite は curl >= 7.73.0 であり、
+    8.10.0 の前後どちらでも curlrc が読まれるよう両 filename を XDG lane 内だけに置き、HOME 側には置かない。"""
+    _assert_probe_ignores_curlrc_proxy(tmp_path, "xdg")
+
+
+def test_probe_ignores_home_curlrc_connect_to_lane_and_reaches_the_loopback_target(tmp_path):
+    """HOME lane: `$HOME/.curlrc` のみ materialize。`$XDG_CONFIG_HOME/{curlrc,.curlrc}` は存在しない。"""
+    _assert_probe_ignores_curlrc_connect_to(tmp_path, "home")
+
+
+def test_probe_ignores_xdg_curlrc_connect_to_lane_and_reaches_the_loopback_target(tmp_path):
+    """XDG lane: `$XDG_CONFIG_HOME/{curlrc,.curlrc}` のみ materialize。`$HOME/.curlrc` は存在しない。
+
+    manpage 上の XDG 候補は dot なしの `$XDG_CONFIG_HOME/curlrc` だが、XDG_CONFIG_HOME 探索自体は curl 7.73.0 で導入され
+    （7.73.0 以上 8.10.0 未満は `$XDG_CONFIG_HOME/.curlrc` を読む）、dot なし curlrc の lookup は 8.10.0 で追加された
+    （観測: 8.5.0 は `.curlrc` のみ）。XDG lane の runtime prerequisite は curl >= 7.73.0 であり、
+    8.10.0 の前後どちらでも curlrc が読まれるよう両 filename を XDG lane 内だけに置き、HOME 側には置かない。"""
+    _assert_probe_ignores_curlrc_connect_to(tmp_path, "xdg")
 
 
 # ---------------------------------------------------------------------------
