@@ -29,6 +29,9 @@ SKILL_DIR = ROOT / ".claude" / "skills" / "impl-review-loop"
 MODULE_PATH = SKILL_DIR / "scripts" / "body_only_repair_plan.py"
 SKILL_MD = SKILL_DIR / "SKILL.md"
 STEP5_MD = SKILL_DIR / "steps" / "step-5-feedback-and-termination.md"
+STEP2_MD = SKILL_DIR / "steps" / "step-2-verification.md"
+WORKER_MD = ROOT / ".claude" / "agents" / "implementation-worker.md"
+TEST_RUNNER_MD = ROOT / ".claude" / "agents" / "test-runner.md"
 FIXTURE_DIR = SKILL_DIR / "tests" / "fixtures"
 INCIDENT_FIXTURE = FIXTURE_DIR / "body_only_lane_incident_2963.json"
 SMOKE_PROMPT = FIXTURE_DIR / "body_only_lane_runtime_smoke_prompt.md"
@@ -670,11 +673,171 @@ def test_ac4_each_file_lane_section_has_the_same_semantics(path: Path) -> None:
 
 
 @pytest.mark.parametrize("path", DOC_FILES)
-def test_ac4_each_file_states_worker_does_not_enforce_expected_head_sha(path: Path) -> None:
+def test_ac4_each_file_states_the_worker_guard_enforces_expected_head_sha(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    section = _lane_section(text)
+    guard_part = section[section.index("guard の所在") :]
+
+    # 旧契約（worker は expected_head_sha を強制しない）は削除済みで、新契約（worker が guard で強制）に更新されている。
+    assert not re.search(r"worker は[^\n]*`expected_head_sha` を強制しない", text)
+    assert re.search(r"worker は[^\n]*`expected_head_sha` を強制する", guard_part)
+    for token in (
+        "mutation 直前に `guard`",
+        "overwrite せず",
+        "status: blocked",
+        "wrapper_used: false",
+        "expected_head_sha_mismatch",
+        "live_body_hash_mismatch",
+        "check_body_freshness",
+        "verify_body_readback",
+    ):
+        assert token in section, f"{path.name} lane section lacks {token}"
+
+
+def _cli_block(section: str, subcommand_line: str) -> str:
+    """lane 節内の ``subcommand_line`` を含む fenced code block の本文を返す。"""
+    for block in re.findall(r"```bash\n(.*?)```", section, re.S):
+        if subcommand_line in block:
+            return block
+    raise AssertionError(f"no bash block with {subcommand_line!r}")
+
+
+def _subparser_flags(subcommand: str) -> tuple[list[str], list[str]]:
+    parser = mod.build_production_parser()
+    sub = next(action for action in parser._actions if getattr(action, "choices", None))
+    required: list[str] = []
+    optional: list[str] = []
+    for action in sub.choices[subcommand]._actions:
+        if not action.option_strings or "-h" in action.option_strings:
+            continue
+        (required if action.required else optional).append(action.option_strings[0])
+    return required, optional
+
+
+PRODUCTION_CLI = "uv run --locked python3 .claude/skills/impl-review-loop/scripts/body_only_repair_plan.py"
+
+
+@pytest.mark.parametrize("path", DOC_FILES)
+@pytest.mark.parametrize("subcommand", ["plan", "guard", "ci-freshness"])
+def test_ac4_each_file_documents_every_production_cli_flag_taken_from_the_real_parser(
+    path: Path, subcommand: str
+) -> None:
+    section = _lane_section(path.read_text(encoding="utf-8"))
+    block = _cli_block(section, f"{PRODUCTION_CLI} {subcommand}")
+    required, optional = _subparser_flags(subcommand)
+
+    assert required, subcommand
+    for flag in required:
+        assert flag in block, f"{path.name} {subcommand} invocation lacks required {flag}"
+    for flag in optional:
+        assert flag in block, f"{path.name} {subcommand} invocation must show optional {flag}"
+    # 必須引数を optional 扱い（角括弧）にしていない。
+    for flag in required:
+        assert f"[{flag}" not in block, f"{path.name} marks required {flag} as optional"
+
+
+@pytest.mark.parametrize("path", DOC_FILES)
+def test_ac4_each_file_documents_the_plan_output_fields_and_the_record_invocations(path: Path) -> None:
     section = _lane_section(path.read_text(encoding="utf-8"))
 
-    assert re.search(r"worker は[^\n]*`expected_head_sha` を強制しない", section)
-    assert "check_body_freshness" in section and "verify_body_readback" in section
+    for field in (
+        "eligible",
+        "reason_codes",
+        "expected_head_sha",
+        "expected_live_body_sha256",
+        "body_file_path",
+        "body_file_sha256",
+    ):
+        assert field in section, f"{path.name} lacks plan output field {field}"
+    dispatched = _cli_block(section, "record --loop-state-file <LOOP_STATE file> --state dispatched")
+    no_mutation = _cli_block(section, "record --loop-state-file <LOOP_STATE file> --state no_mutation")
+    assert PRODUCTION_CLI in dispatched and PRODUCTION_CLI in no_mutation
+    assert "--state dispatched|no_mutation" not in section  # 実引数（placeholder の列挙ではない）で書く
+
+
+@pytest.mark.parametrize("path", DOC_FILES)
+def test_ac4_each_file_orders_record_worker_guard_readback_ci_and_reuse_stored(path: Path) -> None:
+    order = _order_part(_lane_section(path.read_text(encoding="utf-8")))
+
+    sequence = [
+        f"{PRODUCTION_CLI} plan",
+        "--state dispatched",  # worker 起動の直前
+        "IMPLEMENTATION_WORKER_REQUEST_V2:",
+        f"{PRODUCTION_CLI} guard",
+        "--state no_mutation",  # guard 拒否の直後
+        "verify_body_readback",
+        "body_edit_updatedAt",
+        ".claude/skills/impl-review-loop/scripts/wait_ci_checks.py",
+        f"{PRODUCTION_CLI} ci-freshness",
+        "step4-adjudicate --reuse-stored",
+        "step5-terminal-gate",
+    ]
+    positions = [order.index(token) for token in sequence]
+    assert positions == sorted(positions), f"{path.name} order is wrong: {list(zip(sequence, positions))}"
+
+
+@pytest.mark.parametrize("path", DOC_FILES)
+def test_ac4_each_file_documents_the_worker_request_body_file_fields(path: Path) -> None:
+    section = _lane_section(path.read_text(encoding="utf-8"))
+    request = re.search(r"IMPLEMENTATION_WORKER_REQUEST_V2:\n(.*?)```", section, re.S)
+
+    assert request, f"{path.name} has no worker request block"
+    body = request.group(1)
+    assert "mode: update_pr_body_hygiene" in body
+    for field in (
+        "issue_number",
+        "expected_head_sha",
+        "body_file_path",
+        "body_file_sha256",
+        "expected_live_body_sha256",
+    ):
+        assert re.search(rf"^\s+{field}:", body, re.M), f"{path.name} request lacks {field}"
+    assert "plan の" in body  # plan の出力をそのまま渡す（手組み・加工をしない）
+    assert "改変せず" in section and "update_pr.py --body-file" in section
+
+
+@pytest.mark.parametrize("path", DOC_FILES)
+def test_ac4_each_file_documents_no_mutation_reevaluation_budget(path: Path) -> None:
+    section = _lane_section(path.read_text(encoding="utf-8"))
+
+    assert "outcome: dispatched" in section and "outcome: no_mutation" in section
+    assert "ちょうど 1 件" in section
+    assert "2 件" in section and "通常 routing" in section
+    assert "`{lane, outcome}`" in section  # entry の field は closed set
+    assert "outcome != no_mutation" in section
+    assert "再評価" in section
+
+
+@pytest.mark.parametrize("path", DOC_FILES)
+def test_ac4_each_file_documents_the_post_edit_required_ci_freshness_loop(path: Path) -> None:
+    section = _lane_section(path.read_text(encoding="utf-8"))
+
+    assert "gh pr view" in section and "updatedAt" in section
+    assert "`wait_ci_checks.py --required`" in section or "wait_ci_checks.py \\\n" in section
+    assert "間隔 15 秒・合計 1800 秒の deadline" in section
+    for token in (
+        "stale_pre_edit",
+        "head_bound",
+        "unknown_workflow",
+        "startedAt >= body_edit_updatedAt",
+        "unchanged head",
+    ):
+        assert token in section, f"{path.name} lacks {token}"
+    assert "deadline（1800 秒）超過" in section and "terminal approval に進まず通常 routing" in section
+
+
+@pytest.mark.parametrize("path", DOC_FILES)
+def test_ac4_each_file_states_best_effort_race_window_and_provenance_residual_risk(path: Path) -> None:
+    section = _lane_section(path.read_text(encoding="utf-8"))
+
+    assert "best-effort の optimistic guard" in section
+    assert "race window" in section
+    assert "lost update の絶対防止は主張せず" in section
+    assert "lock / approval layer" in section
+    assert "compare-and-swap" in section
+    assert "来歴" in section and "真正性は証明しない" in section
+    for token in ("terminal gate bypass", "carry-forward", "reviewer の直接呼出しのみでの fresh review 成立扱い"):
+        assert token in section, f"{path.name} lacks {token}"
 
 
 @pytest.mark.parametrize("path", DOC_FILES)
@@ -713,7 +876,10 @@ def test_ac4_dry_run_cli_path_and_markers_exist_only_in_the_skill_md_dry_run_sec
 
     assert "--dry-run-fixture" in section.group(0)
     assert "--dry-run-fixture" not in outside
-    assert "body_only_repair_plan.py" not in outside
+    # production subcommand（plan / record / guard / ci-freshness）の invocation は dry-run 節の外にも書くが、
+    # dry-run entry（引数なしの module 起動）は dry-run 節にだけ存在する。
+    for match in re.finditer(r"body_only_repair_plan\.py\s+(\S+)", outside):
+        assert match.group(1) in ("plan", "record", "guard", "ci-freshness"), match.group(0)
     assert "BODY_ONLY_LANE_" not in text
 
 
@@ -2521,6 +2687,229 @@ def test_ac11_plan_reads_the_raw_report_row_because_the_adapter_discards_test_co
 
     row, error = mod.bind_test_count_row("evaluator", report["runtime_ac_results"], [harness.H_AC1])
     assert error is None and row["test_count"]["passed"] == 12
+
+
+# --- AC10 / AC11 (documents: implementation-worker.md / test-runner.md / step-2-verification.md) ---------
+
+
+def _base_text(path: Path) -> str:
+    base = next(
+        (ref for ref in ("origin/main", "main") if _git("rev-parse", "--verify", "--quiet", ref).returncode == 0),
+        "HEAD",
+    )
+    completed = _git("show", f"{base}:{path.relative_to(ROOT).as_posix()}")
+    assert completed.returncode == 0, completed.stderr
+    return completed.stdout
+
+
+def _frontmatter(text: str) -> str:
+    match = re.match(r"---\n(.*?)\n---\n", text, re.S)
+    assert match, "frontmatter not found"
+    return match.group(1)
+
+
+def _markdown_section(text: str, heading: str) -> str:
+    """``heading`` から次の同 level 以上の見出しの直前までを返す（fenced code 内の ``#`` 行は見出しにしない）。"""
+    level = len(heading) - len(heading.lstrip("#"))
+    lines = text.splitlines(keepends=True)
+    start = next(index for index, line in enumerate(lines) if line.rstrip("\n") == heading)
+    collected = [lines[start]]
+    in_fence = False
+    for line in lines[start + 1 :]:
+        if line.startswith("```"):
+            in_fence = not in_fence
+        elif not in_fence:
+            marks = re.match(r"(#{1,6}) ", line)
+            if marks and len(marks.group(1)) <= level:
+                break
+        collected.append(line)
+    return "".join(collected)
+
+
+def _is_ordered_subsequence(needles: list[str], haystack: list[str]) -> bool:
+    iterator = iter(haystack)
+    return all(any(line == candidate for candidate in iterator) for line in needles)
+
+
+TEST_COUNT_HEADING = "### `runtime_ac_results[]` 行に追加できる任意項目 `test_count` の導出規則（Issue #2971）"
+
+WORKER_REASON_ENUM_OLD = (
+    "  reason_code: null | expected_head_sha_missing | expected_head_sha_mismatch | primary_rate_limit"
+    " | secondary_rate_limit | validation_failed | permission_denied | head_unchanged_after_accepted"
+    " | unexpected_head_change | transport_error | unknown_http_status"
+)
+
+
+def test_ac10_worker_md_documents_the_three_body_file_fields_and_conditional_requirements() -> None:
+    text = WORKER_MD.read_text(encoding="utf-8")
+    request = _markdown_section(text, "## IMPLEMENTATION_WORKER_REQUEST_V2")
+
+    for field in ("body_file_path", "body_file_sha256", "expected_live_body_sha256"):
+        assert re.search(rf"^# {field}: ", request, re.M), f"request block does not declare optional {field}"
+    assert "すべて optional" in request
+    assert "expected_head_sha と issue_number を必須とする" in request
+    assert "これらの field を伴わない既存の update_pr_body_hygiene" in request
+    # 3 field は active な yaml 行（必須 field）としては追加しない（optional は説明コメントで追加する）。
+    yaml_block = re.search(r"```yaml\nIMPLEMENTATION_WORKER_REQUEST_V2:\n(.*?)```", request, re.S)
+    assert yaml_block
+    assert not re.search(r"^  (body_file_path|body_file_sha256|expected_live_body_sha256):", yaml_block.group(1), re.M)
+
+
+def test_ac10_worker_md_adds_live_body_hash_mismatch_to_the_result_reason_codes() -> None:
+    text = WORKER_MD.read_text(encoding="utf-8")
+    result = _markdown_section(text, "## IMPLEMENTATION_WORKER_RESULT_V2")
+    enum_line = next(line for line in result.splitlines() if line.startswith("  reason_code:"))
+
+    assert enum_line == WORKER_REASON_ENUM_OLD + " | live_body_hash_mismatch"
+    assert re.search(r"^  #   live_body_hash_mismatch:", result, re.M)
+
+
+def test_ac10_worker_md_documents_the_pre_mutation_guard_procedure() -> None:
+    text = WORKER_MD.read_text(encoding="utf-8")
+    hygiene = _markdown_section(text, "## update_pr_body_hygiene mode（PR 本文衛生修正モード）")
+    guard_section = _markdown_section(
+        hygiene, "### body-only hygiene の pre-mutation guard（`body_file_path` 等を伴う場合、Issue #2971）"
+    )
+    block = _cli_block(guard_section, f"{PRODUCTION_CLI} guard")
+    required, optional = _subparser_flags("guard")
+
+    assert not optional
+    for flag in required:
+        assert flag in block, flag
+    # mutation 直前に guard を実行し、proceed の場合だけ body file を無改変で wrapper へ渡す。
+    update_call = _cli_block(guard_section, ".claude/skills/open-pr/scripts/update_pr.py")
+    assert guard_section.index(block) < guard_section.index(update_call)
+    assert "mutation 直前" in guard_section or "**直前**" in guard_section
+    assert "一切改変せず" in guard_section
+    for argument in ('--pr-number "$PR_NUMBER"', '--body-file "$BODY_FILE_PATH"', '--linked-issue "$ISSUE_NUMBER"'):
+        assert argument in update_call
+    assert "gh pr edit" not in update_call
+    for token in (
+        "`expected_head_sha` と `issue_number`",
+        "issue_number",
+        "status: blocked",
+        "reason_code: expected_head_sha_mismatch",
+        "reason_code: live_body_hash_mismatch",
+        "wrapper_used: false",
+        "overwrite せず",
+        "worktree",
+    ):
+        assert token in guard_section, f"guard section lacks {token}"
+
+
+def test_ac10_worker_md_states_the_best_effort_limit() -> None:
+    text = WORKER_MD.read_text(encoding="utf-8")
+    guard_section = _markdown_section(
+        text, "### body-only hygiene の pre-mutation guard（`body_file_path` 等を伴う場合、Issue #2971）"
+    )
+
+    assert "best-effort の optimistic guard" in guard_section
+    assert "compare-and-swap" in guard_section
+    assert "race window" in guard_section
+    assert "lost update の絶対防止は主張せず" in guard_section
+    assert "lock / approval layer" in guard_section
+
+
+@pytest.mark.parametrize("path", DOC_FILES)
+def test_ac10_lane_files_use_the_same_guard_invocation_as_the_worker_definition(path: Path) -> None:
+    worker_text = WORKER_MD.read_text(encoding="utf-8")
+    worker_block = _cli_block(worker_text, f"{PRODUCTION_CLI} guard")
+    lane_block = _cli_block(_lane_section(path.read_text(encoding="utf-8")), f"{PRODUCTION_CLI} guard")
+
+    assert re.findall(r"--[a-z0-9-]+", worker_block) == re.findall(r"--[a-z0-9-]+", lane_block)
+
+
+def test_ac10_worker_md_change_is_additive_and_leaves_frontmatter_and_existing_modes_untouched() -> None:
+    new_text = WORKER_MD.read_text(encoding="utf-8")
+    base_text = _base_text(WORKER_MD)
+
+    assert _frontmatter(new_text) == _frontmatter(base_text)
+    # 既存行は（reason_code の enum 行への 1 項目追加を除き）すべて同順で残る（= 差分は追加のみ）。
+    new_lines = new_text.splitlines()
+    base_lines = [
+        line + " | live_body_hash_mismatch" if line == WORKER_REASON_ENUM_OLD else line
+        for line in base_text.splitlines()
+    ]
+    assert _is_ordered_subsequence(base_lines, new_lines)
+    for heading in (
+        "## update_branch mode（ブランチ更新モード）",
+        "## apply_pr_review_fix_delta mode（PR レビュー修正差分の適用モード）",
+        "### wrapper 強制ルール",
+        "### validator failure 時の挙動",
+        "### action.kind → worker mode の振り分け表",
+    ):
+        assert _markdown_section(new_text, heading) == _markdown_section(base_text, heading), heading
+    # 新規 SubAgent を作らない。
+    assert not list((ROOT / ".claude" / "agents").glob("*hygiene*")) and not list(
+        (ROOT / ".claude" / "agents").glob("*body-only*")
+    )
+
+
+def test_ac11_test_runner_md_documents_the_test_count_derivation_rule() -> None:
+    text = TEST_RUNNER_MD.read_text(encoding="utf-8")
+    section = _markdown_section(text, TEST_COUNT_HEADING)
+
+    for token in (
+        "optional field `test_count: {subject, passed}`",
+        "既存 field の意味・必須性は変えない",
+        "最終 summary 行",
+        "`<N> passed`",
+        "pytest に渡した対象 selector",
+        "省略",
+        "failed",
+        "error",
+        "pytest 系でない",
+        "`notes` の自然言語",
+        "導出しない",
+    ):
+        assert token in section, f"test-runner.md test_count section lacks {token}"
+
+
+def test_ac11_step2_verification_md_documents_the_test_count_derivation_rule() -> None:
+    text = STEP2_MD.read_text(encoding="utf-8")
+    section = _markdown_section(text, TEST_COUNT_HEADING)
+
+    for token in (
+        "optional field `test_count: {subject, passed}`",
+        "必須性は変えず",
+        "最終 summary 行",
+        "`<N> passed`",
+        "pytest 対象 selector",
+        "省略",
+        "failed",
+        "非 pytest command",
+        "`notes` の自然言語",
+        "導出しない",
+        "`test-runner.md` の同名節を正本",
+    ):
+        assert token in section, f"step-2-verification.md test_count section lacks {token}"
+    # 既存の必須 field 表の行は変えていない（test_count は表の必須項目に混ぜない）。
+    row = next(line for line in text.splitlines() if line.startswith("| `runtime_ac_results[]` |"))
+    assert "test_count" not in row
+
+
+def test_ac11_test_runner_md_machine_valid_example_and_frontmatter_are_unchanged() -> None:
+    new_text = TEST_RUNNER_MD.read_text(encoding="utf-8")
+    base_text = _base_text(TEST_RUNNER_MD)
+
+    assert _frontmatter(new_text) == _frontmatter(base_text)
+    for heading in (
+        "### machine-valid example（独立 PASS report 例）",
+        "### field grammar（説明用書式。そのまま出力しない）",
+    ):
+        assert _markdown_section(new_text, heading) == _markdown_section(base_text, heading), heading
+    example = _markdown_section(new_text, "### machine-valid example（独立 PASS report 例）")
+    assert "test_count" not in example
+    # 差分は追加のみ（既存行は同順ですべて残る）。
+    assert _is_ordered_subsequence(base_text.splitlines(), new_text.splitlines())
+
+
+def test_ac11_step2_verification_md_change_is_additive() -> None:
+    new_text = STEP2_MD.read_text(encoding="utf-8")
+    base_text = _base_text(STEP2_MD)
+
+    assert _frontmatter(new_text) == _frontmatter(base_text) if new_text.startswith("---\n") else True
+    assert _is_ordered_subsequence(base_text.splitlines(), new_text.splitlines())
 
 
 # --- meta: every AC prefix has at least one test (no vacuous AC) ---------------------------
