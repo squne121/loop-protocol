@@ -680,10 +680,13 @@ key 集合は閉じており、集合外の key を持つ entry は malformed �
   `issue-contract-review` の成功経路でも非 blocking の carrier
   （`runtime_assertion_disposition_classification`）として公開され、
   `merged_review_result` まで保持される。carrier は verdict / `overall_status` を変えない。
-- `evaluate_issue_risk_trigger()` は assertion 単位の宣言の影響を受けない。hard-required の
-  全 assertion が `not_applicable` / compat であっても、policy 由来の Issue-level の
-  `decision` 要求は緩まない（保守的な既知の limitation。rule-level の緩和設計は
-  policy 側の Issue #2775 の責務）。
+- `evaluate_issue_risk_trigger()` は assertion 単位の宣言（`disposition`）の影響を受けない。
+  hard-required の全 assertion が `not_applicable` / compat であっても、policy 由来の
+  Issue-level の `decision` 要求は緩まない（保守的な既知の limitation）。rule-level の
+  緩和は次の 2 つに分かれる。skill surface の assertion applicability は policy 側の
+  Issue #2775 の責務であり、`scripts/claude-gpt/**` の comment-only 変更に限った
+  rule-level 免除は Issue #2961 が実装した「comment-only 免除」
+  （下記 `#### comment-only 免除`）だけである。
 
 不変条件:
 
@@ -701,6 +704,61 @@ key 集合は閉じており、集合外の key を持つ entry は malformed �
   分類境界のみを定める。
 
 ---
+
+
+#### comment-only 免除（`executable_semantics_unchanged`、Issue #2961）
+
+comment-only / non-executable な `scripts/claude-gpt/**` 変更を宣言する Issue が、
+hard の runtime `immediate` と runtime assertion binding を要求されず
+`decision: not_applicable` のまま readiness を通るための、決定論的な免除宣言の検証である。
+`evaluate_issue_risk_trigger()`（EXTSURF001）と
+`evaluate_runtime_assertion_binding_coverage()`（RUNTIMEASSERT001）は、同一の shared
+免除判定 helper を呼ぶため、両者は drift しない。
+
+- policy 側の opt-in: `docs/dev/extension-surface-runtime-policy.yaml` で
+  `claude-gpt-lifecycle-invocation-change` rule だけが rule-level の optional property
+  `issue_time_exemption`（`declaration_key: executable_semantics_unchanged` /
+  `mode: exact_file_path_git_diff_vc`）を持つ。schema の closed validator が key 名と enum を
+  固定し、他 rule（hook / skill / subagent / agent）への付与を拒否する。既存の
+  `exceptions[]`（`human_evidence_required` / `approval_authority: owner`）は変更しない。
+- Issue 側の宣言: Runtime Verification Applicability に closed key set の
+  `executable_semantics_unchanged: {rule: claude-gpt-lifecycle-invocation-change, ac: AC<N>}`
+  を書く。key は `rule` / `ac` のみ。
+- 免除は次をすべて満たす場合に限り適用される。
+  1. policy 側の opt-in がある。
+  2. 当該 rule に match する Allowed Paths の全 entry が exact な file path である
+     （glob 文字 `*` `?` `[` `]` `{` `}` を含まない、末尾が `/` でない、最終 path segment が
+     `.` を含む拡張子付き basename）。1 entry でも満たさなければ免除しない。
+  3. 宣言が closed key set で well-formed である。
+  4. 参照 AC が Acceptance Criteria に実在する。
+  5. shared helper `build_ac_vc_commands()` が consumer の canonical VC parse 結果
+     （`VcParseResult.commands` の `ac_refs` / `command`）から作る `ac_vc_commands` に、
+     その AC の canonical `# AC<N>` 対応がある。
+  6. 当該 rule に match する全ての exact file path のそれぞれについて、宣言 AC の VC command の
+     いずれかが `shlex.split` によるトークン化（pure string 処理で実行はしない）で先頭 2 token が
+     `git` `diff` であり、かつその path を token として含む。`rg 'git diff'` や
+     `echo git diff` のような無関係な command、および一部の path だけを引数に持つ
+     `git diff` は満たさない。
+- `ac_vc_commands` が渡されない（`None`）場合は免除しない（fail-closed）。旧 call site や
+  `review-issue` の parser 不在 fallback 経路は従来どおり `immediate` を要求する。
+- 免除は当該 rule だけを `final_decision` と required runtime assertion の導出から除外する。
+  他 rule が同時に match する場合、その rule の hard 要求は消えない。
+- 免除が適用された場合に限り `evaluate_issue_risk_trigger()` の result に
+  `issue_time_exemptions: [{rule_id, ac, paths}]` が載る。consumer はこの値を既存の
+  非 blocking 経路へ転記するだけである（`review-issue` は `non_blocking_improvements`、
+  `issue-contract-review` は info severity のカテゴリ
+  `extension_surface_issue_time_exemption_applied`）。verdict / `overall_status` は変えない。
+
+検証の限界（residual risk、本設計として受容する）:
+
+- matcher が検証するのは宣言と VC の **構造のみ** である。免除対象 file を引数に持つ `git diff`
+  VC が存在することは、executable semantics が不変であることの証明ではない。
+- executable semantics が実際に不変であることの acceptance evidence は、PR 時の VC 実行と
+  review が担う。宣言と、免除対象 file を引数に持つ `git diff` VC があれば exact file path の
+  claude-gpt rule に限り免除される、という残余リスクを受容している。
+- actual invocation command shape / environment variable handling / output parsing logic を変える
+  Issue は従来どおり hard `immediate` を要求される。この免除はそれらを変えないと宣言する
+  Issue にだけ適用でき、宣言の真偽までは機械判定しない。
 
 ## 12. live runtime verification における接続先 server 診断と実 request 受理の evidence 分離（Issue #2803 / #2938）
 

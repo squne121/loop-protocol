@@ -515,12 +515,28 @@ def readiness_error_to_structured_blocker(
 # `run_checks()` emits directly, so a merged review result keeps ONE carrier
 # identity instead of a `RUNTIMEASSERT003` / category split.
 _RUNTIME_ASSERTION_DISPOSITION_CARRIER_CODE = "runtime_assertion_disposition_classification"
+#
+# Issue #2961: `extension_surface_issue_time_exemption_applied` (the readiness
+# info-severity carrier for an applied comment-only exemption) is the third
+# non-blocking category. Like the disposition carrier, its readiness
+# `category` and the `non_blocking_improvements[].code` are the SAME string.
+_EXTENSION_SURFACE_ISSUE_TIME_EXEMPTION_CARRIER_CODE = (
+    "extension_surface_issue_time_exemption_applied"
+)
 _NON_BLOCKING_READINESS_ERROR_CATEGORIES = {
     "extension_surface_candidate_advisory",
     _RUNTIME_ASSERTION_DISPOSITION_CARRIER_CODE,
+    _EXTENSION_SURFACE_ISSUE_TIME_EXEMPTION_CARRIER_CODE,
 }
 _READINESS_ADVISORY_CODE_BY_CATEGORY = {
     _RUNTIME_ASSERTION_DISPOSITION_CARRIER_CODE: _RUNTIME_ASSERTION_DISPOSITION_CARRIER_CODE,
+    _EXTENSION_SURFACE_ISSUE_TIME_EXEMPTION_CARRIER_CODE: _EXTENSION_SURFACE_ISSUE_TIME_EXEMPTION_CARRIER_CODE,
+}
+# Carrier codes whose readiness-side copy is dropped from a merged result when
+# `run_checks()` already emitted a byte-identical entry (one identity, no dupes).
+_DEDUPED_CARRIER_CODES = {
+    _RUNTIME_ASSERTION_DISPOSITION_CARRIER_CODE,
+    _EXTENSION_SURFACE_ISSUE_TIME_EXEMPTION_CARRIER_CODE,
 }
 
 
@@ -1052,7 +1068,7 @@ def merge_readiness_into_review_result(
                 entry
                 for entry in new_improvements
                 if not (
-                    entry["code"] == _RUNTIME_ASSERTION_DISPOSITION_CARRIER_CODE
+                    entry["code"] in _DEDUPED_CARRIER_CODES
                     and any(
                         existing.get("code") == entry["code"]
                         and existing.get("evidence") == entry["evidence"]
@@ -2059,6 +2075,87 @@ def check_c11_decision_tag_consistency(body: str) -> tuple[str, list[str]]:
     return CheckResult.PASS, []
 
 
+def _ac_vc_commands_from_parse_result(evaluator, parse_result):
+    """Issue #2961: ``ac_vc_commands`` for the shared exemption helper, built
+    by the shared evaluator's pure ``build_ac_vc_commands`` from the existing
+    canonical parser result (``VcParseResult.commands``). ``None`` (never
+    ``{}``) when no canonical parse result exists, which makes the evaluator
+    fail closed (no exemption)."""
+    if parse_result is None:
+        return None
+    # An evaluator without the shared helper (e.g. a minimal test stub) can
+    # never exempt: fail closed instead of raising.
+    build = getattr(evaluator, "build_ac_vc_commands", None)
+    if build is None:
+        return None
+    return build(parse_result.commands)
+
+
+def _ac_vc_commands_for_body(evaluator, vc_section: str):
+    """Parse the VC section with the same canonical parser as C4/C5/C15 and
+    derive ``ac_vc_commands``. The review-issue ``_VC_SECTION_PARSER_AVAILABLE
+    == False`` regex fallback cannot recover command bodies, so ``None`` is
+    returned there and no exemption is ever applied (Issue #2961)."""
+    if not _VC_SECTION_PARSER_AVAILABLE:
+        return None
+    return _ac_vc_commands_from_parse_result(evaluator, _parse_vc_section(vc_section or ""))
+
+
+def _evaluate_issue_risk_trigger_for_body(
+    body: str, issue_kind: str
+) -> tuple[Optional[dict], Optional[Exception]]:
+    """Run the shared ``evaluate_issue_risk_trigger`` for C14 and the Issue #2961
+    exemption carrier. ``(None, None)``: not applicable; ``(None, exc)``:
+    ``PolicyLoadError``; otherwise ``(verdict, None)``. Only transports the
+    VC command bodies / AC section; adds no judgement logic."""
+    if issue_kind != "implementation":
+        return None, None
+
+    allowed_path_entries = pc_extract_allowed_paths(body)
+    if not allowed_path_entries:
+        return None, None
+
+    rva_section = extract_section(body, "Runtime Verification Applicability")
+    decision_match = re.search(r"decision:\s*(\S+)", rva_section) if rva_section else None
+    declared_decision = decision_match.group(1).strip() if decision_match else None
+
+    evaluator = _load_extension_surface_policy_matcher()
+    if evaluator is None:
+        return None, None
+
+    ac_section = extract_section(body, "Acceptance Criteria")
+    vc_section = extract_section(body, "Verification Commands")
+    ac_vc_commands = _ac_vc_commands_for_body(evaluator, vc_section)
+
+    try:
+        verdict = evaluator.evaluate_issue_risk_trigger(
+            allowed_path_entries=allowed_path_entries,
+            declared_decision=declared_decision,
+            rva_section_text=rva_section or "",
+            ac_section_text=ac_section or "",
+            ac_vc_commands=ac_vc_commands,
+        )
+    except evaluator.PolicyLoadError as exc:
+        return None, exc
+    return verdict, None
+
+
+def get_extension_surface_issue_time_exemption_carrier(body: str, issue_kind: str) -> list[str]:
+    """Issue #2961: non-blocking carrier lines for an APPLIED comment-only
+    exemption (``[]`` when none). Transcribes the shared evaluator's
+    ``issue_time_exemptions`` verbatim via its shared formatter."""
+    verdict, policy_error = _evaluate_issue_risk_trigger_for_body(body, issue_kind)
+    if policy_error is not None or verdict is None:
+        return []
+    exemptions = verdict.get("issue_time_exemptions") or []
+    if not exemptions:
+        return []
+    evaluator = _load_extension_surface_policy_matcher()
+    if evaluator is None:
+        return []
+    return evaluator.format_issue_time_exemption_lines(exemptions)
+
+
 def check_c14_extension_surface_risk_trigger(body: str, issue_kind: str) -> tuple[str, list[str]]:
     """C14 (Issue #2290): declared Allowed Paths vs. extension-surface risk-trigger policy.
 
@@ -2073,31 +2170,17 @@ def check_c14_extension_surface_risk_trigger(body: str, issue_kind: str) -> tupl
     if issue_kind != "implementation":
         return CheckResult.NA, []
 
-    allowed_path_entries = pc_extract_allowed_paths(body)
-    if not allowed_path_entries:
-        return CheckResult.NA, []
-
-    rva_section = extract_section(body, "Runtime Verification Applicability")
-    decision_match = re.search(r"decision:\s*(\S+)", rva_section) if rva_section else None
-    declared_decision = decision_match.group(1).strip() if decision_match else None
-
-    evaluator = _load_extension_surface_policy_matcher()
-    if evaluator is None:
-        return CheckResult.NA, []
-
-    try:
-        verdict = evaluator.evaluate_issue_risk_trigger(
-            allowed_path_entries=allowed_path_entries,
-            declared_decision=declared_decision,
-            rva_section_text=rva_section or "",
-        )
-    except evaluator.PolicyLoadError as exc:
+    verdict, policy_error = _evaluate_issue_risk_trigger_for_body(body, issue_kind)
+    if policy_error is not None:
+        exc = policy_error
         # Distinguishable from the "matcher module not found" NA above
         # (Issue #2290 P1-2, PR #2335): WARN (not NA, not FAIL) surfaces
         # that the policy itself was unusable -- a non-blocking advisory
         # finding rather than silently looking identical to "no candidate
         # match found" (NA) or forcing a hard block (FAIL).
         return CheckResult.WARN, [f"extension-surface risk-trigger policy unavailable: {exc}"]
+    if verdict is None:
+        return CheckResult.NA, []
 
     if verdict["verdict"] == "needs_fix":
         return CheckResult.FAIL, verdict["reasons"]
@@ -2160,6 +2243,7 @@ def _evaluate_runtime_assertion_binding_coverage_for_body(
     ac_section = extract_section(body, "Acceptance Criteria")
     vc_section = extract_section(body, "Verification Commands")
 
+    parse_result = None
     if _VC_SECTION_PARSER_AVAILABLE and vc_section:
         parse_result = _parse_vc_section(vc_section)
         ac_vc_refs = {re.sub(r"^AC", "", ref) for ref in parse_result.ac_refs}
@@ -2170,12 +2254,24 @@ def _evaluate_runtime_assertion_binding_coverage_for_body(
     if evaluator is None:
         return None, None
 
+    # Issue #2961: reuse the existing parse result (no second parse). Without
+    # the canonical parser (regex fallback) `ac_vc_commands` is None and the
+    # shared evaluator never applies the comment-only exemption.
+    if _VC_SECTION_PARSER_AVAILABLE:
+        ac_vc_commands = _ac_vc_commands_from_parse_result(
+            evaluator,
+            parse_result if parse_result is not None else _parse_vc_section(vc_section or ""),
+        )
+    else:
+        ac_vc_commands = None
+
     try:
         verdict = evaluator.evaluate_runtime_assertion_binding_coverage(
             allowed_path_entries=allowed_path_entries,
             rva_section_text=rva_section or "",
             ac_section_text=ac_section or "",
             ac_vc_refs=ac_vc_refs,
+            ac_vc_commands=ac_vc_commands,
         )
     except evaluator.PolicyLoadError as exc:
         return None, exc
@@ -3175,6 +3271,25 @@ def run_checks(
                 ),
                 emit_finding=False,
             )
+
+    # C14c: applied comment-only exemption carrier (Issue #2961). Non-blocking
+    # transcription of the shared evaluator's `issue_time_exemptions`;
+    # `emit_finding=False` so it never touches checks.* / findings / verdict.
+    exemption_carrier_lines = get_extension_surface_issue_time_exemption_carrier(body, issue_kind)
+    if exemption_carrier_lines:
+        _add_warning(
+            result,
+            code=_EXTENSION_SURFACE_ISSUE_TIME_EXEMPTION_CARRIER_CODE,
+            severity="advisory",
+            evidence=exemption_carrier_lines,
+            suggested_action=(
+                "Non-blocking: a comment-only exemption declaration "
+                "(executable_semantics_unchanged) was structurally accepted. The matcher verifies "
+                "structure only; that executable semantics are actually unchanged is evidenced by "
+                "the PR-time VC execution and review."
+            ),
+            emit_finding=False,
+        )
 
     # C14b: Extension surface candidate perimeter advisory (Issue #2339,
     # non-blocking -- must never touch checks.* / all_check_values / verdict).
