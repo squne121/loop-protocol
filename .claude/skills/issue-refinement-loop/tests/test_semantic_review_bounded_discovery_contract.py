@@ -1,0 +1,624 @@
+"""Issue #2973 AC1-AC6: path 未列挙 role の bounded discovery 契約の static test。
+
+`issue-design-reviewer.md` と `semantic-design-review.md` の単一 `Consumer-audit` section（と reviewer へ渡す起動
+prompt の blockquote）が、required role 単位の bounded discovery を要求していることと、path 未列挙 role を持つ
+synthetic fixture の静的 ground truth を固定する。model の発見能力は証明しない（実 SubAgent runtime smoke が担う）。
+"""
+
+from __future__ import annotations
+
+import ast
+import importlib.util
+import itertools
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+_TESTS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _TESTS_DIR.parents[3]
+_AGENT_RELATIVE = ".claude/agents/issue-design-reviewer.md"
+_AGENT_PATH = _REPO_ROOT / _AGENT_RELATIVE
+_REFERENCE_PATH = _REPO_ROOT / ".claude/skills/issue-refinement-loop/references/semantic-design-review.md"
+_FIXTURES_DIR = _TESTS_DIR / "fixtures"
+_DOCS = {"agent": _AGENT_PATH, "reference": _REFERENCE_PATH}
+
+
+def _load(name: str, filename: str) -> Any:
+    cached = sys.modules.get(name)
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location(name, _TESTS_DIR / filename)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+E63 = _load("issue2963_reachability_runtime_evaluator", "issue2963_reachability_runtime_evaluator.py")
+EVAL = _load("issue2973_bounded_discovery_runtime_evaluator", "issue2973_bounded_discovery_runtime_evaluator.py")
+
+# #2963 の fixture（本 Issue では変更しない。path の独立性を検証するためだけに参照する）。
+_FIXTURES_2963 = ("consumer_reachability_negative_case", "consumer_reachability_positive_control_case")
+_FIXTURES_2963 += ("consumer_reachability_simple_docs_only_case",)
+
+# #2961 の live source は fixture / test のどこからも import も読み取りもしない。
+# 自己検査で自分自身に一致しないよう、名前は連結で組み立てる。
+_LIVE_SOURCE_NAMES = (
+    "extension_surface_" + "policy_matcher",
+    "check_issue_" + "contract",
+    "contract_readiness_" + "check",
+)
+
+_OWN_FILES = (
+    "test_semantic_review_bounded_discovery_contract.py",
+    "test_issue_design_reviewer_bounded_discovery_evaluator.py",
+    "test_issue_design_reviewer_bounded_discovery_runtime_smoke.py",
+    "issue2973_bounded_discovery_runtime_evaluator.py",
+)
+
+# ---------------------------------------------------------------------------
+# Markdown helpers（#2963 の static test と同じ判別）
+# ---------------------------------------------------------------------------
+
+
+def _read(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def _headings(text: str) -> list[tuple[int, int, str]]:
+    result: list[tuple[int, int, str]] = []
+    in_fence = False
+    for index, line in enumerate(text.splitlines()):
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        match = re.match(r"^(#{1,6})\s+(.*\S)\s*$", line)
+        if match:
+            result.append((index, len(match.group(1)), match.group(2)))
+    return result
+
+
+_AUDIT_TITLE = re.compile(r"consumer[\s_-]*audit", re.IGNORECASE)
+_PARALLEL_TITLE = re.compile(
+    r"consumer|reachab|inventory|checklist|dataflow|data flow|call[- ]graph|discover|探索|発見", re.IGNORECASE
+)
+
+
+def _audit_section(text: str) -> str:
+    headings = _headings(text)
+    lines = text.splitlines()
+    starts = [(i, level) for i, level, title in headings if _AUDIT_TITLE.search(title)]
+    assert len(starts) == 1, f"expected exactly one consumer-audit section, got {len(starts)}"
+    start, level = starts[0]
+    end = len(lines)
+    for i, other_level, _title in headings:
+        if i > start and other_level <= level:
+            end = i
+            break
+    return "\n".join(lines[start:end])
+
+
+def _launch_prompt(text: str) -> str:
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in text.splitlines():
+        if line.startswith(">"):
+            current.append(line.lstrip("> ").rstrip())
+        elif current:
+            blocks.append(current)
+            current = []
+    if current:
+        blocks.append(current)
+    prompts = ["\n".join(block) for block in blocks if any("bundle.json" in line for line in block)]
+    assert len(prompts) == 1, f"expected exactly one launch prompt block, got {len(prompts)}"
+    return prompts[0]
+
+
+def _flat(text: str) -> str:
+    """空白を 1 つに畳む。日本語どうしの間の改行は連結する（折り返し位置に依存させない）。"""
+    joined = re.sub(r"(?<=[^\x00-\x7f])\s*\n\s*(?=[^\x00-\x7f])", "", text)
+    return re.sub(r"\s+", " ", joined)
+
+
+def _scopes(name: str) -> dict[str, str]:
+    """document 名 -> {section, prompt}（正規化済み）。"""
+    text = _read(_DOCS[name])
+    return {"section": _flat(_audit_section(text)), "prompt": _flat(_launch_prompt(text))}
+
+
+def _assert_needles(label: str, haystack: str, needles: tuple[str, ...]) -> None:
+    for needle in needles:
+        assert needle in haystack, f"{label}: missing {needle!r}"
+
+
+# ---------------------------------------------------------------------------
+# AC1-AC4
+# ---------------------------------------------------------------------------
+
+
+def test_reviewer_contract_requires_role_scoped_bounded_discovery_when_paths_unlisted() -> None:
+    """AC1: required role 単位の discovery（path を解決できる role は直接 Read、未解決 role だけ Grep / Glob）。"""
+    for name in _DOCS:
+        scopes = _scopes(name)
+        _assert_needles(
+            f"{name} section",
+            scopes["section"],
+            (
+                "required role（producer / parser / evaluator / matcher / decision-critical consumer）単位に適用する",
+                "repository 相対 path を一意に記載している role は、その path を直接 Read し、検索しない",
+                "explicit path を持つ role を再探索しない",
+                "path の記載がない、または一意に解決できない role だけ",
+                "named symbol / evaluator / caller 名を query にして",
+                "repository root 配下に限定した Grep / Glob",
+                "Read で確認してから audit を続ける",
+            ),
+        )
+        _assert_needles(
+            f"{name} launch prompt",
+            scopes["prompt"],
+            (
+                "pinned body が repository 相対 path を列挙していない role",
+                "named symbol を query にした bounded discovery",
+                "path を列挙している role は検索せず直接読む",
+                "explicit path を持つ role を再探索しない",
+                "Grep / Glob tool だけを使い",
+                "`path` に `<root>` 配下の絶対 path を明示する",
+                "Grep の `pattern` は未解決 role の named symbol を",
+                "Glob の `pattern` は未解決 role の file 名断片を含める",
+            ),
+        )
+    # 起動 prompt は両 document で同一内容のまま。
+    assert _flat(_launch_prompt(_read(_AGENT_PATH))) == _flat(_launch_prompt(_read(_REFERENCE_PATH)))
+    # #2963 の既存 needle と `観測できなかった path と理由` の 1 回出現は保つ。
+    for name, path in _DOCS.items():
+        scopes = _scopes(name)
+        _assert_needles(
+            f"{name} #2963 prompt needles",
+            scopes["prompt"],
+            ("pinned body が列挙する", "4 役すべての各 file を", "evaluator / matcher の file"),
+        )
+        _assert_needles(f"{name} #2963 section needles", scopes["section"], ("4 役すべての各 file を",))
+        assert _flat(_read(path)).count("観測できなかった path と理由") == 1, name
+
+
+def test_discovery_bounds_match_evaluator_constants_and_no_new_analyzer_or_registry() -> None:
+    """AC2: 文書中の bound の数値が evaluator 定数と同一（3 箇所: 文書 / evaluator / 本 test）で、新機構を足さない。"""
+    # Issue 本文「固定する bound の値」（実装側の都合で変更しない）。
+    assert (EVAL.DISCOVERY_SEARCH_CALL_MAX, EVAL.DISCOVERY_SOURCE_READ_MAX) == (8, 8)
+    assert EVAL.SEARCH_SCOPE == "repository_root_only" and EVAL.DISCOVERY_TOOLS == ("Grep", "Glob")
+    for name in _DOCS:
+        scopes = _scopes(name)
+        for scope, haystack in scopes.items():
+            search = re.findall(r"DISCOVERY_SEARCH_CALL_MAX: (\d+)", haystack)
+            reads = re.findall(r"DISCOVERY_SOURCE_READ_MAX: (\d+)", haystack)
+            assert search == [str(EVAL.DISCOVERY_SEARCH_CALL_MAX)], f"{name} {scope}: {search}"
+            assert reads == [str(EVAL.DISCOVERY_SOURCE_READ_MAX)], f"{name} {scope}: {reads}"
+        _assert_needles(
+            f"{name} section",
+            scopes["section"],
+            (
+                "`DISCOVERY_SEARCH_CALL_MAX: 8`",
+                "`DISCOVERY_SOURCE_READ_MAX: 8`",
+                "`SEARCH_SCOPE: repository_root_only`",
+                "`DISCOVERY_TOOLS: [Grep, Glob]`",
+                "Grep と Glob の tool_use の合計",
+                "成功・失敗を問わず数える",
+                "`bundle.json` と `body_file` を除く repository file の Read の合計",
+                "`path` の省略・root 外 path・`..` による脱出・root 外を指す絶対 pattern は違反",
+                "Bash の rg / grep / find は discovery として数えない",
+                "新しい analyzer / schema / registry / approval layer は追加しない",
+            ),
+        )
+        _assert_needles(
+            f"{name} prompt",
+            scopes["prompt"],
+            ("Grep と Glob の合計 8 回以内", "`bundle.json` と `body_file` 以外の Read は 8 回以内"),
+        )
+    # evaluator は #2963 の scanner / helper を import して再利用する（複製しない）。
+    for helper in (
+        "scan_tool_records",
+        "_high_ref_union",
+        "_is_root_command",
+        "_is_head_command",
+        "_read_target",
+        "iter_stream_events",
+        "parse_raw_result_object",
+        "load_runner_module",
+    ):
+        assert getattr(EVAL, helper) is getattr(E63, helper), f"{helper} must be the reused #2963 helper"
+    # 汎用 analyzer / registry / runner を新設しない（新 evaluator は class を定義しない）。
+    tree = ast.parse((_TESTS_DIR / "issue2973_bounded_discovery_runtime_evaluator.py").read_text(encoding="utf-8"))
+    assert [n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)] == []
+
+
+def test_unlisted_path_alone_is_not_high_and_unobservable_after_discovery_is_not_clear() -> None:
+    """AC3: path 未記載それ自体は high にしない / 因果 / decoy / 発見できない場合に限り high 以上。"""
+    for name in _DOCS:
+        scopes = _scopes(name)
+        _assert_needles(
+            f"{name} section",
+            scopes["section"],
+            (
+                "path が未記載であること自体を理由に high にしない",
+                "成功した（error ではない）検索結果に target source の path が現れてから、その file を Read する",
+                "body・test・evaluator 内の自己参照 literal hit だけでは discovery 成功としない",
+                "同名 symbol を持つ decoy があり得るため、最初の hit を盲目的に Read せず",
+                "decision-critical consumer の import / call-site から decoy ではない target を確定する",
+                "bounded discovery を尽くしても必要な source を発見・観測できなかった場合に限り",
+                "`assessment: clear` にせず",
+                "観測できなかった symbol と試行した検索を `evidence_refs` に残して high 以上の finding にする",
+                "「観測不能は clear にしない」と整合する",
+            ),
+        )
+        _assert_needles(
+            f"{name} prompt",
+            scopes["prompt"],
+            (
+                "path が未記載であること自体を理由に high にしない",
+                "成功した検索結果に target source の path が現れてから、その file を Read する",
+                "最初の hit を盲目的に Read せず",
+                "consumer の import / call-site から target を確定する",
+                "bounded discovery を尽くしても必要な source を発見・観測できなかった場合に限り",
+                "観測できなかった symbol と試行した検索を `evidence_refs` に残して high 以上の finding にする",
+            ),
+        )
+        # 順序: 「発見・観測できなかった場合に限り」の後に「観測できなかった symbol と試行した検索」が来る。
+        for haystack in scopes.values():
+            first = haystack.index("bounded discovery を尽くしても必要な source を発見・観測できなかった場合に限り")
+            assert haystack.index("観測できなかった symbol と試行した検索", first) > first
+        # 既存の義務文言（観測できなかった path と理由）は別の文として 1 回だけ残り、置換されていない。
+        assert _flat(_read(_DOCS[name])).count("観測できなかった path と理由") == 1
+        for scope, haystack in scopes.items():  # section と launch prompt に 1 回ずつ
+            assert haystack.count("観測できなかった symbol と試行した検索") == 1, f"{name} {scope}"
+
+
+def test_single_audit_section_and_authority_separation_preserved() -> None:
+    """AC4: 単一 Consumer-audit section に収まり、権限分離と #2828 の責務を侵さず、docs-only に一律要求しない。"""
+    for name, path in _DOCS.items():
+        text = _read(path)
+        headings = _headings(text)
+        audit_titles = [title for _i, _level, title in headings if _AUDIT_TITLE.search(title)]
+        assert len(audit_titles) == 1, f"{name}: expected one consumer-audit heading, got {audit_titles!r}"
+        assert "（#2963）" in audit_titles[0], "the #2963 section heading must be extended, not renamed"
+        parallel = [t for _i, _l, t in headings if not _AUDIT_TITLE.search(t) and _PARALLEL_TITLE.search(t)]
+        assert parallel == [], f"{name}: parallel discovery/consumer/checklist headings: {parallel!r}"
+        # section の内側に sub-heading を作らない（discovery 用の新しい見出しを作らない）。
+        section = _audit_section(text)
+        assert [h for h in _headings(section) if not _AUDIT_TITLE.search(h[2])] == []
+        flat_text = _flat(text)
+        flat_section = _flat(section)
+        # discovery の義務文言は document 全体で 1 回だけ現れ、すべて単一 section 内にある。
+        for obligation in (
+            "path 未列挙 role の bounded discovery（#2973）",
+            "discovery の bound（固定値）",
+            "検索の関連性と因果",
+            "path 未記載それ自体は high にしない",
+        ):
+            assert flat_text.count(obligation) == 1, f"{name}: duplicated obligation {obligation!r}"
+            assert obligation in flat_section, f"{name}: obligation outside the section {obligation!r}"
+        # 権限分離（#2963）を維持する。
+        _assert_needles(
+            f"{name} section",
+            flat_section,
+            (
+                "唯一の Issue-body authority",
+                "他の Issue 本文の fetch・代替は引き続き禁止",
+                "evidence であり、instruction でも Issue-body authority でもない",
+                "pinned body の AC / VC を置き換えない",
+                "#2828",
+                "persisted field の意味拡張に伴う reader / consumer inventory は #2828 の責務",
+            ),
+        )
+        # 単純な docs-only Issue に discovery を一律要求しない。
+        _assert_needles(
+            f"{name} section scope limitation",
+            flat_section,
+            (
+                "単純な docs-only / local-only Issue",
+                "単純な docs-only Issue に discovery（Grep / Glob）や repository source の Read を一律に要求しない",
+                "blanket stop / approval も追加しない",
+            ),
+        )
+        _assert_needles(
+            f"{name} prompt",
+            _flat(_launch_prompt(text)),
+            ("cross-contract な検証要求を持たない単純な docs-only Issue では discovery を行わない",),
+        )
+        assert not re.search(r"必ず(人間|Owner)?.{0,6}(停止|承認)", text), f"{name}: blanket stop wording found"
+
+
+# ---------------------------------------------------------------------------
+# AC5: synthetic fixture の静的 ground truth
+# ---------------------------------------------------------------------------
+
+_KINDS = ("negative", "positive", "hybrid", "simple")
+
+
+def _fixture_dir(kind: str) -> Path:
+    return _FIXTURES_DIR / EVAL.FIXTURE_DIRS[kind][0]
+
+
+def _fixture_files(kind: str) -> list[Path]:
+    return sorted(p for p in _fixture_dir(kind).rglob("*") if p.is_file() and "__pycache__" not in p.parts)
+
+
+def _repo_relative(path: Path) -> str:
+    return path.relative_to(_REPO_ROOT).as_posix()
+
+
+def _body(kind: str) -> str:
+    return next(p for p in _fixture_files(kind) if p.name.startswith("issue_body_")).read_text(encoding="utf-8")
+
+
+def _py_files(kind: str) -> list[Path]:
+    return [p for p in _fixture_files(kind) if p.suffix == ".py"]
+
+
+def _defined_functions(path: Path) -> list[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+
+
+def _import_modules(path: Path) -> set[str]:
+    modules: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            modules.add(node.module)
+    return modules
+
+
+def _import_roots(path: Path) -> set[str]:
+    return {module.split(".")[0] for module in _import_modules(path)}
+
+
+def _called_arg_subscript_keys(source: Path, callee: str) -> set[str]:
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    keys: set[str] = set()
+    for func in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)):
+        assigns: dict[str, ast.expr] = {}
+        for node in ast.walk(func):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                assigns[node.targets[0].id] = node.value
+        for node in ast.walk(func):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == callee):
+                continue
+            for arg in [*node.args, *(kw.value for kw in node.keywords)]:
+                expr = assigns.get(arg.id, arg) if isinstance(arg, ast.Name) else arg
+                for sub in ast.walk(expr):
+                    if isinstance(sub, ast.Subscript) and isinstance(sub.slice, ast.Constant):
+                        keys.add(str(sub.slice.value))
+    return keys
+
+
+def _evaluator_parameters(path: Path, symbol: str) -> list[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    func = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == symbol)
+    return [arg.arg for arg in func.args.args]
+
+
+def _load_decide(kind: str) -> Any:
+    """fixture consumer を unique module 名で読み込む（fixture 内 sibling module は終了後に除去する）。"""
+    directory = str(_fixture_dir(kind))
+    prefix = EVAL.FIXTURE_DIRS[kind][1]
+    roles = EVAL.fixture_roles(kind)
+    sys.path.insert(0, directory)
+    before = set(sys.modules)
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        name = f"issue2973_fixture_{prefix}_consumer"
+        spec = importlib.util.spec_from_file_location(name, _REPO_ROOT / roles["consumer"]["path"])
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        return getattr(module, roles["consumer"]["symbol"])
+    finally:
+        sys.dont_write_bytecode = previous
+        sys.path.remove(directory)
+        for added in set(sys.modules) - before:
+            sys.modules.pop(added, None)
+        sys.modules.pop(f"issue2973_fixture_{prefix}_consumer", None)
+
+
+_BODY_WITHOUT_GIT_DIFF = "# AC1\n$ uv run --locked pytest tests/test_x.py\n"
+_BODY_WITH_GIT_DIFF = "# AC1\n$ git diff --exit-code origin/main -- a.py\n"
+
+
+def test_unlisted_path_fixture_ground_truth_and_independence() -> None:
+    all_roles = {kind: EVAL.fixture_roles(kind) for kind in _KINDS}
+
+    # ground truth metadata は実在する fixture file と一致する。
+    for kind in ("negative", "positive", "hybrid"):
+        roles = all_roles[kind]
+        assert list(roles) == ["producer", "parser", "evaluator", "consumer"]
+        for role, info in roles.items():
+            assert set(info) == {"path", "symbol", "file_fragment", "listed", "decoy_path"}
+            assert (_REPO_ROOT / info["path"]).is_file(), f"{kind}/{role}: target source is missing"
+            assert Path(info["path"]).stem == info["file_fragment"]
+        listed = [role for role, info in roles.items() if info["listed"]]
+        assert listed == (["producer", "parser"] if kind == "hybrid" else []), f"{kind}: listed={listed}"
+        decoys = {role: info["decoy_path"] for role, info in roles.items() if info["decoy_path"]}
+        if kind == "negative":
+            assert list(decoys) == ["evaluator"] and (_REPO_ROOT / decoys["evaluator"]).is_file()
+        else:
+            assert decoys == {}, f"{kind}: only the negative fixture has a decoy"
+    assert all_roles["simple"] == {}
+    allowed = EVAL.fixture_allowed_read_paths("simple")
+    assert len(allowed) == 1 and (_REPO_ROOT / allowed[0]).is_file()
+    assert EVAL.fixture_allowed_read_paths("negative") == []
+
+    # (1) body: negative / positive は named symbol のみ。hybrid は producer / parser の path のみ。
+    for kind in ("negative", "positive", "hybrid"):
+        body = _body(kind)
+        for role, info in all_roles[kind].items():
+            name = Path(info["path"]).name
+            if info["listed"]:
+                assert info["path"] in body, f"{kind}/{role}: listed path missing"
+            else:
+                assert info["symbol"] in body and info["file_fragment"] in body, f"{kind}/{role}: symbol missing"
+                assert info["path"] not in body and f"{name}" not in body, f"{kind}/{role}: unlisted path leaked"
+                assert _fixture_dir(kind).name not in body or kind == "hybrid", f"{kind}: fixture directory leaked"
+        if kind == "negative":
+            assert "decoy" not in body and all_roles[kind]["evaluator"]["decoy_path"] not in body
+    hybrid_unlisted = [i for i in all_roles["hybrid"].values() if not i["listed"]]
+    assert len(hybrid_unlisted) == 2
+    for info in hybrid_unlisted:
+        assert _fixture_dir("hybrid").name not in info["symbol"] and info["path"] not in _body("hybrid")
+
+    # (2) simple: cross-contract な検証要求を持たない（role 名・symbol・source path を持たず、allowed path だけ）。
+    simple = _body("simple")
+    assert allowed[0] in simple
+    for kind in ("negative", "positive", "hybrid"):
+        for info in all_roles[kind].values():
+            assert info["symbol"] not in simple and info["file_fragment"] not in simple
+    for token in ("evaluator", "consumer", "producer", "parser", "matcher", "cross-contract"):
+        assert token not in simple, f"simple body must not carry cross-contract wording: {token}"
+    assert not [p for p in _fixture_files("simple") if p.suffix == ".py"]
+
+    # (3) 4 fixture の path は一意で、他 fixture / #2963 の fixture の path の部分文字列にならない。
+    path_sets = {
+        kind: [_repo_relative(_fixture_dir(kind)), *(_repo_relative(p) for p in _fixture_files(kind))]
+        for kind in _KINDS
+    }
+    for left, right in itertools.permutations(_KINDS, 2):
+        for a in path_sets[left]:
+            for b in path_sets[right]:
+                assert a not in b, f"fixture path {a!r} ({left}) is a substring of {b!r} ({right})"
+    old_paths = [
+        _repo_relative(p)
+        for directory in _FIXTURES_2963
+        for p in [_FIXTURES_DIR / directory, *(q for q in (_FIXTURES_DIR / directory).rglob("*") if q.is_file())]
+        if "__pycache__" not in p.parts
+    ]
+    assert old_paths, "the #2963 fixtures must exist"
+    for kind in _KINDS:
+        for a in path_sets[kind]:
+            for b in old_paths:
+                assert a not in b and b not in a, f"{a!r} ({kind}) collides with the #2963 fixture path {b!r}"
+    names = [p.name for kind in _KINDS for p in _fixture_files(kind)]
+    assert len(names) == len(set(names)), "fixture file names must be unique across fixtures"
+
+    # (4) named symbol は当該 fixture の source 側で一意に定義される（negative の evaluator だけ decoy と同名 2 件）。
+    definitions: dict[str, dict[str, list[str]]] = {}
+    for kind in ("negative", "positive", "hybrid"):
+        defs: dict[str, list[str]] = {}
+        for path in _py_files(kind):
+            for func in _defined_functions(path):
+                defs.setdefault(func, []).append(_repo_relative(path))
+        definitions[kind] = defs
+        for role, info in all_roles[kind].items():
+            sites = defs.get(info["symbol"], [])
+            expected = [info["path"]] if not info["decoy_path"] else sorted([info["path"], info["decoy_path"]])
+            assert sorted(sites) == expected, f"{kind}/{role}: {info['symbol']} defined in {sites}"
+    for left, right in itertools.permutations(("negative", "positive", "hybrid"), 2):
+        for info in all_roles[left].values():
+            assert info["symbol"] not in definitions[right], (
+                f"symbol {info['symbol']} of {left} also defined in {right}"
+            )
+            sources = "".join(p.read_text(encoding="utf-8") for p in _py_files(right))
+            assert info["symbol"] not in sources and info["file_fragment"] not in sources
+    old_sources = "".join(
+        p.read_text(encoding="utf-8") for d in _FIXTURES_2963 for p in (_FIXTURES_DIR / d).rglob("*.py")
+    )
+    for kind in ("negative", "positive", "hybrid"):
+        for info in all_roles[kind].values():
+            assert info["symbol"] not in old_sources and info["file_fragment"] not in old_sources
+    # negative: consumer が import する側が target で、decoy は import されない。
+    neg = all_roles["negative"]
+    consumer_imports = _import_modules(_REPO_ROOT / neg["consumer"]["path"])
+    assert neg["evaluator"]["file_fragment"] in consumer_imports
+    decoy_stem = Path(neg["evaluator"]["decoy_path"]).stem
+    assert decoy_stem != neg["evaluator"]["file_fragment"]
+    assert decoy_stem not in neg["evaluator"]["file_fragment"] and neg["evaluator"]["file_fragment"] not in decoy_stem
+    for path in _py_files("negative"):
+        assert decoy_stem not in _import_modules(path), f"{path.name} imports the decoy"
+    # 全 fixture: 4 役の module 名は互いに他の module 名の部分文字列にならない（import 由来の帰属が曖昧にならない）。
+    stems = [Path(i["path"]).stem for k in ("negative", "positive", "hybrid") for i in all_roles[k].values()]
+    stems.append(decoy_stem)
+    for a, b in itertools.permutations(stems, 2):
+        assert a not in b, f"module stem {a!r} is a substring of {b!r}"
+
+    # dataflow gap: negative / hybrid は VC command 本文が consumer から evaluator へ届かず、positive は届く。
+    for kind in ("negative", "hybrid"):
+        roles = all_roles[kind]
+        assert _evaluator_parameters(_REPO_ROOT / roles["evaluator"]["path"], roles["evaluator"]["symbol"]) == [
+            "ac_vc_refs"
+        ]
+        keys = _called_arg_subscript_keys(_REPO_ROOT / roles["consumer"]["path"], roles["evaluator"]["symbol"])
+        assert "ac" in keys and "command" not in keys
+    pos = all_roles["positive"]
+    assert _evaluator_parameters(_REPO_ROOT / pos["evaluator"]["path"], pos["evaluator"]["symbol"]) == [
+        "ac_vc_commands"
+    ]
+    pos_keys = _called_arg_subscript_keys(_REPO_ROOT / pos["consumer"]["path"], pos["evaluator"]["symbol"])
+    assert {"ac", "command"} <= pos_keys
+    decide = {kind: _load_decide(kind) for kind in ("negative", "positive", "hybrid")}
+    assert decide["negative"](_BODY_WITHOUT_GIT_DIFF, {"AC1"})["status"] == "pass"  # evidence が届かず見逃す
+    assert decide["hybrid"](_BODY_WITHOUT_GIT_DIFF, {"AC1"})["status"] == "pass"
+    assert decide["positive"](_BODY_WITHOUT_GIT_DIFF, {"AC1"})["status"] == "fail"
+    assert decide["positive"](_BODY_WITH_GIT_DIFF, {"AC1"})["status"] == "pass"
+    # decoy は command 本文を受け取る（誤って clear と読ませる罠）。target は受け取らない。
+    decoy_text = (_REPO_ROOT / neg["evaluator"]["decoy_path"]).read_text(encoding="utf-8")
+    assert (
+        "ac_vc_commands" in decoy_text and "ac_vc_commands" not in (_REPO_ROOT / neg["evaluator"]["path"]).read_text()
+    )
+
+    # test / evaluator 内の symbol literal は自己参照 hit であり、target source の代替として数えない。
+    self_files = [Path(__file__), _TESTS_DIR / "issue2973_bounded_discovery_runtime_evaluator.py"]
+    for kind in ("negative", "hybrid"):
+        for role, info in all_roles[kind].items():
+            hits = "\n".join(
+                f"{_repo_relative(path)}:{number}:    value = {literal!r}"
+                for path in self_files
+                for number, literal in enumerate((info["symbol"], info["path"]), 1)
+            )
+            assert not EVAL.result_lists_path(hits, str(_REPO_ROOT), info["path"]), (
+                f"{kind}/{role}: a self-referential literal hit must not count as discovery success"
+            )
+            assert EVAL.result_lists_path(f"{info['path']}\n{hits}", str(_REPO_ROOT), info["path"])
+
+    # (5) fixture と test は #2961 の live source を import も読み取りもしない。
+    own = [_TESTS_DIR / name for name in _OWN_FILES]
+    for path in [*own, *(p for kind in _KINDS for p in _fixture_files(kind))]:
+        assert path.is_file(), f"missing file: {path}"
+        content = path.read_text(encoding="utf-8")
+        for name in _LIVE_SOURCE_NAMES:
+            assert name not in content, f"{path.name} references live source {name}"
+        if path.suffix == ".py":
+            assert not (_import_roots(path) & set(_LIVE_SOURCE_NAMES)), f"{path.name} imports a live source"
+
+
+# ---------------------------------------------------------------------------
+# AC6: frontmatter / 対象外 file の不変
+# ---------------------------------------------------------------------------
+
+
+def _frontmatter_block(text: str) -> str:
+    match = re.match(r"^---\n(.*?)\n---\n", text, re.DOTALL)
+    assert match, "agent definition must start with a frontmatter block"
+    return match.group(1)
+
+
+def test_reviewer_frontmatter_unchanged_from_origin_main() -> None:
+    """AC6: `issue-design-reviewer.md` の frontmatter は origin/main と一致する（body の変更は許容）。"""
+    completed = subprocess.run(
+        ["git", "-C", str(_REPO_ROOT), "show", f"origin/main:{_AGENT_RELATIVE}"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, (
+        f"origin/main must be resolvable to compare the frontmatter (fetch origin): {completed.stderr.strip()}"
+    )
+    assert _frontmatter_block(completed.stdout) == _frontmatter_block(_read(_AGENT_PATH))
+    # 対照: body は本 Issue で変更されている（frontmatter 比較が vacuous でないこと）。
+    assert "path 未列挙 role の bounded discovery（#2973）" in _read(_AGENT_PATH)

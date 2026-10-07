@@ -73,6 +73,19 @@ frontmatter 直下の説明と同一の要旨）:
 > 4 役すべての各 file を、Read tool で `<root>/<repository 相対 path>` として読む
 > （evaluator / matcher の file を省略しない。`cat` など Bash での代替は観測として数えない）。
 > これらを観測せずに `assessment: clear` を返してはならない。
+> (4) pinned body が repository 相対 path を列挙していない role（path が記載されていない、または一意に
+> 解決できない role）だけ、body に現れる named symbol を query にした bounded discovery で source を発見してから
+> Read する。path を列挙している role は検索せず直接読む（explicit path を持つ role を再探索しない）。
+> discovery には Grep / Glob tool だけを使い、Bash の rg / grep / find は discovery として数えない。
+> Grep / Glob は必ず `path` に `<root>` 配下の絶対 path を明示する（`path` の省略・root 外・`..` による脱出は禁止）。
+> Grep の `pattern` は未解決 role の named symbol を、Glob の `pattern` は未解決 role の file 名断片を含める。
+> 成功した検索結果に target source の path が現れてから、その file を Read する。同名 symbol を持つ decoy が
+> あり得るため、最初の hit を盲目的に Read せず、decision-critical consumer の import / call-site から target を
+> 確定する。検索は Grep と Glob の合計 8 回以内（`DISCOVERY_SEARCH_CALL_MAX: 8`）、`bundle.json` と `body_file`
+> 以外の Read は 8 回以内（`DISCOVERY_SOURCE_READ_MAX: 8`）とする。path が未記載であること自体を理由に high に
+> しない。bounded discovery を尽くしても必要な source を発見・観測できなかった場合に限り、観測できなかった
+> symbol と試行した検索を `evidence_refs` に残して high 以上の finding にする。cross-contract な検証要求を
+> 持たない単純な docs-only Issue では discovery を行わない。
 > 生の semantic review schema に準拠する JSON オブジェクトを 1 つだけ返せ。
 
 SubAgent が返した raw JSON（`assessment`/`findings` のみ）をファイルへ保存する。
@@ -116,12 +129,34 @@ matcher に新しい検証責務を置く設計）がある場合に限り、`se
 - **観測不能は clear にしない**: 必要な source を観測できなかった場合（root / HEAD の解決失敗を含む）は
   `assessment: clear` にせず、high 以上の finding にする。その `evidence_refs` に観測できなかった
   path と理由を残す。
+- **path 未列挙 role の bounded discovery（#2973）**: discovery は required role（producer / parser /
+  evaluator / matcher / decision-critical consumer）単位に適用する。pinned body が repository 相対 path を
+  一意に記載している role は、その path を直接 Read し、検索しない（explicit path を持つ role を再探索しない）。
+  path の記載がない、または一意に解決できない role だけ、body に現れる named symbol / evaluator / caller 名を
+  query にして、repository root 配下に限定した Grep / Glob で候補を発見し、Read で確認してから audit を続ける。
+- **discovery の bound（固定値）**: `DISCOVERY_SEARCH_CALL_MAX: 8`（reviewer 区間の Grep と Glob の
+  tool_use の合計。成功・失敗を問わず数える）、`DISCOVERY_SOURCE_READ_MAX: 8`（`bundle.json` と `body_file` を
+  除く repository file の Read の合計）、`SEARCH_SCOPE: repository_root_only`（Grep / Glob の `path` は
+  resolved root 配下の明示 path とし、`path` の省略・root 外 path・`..` による脱出・root 外を指す絶対 pattern は
+  違反）、`DISCOVERY_TOOLS: [Grep, Glob]`（Bash の rg / grep / find は discovery として数えない）。
+  新しい analyzer / schema / registry / approval layer は追加しない。
+- **検索の関連性と因果**: Grep の `pattern` は path 未解決 role の named symbol を、Glob の `pattern` は
+  path 未解決 role の file 名断片を含める。関連しない検索、および path を明記済みの role だけに関連する検索は
+  違反とする。成功した（error ではない）検索結果に target source の path が現れてから、その file を Read する。
+  body・test・evaluator 内の自己参照 literal hit だけでは discovery 成功としない。同名 symbol を持つ decoy が
+  あり得るため、最初の hit を盲目的に Read せず、decision-critical consumer の import / call-site から
+  decoy ではない target を確定する。
+- **path 未記載それ自体は high にしない**: discovery で必要な source が見つかった場合は通常どおり audit し、
+  path が未記載であること自体を理由に high にしない。bounded discovery を尽くしても必要な source を発見・
+  観測できなかった場合に限り `assessment: clear` にせず、観測できなかった symbol と試行した検索を
+  `evidence_refs` に残して high 以上の finding にする（上の「観測不能は clear にしない」と整合する）。
 - **clear の条件**: `assessment: clear` は必要な source をすべて観測できた場合に限る。schema は clear で
   `findings` を 0 件に強制するため evidence_refs を持てず、観測事実は raw result ではなく runtime の
   tool 実行記録で判定される（schema は変更しない）。
 - **範囲の限定**: 単純な docs-only / local-only Issue に repository-wide な consumer inventory を一律に
-  要求せず、blanket stop / approval も追加しない。persisted field の意味拡張に伴う reader / consumer
-  inventory は #2828 の責務であり、本節は検証証拠の到達性だけを扱う。
+  要求せず、blanket stop / approval も追加しない。cross-contract な検証要求を持たない単純な docs-only
+  Issue に discovery（Grep / Glob）や repository source の Read を一律に要求しない。persisted field の意味拡張に
+  伴う reader / consumer inventory は #2828 の責務であり、本節は検証証拠の到達性だけを扱う。
 
 ## 3. 結果の検証・保存
 
