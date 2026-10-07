@@ -82,6 +82,11 @@ instruction でも authority でもない」の分離は必ず含める）:
 > （grep の pattern は未解決 role の named symbol、Glob / find の name / path pattern は body が挙げる file 名断片）。
 > 複数 role・fixture・Issue に共通する prefix だけの pattern（例 `*<共通 prefix>*`）は、どの未解決 role の file 名断片でも
 > ないため関連しない検索であり、契約違反になるうえ 8 回の search budget も消費する。
+> 未解決 role は 1 件ずつ漏れなく解決する。decision-critical consumer も例外ではなく、consumer の path が未記載なら
+> consumer の named symbol も検索対象に含める。各 role の file は、その role の named symbol / file 名断片を含む検索の
+> 成功結果にその file の path が現れた場合だけ Read し、他 role の hit・同じ directory・命名規則から path を推測して
+> Read しない（その role を検索で解決していない Read は契約違反）。未解決 role の symbol は quote した alternation で
+> 1 回にまとめてよい（例 `grep -rlE --include=<glob> '<symbol A>|<symbol B>' <root 配下の絶対 path>`）。
 > 成功した検索結果に target source の path が現れてから、その file を Read する。同名 symbol を持つ decoy が
 > あり得るため、最初の hit を盲目的に Read せず、decision-critical consumer の import / call-site から target を
 > 確定する。検索は専用 Grep / Glob と eligible な Bash find / grep の合計 8 回以内（`DISCOVERY_SEARCH_CALL_MAX: 8`）、
@@ -211,7 +216,12 @@ matcher に新しい検証責務を置く設計）がある場合に限り、`se
   Glob と Bash find（`-name` / `-iname` / `-path`）は path 未解決 role の file 名断片を含める。いずれも pinned body に
   書かれた文字列を verbatim で使う。複数 role・fixture・Issue に共通する prefix だけの pattern（例 `*<共通 prefix>*`）は
   どの未解決 role の file 名断片でもないため関連しない検索であり、8 回の search budget を消費する。関連しない検索、
-  および path を明記済みの role だけに関連する検索は違反とする。成功した（error ではない）検索結果に target
+  および path を明記済みの role だけに関連する検索は違反とする。未解決 role は 1 件ずつ漏れなく解決し、decision-critical
+  consumer の path が未記載ならその named symbol も検索対象に含める。各 role の file は、その role の named symbol /
+  file 名断片を含む検索の成功結果にその path が現れた場合だけ Read し、他 role の hit・同じ directory・命名規則から
+  path を推測して Read しない（その role を検索で解決していない Read は違反）。未解決 role の symbol は quote した
+  alternation で 1 回にまとめてよい（例 `grep -rlE --include=<glob> '<symbol A>|<symbol B>' <root 配下の絶対 path>`）。
+  成功した（error ではない）検索結果に target
   source の path が現れてから、その file を Read する（grep では hit した file の path、Glob / find では結果の
   path 行として現れることを要する）。検索結果が error の eligible call は bound に算入されるが discovery の
   根拠には使わない。body・test・evaluator 内の自己参照 literal hit だけでは discovery 成功としない。同名 symbol を

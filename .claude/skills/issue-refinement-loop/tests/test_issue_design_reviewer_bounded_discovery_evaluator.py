@@ -1647,3 +1647,41 @@ def test_fixture_wide_shared_prefix_queries_observed_in_live_runs_remain_irrelev
     symbol = next(iter(unresolved.values()))["symbol"]
     eligible_grep = classify("Bash", {"command": f"grep -rl --include=*.py {symbol} {ROOT}"})
     assert eligible_grep["violation"] is None and eligible_grep["classification"] == "bash_lane_discovery"
+
+
+@pytest.mark.parametrize("lane", ["grep", "bash_grep"])
+def test_reading_the_consumer_without_searching_for_it_is_read_before_discovery(lane: str) -> None:
+    """live run で観測: consumer を検索せず、他 role の検索だけで推測した consumer path を Read した。
+
+    consumer も未解決 role なので、その role を検索で解決していない Read は違反のまま（evaluator を緩めない）。"""
+
+    def guessed_consumer(s: Stream) -> None:
+        _prefix(s)
+        for role in ("producer", "evaluator", "parser"):
+            symbol, path = NEG_ROLES[role]["symbol"], NEG_ROLES[role]["path"]
+            if lane == "grep":
+                s.grep(symbol, _hit_text(path))
+            else:
+                s.bash_grep(symbol, _abs_lines(path), flags="-rl")
+        for role in ("consumer", "evaluator", "producer", "parser"):
+            s.read_role(NEG_ROLES, role, output="no import hints")
+
+    outcome = evaluate(build("negative", guessed_consumer))
+    assert_outcome(outcome, "fail", 4, "read_before_discovery:consumer")
+    assert "missing_target_read:consumer" in outcome["evidence"]["violations"]
+
+
+def test_one_alternation_grep_covering_every_unresolved_role_is_accepted() -> None:
+    """prompt が許可する alternation の 1 回まとめ grep は全未解決 role を解決する。"""
+
+    def alternation(s: Stream) -> None:
+        _prefix(s)
+        pattern = _all_symbols_pattern(NEG_ROLES)
+        paths = _abs_lines(*(r["path"] for r in NEG_ROLES.values()), DECOY)
+        s.bash(f"grep -rlE --include=*.py '{pattern}' {ROOT}", paths)
+        _read_all_targets(s)
+        s.read_path(DECOY, "decoy")
+
+    outcome = evaluate(build("negative", alternation))
+    assert_outcome(outcome, "pass", 5)
+    assert outcome["evidence"]["discovery"]["search_calls"] == 1

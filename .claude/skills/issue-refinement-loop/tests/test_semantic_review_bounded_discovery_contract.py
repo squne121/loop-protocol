@@ -781,12 +781,39 @@ def test_prompt_and_section_require_bash_lane_start_and_role_specific_query_patt
                 "固定値",  # bound の固定値節は残る
             ),
         )
+        # 未解決 role を 1 件ずつ漏れなく検索で解決し、path を推測して Read しない（consumer も例外ではない）。
+        _assert_needles(
+            f"{name} prompt per-role resolution",
+            scopes["prompt"],
+            (
+                "未解決 role は 1 件ずつ漏れなく解決する",
+                "decision-critical consumer も例外ではなく",
+                "consumer の named symbol も検索対象に含める",
+                "他 role の hit・同じ directory・命名規則から path を推測して",
+                "Read しない（その role を検索で解決していない Read は契約違反）",
+                "quote した alternation で 1 回にまとめてよい",
+                "`grep -rlE --include=<glob> '<symbol A>|<symbol B>' <root 配下の絶対 path>`",
+            ),
+        )
+        _assert_needles(
+            f"{name} section per-role resolution",
+            scopes["section"],
+            (
+                "未解決 role は 1 件ずつ漏れなく解決し",
+                "consumer の path が未記載ならその named symbol も検索対象に含める",
+                "他 role の hit・同じ directory・命名規則から",
+                "path を推測して Read しない（その role を検索で解決していない Read は違反）",
+                "quote した alternation で 1 回にまとめてよい",
+            ),
+        )
         # 新しい heading は追加しない（既存の単一 Consumer-audit section の拡張のみ）。
         assert _flat(_read(_DOCS[name])).count("観測できなかった path と理由") == 1, name
     # 推奨例の command は eligible 形状として evaluator が実際に受理し、固定 bound は 8 / 8 のまま。
     root = "/synthetic/root"
     parsed = EVAL.parse_bash_search(f"grep -rl --include=*.py SymA {root}", root)
     assert parsed["reason"] is None and parsed["scope_violation"] is None and parsed["cmd"] == "grep"
+    alternation = EVAL.parse_bash_search(f"grep -rlE --include=*.py 'SymA|SymB' {root}", root)
+    assert alternation["reason"] is None and alternation["scope_violation"] is None
     assert (EVAL.DISCOVERY_SEARCH_CALL_MAX, EVAL.DISCOVERY_SOURCE_READ_MAX) == (8, 8)
     # relevance 規則の evaluator 側: 全 role の symbol / file 名断片だけが関連する（fixture 共通 prefix は無関係）。
     for kind in ("negative", "positive"):
