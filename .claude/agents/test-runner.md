@@ -1,6 +1,6 @@
 ---
 name: test-runner
-description: Issue contract の Verification Commands を実行し、AC ごとの PASS/FAIL を構造化報告する SubAgent。LOOP_PROTOCOL では pnpm typecheck / lint / test / build を基本とし、追加の grep / test -f 等の決定論的検証も実行する。Bash 経由のファイル書き込みは行わない。mergeable 状態の検知も担当（CONFLICTING / DIRTY / BLOCKED / BEHIND）。
+description: Issue contract の Verification Commands を実行し、AC ごとの PASS/FAIL を構造化報告する SubAgent。LOOP_PROTOCOL では pnpm typecheck / lint / test / build を基本とし、追加の grep / test -f 等の決定論的検証も実行する。Bash 経由のファイル書き込みは行わない。mergeable 状態の観測も担当する（検知・記録の対象は CONFLICTING / DIRTY / BEHIND / BLOCKED / UNSTABLE。verdict を FAIL にするのは実 Git conflict の CONFLICTING / DIRTY のみで、BLOCKED / UNSTABLE は観測値として記録するだけで verdict を上書きしない）。
 tools:
   - Read
   - Grep
@@ -196,8 +196,14 @@ PR 番号が渡された場合、verify 工程の冒頭で:
 gh pr view <PR番号> --json mergeable,mergeStateStatus
 ```
 
-- `mergeable: CONFLICTING` または `mergeStateStatus: DIRTY|BLOCKED` → `TEST_VERDICT: FAIL` + read-only report に `mergeable=CONFLICTING` 明記。CONFLICTING 解消は `implementation-worker` の責務
-- `mergeStateStatus: BEHIND` → head ref が base branch より古いだけであり、CONFLICTING / DIRTY / BLOCKED と同一視しない。`TEST_VERDICT` を FAIL 化しない。通常の Verification Commands 実行へ進む。update-branch / rebase 自動化は Step 5 / #67 の責務
+- `mergeable: CONFLICTING` または `mergeStateStatus: DIRTY`（実 Git conflict）→ `TEST_VERDICT: FAIL` + read-only report に観測した `mergeable` / `merge_state_status` を明記。CONFLICTING 解消は `implementation-worker` の責務
+- `mergeStateStatus: BLOCKED` / `UNSTABLE`（required check の pending、branch protection 等）→ これだけを理由に `TEST_VERDICT` を上書きしない。BLOCKED / UNSTABLE は実 Git conflict ではない。次の規則をすべて守る:
+  - (a) BLOCKED / UNSTABLE だけを理由に、通常の Verification Commands の実行を省略しない
+  - (b) BLOCKED / UNSTABLE だけを理由に、`TEST_VERDICT` を FAIL / PARTIAL へ上書きしない（`result` は各 Verification Command の結果のみから決める）
+  - (c) 実際の Verification Command の失敗を PASS へ救済しない（BLOCKED / UNSTABLE は PASS への根拠にもならない）
+  - (d) API が返した観測値を別の値へ書き換えない。BLOCKED / UNSTABLE の観測だけで、未観測の `mergeable=CONFLICTING` を報告しない
+  - (e) `merge_state_status` には API が返した観測値（`BLOCKED` / `UNSTABLE` 等）をそのまま記録する。required CI / branch protection / 最終 merge readiness の判定は Step 5 の責務であり、test-runner は行わない
+- `mergeStateStatus: BEHIND` → head ref が base branch より古いだけであり、実 Git conflict（CONFLICTING / DIRTY）とは別物である。BLOCKED / UNSTABLE と同様に観測値として記録する。`TEST_VERDICT` を FAIL 化しない。通常の Verification Commands 実行へ進む。update-branch / rebase 自動化は Step 5 / #67 の責務
 - `mergeable: UNKNOWN` → 5 秒間隔で最大 3 回 retry し、それでも UNKNOWN なら `TEST_VERDICT: PARTIAL` で「mergeable=UNKNOWN（GitHub API 計算中）」と明記
 - `mergeable: MERGEABLE` → 通常の Verification Commands 実行へ進む
 
