@@ -144,6 +144,10 @@ _PUBLIC_EVIDENCE_SHA_LENGTHS = {
     ("skill_text_counterfactual", "prompt_sha256", "base"): 64,
     ("skill_text_counterfactual", "arms", "candidate", "tested_head"): 40,
     ("skill_text_counterfactual", "arms", "base", "tested_head"): 40,
+    ("skill_text_counterfactual", "arms", "candidate", "resolved_executable_sha256"): 64,
+    ("skill_text_counterfactual", "arms", "base", "resolved_executable_sha256"): 64,
+    ("skill_text_counterfactual", "arms", "candidate", "settings_digest_sha256"): 64,
+    ("skill_text_counterfactual", "arms", "base", "settings_digest_sha256"): 64,
 }
 
 # Issue #2421: ``resolved_executable`` must never persist a raw absolute
@@ -8759,6 +8763,10 @@ def _cf_arm_summary(repo_root: str, arm_path: str | None, obs: dict | None, exec
         "exit_code": evidence.get("exit_code"),
         "process_exit_code": evidence.get("process_exit_code"),
         "tested_head": evidence.get("tested_head"),
+        "run_id": evidence.get("run_id"),
+        "runtime_version": evidence.get("runtime_version"),
+        "resolved_executable_sha256": evidence.get("resolved_executable_sha256"),
+        "settings_digest_sha256": (evidence.get("settings_provenance") or {}).get("digest_sha256"),
         "evidence_error": obs.get("evidence_error"),
         "errors": evidence.get("errors"),
         "stderr_excerpt": (execution or {}).get("stderr_excerpt"),

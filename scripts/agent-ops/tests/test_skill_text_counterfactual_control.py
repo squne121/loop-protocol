@@ -299,6 +299,11 @@ def test_discriminative_candidate_pass_and_base_ordered_only_failure_exits_zero(
     assert cf["prompt_sha256"]["candidate"] == cf["prompt_sha256"]["base"] == cf_repo.prompt_sha
     assert cf["prompt_sha256"]["identical"] is True
     assert cf["reasons"] == []
+    for arm in ("candidate", "base"):
+        identity = cf["arms"][arm]
+        assert identity["tested_head"] == executor.calls[("candidate", "base").index(arm)]["head"]
+        assert identity["resolved_executable_sha256"] == EXE_SHA
+        assert identity["runtime_version"] == "9.9.9 (fake)"
 
 
 def test_discriminative_summary_public_hash_fields_are_not_redacted(cf_repo, monkeypatch):
