@@ -456,6 +456,17 @@ rules:
     execution_context: external_process_invocation
     default_decision: immediate
     verification_profile: claude-gpt-process-io-smoke
+    # Issue #2961: issue-time comment-only 免除の opt-in（この rule だけが持つ）。
+    # Issue 側は RVA に
+    #   executable_semantics_unchanged: {rule: claude-gpt-lifecycle-invocation-change, ac: AC<N>}
+    # を宣言し、当該 rule に match する全 Allowed Paths が exact file path で、
+    # そのそれぞれを引数に持つ `git diff` で始まる VC が宣言 AC に存在する場合に限り、
+    # shared matcher が当該 rule だけを final_decision / required runtime assertion の
+    # 導出から除外する。検証するのは宣言と VC の構造のみで、executable semantics が
+    # 不変であることの証明ではない（実担保は PR 時の VC 実行と review）。
+    issue_time_exemption:
+      declaration_key: executable_semantics_unchanged
+      mode: exact_file_path_git_diff_vc
     exceptions:
       - id: claude-gpt-proven-not-distributed
         predicate: proven_not_distributed
