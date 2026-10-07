@@ -32,6 +32,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import NoReturn
 
@@ -52,6 +53,7 @@ SCOPE_STATEMENT = (
     "worktree-agent-runtime-smoke/SKILL.md itself drive behavior."
 )
 _UNAVAILABLE_MARKERS = (
+    "hit your session limit",
     "Please run /login",
     "Not authenticated",
     "invalid_grant",
@@ -89,6 +91,33 @@ def _claude_version() -> str | None:
         return None
     completed = subprocess.run([exe, "--version"], capture_output=True, text=True, check=False, timeout=60)
     return (completed.stdout or completed.stderr).strip().splitlines()[0] if completed.returncode == 0 else None
+
+
+def _probe_cli() -> tuple[bool, str]:
+    """One tiny real call before the expensive runs: a rate-limited / unauthenticated CLI is
+    "runtime unavailable" (SKIP), never a counterfactual FAIL and never a PASS."""
+    exe = shutil.which("claude")
+    if exe is None:
+        return False, "claude CLI is not on PATH"
+    try:
+        completed = subprocess.run(
+            [exe, "-p", "--output-format", "stream-json", "--verbose", "--max-turns", "1",
+             "--no-session-persistence"],
+            input="Reply with the single word OK.", capture_output=True, text=True, check=False,
+            timeout=180, cwd=tempfile.gettempdir(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"claude CLI probe could not complete: {type(exc).__name__}"
+    for line in completed.stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            if event.get("is_error"):
+                return False, _mask(f"claude CLI probe returned an error result: {str(event.get('result'))[:160]}")
+            return True, "ok"
+    return False, "claude CLI probe produced no result event"
 
 
 def _write_log(case: str, *, result: str, exit_code: int | None, reason: str, environment: dict, input_: dict,
@@ -159,6 +188,9 @@ def _run_case(case: str, expect_discriminative: bool) -> None:
     }
     if version is None:
         _skip(case_label, "claude CLI is not available (or --version failed)", environment, input_)
+    available, probe_reason = _probe_cli()
+    if not available:
+        _skip(case_label, probe_reason, environment, input_)
 
     root = _canonical_root()
     throwaway = root / ".claude" / "worktrees" / f"{THROWAWAY_PREFIX}{case}-{secrets.token_hex(8)}"
