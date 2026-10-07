@@ -38,12 +38,13 @@ reviewer_verdict（`verdict`/`reviewed_head_sha`/`blockers`/`warnings`）と liv
 | `route_to_update_branch` | 合成された `update_branch` action を worker に委譲し、検証・PR review を再実行（終了しない） |
 | `route_scope_clean_reconciliation`（#2102） | main drift による base-bound evidence の選択的失効を実行してから Step 5 を resume する（終了しない。手順は下記「main drift の scope-clean reconciliation 再開（resume）手順」参照） |
 | `route_stale_head_rereview` | 現在 head で PR review を再実行（終了しない） |
+| body-only lane（`REQUEST_CHANGES` かつ `decide_body_only_repair` が eligible。`conflict_hard_stop` / `already_satisfied` / `route_to_update_branch` のいずれにも一致しなかった場合のみ評価。下記「body-only lane」節） | iteration を消費せず、`iteration` が `max_iterations` 未満・到達のどちらでも `continue_loop` に優先して body-only repair → fresh pr-review → `step5-terminal-gate`（終了しない） |
 | `continue_loop` | LOOP_STATE.iteration += 1、Step 1 に戻る（blockers を fix_delta として渡す） |
 | `already_satisfied`（#2607。`step-5-mergeability-handling.md` の「already_satisfied recovery route」参照） | `termination_reason: already_satisfied` を立て、終了処理へ。`decision.selected_action` の `result`/`recommendation` を報告するのみで、PR/Issue の close 等の mutation は実行しない |
 | `route_human_escalation` | `termination_reason: human_escalation` を立て、即停止（`HUMAN_REVIEW_REQUIRED` verdict、または max iteration 到達・secret/protected-path gate 等の実 hard gate の場合のみ） |
 | `conflict_hard_stop` | CONFLICTING PR Escalation Runbook 発動（actual conflict のみ。#1860 Owner Decision の唯一の hard stop） |
 | `fail_closed`（`mergeability_unknown` / `merge_state_status_*_not_conflict_defer_to_ci_evaluator`） | warning として記録し、bounded retry または次サイクルでの current-head CI / branch-protection 再評価に委ねる（human escalation にはしない） |
-| `fail_closed`（`LOOP_STATE.iteration >= LOOP_STATE.max_iterations`） | `termination_reason: max_iterations` を立て、fail-close で人間判断 |
+| `fail_closed`（`LOOP_STATE.iteration >= LOOP_STATE.max_iterations`。`decide_body_only_repair` が eligible の body-only lane を除く） | `termination_reason: max_iterations` を立て、fail-close で人間判断 |
 | `fail_closed`（`concurrent_base_churn_budget_exhausted`） | `evidence_epoch.drift_rebind_attempts` が上限（既定 2、#2039/#1023 の bounded no-progress budget と同じ考え方）を超過。drift 起因の再試行を打ち切り `termination_reason: human_escalation` ではなく機械的な fail-closed 停止として人間判断を仰ぐ（#2102） |
 
 ### terminal approval は `step5-terminal-gate` 経由に固定する（Issue #2837）
@@ -146,12 +147,43 @@ semantic planning・overlap・contract snapshot・body SHA・artifact 異常に�
 
 body-only な自動修正（`update_pr_body_hygiene`、reference authority entrypoint が `closing_required` を返した場合に限る `ensure_closing_keyword` 追加等）が必要な場合も、reviewer は
 自己申告せず、具体的な内容を `blockers[]`/`warnings[]` に記載する。
-control-plane はその記述を読み、`REQUEST_CHANGES` として `continue_loop` 経路で次イテレーションへ回すか、
-機械的に修正可能と判断した場合のみ `implementation-worker` の該当 mode（entrypoint が `closing_required` の場合のみ `ensure_closing_keyword` /
-`update_pr_body_hygiene`）に委譲する。これらの body-only 対応は head SHA を変えないため、`update_branch`
+control-plane は blocker 文面を自由に解釈せず、body-only 修正を行うかどうかを `decide_body_only_repair`
+（`.claude/skills/impl-review-loop/scripts/body_only_repair_plan.py`）の結果だけで判断する。eligible なら
+下記「body-only lane」節の手順で `implementation-worker` の `update_pr_body_hygiene` mode に委譲し、ineligible なら
+`REQUEST_CHANGES` として `continue_loop` 経路で次イテレーションへ回す。`ensure_closing_keyword`
+（entrypoint が `closing_required` を返した場合のみ）は引き続き #2878 の single evaluator が所有し、
+`decide_body_only_repair` の eligibility 対象に含めない。これらの body-only 対応は head SHA を変えないため、`update_branch`
 と異なり verification の再実行は不要で、PR review のみ再実行する。`blockers` が非空のまま
 `verdict == APPROVE` を返した reviewer 結果は `route_loop_verdict_v2()` が `fail_closed`
 （`approve_with_blockers_inconsistent`）として扱う。
+
+### body-only lane（`iteration ≥ max_iterations` の fail-close に対する例外、Issue #2971）
+
+current PR HEAD の verification / runtime evidence / required CI が完了済みで、pr-reviewer の blockers が **PR 本文に既にある evidence の同期だけ**（`## Runtime Verification Evidence` section 欠落・stale な件数・pending 文言の closed な 3 kind）に限られる場合に限り、`iteration ≥ max_iterations` でも implementation iteration を消費せず body-only repair を 1 回だけ行える。eligibility は `decide_body_only_repair`（pure な単一 authority。新規 route / schema / registry / lock は作らない）だけが決め、`SKILL.md` の「body-only lane」節と同一の意味論に従う。
+
+**適用条件（bounded 規則）**:
+
+- `REQUEST_CHANGES` で `decide_body_only_repair` が eligible の場合のみ、`iteration` が `max_iterations` 未満・到達のどちらでも `continue_loop → Step 1` に優先して適用する。`iteration ≥ max_iterations` であること自体は eligibility を妨げない。
+- `conflict_hard_stop`（`mergeable == CONFLICTING` または `merge_state_status == DIRTY`、verdict に関係なく最優先）・`already_satisfied`・`route_to_update_branch`（`merge_state_status == BEHIND`）のいずれにも一致しなかった場合にのみ評価する。`CONFLICTING` / `DIRTY` / `BEHIND` では適用不能で既存 routing に従う。mergeability の gate は control-plane が呼出し前に行い、`decide_body_only_repair` に mergeability の引数は追加しない。
+- code / test / Issue contract / branch の変更を要する blocker が 1 件でもあれば ineligible となり、従来どおり iteration を消費する（`max_iterations` 到達時は fail-close）。
+- lane は同一 PR で最大 1 回。mutation 要求（worker 起動）を 1 回行った時点（成否を問わない）で、既存 `LOOP_STATE.blockers_history[]` に `lane: body_only_repair` の entry を 1 件追記し、その件数を次回の `prior_body_only_repairs` として渡す（`prior_body_only_repairs >= 1` は ineligible）。`LOOP_STATE` の key 集合は変更せず、新規 ledger / lock も作らない。
+- `check_body_freshness` が `stale_body_rebuild_required` / `ineligible_head_changed` を返した場合は mutation を行わず（`blockers_history` への追記もしない）、fresh な live 状態で eligibility を最大 1 回だけ再評価する。再び ineligible または stale なら通常 routing（`continue_loop` / `max_iterations` fail-close）へ戻る。
+
+**実行順序（canonical fresh review path）**:
+
+1. eligible → mutation 直前に live の head と PR body を fresh に取得し、`check_body_freshness` を通す。`proceed` 以外は mutation しない。
+2. `proceed` の場合のみ、control-plane が `body_plan.completed_body_text` を body file へ書き出し、その path を `implementation-worker` の `update_pr_body_hygiene` mode の入力として渡す。worker は body file を改変せず `open-pr/scripts/update_pr.py --body-file` wrapper へそのまま渡す（`gh pr edit` の直接呼出し禁止。`IMPLEMENTATION_WORKER_REQUEST_V2` schema と `implementation-worker.md` は変更しない）。
+3. 書込み後に head と body を readback し、`verify_body_readback` が `ok` であることを確認する。
+4. verification は再実行しない（HEAD が不変のため）。
+5. binding（head / Issue body SHA-256 / 順序付き command hashes）が不変なら `step4-adjudicate --reuse-stored` で `dispatch.seq` を +1 し、reviewer を起動する **前** に `<review-result-dir>/dispatch_seq` へ保存する（`step-4-pr-review.md` 参照）。binding が変化した場合は `--reuse-stored` を使わず通常の `step4-adjudicate`（再検証あり）へ戻り、lane は消費済みとして通常 routing に従う。
+6. 新規 `pr-reviewer` を dispatch し、fresh reviewer completion を得る。
+7. 保存済み `dispatch_seq` と同一 binding を上記の `step5-terminal-gate` へ渡す。`APPROVE` かつ `blockers == []` かつ live mergeability が適格な場合のみ `approved`。fresh reviewer が code / test / contract change を要求した場合は通常 routing（iteration 消費・`max_iterations` fail-close）へ戻る。
+
+**guard の所在と禁止事項**:
+
+- worker は `update_pr_body_hygiene` で `expected_head_sha` を強制しない。HEAD / body の保証は worker ではなく control-plane の `check_body_freshness`（mutation 直前）と `verify_body_readback`（書込み後）が担う。`update_pr.py` に head / body の freshness 検査や readback は無い。
+- 次を禁止する: terminal gate bypass（`step5-terminal-gate` exit 0 以外での `approved` 確定）、古い reviewer result の carry-forward（lane 前の reviewer 結果の流用）、reviewer の直接呼出しのみでの fresh review 成立扱い（`step4-adjudicate --reuse-stored` による `dispatch_seq` の +1 と保存、`step5-terminal-gate` への受け渡しを省略する経路）。
+- `adjudicate_vc_result.py` / `route_loop_verdict_v2.py` / `step5-terminal-gate` に max-iteration の例外は入れない。terminal approval は引き続き `step5-terminal-gate` だけが authority である。
 
 ### `ensure_closing_keyword` の適用条件（reference authority entrypoint、Issue #2878）
 
