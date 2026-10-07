@@ -768,6 +768,109 @@ def test_fail_closed_on_pass_conversion_or_forged_skip_envelope_echo_covering_a_
     assert gate == {"invoke_pr_reviewer": False, "reason_code": "adjudication_missing_or_malformed"}
 
 
+FALLBACK_REASON = "pr_review_only_fallback_detected"
+
+
+def test_fail_closed_on_pass_conversion_or_forged_ordinary_ac_fallback_next_to_delegated_row(tmp_path, mixed):
+    # An ORDINARY AC carrying fallback_detected: true must never be turned into PASS (and so open a reviewer
+    # dispatch) merely because a DIFFERENT pr_review_only row is delegated. Row-level, not report-level.
+    index = _pr_review_only_index(mixed)
+    report = _report(
+        mixed,
+        row_overrides={0: {"fallback_detected": True}, index: {"exit_code": 1, "status": "fail"}},
+    )
+    ws = Workspace(tmp_path / "delegated", mixed)
+
+    rc, payload = ws.adjudicate(report)
+
+    _assert_no_dispatch(ws, rc, payload, [FALLBACK_REASON])
+    assert "pr_review_only_runtime_evidence_pass" not in json.dumps(payload)
+    assert "expected_fail_resolved_on_current_head" not in json.dumps(payload)
+    rc, term = ws.terminal_gate(dispatch_seq=1)
+    assert rc == 1
+    assert term["route"] == "continue_loop"
+    assert term["reason_code"] == "dispatch_seq_mismatch"
+
+    # The same ordinary-row fallback is refused with the SAME reason_code when nothing is delegated
+    # (the pr_review_only row passes), with and without the opt-in flag: delegation changes nothing here.
+    clean_report = _report(mixed, row_overrides={0: {"fallback_detected": True}}, result="PASS")
+    for delegate in (False, True):
+        other = Workspace(tmp_path / f"compare_delegate_{delegate}", mixed)
+        rc, payload = other.adjudicate(clean_report, delegate=delegate)
+        _assert_no_dispatch(other, rc, payload, [FALLBACK_REASON])
+
+    # A delegated row that itself fails AND carries fallback does not excuse an ordinary row's fallback either.
+    both = _report(
+        mixed,
+        row_overrides={
+            0: {"fallback_detected": True},
+            index: {"exit_code": 1, "status": "fail", "fallback_detected": True},
+        },
+    )
+    other = Workspace(tmp_path / "delegated_with_fallback", mixed)
+    rc, payload = other.adjudicate(both)
+    _assert_no_dispatch(other, rc, payload, [FALLBACK_REASON])
+
+
+def test_fail_closed_on_pass_conversion_or_forged_ordinary_fallback_via_direct_call(mixed):
+    index = _pr_review_only_index(mixed)
+    report = _report(
+        mixed,
+        row_overrides={0: {"fallback_detected": True}, index: {"exit_code": 1, "status": "fail"}},
+    )
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=mixed.snapshot,
+        current_vc_result=mod.adapt_test_verdict_to_current_vc_result(report)[0],
+        diff_summary=_diff_summary(mixed),
+        allowed_paths=list(ALLOWED_PATHS),
+        test_verdict=report,
+        expected_issue_number=ISSUE_NUMBER,
+        expected_pr_number=PR_NUMBER,
+        delegate_pr_review_only_nonpass=True,
+    )
+    assert result["overall_status"] == "indeterminate" and result["blocking"] is True
+    assert result["errors"] == [FALLBACK_REASON]
+    assert result["per_ac"] == []
+
+
+def test_fail_closed_on_pass_conversion_or_forged_delegation_is_off_by_default_for_direct_calls(single):
+    # The function-level default must stay fail-closed: no opt-in, no delegation.
+    report = _report(single, row_overrides={0: {"exit_code": 1, "status": "fail"}})
+    result = mod.adjudicate_vc_result(
+        contract_snapshot=single.snapshot,
+        current_vc_result=mod.adapt_test_verdict_to_current_vc_result(report)[0],
+        diff_summary=_diff_summary(single),
+        allowed_paths=list(ALLOWED_PATHS),
+        test_verdict=report,
+        expected_issue_number=ISSUE_NUMBER,
+        expected_pr_number=PR_NUMBER,
+    )
+    assert result["overall_status"] == "indeterminate" and result["blocking"] is True
+    assert result["errors"] == ["pr_review_only_current_execution_not_pass:AC1"]
+    assert result["per_ac"] == []
+
+
+def test_fail_closed_on_pass_conversion_or_forged_delegated_row_only_fallback_stays_delegable(tmp_path, mixed):
+    # Existing behaviour is unchanged: when ONLY the delegated pr_review_only row carries fallback_detected,
+    # the ordinary AC is clean and the reviewer dispatch is still permitted (and still not a pass).
+    index = _pr_review_only_index(mixed)
+    report = _report(mixed, row_overrides={index: {"fallback_detected": True}})
+    ws = Workspace(tmp_path, mixed)
+
+    rc, payload = ws.adjudicate(report)
+
+    assert rc == 0, payload
+    assert payload["invoke_pr_reviewer"] is True and payload["reason_code"] is None
+    assert payload["adjudication"]["pr_review_only_nonpass_delegated"] == ["AC2"]
+    stored = ws.stored()
+    assert [entry["status"] for entry in stored["per_ac"]] == ["pass", "indeterminate"]
+    assert [entry["reason_code"] for entry in stored["per_ac"]] == [
+        "expected_fail_resolved_on_current_head",
+        DELEGATED,
+    ]
+    assert _decoded(stored["per_ac"][1])["fallback_detected"] is True
+
+
 def _forge(entry: dict[str, Any], how: str) -> None:
     facts_pass = {
         "exit_code": 0,

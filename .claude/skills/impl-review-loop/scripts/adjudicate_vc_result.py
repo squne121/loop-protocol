@@ -719,6 +719,25 @@ def _runtime_only_current_head_binding_error(
     )
 
 
+def _non_delegated_rows_are_fallback_free(current_vc_result: Any, delegated_keys: frozenset[tuple[str, str]]) -> bool:
+    """Issue #2916: with a delegated non-pass row the report-level
+    ``fallback_detected`` aggregate is not used (the delegated row itself may
+    carry it), so EVERY OTHER row is checked on its own: ``fallback_detected``
+    must be exactly False. A fallback on an ordinary / runtime_only / non-delegated
+    row is never excused by a different row's delegation (no PASS conversion)."""
+    rows = current_vc_result.get("results") if isinstance(current_vc_result, dict) else None
+    if not isinstance(rows, list):
+        return False
+    for row in rows:
+        if not isinstance(row, dict):
+            return False
+        if (row.get("ac"), row.get("command_hash")) in delegated_keys:
+            continue
+        if row.get("fallback_detected") is not False:
+            return False
+    return True
+
+
 # Issue #2912: the pr_review_only INDEPENDENT route binds current-head evidence
 # exactly like runtime_only does (the same helper, so the two cannot drift),
 # but every reason code carries the `pr_review_only_` prefix and the report's
@@ -736,6 +755,7 @@ def _pr_review_only_current_head_binding_error(
     expected_issue_number: Any = None,
     expected_pr_number: Any = None,
     allow_delegated_nonpass: bool = False,
+    delegated_keys: frozenset[tuple[str, str]] = frozenset(),
 ) -> str | None:
     return _current_head_binding_error(
         reason_prefix="pr_review_only",
@@ -749,6 +769,7 @@ def _pr_review_only_current_head_binding_error(
         expected_pr_number=expected_pr_number,
         bind_report_pr_number=True,
         allow_delegated_nonpass=allow_delegated_nonpass,
+        delegated_keys=delegated_keys,
     )
 
 
@@ -957,6 +978,7 @@ def _current_head_binding_error(
     expected_pr_number: Any = None,
     bind_report_pr_number: bool = False,
     allow_delegated_nonpass: bool = False,
+    delegated_keys: frozenset[tuple[str, str]] = frozenset(),
 ) -> str | None:
     """Return a fail-closed reason unless an independent current-head
     binding (Issue / PR / current head / reviewed head / diff
@@ -984,11 +1006,17 @@ def _current_head_binding_error(
         # Issue #2916: at least one executed non-pass item is delegated to the
         # reviewer, so the report-level result must itself be non-pass. A
         # report-level PASS next to a failing row is a failure dressed up as
-        # success and is refused; the recorded fallback fact is not an error here.
+        # success and is refused; the delegated row's own recorded fallback fact is not an error here
+        # (every other row is checked on its own below).
         if current_vc_result.get("status") not in {"fail", "partial"}:
             return f"{reason_prefix}_nonpass_report_result_inconsistent"
         if current_vc_result.get("errors") != []:
             return f"{reason_prefix}_current_vc_result_errors_present"
+        # The report-level fallback aggregate is not used here (the delegated
+        # row may carry the recorded fallback fact); every OTHER row is checked
+        # on its own so no non-delegated row's fallback is excused.
+        if not _non_delegated_rows_are_fallback_free(current_vc_result, delegated_keys):
+            return f"{reason_prefix}_fallback_detected"
     else:
         if current_vc_result.get("status") != "pass":
             return f"{reason_prefix}_current_vc_result_not_pass"
@@ -1059,6 +1087,7 @@ def _current_pass_envelope_is_certified(
     changed_paths_present: bool,
     allowed_paths: list[str],
     allow_delegated_nonpass_aggregate: bool = False,
+    delegated_keys: frozenset[tuple[str, str]] = frozenset(),
 ) -> bool:
     if not isinstance(contract_snapshot, dict) or not isinstance(current_vc_result, dict):
         return False
@@ -1076,7 +1105,9 @@ def _current_pass_envelope_is_certified(
     # OTHER binding check stays. This only certifies the ordinary rows' own
     # envelope (their own exit_code / status are still checked per row).
     if allow_delegated_nonpass_aggregate:
-        aggregate_ok = current_vc_result.get("status") in {"fail", "partial"}
+        aggregate_ok = current_vc_result.get("status") in {"fail", "partial"} and _non_delegated_rows_are_fallback_free(
+            current_vc_result, delegated_keys
+        )
     else:
         aggregate_ok = (
             current_vc_result.get("status") == "pass"
@@ -1615,6 +1646,7 @@ def adjudicate_vc_result(
                 expected_issue_number=expected_issue_number,
                 expected_pr_number=expected_pr_number,
                 allow_delegated_nonpass=bool(delegated_nonpass_keys),
+                delegated_keys=frozenset(delegated_nonpass_keys),
             )
             if binding_error is None:
                 binding_error = _pr_review_only_raw_report_error(test_verdict)
@@ -1660,6 +1692,7 @@ def adjudicate_vc_result(
         changed_paths_present,
         normalized_allowed,
         allow_delegated_nonpass_aggregate=bool(delegated_nonpass_keys),
+        delegated_keys=frozenset(delegated_nonpass_keys),
     )
     # Issue #2467 P0-2 review fix: build per_ac by walking `current_order` in
     # its ORIGINAL (Issue declaration) order, including resolved
