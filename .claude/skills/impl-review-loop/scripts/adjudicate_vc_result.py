@@ -735,6 +735,7 @@ def _pr_review_only_current_head_binding_error(
     allowed_paths: list[str],
     expected_issue_number: Any = None,
     expected_pr_number: Any = None,
+    allow_delegated_nonpass: bool = False,
 ) -> str | None:
     return _current_head_binding_error(
         reason_prefix="pr_review_only",
@@ -747,6 +748,7 @@ def _pr_review_only_current_head_binding_error(
         expected_issue_number=expected_issue_number,
         expected_pr_number=expected_pr_number,
         bind_report_pr_number=True,
+        allow_delegated_nonpass=allow_delegated_nonpass,
     )
 
 
@@ -806,6 +808,109 @@ def _is_pr_review_only_skip_echo(item: dict[str, Any]) -> bool:
 _PR_REVIEW_ONLY_RAW_EXECUTION_FLAGS = ("fallback_detected", "human_review_required", "stop_condition_triggered")
 
 
+# Issue #2916: reviewer delegation of an EXECUTED non-pass pr_review_only item.
+#
+# A non-pass execution fact is never rewritten into PASS and never covered by
+# skip metadata. When (and only when) the caller opts in through
+# ``--delegate-pr-review-only-nonpass``, the independent route records the fact
+# LOSSLESSLY in the existing per_ac ``failure_keys`` field (``{kind, key}``
+# rows; no new schema / key set) and marks the entry
+# ``status: indeterminate`` / ``blocking: true`` with the reason code below.
+# ``evaluate_step4_vc_gate()`` then permits a reviewer DISPATCH for exactly that
+# shape; the AC stays unresolved (``blocking: true``) so dispatch permission is
+# neither AC achievement nor terminal approval. Terminal approval stays the
+# exclusive decision of ``step5_terminal_gate()`` (an ``approved`` reviewer route
+# plus the dispatch / binding / gate checks).
+REASON_PR_REVIEW_ONLY_NONPASS_DELEGATED = "pr_review_only_nonpass_delegated_to_reviewer"
+_NONPASS_FACT_KIND = "pr_review_only_current_execution_fact"
+_NONPASS_FACT_NAMES = (
+    "exit_code",
+    "status",
+    "fallback_detected",
+    "human_review_required",
+    "stop_condition_triggered",
+)
+
+
+def _nonpass_facts_of(item: dict[str, Any]) -> dict[str, Any]:
+    """The per-command execution facts of an adapter-derived current item."""
+    return {name: item.get(name) for name in _NONPASS_FACT_NAMES}
+
+
+def _is_delegable_nonpass_facts(facts: dict[str, Any]) -> bool:
+    """True only for COHERENT executed non-pass facts that a reviewer may judge.
+
+    Delegable: ``fail`` with a non-zero exit, ``skip`` with a non-zero exit
+    (the test-runner's own SKIP, exit 77), or ``pass`` / exit 0 that carries
+    ``fallback_detected: true``. Everything else stays fail-closed: contradictory
+    facts (``pass`` with a non-zero exit, ``fail`` / ``skip`` with exit 0 --
+    these look like a failure dressed up as success), unknown status values,
+    non-bool flags, and any ``human_review_required`` / ``stop_condition_triggered``
+    (explicit human / stop signals are never delegated to the reviewer)."""
+    exit_code = facts.get("exit_code")
+    status = facts.get("status")
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        return False
+    fallback = facts.get("fallback_detected")
+    if not isinstance(fallback, bool):
+        return False
+    if facts.get("human_review_required") is not False or facts.get("stop_condition_triggered") is not False:
+        return False
+    if status in {"fail", "skip"}:
+        return exit_code != 0
+    if status == "pass":
+        return exit_code == 0 and fallback is True
+    return False
+
+
+def _encode_nonpass_facts(facts: dict[str, Any]) -> list[dict[str, str]]:
+    """Lossless ``failure_keys`` rows: ``name=<json value>`` per fact."""
+    return [
+        {"kind": _NONPASS_FACT_KIND, "key": f"{name}={json.dumps(facts.get(name))}"}
+        for name in _NONPASS_FACT_NAMES
+    ]
+
+
+def _decode_nonpass_facts(failure_keys: Any) -> dict[str, Any] | None:
+    """Strict inverse of ``_encode_nonpass_facts``; None when malformed."""
+    if not isinstance(failure_keys, list) or len(failure_keys) != len(_NONPASS_FACT_NAMES):
+        return None
+    facts: dict[str, Any] = {}
+    for row in failure_keys:
+        if not isinstance(row, dict) or row.get("kind") != _NONPASS_FACT_KIND:
+            return None
+        key = row.get("key")
+        if not isinstance(key, str) or "=" not in key:
+            return None
+        name, _, raw = key.partition("=")
+        if name not in _NONPASS_FACT_NAMES or name in facts:
+            return None
+        try:
+            facts[name] = json.loads(raw)
+        except ValueError:
+            return None
+    if set(facts) != set(_NONPASS_FACT_NAMES):
+        return None
+    return facts
+
+
+def _is_valid_delegated_nonpass_entry(entry: Any) -> bool:
+    """Shape check of a persisted per_ac entry that delegates a non-pass
+    execution to the reviewer. A forged / hand-edited entry (facts that are
+    not an executed non-pass, an entry claiming ``pass`` / non-blocking, a
+    missing identity) never opens the Step 4 gate."""
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("reason_code") != REASON_PR_REVIEW_ONLY_NONPASS_DELEGATED:
+        return False
+    if entry.get("status") != "indeterminate" or entry.get("blocking") is not True:
+        return False
+    if not _is_nonempty_string(entry.get("ac")) or not _is_nonempty_string(entry.get("command_hash")):
+        return False
+    facts = _decode_nonpass_facts(entry.get("failure_keys"))
+    return facts is not None and _is_delegable_nonpass_facts(facts)
+
+
 def _pr_review_only_raw_report_error(test_verdict: Any) -> str | None:
     """Fail-closed validation of the RAW TEST_VERDICT_MACHINE/v2 report for the
     independent pr_review_only route (Issue #2912 fix_delta, PR #2924 P2).
@@ -851,6 +956,7 @@ def _current_head_binding_error(
     expected_issue_number: Any = None,
     expected_pr_number: Any = None,
     bind_report_pr_number: bool = False,
+    allow_delegated_nonpass: bool = False,
 ) -> str | None:
     """Return a fail-closed reason unless an independent current-head
     binding (Issue / PR / current head / reviewed head / diff
@@ -874,12 +980,22 @@ def _current_head_binding_error(
 
     if not _is_nonempty_string(current_vc_result.get("generated_at")):
         return f"{reason_prefix}_generated_at_missing"
-    if current_vc_result.get("status") != "pass":
-        return f"{reason_prefix}_current_vc_result_not_pass"
-    if current_vc_result.get("errors") != []:
-        return f"{reason_prefix}_current_vc_result_errors_present"
-    if current_vc_result.get("fallback_detected") is not False:
-        return f"{reason_prefix}_fallback_detected"
+    if allow_delegated_nonpass:
+        # Issue #2916: at least one executed non-pass item is delegated to the
+        # reviewer, so the report-level result must itself be non-pass. A
+        # report-level PASS next to a failing row is a failure dressed up as
+        # success and is refused; the recorded fallback fact is not an error here.
+        if current_vc_result.get("status") not in {"fail", "partial"}:
+            return f"{reason_prefix}_nonpass_report_result_inconsistent"
+        if current_vc_result.get("errors") != []:
+            return f"{reason_prefix}_current_vc_result_errors_present"
+    else:
+        if current_vc_result.get("status") != "pass":
+            return f"{reason_prefix}_current_vc_result_not_pass"
+        if current_vc_result.get("errors") != []:
+            return f"{reason_prefix}_current_vc_result_errors_present"
+        if current_vc_result.get("fallback_detected") is not False:
+            return f"{reason_prefix}_fallback_detected"
     if current_vc_result.get("human_review_required") is not False:
         return f"{reason_prefix}_human_review_required"
     if current_vc_result.get("stop_condition_triggered") is not False:
@@ -942,6 +1058,7 @@ def _current_pass_envelope_is_certified(
     changed_paths: list[str],
     changed_paths_present: bool,
     allowed_paths: list[str],
+    allow_delegated_nonpass_aggregate: bool = False,
 ) -> bool:
     if not isinstance(contract_snapshot, dict) or not isinstance(current_vc_result, dict):
         return False
@@ -954,13 +1071,23 @@ def _current_pass_envelope_is_certified(
     current_head = current_vc_result.get("head_sha")
     reviewed_head = current_vc_result.get("reviewed_head_sha")
     diff_head = diff_summary.get("head_sha")
+    # Issue #2916: when an executed non-pass pr_review_only item is delegated to
+    # the reviewer the report-level result is non-pass by construction; every
+    # OTHER binding check stays. This only certifies the ordinary rows' own
+    # envelope (their own exit_code / status are still checked per row).
+    if allow_delegated_nonpass_aggregate:
+        aggregate_ok = current_vc_result.get("status") in {"fail", "partial"}
+    else:
+        aggregate_ok = (
+            current_vc_result.get("status") == "pass"
+            and current_vc_result.get("fallback_detected") is False
+        )
     return (
         contract_snapshot.get("status") == "go"
         and _is_nonempty_string(contract_sha)
         and _is_nonempty_string(current_vc_result.get("generated_at"))
-        and current_vc_result.get("status") == "pass"
+        and aggregate_ok
         and current_vc_result.get("errors") == []
-        and current_vc_result.get("fallback_detected") is False
         and current_vc_result.get("human_review_required") is False
         and current_vc_result.get("stop_condition_triggered") is False
         and _is_nonempty_string(current_head)
@@ -1260,6 +1387,7 @@ def adjudicate_vc_result(
     require_producer_receipt: bool = False,
     expected_issue_number: Any = None,
     expected_pr_number: Any = None,
+    delegate_pr_review_only_nonpass: bool = False,
 ) -> dict[str, Any]:
     # Issue #1648 fix_delta AC9 (P1-3): a caller that forgets to pass
     # --require-producer-receipt must not silently accept a materialized
@@ -1375,6 +1503,9 @@ def adjudicate_vc_result(
     seen_current_keys: set[tuple[str, str]] = set()
     excluded_current_count = 0
     excluded_current_keys: set[tuple[str, str]] = set()
+    # Issue #2916: (ac, command_hash) keys of executed non-pass pr_review_only
+    # items that are delegated to the reviewer (opt-in, independent route only).
+    delegated_nonpass_keys: set[tuple[str, str]] = set()
     for idx, item in enumerate(current_items):
         norm, errs = _normalize_item(item)
         if norm is None:
@@ -1408,11 +1539,20 @@ def adjudicate_vc_result(
                     errors=[f"pr_review_only_independent_requires_executed_item:{norm['ac']}"],
                 )
             if not _is_pr_review_only_current_execution_pass(norm):
-                return _result(
-                    overall_status="indeterminate", per_ac=[], rerun_required=True,
-                    source_integrity=source_integrity, evidence_refs=evidence_refs,
-                    errors=[f"pr_review_only_current_execution_not_pass:{norm['ac']}"],
-                )
+                # Issue #2916: an EXECUTED, coherent non-pass fact (FAIL / SKIP /
+                # fallback) may be delegated to the reviewer when the caller opted
+                # in. The fact is recorded verbatim below (never PASS, never
+                # covered by skip metadata); anything else keeps failing closed.
+                if not (
+                    delegate_pr_review_only_nonpass
+                    and _is_delegable_nonpass_facts(_nonpass_facts_of(norm))
+                ):
+                    return _result(
+                        overall_status="indeterminate", per_ac=[], rerun_required=True,
+                        source_integrity=source_integrity, evidence_refs=evidence_refs,
+                        errors=[f"pr_review_only_current_execution_not_pass:{norm['ac']}"],
+                    )
+                delegated_nonpass_keys.add(mapping_key)
             excluded_current_count += 1
             excluded_current_keys.add(mapping_key)
             current_order.append({"kind": "pr_review_only", "norm": norm})
@@ -1474,6 +1614,7 @@ def adjudicate_vc_result(
                 allowed_paths=normalized_allowed,
                 expected_issue_number=expected_issue_number,
                 expected_pr_number=expected_pr_number,
+                allow_delegated_nonpass=bool(delegated_nonpass_keys),
             )
             if binding_error is None:
                 binding_error = _pr_review_only_raw_report_error(test_verdict)
@@ -1518,6 +1659,7 @@ def adjudicate_vc_result(
         changed_paths,
         changed_paths_present,
         normalized_allowed,
+        allow_delegated_nonpass_aggregate=bool(delegated_nonpass_keys),
     )
     # Issue #2467 P0-2 review fix: build per_ac by walking `current_order` in
     # its ORIGINAL (Issue declaration) order, including resolved
@@ -1562,6 +1704,26 @@ def adjudicate_vc_result(
     for entry in current_order:
         norm = entry["norm"]
         if entry["kind"] == "pr_review_only":
+            if independent_pr_review_only and (norm["ac"], norm["command_hash"]) in delegated_nonpass_keys:
+                # Issue #2916: the executed non-pass fact is kept verbatim in the
+                # existing ``failure_keys`` field. The entry is NOT a pass: it stays
+                # ``indeterminate`` / ``blocking`` (AC not achieved) and only
+                # marks the item as one the reviewer must judge.
+                per_ac.append(
+                    {
+                        "ac": norm["ac"],
+                        "status": "indeterminate",
+                        "blocking": True,
+                        "command_hash": norm["command_hash"],
+                        "failure_keys": _encode_nonpass_facts(_nonpass_facts_of(norm)),
+                        "reason_code": REASON_PR_REVIEW_ONLY_NONPASS_DELEGATED,
+                        "summary": (
+                            "pr_review_only current-head execution is non-pass; the recorded "
+                            "facts are delegated to pr-reviewer (not AC achievement)"
+                        ),
+                    }
+                )
+                continue
             if independent_pr_review_only:
                 # Issue #2912: the independent route ALWAYS keeps the resolved
                 # entry at its Issue declaration position (like runtime_only),
@@ -1674,7 +1836,13 @@ def adjudicate_vc_result(
         (entry["status"] for entry in per_ac),
         key=lambda status: STATUS_PRIORITY.get(status, STATUS_PRIORITY["indeterminate"]),
     )
-    rerun_required = any(entry["status"] in {"indeterminate", "environment_blocked"} for entry in per_ac)
+    # Issue #2916: a delegated non-pass entry is judged by the reviewer, so a
+    # re-run of Step 2 cannot change it (it never sets rerun_required itself).
+    rerun_required = any(
+        entry["status"] in {"indeterminate", "environment_blocked"}
+        and entry.get("reason_code") != REASON_PR_REVIEW_ONLY_NONPASS_DELEGATED
+        for entry in per_ac
+    )
 
     if not source_integrity["evidence_complete"] and highest in {"pre_existing_fail", "out_of_scope_fail"}:
         highest = "indeterminate"
@@ -1765,16 +1933,37 @@ def evaluate_step4_vc_gate(
     if source_integrity.get("evidence_fresh") is not True:
         return {"invoke_pr_reviewer": False, "reason_code": "adjudication_missing_or_malformed"}
 
-    if adjudication_result.get("blocking") is not False:
+    # Issue #2916: an executed non-pass pr_review_only item delegated to the
+    # reviewer is the ONLY shape allowed to coexist with ``blocking: true``. It
+    # permits a reviewer DISPATCH only: the persisted adjudication keeps
+    # ``overall_status: indeterminate`` / ``blocking: true`` (the AC is not
+    # achieved) and terminal approval still needs step5_terminal_gate().
+    has_delegated = any(
+        isinstance(entry, dict) and entry.get("reason_code") == REASON_PR_REVIEW_ONLY_NONPASS_DELEGATED
+        for entry in per_ac
+    )
+    if has_delegated:
+        if (
+            adjudication_result.get("overall_status") != "indeterminate"
+            or adjudication_result.get("blocking") is not True
+        ):
+            return {"invoke_pr_reviewer": False, "reason_code": "adjudication_ac_not_resolved"}
+    elif adjudication_result.get("blocking") is not False:
         return {"invoke_pr_reviewer": False, "reason_code": "adjudication_blocking_true"}
 
     for entry in per_ac:
+        if isinstance(entry, dict) and entry.get("reason_code") == REASON_PR_REVIEW_ONLY_NONPASS_DELEGATED:
+            if not _is_valid_delegated_nonpass_entry(entry):
+                return {"invoke_pr_reviewer": False, "reason_code": "adjudication_ac_not_resolved"}
+            continue
         if not isinstance(entry, dict) or entry.get("status") not in {
             "pass",
             "pre_existing_fail",
             "out_of_scope_fail",
         }:
             return {"invoke_pr_reviewer": False, "reason_code": "adjudication_ac_not_resolved"}
+        if has_delegated and entry.get("blocking") is not False:
+            return {"invoke_pr_reviewer": False, "reason_code": "adjudication_blocking_true"}
 
     if source_integrity.get("head_sha") != expected_head_sha:
         return {"invoke_pr_reviewer": False, "reason_code": "head_mismatch"}
@@ -1998,6 +2187,7 @@ def step4_adjudicate(
     expected_pr_number: Any = None,
     require_producer_receipt: bool = False,
     reuse_stored: bool = False,
+    delegate_pr_review_only_nonpass: bool = False,
 ) -> tuple[int, dict[str, Any]]:
     """adapt -> adjudicate -> persist -> gate in a single process (Issue #2837).
 
@@ -2068,6 +2258,7 @@ def step4_adjudicate(
                 require_producer_receipt=require_producer_receipt,
                 expected_issue_number=expected_issue_number,
                 expected_pr_number=expected_pr_number,
+                delegate_pr_review_only_nonpass=delegate_pr_review_only_nonpass,
             )
             for extra in (
                 contract_snapshot_errors,
@@ -2084,6 +2275,15 @@ def step4_adjudicate(
                 "blocking": adjudication["blocking"],
                 "errors": list(adjudication["errors"]),
             }
+            delegated_acs = [
+                entry["ac"]
+                for entry in adjudication["per_ac"]
+                if entry.get("reason_code") == REASON_PR_REVIEW_ONLY_NONPASS_DELEGATED
+            ]
+            if delegated_acs and not adjudication["errors"]:
+                # Issue #2916: tell the root that a reviewer dispatch (if opened)
+                # is a delegation of recorded non-pass facts, not an AC pass.
+                summary["pr_review_only_nonpass_delegated"] = delegated_acs
 
     step4_persist_vc_adjudication(
         loop_state,
@@ -2466,6 +2666,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="adapt: path to write the converted baseline_vc_preflight/v1 JSON (default: stdout).",
     )
     parser.add_argument(
+        "--delegate-pr-review-only-nonpass",
+        action="store_true",
+        help=(
+            "step4-adjudicate (Issue #2916, opt-in): on the independent pr_review_only "
+            "route, record an EXECUTED non-pass item (FAIL / SKIP / fallback; the facts "
+            "are kept verbatim in per_ac failure_keys, never rewritten to PASS) and allow "
+            "a pr-reviewer DISPATCH. The AC stays blocking / unresolved and terminal "
+            "approval still needs step5-terminal-gate. Without this flag a non-pass "
+            "pr_review_only execution fails closed (pr_review_only_current_execution_not_pass)."
+        ),
+    )
+    parser.add_argument(
         "--reuse-stored",
         action="store_true",
         help=(
@@ -2823,6 +3035,7 @@ def _run_step4_adjudicate(args: argparse.Namespace) -> int:
         expected_issue_number=args.expected_issue_number,
         expected_pr_number=args.expected_pr_number,
         require_producer_receipt=args.require_producer_receipt,
+        delegate_pr_review_only_nonpass=args.delegate_pr_review_only_nonpass,
     )
     failed = _persist_loop_state_or_report(args, loop_state, invalidate_on_failure=True)
     if failed is not None:
