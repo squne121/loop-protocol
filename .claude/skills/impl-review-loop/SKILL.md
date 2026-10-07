@@ -239,7 +239,17 @@ control-plane は次の production CLI（`body_only_repair_plan.py` の `plan` /
    uv run --locked python3 .claude/skills/impl-review-loop/scripts/body_only_repair_plan.py record --loop-state-file <LOOP_STATE file> --state no_mutation
    ```
 
-5. 書込み後に control-plane が live の head と body を `gh pr view <N> --repo <owner/repo> --json headRefOid,body,updatedAt` で readback し、`verify_body_readback` の判定（HEAD が `expected_head_sha` から不変、かつ canonicalize 後（CRLF→LF、末尾改行除去）の readback body が completed body と一致）が `ok` であることを確認する。`ok` でなければ terminal approval に進まず通常 routing に従う。この時点の `updatedAt` を body edit の causality watermark（`body_edit_updatedAt`）として **1 回だけ**取得する。
+5. 書込み後に control-plane が readback する。`verify_body_readback` には CLI が無いため、同じ判定（HEAD が不変、かつ canonicalize 後（CRLF→LF、末尾改行除去）の live body が completed body と一致）を `guard` で等価に表現する。`--expected-head-sha` に不変の head（`plan` の `expected_head_sha`）、`--expected-live-body-sha256` に **`body_file_sha256`**（completed body の canonical hash）を渡し、live の head / body は CLI 自身が `gh pr view` で取得して照合させる。この `guard` が exit 0 で通ることが readback `ok` の条件で、exit 非 0 の場合は terminal approval に進まず通常 routing に従う。
+
+   ```bash
+   uv run --locked python3 .claude/skills/impl-review-loop/scripts/body_only_repair_plan.py guard \
+     --repo <owner/repo> --pr-number <N> \
+     --expected-head-sha <不変の head（plan の expected_head_sha）> \
+     --expected-live-body-sha256 <body_file_sha256> \
+     --body-file <body_file_path> --body-file-sha256 <body_file_sha256>
+   ```
+
+   readback が `ok` の時点で `gh pr view <N> --repo <owner/repo> --json updatedAt --jq .updatedAt` の値を body edit の causality watermark（`body_edit_updatedAt`）として **1 回だけ**取得する。
 6. post-edit required CI の fresh 判定: PR body の `edited` で同一 head の required check が再起動されるため、unchanged head で `wait_ci_checks.py --required` を再実行し、その出力を `ci-freshness` で判定する。この 2 つを **間隔 15 秒・合計 1800 秒の deadline** までの loop として実行する（固定 sleep で済ませず、`wait_ci_checks.py` の既存 polling を使う）。
 
    ```bash

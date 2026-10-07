@@ -777,6 +777,24 @@ def test_ac4_each_file_orders_record_worker_guard_readback_ci_and_reuse_stored(p
 
 
 @pytest.mark.parametrize("path", DOC_FILES)
+def test_ac4_each_file_expresses_the_readback_equivalently_with_guard_on_the_body_file_hash(path: Path) -> None:
+    section = _lane_section(path.read_text(encoding="utf-8"))
+    order = _order_part(section)
+    readback = _cli_block(order[order.index("verify_body_readback") :], f"{PRODUCTION_CLI} guard")
+    required, _optional = _subparser_flags("guard")
+
+    assert "CLI が無い" in order  # verify_body_readback に CLI が無いため guard で等価に表す
+    for flag in required:
+        assert flag in readback, flag
+    # readback は completed body の canonical hash（body_file_sha256）を期待 live body hash として照合する。
+    assert re.search(r"--expected-live-body-sha256 <body_file_sha256>", readback)
+    assert re.search(r"--expected-head-sha <不変の head", readback)
+    assert "exit 0 で通ること" in order and "readback `ok` の条件" in order
+    # この readback は dispatch 後（worker request の後）、CI watermark の取得より前に置く。
+    assert order.index("IMPLEMENTATION_WORKER_REQUEST_V2:") < order.index(readback) < order.index("body_edit_updatedAt")
+
+
+@pytest.mark.parametrize("path", DOC_FILES)
 def test_ac4_each_file_documents_the_worker_request_body_file_fields(path: Path) -> None:
     section = _lane_section(path.read_text(encoding="utf-8"))
     request = re.search(r"IMPLEMENTATION_WORKER_REQUEST_V2:\n(.*?)```", section, re.S)
