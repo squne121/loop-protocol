@@ -79,6 +79,9 @@ frontmatter 直下の説明と同一の要旨）:
 > discovery の lane は session で実際に使える tool に従う。専用の Grep / Glob tool が使えるなら、それだけを使い、
 > `path` に `<root>` 配下の絶対 path を明示する。専用の Grep / Glob が使えない（`No such tool available` になる）
 > 場合は、Bash の `find` / `grep` で discovery する。専用 Grep / Glob が無いこと自体を理由に high にしない。
+> 専用の Grep / Glob の呼び出しが 1 回でも `No such tool available` になったら、以後は専用 tool を再試行せず、
+> Bash lane だけで discovery する（失敗した専用 tool の呼び出しも search call として数えられる）。Bash lane は
+> eligible な `grep -rl --include=<glob> <named symbol> <root 配下の絶対 path>` から始めることを推奨する。
 > reviewer 区間で許される Bash は、(1) の root 解決 command、(2) の HEAD 解決 command、eligible な find / grep の
 > 3 種類だけである。これ以外の Bash（`rg` / `ugrep` / `git grep` / `git ls-files` / `ls -R` / `env grep` /
 > `timeout 5 grep` / `cd <root> && grep` / `xargs grep` / `cat` / `sed` を含む）はすべて契約違反である。
@@ -89,7 +92,10 @@ frontmatter 直下の説明と同一の要旨）:
 > find は `-type` `-name` `-iname` `-path` `-maxdepth` `-o` だけを使う（`-exec` `-delete` 等は禁止）。
 > 出力を小さく保つため、grep は `-l` と `--include=` / `--exclude-dir=` を併用することを推奨する。
 > 検索 query は、Grep / grep では未解決 role の named symbol を、Glob / find（`-name` / `-iname` / `-path`）では
-> 未解決 role の file 名断片を含める。
+> 未解決 role の file 名断片を含める。いずれも pinned body に書かれた文字列を verbatim で使い、推測した名前を使わない
+> （grep の pattern は未解決 role の named symbol、Glob / find の name / path pattern は body が挙げる file 名断片）。
+> 複数 role・fixture・Issue に共通する prefix だけの pattern（例 `*<共通 prefix>*`）は、どの未解決 role の file 名断片でも
+> ないため関連しない検索であり、契約違反になるうえ 8 回の search budget も消費する。
 > 成功した検索結果に target source の path が現れてから、その file を Read する。同名 symbol を持つ decoy が
 > あり得るため、最初の hit を盲目的に Read せず、decision-critical consumer の import / call-site から target を
 > 確定する。検索は専用 Grep / Glob と eligible な Bash find / grep の合計 8 回以内（`DISCOVERY_SEARCH_CALL_MAX: 8`）、
@@ -170,7 +176,9 @@ matcher に新しい検証責務を置く設計）がある場合に限り、`se
   取得、その他の任意 Bash）は discovery 成功と認めず、search call として数えたうえで違反とする。root / HEAD の
   解決 command は non-discovery であり search bound に算入しない。
 - **検索の関連性と因果**: grep 系（専用 Grep と Bash grep）の pattern は path 未解決 role の named symbol を、
-  Glob と Bash find（`-name` / `-iname` / `-path`）は path 未解決 role の file 名断片を含める。関連しない検索、
+  Glob と Bash find（`-name` / `-iname` / `-path`）は path 未解決 role の file 名断片を含める。いずれも pinned body に
+  書かれた文字列を verbatim で使う。複数 role・fixture・Issue に共通する prefix だけの pattern（例 `*<共通 prefix>*`）は
+  どの未解決 role の file 名断片でもないため関連しない検索であり、8 回の search budget を消費する。関連しない検索、
   および path を明記済みの role だけに関連する検索は違反とする。成功した（error ではない）検索結果に target
   source の path が現れてから、その file を Read する（grep では hit した file の path、Glob / find では結果の
   path 行として現れることを要する）。検索結果が error の eligible call は bound に算入されるが discovery の
@@ -179,7 +187,9 @@ matcher に新しい検証責務を置く設計）がある場合に限り、`se
   decoy ではない target を確定する。
 - **path 未記載それ自体は high にしない**: discovery で必要な source が見つかった場合は通常どおり audit し、
   path が未記載であること自体、および専用 Grep / Glob が session tool pool に無いこと自体を理由に high にしない
-  （Bash lane で続行する）。bounded discovery（いずれの lane でも）を尽くしても必要な source を発見・
+  （Bash lane で続行する。専用 Grep / Glob が 1 回でも `No such tool available` になったら以後は専用 tool を再試行せず、
+  eligible な `grep -rl --include=<glob> <named symbol> <root 配下の絶対 path>` から始まる Bash lane だけを使う。失敗した
+  専用 tool の呼び出しも search call として数えられる）。bounded discovery（いずれの lane でも）を尽くしても必要な source を発見・
   観測できなかった場合に限り `assessment: clear` にせず、観測できなかった symbol と試行した検索を
   `evidence_refs` に残して high 以上の finding にする（上の「観測不能は clear にしない」と整合する）。
 - **clear の条件**: `assessment: clear` は必要な source をすべて観測できた場合に限る。schema は clear で

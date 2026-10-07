@@ -1615,3 +1615,35 @@ def test_artifact_tool_use_summary_includes_search_tools_and_is_sanitized() -> N
     home.grep("fn_evaluator_zz", "/home/someone/secret/path.py", path=f"{ROOT}/x")
     summary = NEW.summarize_tool_uses(home.stop().agent_result().final().text(), ROOT, INV)
     assert "/home/" not in json.dumps(summary) and "<HOME>" in json.dumps(summary)
+
+
+@pytest.mark.parametrize("kind", ["negative", "positive"])
+def test_fixture_wide_shared_prefix_queries_observed_in_live_runs_remain_irrelevant_violations(kind: str) -> None:
+    """live run で観測された Glob `**/*<prefix>*` と find `-name "*<prefix>*"` は、fixture 全体で共通する prefix
+    だけの query であり、どの未解決 role の file 名断片でもないため違反のまま（evaluator を緩めない）。"""
+    prefix = NEW.FIXTURE_DIRS[kind][1]
+    roles = NEW.fixture_roles(kind)
+    unresolved = NEW._unresolved_roles(roles)
+    assert unresolved
+    for role in unresolved.values():
+        assert prefix in role["file_fragment"] and role["file_fragment"] != prefix
+
+    def classify(name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
+        tool_use = {"id": "toolu_x", "name": name, "stream_index": 1, "input": tool_input}
+        return NEW.classify_interval_tool_use(
+            tool_use, resolved_root=ROOT, invocation_dir=INV, body_file="body.md", unresolved_roles=unresolved
+        )
+
+    glob = classify("Glob", {"path": ROOT, "pattern": f"**/*{prefix}*"})
+    assert glob["violation"] == "irrelevant_query:Glob" and glob["counted_as_search"] is True
+    assert glob["classification"] == "non_discovery"
+    find = classify("Bash", {"command": f'find {ROOT} -type f -name "*{prefix}*"'})
+    assert find["violation"] == "irrelevant_query:Bash:find" and find["counted_as_search"] is True
+    assert find["classification"] == "non_discovery"
+    # 対照: role の file 名断片を verbatim で含めれば関連する検索として認定される。
+    fragment = next(iter(unresolved.values()))["file_fragment"]
+    assert classify("Glob", {"path": ROOT, "pattern": f"**/{fragment}*"})["violation"] is None
+    assert classify("Bash", {"command": f'find {ROOT} -type f -name "{fragment}*"'})["violation"] is None
+    symbol = next(iter(unresolved.values()))["symbol"]
+    eligible_grep = classify("Bash", {"command": f"grep -rl --include=*.py {symbol} {ROOT}"})
+    assert eligible_grep["violation"] is None and eligible_grep["classification"] == "bash_lane_discovery"

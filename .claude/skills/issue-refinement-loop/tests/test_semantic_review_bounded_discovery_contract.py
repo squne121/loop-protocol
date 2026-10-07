@@ -740,3 +740,57 @@ def test_reviewer_frontmatter_unchanged_from_origin_main() -> None:
     assert _frontmatter_block(completed.stdout) == _frontmatter_block(_read(_AGENT_PATH))
     # 対照: body は本 Issue で変更されている（frontmatter 比較が vacuous でないこと）。
     assert "path 未列挙 role の bounded discovery（#2973）" in _read(_AGENT_PATH)
+
+
+def test_prompt_and_section_require_bash_lane_start_and_role_specific_query_patterns() -> None:
+    """fix_delta iteration 2: 専用 tool 不在時は Bash lane へ直行する。
+
+    query pattern は未解決 role の body 記載文字列に限り、fixture / Issue 共通 prefix だけの pattern は違反で
+    budget を消費する。prompt の文言と evaluator の relevance 規則は一対一に対応する。"""
+    for name in _DOCS:
+        scopes = _scopes(name)
+        _assert_needles(
+            f"{name} prompt",
+            scopes["prompt"],
+            (
+                "専用の Grep / Glob の呼び出しが 1 回でも `No such tool available` になったら、",
+                "以後は専用 tool を再試行せず",
+                "Bash lane だけで discovery する",
+                "失敗した専用 tool の呼び出しも search call として数えられる",
+                "`grep -rl --include=<glob> <named symbol> <root 配下の絶対 path>` から始めることを推奨する",
+                "pinned body に書かれた文字列を verbatim で使い、推測した名前を使わない",
+                "grep の pattern は未解決 role の named symbol",
+                "Glob / find の name / path pattern は body が挙げる file 名断片",
+                "複数 role・fixture・Issue に共通する prefix だけの pattern（例 `*<共通 prefix>*`）",
+                "関連しない検索であり、契約違反になるうえ 8 回の search budget も消費する",
+                "Bash の `find` / `grep` で discovery する",
+                "reviewer 区間で許される Bash は、(1) の root 解決 command、(2) の HEAD 解決 command、"
+                "eligible な find / grep の 3 種類だけである",
+            ),
+        )
+        _assert_needles(
+            f"{name} section",
+            scopes["section"],
+            (
+                "専用 Grep / Glob が 1 回でも `No such tool available` になったら以後は専用 tool を再試行せず",
+                "`grep -rl --include=<glob> <named symbol> <root 配下の絶対 path>` から始まる Bash lane だけを使う",
+                "失敗した専用 tool の呼び出しも search call として数えられる",
+                "pinned body に書かれた文字列を verbatim で使う",
+                "複数 role・fixture・Issue に共通する prefix だけの pattern（例 `*<共通 prefix>*`）",
+                "どの未解決 role の file 名断片でもないため関連しない検索であり、8 回の search budget を消費する",
+                "固定値",  # bound の固定値節は残る
+            ),
+        )
+        # 新しい heading は追加しない（既存の単一 Consumer-audit section の拡張のみ）。
+        assert _flat(_read(_DOCS[name])).count("観測できなかった path と理由") == 1, name
+    # 推奨例の command は eligible 形状として evaluator が実際に受理し、固定 bound は 8 / 8 のまま。
+    root = "/synthetic/root"
+    parsed = EVAL.parse_bash_search(f"grep -rl --include=*.py SymA {root}", root)
+    assert parsed["reason"] is None and parsed["scope_violation"] is None and parsed["cmd"] == "grep"
+    assert (EVAL.DISCOVERY_SEARCH_CALL_MAX, EVAL.DISCOVERY_SOURCE_READ_MAX) == (8, 8)
+    # relevance 規則の evaluator 側: 全 role の symbol / file 名断片だけが関連する（fixture 共通 prefix は無関係）。
+    for kind in ("negative", "positive"):
+        prefix = EVAL.FIXTURE_DIRS[kind][1]
+        for role in EVAL.fixture_roles(kind).values():
+            assert not EVAL._query_matches_role({"kind": "fragment", "texts": [f"**/*{prefix}*"]}, role)
+            assert EVAL._query_matches_role({"kind": "fragment", "texts": [f"**/{role['file_fragment']}*"]}, role)
