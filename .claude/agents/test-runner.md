@@ -368,6 +368,26 @@ TEST_VERDICT:
 - 推測値・固定値（上の例の値を含む）・root の受領時刻や委譲時刻による代用は禁止する。取得に失敗した場合は値を作らず、`generated_at` を欠落させたまま `result` を `PASS` にしない（consumer は空文字・欠落を fail-closed にする）。
 - `date` はこの 1 形以外を実行しない。
 
+### `runtime_ac_results[]` 行に追加できる任意項目 `test_count` の導出規則（Issue #2971）
+
+pytest 系 command の行に限り、optional field `test_count: {subject, passed}` を追加してよい。これは上記の field grammar と machine-valid example（いずれも変更しない）に対する追加の任意 field であり、既存 field の意味・必須性は変えない。この field を欠いた行・持つ行のどちらも、`adjudicate_vc_result.py` の既存の判定（行の既知 field の判定）は同一である。`impl-review-loop` の body-only lane（`body_only_repair_plan.py plan`）は、この field を test 件数の subject 束縛された evidence として読む。
+
+導出規則（機械的な写しだけを行う。推測しない）:
+
+- `passed`: 当該 command の出力の **最終 summary 行**（例: `12 passed in 0.45s`）の `<N> passed` の `N`（非負整数）をそのまま写す。
+- `subject`: 当該 command が pytest に渡した対象 selector（path / node id / `-k` 式。command 文字列に現れるものを逐語で写した文字列）。pytest 全体の件数を別の subject に流用しない（subject は行の command に固有）。
+- 省略する場合: 最終 summary 行に `failed` / `error` を含む、command が pytest 系でない、最終 summary 行を解釈できない、selector を command から写せない場合は field を **省略**する（値を作らない）。
+- `notes` の自然言語や他の行・reviewer の記述から `test_count` を導出しない（`notes` に件数を書いても evidence にならない）。
+
+説明用の書式（machine-valid example ではない。`...` は同じ行の既存 field を表す）:
+
+```text
+    - ac: "AC10"
+      command: "uv run --locked pytest .claude/skills/<skill>/tests/test_x.py -q"
+      ...（既存 field）
+      test_count: {subject: ".claude/skills/<skill>/tests/test_x.py", passed: 12}
+```
+
 ### Step 2 委譲契約（`(ac, command, command_hash)` の逐語 echo）
 
 Step 2（`impl-review-loop` の `step-2-verification.md`）の独立実行では、root が baseline classification 由来の `(ac label, literal command, command_hash)` の組を渡す。consumer（`adjudicate_vc_result.py`）は baseline と current を `(ac, command_hash)` の組で対応付けるため、次を守る。

@@ -94,6 +94,14 @@ IMPLEMENTATION_WORKER_REQUEST_V2:
   expected_head_sha: <sha>     # race guard 用 — update_branch mode では必須（なければ実行しない）
   reviewed_head_sha: <sha>     # impl-review-loop が review した時点の head SHA（任意）
 
+# update_pr_body_hygiene mode 追加フィールド（body-only hygiene 用。すべて optional。Issue #2971）:
+# body_file_path: <path>             # 書き込む completed body file（control-plane が body_only_repair_plan.py plan で生成した値）
+# body_file_sha256: <sha256>         # body file の canonical SHA-256（`sha256:` prefix なしの 64 桁 hex）
+# expected_live_body_sha256: <sha256> # plan 時点の live PR body の canonical SHA-256（mutation 直前 guard の照合値）
+# 上記 field のいずれかを伴う update_pr_body_hygiene では、expected_head_sha と issue_number を必須とする
+# （issue_number は update_pr.py の --linked-issue へ渡す）。これらの field を伴わない既存の update_pr_body_hygiene
+# （ensure_closing_keyword 等）の semantics は変更しない。
+
 # apply_pr_review_fix_delta mode 追加フィールド:
 # review_artifact_ref: <pr_review_comment_url または pr_review_id>
 # reviewed_head_sha: <sha>           # review が行われた時点の SHA
@@ -125,7 +133,7 @@ unknown kind（上記以外）は routing が確定しないため、実行せ�
 ```yaml
 IMPLEMENTATION_WORKER_RESULT_V2:
   status: ok | failed | blocked | permission_blocked
-  reason_code: null | expected_head_sha_missing | expected_head_sha_mismatch | primary_rate_limit | secondary_rate_limit | validation_failed | permission_denied | head_unchanged_after_accepted | unexpected_head_change | transport_error | unknown_http_status
+  reason_code: null | expected_head_sha_missing | expected_head_sha_mismatch | primary_rate_limit | secondary_rate_limit | validation_failed | permission_denied | head_unchanged_after_accepted | unexpected_head_change | transport_error | unknown_http_status | live_body_hash_mismatch
   # reason_code は update_branch エラー時の fail-closed 分類を表す:
   #   expected_head_sha_missing:        expected_head_sha 未指定
   #   expected_head_sha_mismatch:       preflight または 422 で head SHA mismatch
@@ -137,6 +145,7 @@ IMPLEMENTATION_WORKER_RESULT_V2:
   #   unexpected_head_change:           202 Accepted 後 head は変化したが expected_head_sha / base SHA の祖先関係を検証できず fail-closed（#1429 iteration-1 P1-2）
   #   transport_error:                  HTTP status 抽出不能 / gh transport error
   #   unknown_http_status:              上記以外の HTTP status
+  #   live_body_hash_mismatch:          body-only hygiene の pre-mutation guard で、live PR body の canonical hash が expected_live_body_sha256 と異なる、または body file の canonical hash が body_file_sha256 と異なる（overwrite せず blocked。Issue #2971）
   #   null:                       エラーなし（status: ok）
   mode: update_pr_body_hygiene | update_branch | apply_pr_review_fix_delta
   action_kind: <kind>          # REQUEST_V2.required_auto_action.kind を echo
@@ -189,6 +198,37 @@ uv run python3 .claude/skills/open-pr/scripts/update_pr.py \
 
 validator が fail を返した場合（`update_pr.py` が exit 1）、PR body を更新しない。
 `IMPLEMENTATION_WORKER_RESULT_V2.status: failed`、`wrapper_used: true`、`errors` に validator エラーを記録して返す。
+
+### body-only hygiene の pre-mutation guard（`body_file_path` 等を伴う場合、Issue #2971）
+
+`impl-review-loop` の body-only lane は、`body_only_repair_plan.py plan` が生成した completed body file を、既存の `update_pr_body_hygiene` mode で適用する。request が `body_file_path` / `body_file_sha256` / `expected_live_body_sha256` のいずれかを伴う場合に限り、次を守る（これらを伴わない既存の `update_pr_body_hygiene` の挙動・wrapper 強制ルール・validator failure 時の挙動は変えない）。
+
+- **必須入力**: `expected_head_sha` と `issue_number`（`update_pr.py --linked-issue` へ渡す）、および `body_file_path` / `body_file_sha256` / `expected_live_body_sha256` が必要。`expected_head_sha` 未指定は `status: blocked` / `reason_code: expected_head_sha_missing`、`body_file_sha256` / `expected_live_body_sha256` の欠落は照合不能のため fail-closed で `status: blocked` / `reason_code: live_body_hash_mismatch`、`issue_number` 欠落は `status: blocked` / `reason_code: validation_failed`（`errors` に欠落 field 名を記録）とし、いずれも mutation しない。
+- **実行場所**: control-plane が cwd として与える対象 PR の implementation worktree で実行する（worktree の新規作成は不要。`update_pr.py` による changed paths の解決方法は既存の `update_pr_body_hygiene` と同一で、変更しない）。
+- **mutation 直前の guard**: `update_pr.py` を呼ぶ **直前**に、worker 自身が次の `guard` を実行する（live の head / body は CLI 自身が `gh pr view` で取得する。worker が gh 呼出しを即興しない）。`--repo` は `update_pr.py` の `--repo` 省略時と同じく cwd の git remote から解決した `owner/repo` を使う。
+
+```bash
+uv run --locked python3 .claude/skills/impl-review-loop/scripts/body_only_repair_plan.py guard \
+  --repo "$REPO" --pr-number "$PR_NUMBER" \
+  --expected-head-sha "$EXPECTED_HEAD_SHA" \
+  --expected-live-body-sha256 "$EXPECTED_LIVE_BODY_SHA256" \
+  --body-file "$BODY_FILE_PATH" --body-file-sha256 "$BODY_FILE_SHA256"
+```
+
+- **guard の結果**: exit 0（`proceed`）の場合だけ、body file を **一切改変せず**（再生成・整形・追記・置換をしない）既存の wrapper へそのまま渡す。
+
+```bash
+uv run python3 .claude/skills/open-pr/scripts/update_pr.py \
+  --pr-number "$PR_NUMBER" \
+  --body-file "$BODY_FILE_PATH" \
+  --linked-issue "$ISSUE_NUMBER"
+```
+
+  - live head が `expected_head_sha` と異なる場合は overwrite せず `status: blocked` / `reason_code: expected_head_sha_mismatch` / `wrapper_used: false`（`before_head_sha` に guard が返した live head を記録）。
+  - live body の canonical hash が `expected_live_body_sha256` と異なる、または body file の canonical hash が `body_file_sha256` と異なる場合は overwrite せず `status: blocked` / `reason_code: live_body_hash_mismatch` / `wrapper_used: false`。
+  - guard が runtime error（exit 2。`gh pr view` 失敗等）の場合も overwrite せず `status: failed` / `reason_code: transport_error` / `wrapper_used: false` を返し、`errors` に記録する。
+  - guard が `proceed` で `update_pr.py` に到達した後の validator failure は、既存どおり `status: failed` / `wrapper_used: true`。成功時は `status: ok` / `wrapper_used: true`、`rerun_required.verification: false`（HEAD 不変）/ `rerun_required.pr_review: true` を返す。
+- **best-effort の限界**: GitHub に PR body の compare-and-swap は無く、この guard は best-effort の optimistic guard である。guard 通過後から `update_pr.py` の全置換までの race window は残り、その間に他 actor が行った編集は失われ得る。lost update の絶対防止は主張せず、lock / approval layer は追加しない。`update_pr.py` と `gh pr edit --body-file` の直接呼出し禁止（wrapper 強制ルール）は引き続き適用する。
 
 ## update_branch mode（ブランチ更新モード）
 
