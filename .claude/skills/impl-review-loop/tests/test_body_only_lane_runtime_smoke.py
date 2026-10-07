@@ -12,6 +12,7 @@ unavailable）は **skip ではなく fail** として扱う（runtime AC の PA
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -66,6 +67,9 @@ def _runner_argv() -> list[str]:
 def test_ac8_body_only_lane_dry_run_skill_invocation_emits_ordered_markers() -> None:
     assert (ROOT / PROMPT_FILE).is_file()
     assert RUNNER.is_file()
+
+    # runner は --output-dir の exclusive create を要求する。前回実行の同名 artifact（git-ignored）だけを消す。
+    shutil.rmtree(ROOT / OUTPUT_DIR, ignore_errors=True)
 
     result = subprocess.run(
         _runner_argv(),
