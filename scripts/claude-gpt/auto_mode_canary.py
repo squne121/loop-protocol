@@ -4053,7 +4053,7 @@ def run_github_mutation_canary() -> tuple[int, dict]:
 
 
 def _sut_revision() -> dict:
-    main_sha = "unknown"
+    checkout_head_sha = "unknown"
     try:
         result = subprocess.run(
             ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
@@ -4062,7 +4062,7 @@ def _sut_revision() -> dict:
             timeout=10,
         )
         if result.returncode == 0:
-            main_sha = result.stdout.strip()
+            checkout_head_sha = result.stdout.strip()
     except OSError:
         pass
 
@@ -4078,7 +4078,7 @@ def _sut_revision() -> dict:
         return combined.splitlines()[0] if combined else "unknown"
 
     return {
-        "main_sha": main_sha,
+        "checkout_head_sha": checkout_head_sha,
         "launcher_sha256": _sha256_file(SCRIPT_DIR / "launch.sh"),
         "claude_version": _version("claude", "--version"),
         # Issue #2949: PATH 上の local claude-code-proxy binary の version は接続先 server の
