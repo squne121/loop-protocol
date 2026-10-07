@@ -38,12 +38,13 @@ reviewer_verdict（`verdict`/`reviewed_head_sha`/`blockers`/`warnings`）と liv
 | `route_to_update_branch` | 合成された `update_branch` action を worker に委譲し、検証・PR review を再実行（終了しない） |
 | `route_scope_clean_reconciliation`（#2102） | main drift による base-bound evidence の選択的失効を実行してから Step 5 を resume する（終了しない。手順は下記「main drift の scope-clean reconciliation 再開（resume）手順」参照） |
 | `route_stale_head_rereview` | 現在 head で PR review を再実行（終了しない） |
+| body-only lane（`REQUEST_CHANGES` かつ `decide_body_only_repair` が eligible。`conflict_hard_stop` / `already_satisfied` / `route_to_update_branch` のいずれにも一致しなかった場合のみ評価。下記「body-only lane」節） | iteration を消費せず、`iteration` が `max_iterations` 未満・到達のどちらでも `continue_loop` に優先して body-only repair → fresh pr-review → `step5-terminal-gate`（終了しない） |
 | `continue_loop` | LOOP_STATE.iteration += 1、Step 1 に戻る（blockers を fix_delta として渡す） |
 | `already_satisfied`（#2607。`step-5-mergeability-handling.md` の「already_satisfied recovery route」参照） | `termination_reason: already_satisfied` を立て、終了処理へ。`decision.selected_action` の `result`/`recommendation` を報告するのみで、PR/Issue の close 等の mutation は実行しない |
 | `route_human_escalation` | `termination_reason: human_escalation` を立て、即停止（`HUMAN_REVIEW_REQUIRED` verdict、または max iteration 到達・secret/protected-path gate 等の実 hard gate の場合のみ） |
 | `conflict_hard_stop` | CONFLICTING PR Escalation Runbook 発動（actual conflict のみ。#1860 Owner Decision の唯一の hard stop） |
 | `fail_closed`（`mergeability_unknown` / `merge_state_status_*_not_conflict_defer_to_ci_evaluator`） | warning として記録し、bounded retry または次サイクルでの current-head CI / branch-protection 再評価に委ねる（human escalation にはしない） |
-| `fail_closed`（`LOOP_STATE.iteration >= LOOP_STATE.max_iterations`） | `termination_reason: max_iterations` を立て、fail-close で人間判断 |
+| `fail_closed`（`LOOP_STATE.iteration >= LOOP_STATE.max_iterations`。`decide_body_only_repair` が eligible の body-only lane を除く） | `termination_reason: max_iterations` を立て、fail-close で人間判断 |
 | `fail_closed`（`concurrent_base_churn_budget_exhausted`） | `evidence_epoch.drift_rebind_attempts` が上限（既定 2、#2039/#1023 の bounded no-progress budget と同じ考え方）を超過。drift 起因の再試行を打ち切り `termination_reason: human_escalation` ではなく機械的な fail-closed 停止として人間判断を仰ぐ（#2102） |
 
 ### terminal approval は `step5-terminal-gate` 経由に固定する（Issue #2837）
@@ -146,12 +147,120 @@ semantic planning・overlap・contract snapshot・body SHA・artifact 異常に�
 
 body-only な自動修正（`update_pr_body_hygiene`、reference authority entrypoint が `closing_required` を返した場合に限る `ensure_closing_keyword` 追加等）が必要な場合も、reviewer は
 自己申告せず、具体的な内容を `blockers[]`/`warnings[]` に記載する。
-control-plane はその記述を読み、`REQUEST_CHANGES` として `continue_loop` 経路で次イテレーションへ回すか、
-機械的に修正可能と判断した場合のみ `implementation-worker` の該当 mode（entrypoint が `closing_required` の場合のみ `ensure_closing_keyword` /
-`update_pr_body_hygiene`）に委譲する。これらの body-only 対応は head SHA を変えないため、`update_branch`
+control-plane は blocker 文面を自由に解釈せず、body-only 修正を行うかどうかを `decide_body_only_repair`
+（`.claude/skills/impl-review-loop/scripts/body_only_repair_plan.py`）の結果だけで判断する。eligible なら
+下記「body-only lane」節の手順で `implementation-worker` の `update_pr_body_hygiene` mode に委譲し、ineligible なら
+`REQUEST_CHANGES` として `continue_loop` 経路で次イテレーションへ回す。`ensure_closing_keyword`
+（entrypoint が `closing_required` を返した場合のみ）は引き続き #2878 の single evaluator が所有し、
+`decide_body_only_repair` の eligibility 対象に含めない。これらの body-only 対応は head SHA を変えないため、`update_branch`
 と異なり verification の再実行は不要で、PR review のみ再実行する。`blockers` が非空のまま
 `verdict == APPROVE` を返した reviewer 結果は `route_loop_verdict_v2()` が `fail_closed`
 （`approve_with_blockers_inconsistent`）として扱う。
+
+### body-only lane（`iteration ≥ max_iterations` の fail-close に対する例外、Issue #2971）
+
+current PR HEAD の verification / runtime evidence / required CI が完了済みで、pr-reviewer の blockers が **PR 本文に既にある evidence の同期だけ**（`## Runtime Verification Evidence` section 欠落・stale な件数・pending 文言の closed な 3 kind）に限られる場合に限り、`iteration ≥ max_iterations` でも implementation iteration を消費せず body-only repair を 1 回だけ行える。eligibility は `decide_body_only_repair`（pure な単一 authority。新規 route / schema / registry / lock は作らない）だけが決め、`SKILL.md` の「body-only lane」節と同一の意味論に従う。 実行は production CLI（`body_only_repair_plan.py` の `plan` / `record` / `guard` / `ci-freshness`）と既存 `IMPLEMENTATION_WORKER_REQUEST_V2`（`update_pr_body_hygiene` mode）だけで行い、dry-run 専用経路とは別である。
+
+**適用条件（bounded 規則）**:
+
+- `REQUEST_CHANGES` で `decide_body_only_repair` が eligible の場合のみ、`iteration` が `max_iterations` 未満・到達のどちらでも `continue_loop → Step 1` に優先して適用する。`iteration ≥ max_iterations` であること自体は eligibility を妨げない。
+- 終了条件表の `conflict_hard_stop`（`mergeable == CONFLICTING` または `merge_state_status == DIRTY`、verdict に関係なく最優先）・`already_satisfied`・`route_to_update_branch`（`merge_state_status == BEHIND`）のいずれにも一致しなかった場合にのみ評価する。mergeability が `CONFLICTING` / `DIRTY` / `BEHIND` の場合は lane は適用不能で既存 routing に従う。mergeability の gate は control-plane が呼出し前に行い、`decide_body_only_repair` に mergeability の引数は追加しない。
+- eligible な blocker は blocker 全文が closed grammar に完全一致する 3 kind（`runtime_evidence_section_missing` / `stale_count` / `pending_wording`）だけで、未知の substantive 句が残る blocker・code / test / Issue contract / branch の変更を要する blocker が 1 件でもあれば ineligible となり、従来どおり iteration を消費する（`max_iterations` 到達時は fail-close）。
+- lane の消費は、`record` が `--loop-state-file`（`step4-adjudicate` / `step5-terminal-gate` と同じ file）の既存 `LOOP_STATE.blockers_history[]` へ書く二段階 entry で数える。entry の field は closed set `{lane, outcome}` だけで、worker 起動の **直前**に `{lane: body_only_repair, outcome: dispatched}` を 1 件追記し、worker が guard で拒否して mutation を行わなかった（`status: blocked` かつ `wrapper_used: false`）場合だけ、その entry を `outcome: no_mutation` へ更新する。次回の `prior_body_only_repairs` は `outcome != no_mutation` の entry 件数（crash / resume で `dispatched` のまま残った entry、`update_pr.py` に到達した成否不問の mutation は消費済み）で、`prior_body_only_repairs >= 1` は ineligible となるため、mutation を伴う lane は同一 PR で最大 1 回である。`LOOP_STATE` のキー集合は変更せず、新規 ledger / lock も作らない。JSON の手編集はしない（`record` は `blockers_history[]` だけを触る canonical writer）。
+- guard 拒否（`no_mutation`）後の再評価・再 dispatch は、`outcome: no_mutation` の entry が **ちょうど 1 件**の間だけ 1 回許される。`no_mutation` が 2 件になった時点で lane は終了し通常 routing（`continue_loop` / `max_iterations` fail-close）に戻る。件数は同じ `--loop-state-file` から数えるため、compaction / resume 後も再評価上限はリセットされない。
+- `plan` が `stale_body_rebuild_required` / `ineligible_head_changed` 相当（`expected_head_sha_mismatch` / `live_body_hash_mismatch`）で ineligible を返した場合は mutation を行わず（`no_mutation` としてカウントしない）、fresh な live 状態で eligibility を最大 1 回だけ再評価する。再び ineligible または stale なら通常 routing へ戻る。
+
+**実行順序（canonical fresh review path）**:
+
+control-plane は次の production CLI（`body_only_repair_plan.py` の `plan` / `record` / `guard` / `ci-freshness`。いずれも JSON-in / JSON-out で、dry-run 専用 path とは別）だけを使い、Python import・ad-hoc JSON・未定義 prompt field を即興で作らない。exit code は 0 = 肯定（eligible / proceed / fresh / recorded）、1 = 否定、2 = runtime error。
+
+1. `plan` を実行する（live の head / PR body は CLI 自身が `gh pr view` で取得し、`check_body_freshness` が照合する plan 束縛値 `expected_head_sha` / `expected_live_body_sha256` を返す）。
+   必須引数は `--repo` / `--pr-number` / `--issue-number`（`update_pr.py --linked-issue` と同一） / `--worktree`（対象 PR の implementation worktree。changed paths 解決の cwd） / `--reviewer-result-file`（verdict / `reviewed_head_sha` / `blockers` を持つ reviewer result） / `--test-verdict-file`（`TEST_VERDICT_MACHINE/v2` report。`$TEST_RUNNER_REPORT` と同一） / `--wait-ci-output`（`wait_ci_checks.py --required` の出力 file） / `--loop-state-file` / `--expected-contract-body-sha256` / `--expected-command-hashes-file`（この 3 つは既存 `step4-gate` の期待値と同一。VC の current-head 判定は第二の分類器を作らず既存 `adjudicate_vc_result.py step4-gate` に委ねる） / `--body-out`（completed body の書き出し先）。任意引数は `--runtime-summary-file`（`run_worktree_agent_runtime_smoke.py` の `summary.md`）。`--expected-contract-body-sha256` には既存 `step4-gate` と同じく `sha256:` 付き（`sha256:<64 桁 hex>`）の値を渡す（`plan` が返す `expected_live_body_sha256` / `body_file_sha256` は `sha256:` なしの hex で、別の値である）。
+
+   ```bash
+   uv run --locked python3 .claude/skills/impl-review-loop/scripts/body_only_repair_plan.py plan \
+     --repo <owner/repo> --pr-number <N> --issue-number <ISSUE> \
+     --worktree <PR の implementation worktree> \
+     --reviewer-result-file <reviewer result file> \
+     --test-verdict-file <TEST_VERDICT report file> \
+     --wait-ci-output <wait_ci_checks.py 出力 file> \
+     [--runtime-summary-file <summary.md>] \
+     --loop-state-file <LOOP_STATE file> \
+     --expected-contract-body-sha256 <live Issue 本文の SHA-256> \
+     --expected-command-hashes-file <step4-gate の期待 command hash file> \
+     --body-out <completed body の出力 path>
+   ```
+
+   stdout は JSON 1 件 `{eligible, reason_codes, expected_head_sha, expected_live_body_sha256, body_file_path, body_file_sha256}`。exit 0 = eligible、1 = ineligible（lane を消費しない）。ineligible または exit 非 0 の場合は lane を使わず通常 routing に従う。
+2. eligible の場合だけ、worker 起動の **直前**に `record` で dispatch を記録する（この呼出しが lane 消費の唯一の writer）。
+
+   ```bash
+   uv run --locked python3 .claude/skills/impl-review-loop/scripts/body_only_repair_plan.py record --loop-state-file <LOOP_STATE file> --state dispatched
+   ```
+
+3. `plan` の返した値を **そのまま**、既存 `IMPLEMENTATION_WORKER_REQUEST_V2` の `update_pr_body_hygiene` mode の明示 field として `implementation-worker` へ渡す。cwd は対象 PR の implementation worktree。
+
+   ```yaml
+   IMPLEMENTATION_WORKER_REQUEST_V2:
+     mode: update_pr_body_hygiene
+     required_auto_action: {kind: update_pr_body_hygiene}
+     pr_number: <N>
+     issue_number: <ISSUE>                          # 必須（update_pr.py --linked-issue へ渡す）
+     expected_head_sha: <plan の expected_head_sha>      # 必須
+     body_file_path: <plan の body_file_path>
+     body_file_sha256: <plan の body_file_sha256>
+     expected_live_body_sha256: <plan の expected_live_body_sha256>
+   ```
+
+   worker は mutation 直前に `guard`（live の head / body を CLI 自身が取得して照合）を実行し、`proceed` の場合だけ body file を **改変せず** `open-pr/scripts/update_pr.py --body-file ... --linked-issue ...` wrapper へそのまま渡す（`gh pr edit` の直接呼出し禁止）。`expected_head_sha` 不一致は `reason_code: expected_head_sha_mismatch`、live body hash または body file hash の不一致は `reason_code: live_body_hash_mismatch` で、overwrite せず `status: blocked` / `wrapper_used: false` を返す。`guard` の手順と限界は `implementation-worker.md` の `update_pr_body_hygiene` mode を参照する。worker が実行する `guard` の invocation は次のとおり（control-plane が mutation 前にこれを代行・省略してはならない）。
+
+   ```bash
+   uv run --locked python3 .claude/skills/impl-review-loop/scripts/body_only_repair_plan.py guard \
+     --repo <owner/repo> --pr-number <N> \
+     --expected-head-sha <expected_head_sha> \
+     --expected-live-body-sha256 <expected_live_body_sha256> \
+     --body-file <body_file_path> --body-file-sha256 <body_file_sha256>
+   ```
+4. worker が `status: blocked` かつ `wrapper_used: false`（guard 拒否）を返した直後に限り、`record --state no_mutation` で直近の `dispatched` entry を更新し、上記の再評価規則（`no_mutation` がちょうど 1 件の間だけ再評価 1 回、2 件で通常 routing）に従う。`update_pr.py` に到達した場合は成否を問わず `dispatched` のまま消費済みとする。
+
+   ```bash
+   uv run --locked python3 .claude/skills/impl-review-loop/scripts/body_only_repair_plan.py record --loop-state-file <LOOP_STATE file> --state no_mutation
+   ```
+
+5. 書込み後に control-plane が readback する。`verify_body_readback` には CLI が無いため、同じ判定（HEAD が不変、かつ canonicalize 後（CRLF→LF、末尾改行除去）の live body が completed body と一致）を `guard` で等価に表現する。`--expected-head-sha` に不変の head（`plan` の `expected_head_sha`）、`--expected-live-body-sha256` に **`body_file_sha256`**（completed body の canonical hash）を渡し、live の head / body は CLI 自身が `gh pr view` で取得して照合させる。この `guard` が exit 0 で通ることが readback `ok` の条件で、exit 非 0 の場合は terminal approval に進まず通常 routing に従う。
+
+   ```bash
+   uv run --locked python3 .claude/skills/impl-review-loop/scripts/body_only_repair_plan.py guard \
+     --repo <owner/repo> --pr-number <N> \
+     --expected-head-sha <不変の head（plan の expected_head_sha）> \
+     --expected-live-body-sha256 <body_file_sha256> \
+     --body-file <body_file_path> --body-file-sha256 <body_file_sha256>
+   ```
+
+   readback が `ok` の時点で `gh pr view <N> --repo <owner/repo> --json updatedAt --jq .updatedAt` の値を body edit の causality watermark（`body_edit_updatedAt`）として **1 回だけ**取得する。
+6. post-edit required CI の fresh 判定: PR body の `edited` で同一 head の required check が再起動されるため、unchanged head で `wait_ci_checks.py --required` を再実行し、その出力を `ci-freshness` で判定する。この 2 つを **間隔 15 秒・合計 1800 秒の deadline** までの loop として実行する（固定 sleep で済ませず、`wait_ci_checks.py` の既存 polling を使う）。
+
+   ```bash
+   uv run --locked python3 .claude/skills/impl-review-loop/scripts/wait_ci_checks.py \
+     --repo <owner/repo> --pr <N> --head-sha <expected_head_sha> --required > <wait-ci-output file>
+   uv run --locked python3 .claude/skills/impl-review-loop/scripts/body_only_repair_plan.py ci-freshness \
+     --wait-ci-output <wait-ci-output file> \
+     --body-edit-updated-at <body_edit_updatedAt> \
+     --workflow-dir .github/workflows --expected-head-sha <expected_head_sha>
+   ```
+
+   `ci-freshness` は各 required check の `workflow` 名を `.github/workflows/*.yml` の `name:` と突き合わせ、`on.pull_request.types` に `edited` を含む workflow の check は `startedAt >= body_edit_updatedAt` の pass だけを fresh とし（`startedAt < body_edit_updatedAt` の pass は `stale_pre_edit`）、`edited` を含まない workflow の check は head 一致の pass を `head_bound` として受理し、workflow を特定できない check は `unknown_workflow` で fail-closed とする。exit 0（全 required check が `fresh` / `head_bound`）の場合だけ live mergeability を取得して次へ進む。exit 非 0 かつ出力 `retryable: true` の間だけ 15 秒間隔で再実行し、deadline（1800 秒）超過・`retryable: false` は terminal approval に進まず通常 routing に戻る。`wait_ci_checks.py` は変更しない。watermark は readback 直後の同一の値を使い続けるため、PR comment 等で `updatedAt` が進んだ場合の永続的な `stale_pre_edit` も deadline で終端する。これは verification の再実行ではない。
+7. verification は再実行しない（HEAD が不変のため）。binding（head / Issue body SHA-256 / 順序付き command hashes）が不変なら `step4-adjudicate --reuse-stored` で `dispatch.seq` を +1 し、reviewer を起動する **前** に `<review-result-dir>/dispatch_seq` へ保存する。binding が変化した場合は `--reuse-stored` を使わず通常の `step4-adjudicate`（再検証あり）へ戻り、lane は消費済みとして通常 routing に従う。
+8. 新規 `pr-reviewer` を dispatch し、fresh reviewer completion を得る。
+9. 保存済み `dispatch_seq` と同一 binding を上記の `step5-terminal-gate` へ渡す。`APPROVE` かつ `blockers == []` かつ live mergeability が適格な場合のみ `approved`。fresh reviewer が code / test / contract change を要求した場合は通常 routing（iteration 消費・`max_iterations` fail-close）へ戻る。
+
+**guard の所在と禁止事項**:
+
+- worker は body file field を伴う `update_pr_body_hygiene` で `expected_head_sha` を強制する。mutation 直前に `guard` を実行し、live head が `expected_head_sha` と異なる、live body の canonical hash が `expected_live_body_sha256` と異なる、または body file の canonical hash が `body_file_sha256` と異なる場合は overwrite せず `status: blocked`（`wrapper_used: false`）を返す。control-plane は `plan` 時点の `check_body_freshness` 相当の判定と、書込み後の `verify_body_readback` の判定（readback）で HEAD / body を再確認する。`update_pr.py` 自体に head / body の freshness 検査や readback は無い。
+- **best-effort の限界**: GitHub に PR body の compare-and-swap は無く、`guard` は best-effort の optimistic guard である。`guard` 通過後から `update_pr.py` の全置換までの race window は残り、その間に他 actor が行った編集は失われ得る（residual risk）。lost update の絶対防止は主張せず、lock / approval layer / persistent coordination は追加しない。
+- **artifact の来歴は best-effort**: `plan` が evidence ref に使う `summary.md` / pytest 出力は head field を持たないため、worktree HEAD が live head と一致し artifact の mtime が当該 HEAD の commit 時刻以降であることを pre-filter にしている。これは artifact の head 束縛に関する best-effort の来歴確認であり、artifact の真正性は証明しない（residual risk）。`TEST_VERDICT` / CI 出力は明示の head field で束縛する。
+- 次を禁止する: terminal gate bypass（`step5-terminal-gate` exit 0 以外での `approved` 確定）、古い reviewer result の carry-forward（lane 前の reviewer 結果の流用）、reviewer の直接呼出しのみでの fresh review 成立扱い（`step4-adjudicate --reuse-stored` による `dispatch_seq` の +1 と保存、`step5-terminal-gate` への受け渡しを省略する経路）。
+- `adjudicate_vc_result.py` / `route_loop_verdict_v2.py` / `step5-terminal-gate` に max-iteration の例外は入れない。terminal approval は引き続き `step5-terminal-gate` だけが authority である。
 
 ### `ensure_closing_keyword` の適用条件（reference authority entrypoint、Issue #2878）
 

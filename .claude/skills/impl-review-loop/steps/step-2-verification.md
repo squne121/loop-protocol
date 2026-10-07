@@ -57,6 +57,15 @@ root が test-runner へ渡す委譲契約として、`TEST_VERDICT_MACHINE/v2` 
 
 `command_hash` は現行どおり command ごとに必須であり、欠落した行は consumer が受理しない。`generated_at` は上記の意味でのみ使う（既存 field であり、新 field・新 schema は追加しない）。
 
+### `runtime_ac_results[]` 行に追加できる任意項目 `test_count` の導出規則（Issue #2971）
+
+pytest 系 command の行に限り、test-runner は optional field `test_count: {subject, passed}` を返してよい（上の表の既存 field・必須性は変えず、この field の有無で `adjudicate_vc_result.py` の既存判定は変わらない）。`impl-review-loop` の body-only lane（`body_only_repair_plan.py plan`）が、PR 本文の test 件数 drift を機械的に同期する際の evidence として、この field を `TEST_VERDICT_MACHINE/v2` report の raw 行から読む。導出規則は `test-runner.md` の同名節を正本とし、次のとおり。
+
+- `passed`: 当該 command の出力の最終 summary 行の `<N> passed` の `N` を機械的に写した非負整数。
+- `subject`: 当該 command の pytest 対象 selector（path / node id / `-k` 式）を command 文字列から逐語で写した文字列。
+- 省略: summary 行に `failed` / `error` を含む、非 pytest command、summary 行を解釈できない場合は field を省略する。`notes` の自然言語や reviewer の記述から導出しない。
+- root は返却された `test_count` を補正・補完・別行への流用をしない（`command` / `command_hash` と同様に行ごとの事実として扱う）。
+
 ### `ac` label の出所と verbatim echo 規則（baseline 由来、Issue #2837 fix_delta）
 
 consumer（`adjudicate_vc_result.py`）は baseline と current を `(ac, command_hash)` の組で対応付ける。`command_hash` だけが一致しても、`ac` 文字列が baseline classification と 1 文字でも違えば対応付けは成立しない。したがって per-command の `ac` 値の出所を次のとおり一意に固定する。
