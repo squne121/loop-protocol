@@ -151,9 +151,11 @@ from cleanup_contract_v3 import (  # noqa: E402
 from worktree_catalog import (  # noqa: E402
     Deadline,
     GuardDeadlineExceeded,
+    best_effort_root,
     branch_short_name,
     find_by_realpath,
     list_worktrees,
+    resolve_canonical_root,
 )
 
 SCHEMA_REQUEST = "CLEANUP_EXEC_REQUEST_V1"
@@ -339,11 +341,30 @@ def _verified_template() -> dict:
 
 
 def resolve_project_root() -> str:
-    env_root = os.environ.get("CLAUDE_PROJECT_DIR")
-    if env_root:
-        return os.path.realpath(env_root)
-    agent_ops = os.path.dirname(os.path.realpath(__file__))
-    return os.path.realpath(os.path.dirname(os.path.dirname(agent_ops)))
+    """Best-effort canonical root (never raises; Issue #2979).
+
+    ``CLAUDE_PROJECT_DIR`` -> script location, normalised to the repository's
+    primary root by the shared ``worktree_catalog`` helper -- the SAME semantics
+    ``guard_preflight`` uses, so a preflight ``ok`` and the executor never
+    evaluate different roots. When the identity cannot be verified the raw
+    candidate is returned and the executor's existing structured-refusal paths
+    (``verify_*_authorization`` / ``run`` / ``run_discard_*``) report the fixed
+    reason code; the candidate is never trusted as an authorised root.
+    """
+    return best_effort_root(None, __file__)
+
+
+def _canonical_root_or_reason(project_root: str, deadline: Deadline) -> tuple[str | None, str | None]:
+    """Return ``(primary_root, None)`` or ``(None, reason_code)`` (Issue #2979).
+
+    Identity is verified independently on every authorization/execution entry
+    point so an injected or env-derived linked-worktree root can neither be
+    mistaken for the canonical root nor bypass the fail-closed checks.
+    """
+    res = resolve_canonical_root(project_root, deadline)
+    if res.ok and res.primary_root:
+        return res.primary_root, None
+    return None, res.reason_code or "primary_root_unresolved"
 
 
 def _git(args: list[str], deadline: Deadline, maximum: float = 10.0) -> subprocess.CompletedProcess:
@@ -885,6 +906,13 @@ def verify_cleanup_authorization(req: dict, project_root: str, deadline: Deadlin
     branch_name = req["branch_name"]
     worktree_real = os.path.realpath(req["worktree_path"])
 
+    # 0. canonical primary root identity (Issue #2979): fail closed with a fixed
+    # reason code instead of treating a linked worktree / foreign repo as the root.
+    canonical, root_reason = _canonical_root_or_reason(project_root, deadline)
+    if canonical is None:
+        return False, root_reason, verified
+    project_root = canonical
+
     # 1. root default branch
     cur = _current_branch(project_root, deadline)
     default = _default_branch(project_root, deadline)
@@ -985,6 +1013,13 @@ def verify_branch_only_cleanup_authorization(
     worktrees_dir = os.path.realpath(os.path.join(project_root, ".claude", "worktrees"))
 
     verified: dict = _verified_template()
+
+    # 0. canonical primary root identity (Issue #2979).
+    canonical, root_reason = _canonical_root_or_reason(project_root, deadline)
+    if canonical is None:
+        return False, root_reason, verified
+    project_root = canonical
+    worktrees_dir = os.path.realpath(os.path.join(project_root, ".claude", "worktrees"))
 
     # 1. root default branch
     cur = _current_branch(project_root, deadline)
@@ -1352,6 +1387,12 @@ def verify_discard_authorization(req: dict, project_root: str, deadline: Deadlin
     branch_name = req["branch_name"]
     worktree_real = os.path.realpath(req["worktree_path"])
 
+    # Canonical primary root identity (Issue #2979).
+    canonical, root_reason = _canonical_root_or_reason(project_root, deadline)
+    if canonical is None:
+        return False, root_reason, verified
+    project_root = canonical
+
     cur = _current_branch(project_root, deadline)
     default = _default_branch(project_root, deadline)
     if cur is None or cur != default:
@@ -1456,6 +1497,12 @@ def run_discard_check(req: dict, project_root: str | None = None, budget_seconds
     root = os.path.realpath(project_root) if project_root else resolve_project_root()
     deadline = Deadline(budget_seconds)
     try:
+        # Issue #2979: identity is verified inside verify_discard_authorization;
+        # normalise first so the verifier sees the canonical primary root.
+        canonical, root_reason = _canonical_root_or_reason(root, deadline)
+        if canonical is None:
+            return _discard_result("refused", root_reason, _verified_template(), [])
+        root = canonical
         ok, reason, verified = verify_discard_authorization(req, root, deadline)
     except GuardDeadlineExceeded as e:
         return _discard_result("error", str(e), _verified_template(), [])
@@ -1522,6 +1569,16 @@ def run_discard_consume(
     """
     root = os.path.realpath(project_root) if project_root else resolve_project_root()
     deadline = Deadline(budget_seconds)
+
+    # Issue #2979: the contract files live under the canonical primary root; refuse
+    # (before any contract IO / claim) when its identity cannot be verified.
+    try:
+        canonical, root_reason = _canonical_root_or_reason(root, deadline)
+    except GuardDeadlineExceeded as e:
+        return _discard_result("error", str(e), _verified_template(), [])
+    if canonical is None:
+        return _discard_result("refused", root_reason, _verified_template(), [])
+    root = canonical
 
     if not contract_id or not expected_contract_sha256:
         return _discard_result("refused", DISCARD_CONTRACT_ID_REQUIRED, _verified_template(), [])
@@ -1628,6 +1685,15 @@ def run(req: dict, project_root: str | None = None, budget_seconds: float = 60.0
     # the canonical root resolved from CLAUDE_PROJECT_DIR / the script location.
     root = os.path.realpath(project_root) if project_root else resolve_project_root()
     deadline = Deadline(budget_seconds)
+    # Issue #2979: bind every later step (authorization, mutation lock, perform) to
+    # the canonical primary root, or refuse with a fixed reason code.
+    try:
+        canonical, root_reason = _canonical_root_or_reason(root, deadline)
+    except GuardDeadlineExceeded as e:
+        return _result("error", str(e), {}, [])
+    if canonical is None:
+        return _result("refused", root_reason, _verified_template(), [])
+    root = canonical
     try:
         ok, reason, verified = verify_cleanup_authorization(req, root, deadline)
     except GuardDeadlineExceeded as e:

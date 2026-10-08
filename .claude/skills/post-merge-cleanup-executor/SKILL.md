@@ -36,6 +36,35 @@ worker は次のいずれの経路でも子 agent を起動しない:
 
 **実行方針**: 未コミット変更・未追跡ファイルを検出しても、安全に実行できるステップから先行実行し、不明点のみレポートにまとめる。即停止せず main sync / リモート削除済みブランチ削除 / parent issue 確認まで進める。
 
+### 実行コンテキスト（canonical root の固定・Issue #2979）
+
+cleanup は issue worktree 内の session から起動されることがある。session の current worktree は
+「どこから呼ばれたか」の観測値であり、canonical repository root の authority ではない。以下の 2 点を全ステップ共通の
+前提とする（以降のステップは本節の `<canonical root>` と cwd 固定行を使う）。
+
+1. canonical root を取得する（session の cwd から実行する read-only probe。cwd が repo 直下でない場合は
+   probe script を絶対 path で指定する）:
+
+```bash
+uv run --locked python3 scripts/agent-ops/git_worktree_probe.py --json
+```
+
+出力 JSON の `entries[0].worktree_realpath`（`git worktree list --porcelain -z` の先頭 entry = primary worktree）を
+`<canonical root>` とする。`guard_preflight.py` の出力 field は追加していない。
+
+2. 以降の **全 Bash 呼び出しの先頭** に次の cwd 固定行を付ける。`cd` は Bash 呼び出し間で持続せず、
+   ステップ 3 で session 自身の worktree を `cleanup_exec` 経由で削除すると、その後の cwd は削除済みの無効な
+   path になるため、ステップ 4〜8 も相対 path のまま単独では解決できない。絶対 path への `cd` から始めれば
+   無効 cwd からでも復旧できる:
+
+```bash
+cd "<canonical root>" || exit 1
+```
+
+- main 同期（ステップ 2）は canonical root に対してのみ行う。linked worktree 上で `git checkout main` を実行しない
+  （primary が main を checkout 済みのため `fatal: 'main' is already used by worktree` で exit 128 になる）。
+- canonical root が default branch でない場合（drift / detached）は切り替えず、`human_review_required: true` として停止する。
+
 ### 1. 未コミット変更と未追跡ファイルを分類
 
 ```bash
@@ -91,18 +120,29 @@ TEMP_CLEANUP_SAFETY_RULES_V1:
 
 ### 2. main を origin/main に整合
 
+実行コンテキストの cwd 固定行（canonical root）の後に実行する。先に `guard_preflight.py --json` が
+`root_branch_state=default` を返した場合に **限り** canonical root を同期する。drift していれば同期せず停止する:
+
 ```bash
-STAGED=$(git diff --cached --name-only)
-if [ -n "$STAGED" ]; then
-  echo "[INFO] staged 変更を一時退避（git stash）"
-  git stash
+ROOT_STATE=$(uv run --locked python3 scripts/agent-ops/guard_preflight.py --json \
+  | uv run python3 -c "import json,sys; print(json.load(sys.stdin)['root_branch_state'])")
+if [ "$ROOT_STATE" != "default" ]; then
+  echo "[STOP] canonical root が default branch ではない (root_branch_state=$ROOT_STATE)。同期せず human_required として停止" >&2
+  exit 2
 fi
-git checkout main
-git pull origin main
+git pull --ff-only origin main || {
+  echo "[STOP] main を fast-forward 同期できない（incoming 変更と canonical root の変更が衝突、または non-ff）。状態は変更されていない。human_required として停止" >&2
+  exit 3
+}
 ```
 
-- staged 変更がある場合は必ず `git stash` で退避してから `checkout main`（main に carry over するリスク回避）
-- CONFLICT → 即停止し `human_review_required: true` を返す
+- `git checkout main` は実行しない（gate 通過 = canonical root は既に default branch 上にある。drift した primary をこのステップで切り替えない）
+- **stash を使わない**。`git pull --ff-only` は fast-forward が incoming 変更と衝突しない限り、canonical root の
+  index（staged）・working tree（unstaged）・untracked file をそのまま保つ。衝突する場合は何も変更せず非 0 で終了するので、
+  state を残したまま `human_review_required: true` で停止する（変更を黙って持ち越す・消す・成功扱いにしない）
+- issue worktree の変更を main へ carry over しない
+- `ROOT_STATE` が `default` 以外、または取得できない場合は fail-closed で停止し `human_review_required: true` を返す
+- pull 失敗（exit 3）→ 即停止し `human_review_required: true` を返す
 
 ### 3. worktree / branch を整理
 
@@ -125,10 +165,17 @@ enforcement 経路ではない。
 
 1. guard arbitration を機械判定する（mutation を行わない・`AGENT_GUARD_PREFLIGHT_V1` を返す）:
 ```bash
-uv run --locked python3 scripts/agent-ops/guard_preflight.py --json
+LOOP_ISSUE_NUMBER=<issue> uv run --locked python3 scripts/agent-ops/guard_preflight.py --json
 ```
+cwd は canonical root（primary）なので cwd からは対象 Issue を識別できない。`LOOP_ISSUE_NUMBER=<issue>` で cleanup 対象 Issue を
+束縛し、出力の `resolved_worktree.worktree_realpath` が次の `<絶対 worktree path>` と一致することを確認する
+（一致しない場合は `cleanup_exec` を実行せず `human_review_required: true`。削除認可自体は引き続き `cleanup_exec` の責務）。
 `status: ok` 以外（`blocked` / `human_required`）は `allowed_next_commands` の構造化 recovery hint に従う。
 `root_drift_active_worktree_mismatch` は policy B により自動 mutation せず人間承認を要する。
+canonical root は current worktree ではなく Git の primary worktree から解決される（Issue #2979）。解決できない場合は
+`blocked_reason_codes` に固定 literal（`worktree_catalog_unavailable` / `git_common_dir_unavailable` /
+`primary_root_unresolved` / `repository_identity_mismatch` / `active_issue_catalog_conflict`）が入り、`status` は
+`ok` にならない。この場合は cleanup を実行せず `human_review_required: true` で返す。
 
 2. 認可境界 `cleanup_exec` で worktree / branch を削除する（PR merged 等を毎回検証してから exact 削除）:
 ```bash
@@ -138,7 +185,13 @@ uv run --locked python3 scripts/agent-ops/cleanup_exec.py \
   [--non-closing-authority-file <non_closing_authority_file>] --json
 ```
 `status: ok` で `actions_taken` に `worktree_remove` / `branch_delete` が入る。`status: refused` の場合は
-`reason_code`（`pr_not_merged` / `worktree_dirty` / `root_not_default_branch` 等）を `unresolved_cleanup_items` に記録する。
+`reason_code`（`pr_not_merged` / `worktree_dirty` / `root_not_default_branch` 等。canonical root を検証できない場合は
+`worktree_catalog_unavailable` / `git_common_dir_unavailable` / `primary_root_unresolved` / `repository_identity_mismatch`）を
+`unresolved_cleanup_items` に記録する。
+
+この command も実行コンテキストの cwd 固定行（canonical root）の後に実行する。`<絶対 worktree path>` が session 自身の
+worktree であってもよい。削除後の session cwd は無効になるが、以降のステップ 4〜8 の各 Bash 呼び出しは cwd 固定行から始めるため
+削除済み cwd に依存しない。
 
 `[--non-closing-authority-file <non_closing_authority_file>]` は任意引数（Issue #2891）。worker の入力として
 `non_closing_authority_file`（orchestrator が保存した 7 key の JSON object ファイルの path）が渡された場合に
@@ -241,6 +294,7 @@ merged PR の本文 / コメントから以下を抽出:
 ステップ 4 で取得した parent issue が `parent_mode: delivery-rollup` の場合、`plan_child_materialization.py` を実行して残り child を検出し `follow_up_issue_requests` に追加する。
 
 ```bash
+cd "<canonical root>" || exit 1
 # parent が delivery-rollup かどうか確認
 PARENT_BODY=$(gh issue view "$PARENT_ISSUE_NUM" --json body --jq '.body')
 PARENT_MODE=$(echo "$PARENT_BODY" | grep -oP 'parent_mode:\s*\K[\w-]+' | head -1)
@@ -263,19 +317,22 @@ fi
 | `human_escalation` | `warnings` に記録し `human_review_required: true` で返す |
 
 `FOLLOW_UP_ISSUE_REQUEST_V1` の `dedupe_key` は `CHILD_MATERIALIZATION_PLAN_V2.children[*].dedupe_key` を使用する。
-スキーマ正本: `docs/dev/agent-skill-boundaries.md#CHILD_MATERIALIZATION_PLAN_V2`
+スキーマ正本: `<canonical root>/docs/dev/agent-skill-boundaries.md#CHILD_MATERIALIZATION_PLAN_V2`
 
-### 7. Stash の復帰
+### 7. Stash の確認（復帰しない）
+
+実行コンテキストの cwd 固定行（canonical root）の後に実行する。
 
 ```bash
 git stash list | grep "stash@{" | head -5
 ```
 
-ステップ 2 で stash した entry があれば `git stash pop` を試行。CONFLICT → 即停止し `human_review_required: true` で返す。
+ステップ 2 は stash を作成しないため、本手順が復帰（`git stash pop` / `apply`）すべき entry は存在しない。既存の stash entry は
+他の session / 利用者のものなので pop / drop せず、一覧を報告するのみ（`stash_restored: "n/a"`）。
 
 ### 8. POST_MERGE_CLEANUP_REPORT_V1 を生成
 
-後述の Output 仕様で YAML を返す。生成した YAML は `scripts/check_post_merge_cleanup_boundary.py` の
+後述の Output 仕様で YAML を返す。生成した YAML は `<canonical root>/scripts/check_post_merge_cleanup_boundary.py` の
 `validate_report_v1` 相当のスキーマ（必須キー・型・不明キー拒否）を満たす必要がある。
 
 ## Output / 出力: POST_MERGE_CLEANUP_REPORT_V1
@@ -351,6 +408,7 @@ raw `git for-each-ref` や raw `git worktree list --porcelain` の shell 使用�
 - follow-up 起票は本手順内で実行しない（候補列挙のみ。実行は main thread（orchestrator））
 - parent issue close / superseded PR close は本手順内で実行しない（候補列挙のみ。実行は main thread（orchestrator））
 - worktree / branch の削除は確定条件を満たすもののみ。曖昧なら `unresolved_cleanup_items` に記録
+- **canonical root を cwd に固定する（Issue #2979）**: ステップ 1〜8 の Bash 呼び出しは `<canonical root>`（`git_worktree_probe.py --json` の `entries[0].worktree_realpath`）への cwd 固定行から始める。linked worktree 上で `git checkout main` を実行しない。main 同期は `guard_preflight.py --json` が `root_branch_state=default` を返した canonical root に対してのみ行い、drift 時は切り替えず `human_review_required: true` で停止する
 - **scripts entrypoint 経由統一**: git 状態の分類は必ず `.claude/skills/post-merge-cleanup/scripts/classify-git-state.py` 経由で実行する
 - **inline `gh` / `jq` / `grep` / `awk` / heredoc 使用禁止**: ステップ 1 の git 状態分類での inline bash パイプラインは使用しない
 - **スクリプトは `subprocess.run([...])` 配列形式のみ**: `shell=True` 禁止
