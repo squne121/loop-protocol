@@ -20,11 +20,14 @@ from __future__ import annotations
 import ast
 import copy
 import json
+import os
 import re
 import secrets
+import signal
 import subprocess
 import sys
 import textwrap
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,6 +65,14 @@ EXIT_OK = 0
 EXIT_CAPABILITY_UNAVAILABLE = 77
 HELP_TIMEOUT_SECONDS = 60
 RUNNER_TIMEOUT_SECONDS = 1800
+# outer deadline 到達時に runner へ SIGTERM を送ってから SIGKILL へ昇格するまでの bounded grace。runner は SIGTERM を
+# ``_TerminateRequested`` に変換し、arm の process group を停止（``_CF_ARM_INTERRUPT_GRACE_SECONDS`` = 12s）してから
+# ``finally`` で ephemeral worktree 2 個を ``git worktree remove`` する（通常は数秒）。runner 内の個別 git 操作は
+# 最大 300s の timeout を持つが、それを待ち切る無制限待機はせず、この上限を超えたら自分の Popen が所有する group
+# だけを SIGKILL する。
+RUNNER_TERM_GRACE_SECONDS = 120.0
+RUNNER_REAP_WAIT_SECONDS = 5.0
+DIAGNOSTIC_TAIL_CHARS = 1500
 ARM_TIMEOUT_SECONDS = 420
 ARM_MAX_TURNS = 12
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -243,10 +254,20 @@ def evaluate_counterfactual_result(returncode: int, evidence_json: Path, *, test
         if actual != expected:
             problems.append(f"{name}: expected {expected!r}, got {actual!r}")
 
+    def expect_int(name: str, actual: Any, expected: int) -> None:
+        # ``False == 0`` / ``True == 1`` を受理しないよう、型も厳密に int であることを要求する。
+        if type(actual) is not int or actual != expected:
+            problems.append(f"{name}: expected int {expected!r}, got {actual!r}")
+
+    def expect_bool(name: str, actual: Any, expected: bool) -> None:
+        # ``1 == True`` / ``0 == False`` を受理しないよう、bool の同一性で比較する。
+        if actual is not expected:
+            problems.append(f"{name}: expected bool {expected!r}, got {actual!r}")
+
     verdict = summary.get("verdict")
     expect("schema", summary.get("schema"), CF_RESULT_SCHEMA)
     expect("verdict", verdict, VERDICT_DISCRIMINATIVE)
-    expect("exit_code", summary.get("exit_code"), EXIT_OK)
+    expect_int("exit_code", summary.get("exit_code"), EXIT_OK)
     expect(
         "classification (must equal top-level verdict)",
         _get(summary, "skill_text_counterfactual", "classification"),
@@ -256,16 +277,18 @@ def evaluate_counterfactual_result(returncode: int, evidence_json: Path, *, test
     expect("resolved_base_commit_sha", _get(summary, *cf, "resolved_base_commit_sha"), BASE_COMMIT)
     expect("candidate_head_sha (tested HEAD)", _get(summary, *cf, "candidate_head_sha"), tested_head)
     expect("target_skill_path", _get(summary, *cf, "target_skill_path"), TARGET_SKILL)
-    expect("prompt_sha256.identical", _get(summary, *cf, "prompt_sha256", "identical"), True)
-    expect(
+    expect_bool("prompt_sha256.identical", _get(summary, *cf, "prompt_sha256", "identical"), True)
+    expect_bool(
         "ordered_evidence_match.candidate.verified",
         _get(summary, *cf, "ordered_evidence_match", "candidate", "verified"),
         True,
     )
-    expect(
-        "ordered_evidence_match.base.verified", _get(summary, *cf, "ordered_evidence_match", "base", "verified"), False
+    expect_bool(
+        "ordered_evidence_match.base.verified",
+        _get(summary, *cf, "ordered_evidence_match", "base", "verified"),
+        False,
     )
-    expect("cleanup.all_removed", _get(summary, *cf, "cleanup", "all_removed"), True)
+    expect_bool("cleanup.all_removed", _get(summary, *cf, "cleanup", "all_removed"), True)
 
     candidate_blob = _get(summary, *cf, "candidate_skill_blob_id")
     base_blob = _get(summary, *cf, "base_skill_blob_id")
@@ -289,9 +312,9 @@ def evaluate_counterfactual_result(returncode: int, evidence_json: Path, *, test
             problems.append("candidate and base arms share the same tested_head")
         if arms["candidate"].get("run_id") == arms["base"].get("run_id"):
             problems.append("candidate and base arms share the same run_id")
-        expect("arms.candidate.exit_code", arms["candidate"].get("exit_code"), EXIT_OK)
+        expect_int("arms.candidate.exit_code", arms["candidate"].get("exit_code"), EXIT_OK)
         base_exit = arms["base"].get("exit_code")
-        if base_exit in (None, EXIT_OK, EXIT_CAPABILITY_UNAVAILABLE):
+        if type(base_exit) is not int or base_exit in (EXIT_OK, EXIT_CAPABILITY_UNAVAILABLE):
             problems.append(f"arms.base.exit_code must be a runner failure, got {base_exit!r}")
         expect(
             "arms runtime_version equality",
@@ -305,9 +328,133 @@ def _git(*args: str, cwd: Path = ROOT) -> str:
     return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True, timeout=60).stdout
 
 
-def write_runtime_verification_log(judgement: Judgement, paths: RunPaths, tested_head: str, runner_exit: int) -> Path:
-    """worktree-local（git-ignored）の ``artifacts/runtime-verification-AC4-<UTC>.log`` を書く（commit しない）。"""
+# --- P2-2: outer deadline 到達時に runner の finally（worktree 回収）を走らせる bounded 起動 ---------------
+
+
+@dataclass
+class RunnerExecution:
+    returncode: int | None
+    stdout: str = ""
+    stderr: str = ""
+    timed_out: bool = False
+    sigkill_escalated: bool = False
+    timeout_seconds: float | None = None
+
+
+def _decode_partial(raw: Any) -> str:
+    if raw is None:
+        return ""
+    return raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+
+
+def _stop_owned_group(proc: subprocess.Popen[str], *, term_grace: float, reap_wait: float) -> tuple[str, str, bool]:
+    """自分の ``Popen``（``start_new_session=True``、pgid == pid）が所有する group だけを停止する。
+
+    SIGTERM（runner の ``finally`` cleanup を走らせる）→ ``term_grace`` 秒まで EOF 待ち → 超過時のみ SIGKILL →
+    reap と pipe close。SIGKILL 後は ``communicate()`` を呼ばない（group 外へ逃げた子孫が pipe を保持すると EOF 待ちで
+    ハングするため）。返り値は (stdout, stderr, sigkill_escalated)。
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        out, err = proc.communicate(timeout=term_grace)
+        return out, err, False
+    except subprocess.TimeoutExpired as exc:
+        out, err = _decode_partial(exc.stdout), _decode_partial(exc.stderr)
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        proc.wait(timeout=reap_wait)
+    except subprocess.TimeoutExpired:
+        pass
+    for stream in (proc.stdout, proc.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+    return out, err, True
+
+
+def run_runner_bounded(
+    argv: list[str],
+    *,
+    cwd: Path | None = None,
+    timeout: float = RUNNER_TIMEOUT_SECONDS,
+    term_grace: float = RUNNER_TERM_GRACE_SECONDS,
+    reap_wait: float = RUNNER_REAP_WAIT_SECONDS,
+) -> RunnerExecution:
+    """runner を専用 process group で起動し、outer deadline 到達時は SIGTERM → bounded grace → SIGKILL で止める。
+
+    ``subprocess.run(timeout=...)`` は直接の子を kill するだけで、runner の ``finally``（ephemeral worktree の回収）が
+    走らない。ここでは先に SIGTERM を送って runner 自身の cleanup を走らせ、grace を超えた場合だけ SIGKILL する。
+    取得できた stdout / stderr は timeout 時も ``RunnerExecution`` に残す。
+    """
+    proc = subprocess.Popen(
+        argv,
+        cwd=str(cwd) if cwd is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        out, err, escalated = _stop_owned_group(proc, term_grace=term_grace, reap_wait=reap_wait)
+        return RunnerExecution(proc.returncode, out, err, True, escalated, timeout)
+    except BaseException:
+        # pytest 自身の中断（KeyboardInterrupt 等）でも runner を孤児にしない。
+        _stop_owned_group(proc, term_grace=term_grace, reap_wait=reap_wait)
+        raise
+    return RunnerExecution(proc.returncode, out, err)
+
+
+def judge_runner_execution(execution: RunnerExecution, evidence_json: Path, *, tested_head: str) -> Judgement:
+    """outer timeout / 強制終了は PASS にしない。それ以外は runner の exit code と evidence の読み戻しで判定する。"""
+    if not execution.timed_out:
+        return evaluate_counterfactual_result(execution.returncode, evidence_json, tested_head=tested_head)
+    how = (
+        f"SIGTERM grace exceeded, escalated to SIGKILL of the owned process group (runner returncode="
+        f"{execution.returncode}); runner cleanup is not confirmed"
+        if execution.sigkill_escalated
+        else f"stopped by SIGTERM within the grace (runner returncode={execution.returncode})"
+    )
+    return Judgement(
+        "fail", [f"runner exceeded the outer deadline of {execution.timeout_seconds}s and was terminated: {how}"]
+    )
+
+
+def _tail(text: str) -> str:
+    return text[-DIAGNOSTIC_TAIL_CHARS:]
+
+
+def _display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def write_runtime_verification_log(
+    judgement: Judgement,
+    paths: RunPaths,
+    tested_head: str,
+    execution: RunnerExecution,
+    *,
+    log_dir: Path = ROOT / "artifacts",
+) -> Path:
+    """worktree-local（git-ignored）の ``runtime-verification-AC4-<run directory 名>.log`` を書く（commit しない）。
+
+    run directory 名は ``allocate_run_paths`` が排他的に作った UTC 秒 + 固有 token を含むので、同一秒の run でも
+    log path は衝突せず、log が束縛する run（evidence）も名前から一意に分かる。既存 log は上書きしない。
+    """
     now = datetime.now(timezone.utc)
+    runner_exit = execution.returncode
     summary: dict[str, Any] = {}
     try:
         loaded = json.loads(paths.evidence_json.read_text(encoding="utf-8"))
@@ -334,7 +481,7 @@ def write_runtime_verification_log(judgement: Judgement, paths: RunPaths, tested
         arm_line("base"),
         "Input:",
         f"  prompt_file={PROMPT_FILE} base_ref={BASE_COMMIT} target={TARGET_SKILL}",
-        f"  tested_head={tested_head} evidence_json={paths.evidence_json.relative_to(ROOT)}",
+        f"  tested_head={tested_head} evidence_json={_display_path(paths.evidence_json)}",
         "Output:",
         f"  verdict={summary.get('verdict')} exit_code={summary.get('exit_code')}",
         f"  resolved_base_commit_sha={cf.get('resolved_base_commit_sha')}",
@@ -345,6 +492,9 @@ def write_runtime_verification_log(judgement: Judgement, paths: RunPaths, tested
         f"  ordered_evidence_match.candidate.verified={_get(ordered, 'candidate', 'verified')}",
         f"  ordered_evidence_match.base.verified={_get(ordered, 'base', 'verified')}",
         f"  cleanup.all_removed={_get(cf, 'cleanup', 'all_removed')}",
+        f"  runner timed_out={execution.timed_out} sigkill_escalated={execution.sigkill_escalated}",
+        f"  runner stdout tail: {_tail(execution.stdout)!r}",
+        f"  runner stderr tail: {_tail(execution.stderr)!r}",
         "Verdict:",
         f"  Result: {judgement.status.upper()}",
         f"  Exit Code: {runner_exit}",
@@ -352,7 +502,7 @@ def write_runtime_verification_log(judgement: Judgement, paths: RunPaths, tested
         "Limitation: discrimination evidence for the given prompt/runtime/sample (one LLM sample per arm); "
         "not statistical or absolute causal proof.",
     ]
-    log = ROOT / "artifacts" / f"runtime-verification-AC4-{now.strftime('%Y%m%dT%H%M%SZ')}.log"
+    log = log_dir / f"runtime-verification-AC4-{paths.run_dir.name}.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     with open(log, "x", encoding="utf-8") as handle:
         handle.write("\n".join(lines) + "\n")
@@ -373,24 +523,17 @@ def test_ac4_body_only_lane_counterfactual_is_discriminative_on_committed_head(
     assert SHA_RE.match(tested_head)
 
     paths = allocate_run_paths(ROOT / RUN_OUTPUT_ROOT)
-    result = subprocess.run(
-        build_runner_argv(paths),
-        cwd=str(ROOT),
-        capture_output=True,
-        text=True,
-        timeout=RUNNER_TIMEOUT_SECONDS,
-        check=False,
-    )
-    judgement = evaluate_counterfactual_result(result.returncode, paths.evidence_json, tested_head=tested_head)
-    log = write_runtime_verification_log(judgement, paths, tested_head, result.returncode)
+    execution = run_runner_bounded(build_runner_argv(paths), cwd=ROOT)
+    judgement = judge_runner_execution(execution, paths.evidence_json, tested_head=tested_head)
+    log = write_runtime_verification_log(judgement, paths, tested_head, execution)
     print(f"runtime verification log: {log}")
     print(f"evidence json: {paths.evidence_json}")
 
     if judgement.status == "unavailable":
         skip_with_exit_77("; ".join(judgement.problems), capsys)
     assert judgement.status == "pass", (
-        f"counterfactual smoke is not PASS (runner exit={result.returncode}): {judgement.problems}\n"
-        f"stdout={result.stdout[-1500:]}\nstderr={result.stderr[-1500:]}"
+        f"counterfactual smoke is not PASS (runner exit={execution.returncode}): {judgement.problems}\n"
+        f"stdout={_tail(execution.stdout)}\nstderr={_tail(execution.stderr)}"
     )
     summary = paths.output_dir / "summary.md"
     assert summary.is_file() and summary.read_text(encoding="utf-8").strip()
@@ -817,3 +960,187 @@ def test_ac5_the_test_file_keeps_no_fixed_output_directory_and_deletes_nothing()
         if isinstance(node, ast.Attribute):
             assert node.attr not in forbidden_calls
     assert "shutil" not in imported
+
+
+# P2-1: exit code は int 型、真偽値は bool 型でなければならない（False == 0 / True == 1 を受理しない）。
+
+
+@pytest.mark.parametrize(
+    ("field_name", "mutate"),
+    [
+        ("exit_code", lambda s: s.update(exit_code=False)),
+        ("exit_code", lambda s: s.update(exit_code=0.0)),
+        (
+            "arms.candidate.exit_code",
+            lambda s: s["skill_text_counterfactual"]["arms"]["candidate"].update(exit_code=False),
+        ),
+        (
+            "arms.candidate.exit_code",
+            lambda s: s["skill_text_counterfactual"]["arms"]["candidate"].update(exit_code=0.0),
+        ),
+        ("arms.base.exit_code", lambda s: s["skill_text_counterfactual"]["arms"]["base"].update(exit_code=True)),
+        ("arms.base.exit_code", lambda s: s["skill_text_counterfactual"]["arms"]["base"].update(exit_code=1.0)),
+        ("prompt_sha256.identical", lambda s: s["skill_text_counterfactual"]["prompt_sha256"].update(identical=1)),
+        (
+            "ordered_evidence_match.candidate.verified",
+            lambda s: s["skill_text_counterfactual"]["ordered_evidence_match"]["candidate"].update(verified=1),
+        ),
+        (
+            "ordered_evidence_match.base.verified",
+            lambda s: s["skill_text_counterfactual"]["ordered_evidence_match"]["base"].update(verified=0),
+        ),
+        ("cleanup.all_removed", lambda s: s["skill_text_counterfactual"]["cleanup"].update(all_removed=1)),
+    ],
+)
+def test_ac2_boolean_as_int_and_int_as_boolean_are_not_a_pass(
+    tmp_path: Path, field_name: str, mutate: Callable[[dict[str, Any]], None]
+) -> None:
+    judgement = _judge(tmp_path, 0, _mutated(mutate))
+    assert judgement.status == "fail"
+    assert any(problem.startswith(field_name) for problem in judgement.problems), judgement.problems
+
+
+# P2-2: outer deadline 到達時は SIGTERM（runner の finally cleanup）→ bounded grace → 所有 group の SIGKILL。
+
+
+def _fake_runner(source: str, *args: str) -> list[str]:
+    return [sys.executable, "-c", textwrap.dedent(source), *args]
+
+
+_FAKE_NORMAL = """\
+import sys
+print("normal-out", flush=True)
+sys.stderr.write("normal-err\\n")
+"""
+
+_FAKE_TERM_CLEANUP = """\
+import signal, sys, time
+marker = sys.argv[1]
+
+
+def handler(signum, frame):
+    with open(marker, "w", encoding="utf-8") as handle:
+        handle.write("cleaned-up")
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, handler)
+print("started-before-hang", flush=True)
+time.sleep(60)
+"""
+
+_FAKE_TERM_IGNORED = """\
+import os, signal, subprocess, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+child = subprocess.Popen(
+    [sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"]
+)
+print(os.getpid(), child.pid, flush=True)
+time.sleep(60)
+"""
+
+
+def _group_gone(pgid: int, *, wait: float = 5.0) -> bool:
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_ac4_a_runner_that_finishes_before_the_deadline_is_returned_unchanged() -> None:
+    execution = run_runner_bounded(_fake_runner(_FAKE_NORMAL), timeout=30, term_grace=1, reap_wait=1)
+
+    assert execution == RunnerExecution(0, "normal-out\n", "normal-err\n")
+
+
+def test_ac4_timeout_sends_sigterm_first_so_the_runner_can_run_its_cleanup(tmp_path: Path) -> None:
+    marker = tmp_path / "cleanup-marker.txt"
+    execution = run_runner_bounded(_fake_runner(_FAKE_TERM_CLEANUP, str(marker)), timeout=3, term_grace=20, reap_wait=1)
+
+    assert execution.timed_out and not execution.sigkill_escalated
+    assert execution.returncode == 0
+    assert marker.read_text(encoding="utf-8") == "cleaned-up"
+    assert "started-before-hang" in execution.stdout
+
+
+def test_ac4_a_runner_ignoring_sigterm_is_killed_after_the_grace_with_its_owned_group_reaped() -> None:
+    started = time.monotonic()
+    execution = run_runner_bounded(_fake_runner(_FAKE_TERM_IGNORED), timeout=3, term_grace=1, reap_wait=2)
+    elapsed = time.monotonic() - started
+
+    assert execution.timed_out and execution.sigkill_escalated
+    assert execution.returncode == -signal.SIGKILL
+    assert elapsed < 30, "must not wait unboundedly for EOF held by a descendant"
+    runner_pid, grandchild_pid = (int(token) for token in execution.stdout.split())
+    assert _group_gone(runner_pid)
+    with pytest.raises(ProcessLookupError):
+        os.kill(grandchild_pid, 0)
+
+
+def test_ac4_a_timeout_is_never_a_pass_even_when_the_evidence_json_claims_discriminative(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.json"
+    evidence.write_text(json.dumps(_valid_summary()), encoding="utf-8")
+    assert evaluate_counterfactual_result(0, evidence, tested_head="a" * 40) == Judgement("pass", [])
+
+    for escalated in (False, True):
+        execution = RunnerExecution(0, "out", "err", timed_out=True, sigkill_escalated=escalated, timeout_seconds=5)
+        judgement = judge_runner_execution(execution, evidence, tested_head="a" * 40)
+        assert judgement.status == "fail"
+        assert any("outer deadline" in problem for problem in judgement.problems)
+        assert any("not confirmed" in problem for problem in judgement.problems) is escalated
+
+
+def test_ac4_a_runner_that_finishes_in_time_is_judged_by_its_exit_code_and_evidence(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence.json"
+    evidence.write_text(json.dumps(_valid_summary()), encoding="utf-8")
+
+    assert judge_runner_execution(RunnerExecution(0), evidence, tested_head="a" * 40).status == "pass"
+    assert judge_runner_execution(RunnerExecution(1), evidence, tested_head="a" * 40).status == "fail"
+
+
+def test_ac4_timeout_diagnostics_keep_the_bounded_output_tails_in_the_runtime_verification_log(tmp_path: Path) -> None:
+    paths = allocate_run_paths(tmp_path / "runs")
+    marker = tmp_path / "cleanup-marker.txt"
+    execution = run_runner_bounded(_fake_runner(_FAKE_TERM_CLEANUP, str(marker)), timeout=3, term_grace=20, reap_wait=1)
+    judgement = judge_runner_execution(execution, paths.evidence_json, tested_head="a" * 40)
+
+    log = write_runtime_verification_log(judgement, paths, "a" * 40, execution, log_dir=tmp_path / "logs")
+
+    text = log.read_text(encoding="utf-8")
+    assert judgement.status == "fail"
+    assert "Result: FAIL" in text and "timed_out=True" in text and "started-before-hang" in text
+    assert "outer deadline" in text
+    long_tail = RunnerExecution(1, "x" * (DIAGNOSTIC_TAIL_CHARS * 3), "")
+    second = write_runtime_verification_log(
+        Judgement("fail", ["x"]), allocate_run_paths(tmp_path / "runs"), "a" * 40, long_tail, log_dir=tmp_path / "logs"
+    )
+    assert second.read_text(encoding="utf-8").count("x") < DIAGNOSTIC_TAIL_CHARS * 2
+
+
+# P3: runtime verification log の名前は run 固有 token を含み、同一秒でも衝突しない。
+
+
+def test_p3_logs_of_runs_started_in_the_same_second_get_distinct_paths_and_never_overwrite(tmp_path: Path) -> None:
+    frozen = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    first = allocate_run_paths(tmp_path / "runs", token_factory=lambda: "tokenaaa", clock=lambda: frozen)
+    second = allocate_run_paths(tmp_path / "runs", token_factory=lambda: "tokenbbb", clock=lambda: frozen)
+    log_dir = tmp_path / "logs"
+    fail = Judgement("fail", ["x"])
+
+    first_log = write_runtime_verification_log(fail, first, "a" * 40, RunnerExecution(1), log_dir=log_dir)
+    second_log = write_runtime_verification_log(fail, second, "a" * 40, RunnerExecution(1), log_dir=log_dir)
+
+    assert first_log != second_log and first_log.is_file() and second_log.is_file()
+    assert "tokenaaa" in first_log.name and "tokenbbb" in second_log.name
+    first_text = first_log.read_text(encoding="utf-8")
+    assert _display_path(first.evidence_json) in first_text and _display_path(second.evidence_json) not in first_text
+
+    with pytest.raises(FileExistsError):
+        write_runtime_verification_log(fail, first, "b" * 40, RunnerExecution(0), log_dir=log_dir)
+    with pytest.raises(FileExistsError):
+        allocate_run_paths(tmp_path / "runs", token_factory=lambda: "tokenaaa", clock=lambda: frozen)
+    assert first_log.read_text(encoding="utf-8") == first_text
