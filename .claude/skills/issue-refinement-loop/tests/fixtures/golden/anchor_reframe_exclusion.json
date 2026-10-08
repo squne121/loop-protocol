@@ -46,32 +46,11 @@
       "triggered": false
     },
     "web_research_policy": {
-      "confidence": "deterministic",
-      "critical_external_claims": [
-        {
-          "affects": "AC",
-          "claim": "- AC2: Both manual and API changes are in scope",
-          "role": "dispositive",
-          "source_hint": null
-        },
-        {
-          "affects": "InScope",
-          "claim": "- API surface remains stable",
-          "role": "dispositive",
-          "source_hint": null
-        }
-      ],
-      "evidence_spans": [
-        {
-          "end_line": 59,
-          "source": "issue_body",
-          "source_ref": null,
-          "start_line": 1,
-          "text_sha256": "8e3a86e12b1fb23fe5222386d2d871ca11dfa30fc9b420bddc3feebfb910a4c2"
-        }
-      ],
-      "reason_code": "critical_external_spec_claim",
-      "required": true
+      "confidence": "unknown",
+      "critical_external_claims": [],
+      "evidence_spans": [],
+      "reason_code": "no_critical_external_claim",
+      "required": false
     }
   },
   "fail_closed": {
