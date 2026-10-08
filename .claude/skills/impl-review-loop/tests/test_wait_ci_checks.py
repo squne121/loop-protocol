@@ -725,3 +725,132 @@ def test_ci_wait_result_v1_keys_and_statuses_unchanged(
     assert literals <= ALL_STATUSES | {"pending"}  # "pending" is internal, never emitted
     # Single canonical evaluator: no consumer re-implements inventory completeness.
     assert source.count("def fetch_required_inventory") == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #2836 F3: HEAD drift while required contexts are pending / at timeout
+# ---------------------------------------------------------------------------
+
+NEW_HEAD_SHA = "def456"
+
+
+class HeadDriftGh(FakeGh):
+    """FakeGh whose `headRefOid` answer is decided per `pr view` call by `head_for(call_index)`."""
+
+    def __init__(self, head_for: Any, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.head_for = head_for
+        self.head_calls = 0
+
+    def __call__(self, args: list[str]) -> tuple[int, str, str]:
+        if args[:2] == ["pr", "view"] and "baseRefName" not in args:
+            self.calls.append(list(args))
+            index = self.head_calls
+            self.head_calls += 1
+            return self.head_for(index)
+        return super().__call__(args)
+
+
+def test_head_change_while_required_context_unmaterialized_returns_head_sha_changed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F3(1): required context never materializes and HEAD moves mid-wait -> head_sha_changed."""
+    # call 0 = pre-wait check (unchanged); every later call sees the new HEAD.
+    fake = HeadDriftGh(
+        lambda i: (0, (HEAD_SHA if i == 0 else NEW_HEAD_SHA) + "\n", ""),
+        checks=[_zero_rows()],
+    )
+    sleeps = _install(monkeypatch, fake)
+
+    exit_code, payload = _run(capsys)
+
+    assert exit_code == wait_ci_checks.EXIT_NEGATIVE
+    assert payload["status"] == "head_sha_changed"
+    assert payload["error_code"] == "head_sha_changed"
+    assert payload["head_sha"] == HEAD_SHA
+    assert payload["current_head_sha"] == NEW_HEAD_SHA
+    assert len(sleeps) <= 1  # detected on the first pending poll, not after the full timeout
+
+
+def test_head_change_just_before_timeout_judgement_prefers_head_sha_changed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F3(2): HEAD is stable for every pending poll but moves at the timeout boundary."""
+    holder: dict[str, list[int]] = {"sleeps": []}
+
+    def head_for(_index: int) -> tuple[int, str, str]:
+        # 60s timeout / 15s interval: the 4th sleep (elapsed 60) precedes the timeout re-fetch.
+        moved = len(holder["sleeps"]) >= 4
+        return 0, (NEW_HEAD_SHA if moved else HEAD_SHA) + "\n", ""
+
+    fake = HeadDriftGh(head_for, checks=[_zero_rows()])
+    sleeps = _install(monkeypatch, fake)
+    holder["sleeps"] = sleeps  # head_for reads the live sleep log
+
+    exit_code, payload = _run(capsys)
+
+    assert exit_code == wait_ci_checks.EXIT_NEGATIVE
+    assert payload["status"] == "head_sha_changed"
+    assert payload["current_head_sha"] == NEW_HEAD_SHA
+    assert len(sleeps) == 4
+
+
+def test_head_unchanged_pending_still_ends_in_pending_timeout(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F3(3a): HEAD never changes -> existing pending_timeout semantics are preserved."""
+    fake = HeadDriftGh(lambda _i: (0, HEAD_SHA + "\n", ""), checks=[_zero_rows()])
+    sleeps = _install(monkeypatch, fake)
+
+    exit_code, payload = _run(capsys)
+
+    assert exit_code == wait_ci_checks.EXIT_NEGATIVE
+    assert payload["status"] == "pending_timeout"
+    assert payload["current_head_sha"] == HEAD_SHA
+    assert len(sleeps) == 4
+
+
+def test_head_unchanged_pending_then_completes_passed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F3(3b): HEAD never changes and contexts materialize on the 2nd poll -> passed."""
+    fake = HeadDriftGh(
+        lambda _i: (0, HEAD_SHA + "\n", ""),
+        checks=[_zero_rows(), _checks_ok(_rows(CLASSIC_CONTEXTS))],
+    )
+    sleeps = _install(monkeypatch, fake)
+
+    exit_code, payload = _run(capsys)
+
+    assert exit_code == wait_ci_checks.EXIT_PASS
+    assert payload["status"] == "passed"
+    assert payload["current_head_sha"] == HEAD_SHA
+    assert len(sleeps) == 1
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expected_status"),
+    [
+        ("gh: Bad credentials (HTTP 401)", "auth_error"),
+        ("gh: Server Error (HTTP 502)", "gh_error"),
+    ],
+)
+def test_head_fetch_error_during_pending_is_not_success_or_head_changed(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    stderr: str,
+    expected_status: str,
+) -> None:
+    """F3(4): a HEAD-fetch failure while pending keeps classify_gh_error semantics (exit 2)."""
+    fake = HeadDriftGh(
+        lambda i: (0, HEAD_SHA + "\n", "") if i == 0 else (1, "", stderr),
+        checks=[_zero_rows()],
+    )
+    _install(monkeypatch, fake)
+
+    exit_code, payload = _run(capsys)
+
+    assert exit_code == wait_ci_checks.EXIT_RUNTIME
+    assert payload["status"] == expected_status
+    assert payload["status"] not in {"passed", "skipped_only", "head_sha_changed", "pending_timeout"}
+    assert payload["current_head_sha"] == ""

@@ -364,6 +364,21 @@ def main(argv: list[str]) -> int:
                     message=head_message,
                     exit_code=EXIT_RUNTIME,
                 )
+            if current_head_sha != args.head_sha:
+                return emit_result(
+                    status="head_sha_changed",
+                    repo=args.repo,
+                    pr_number=args.pr_number,
+                    head_sha=args.head_sha,
+                    current_head_sha=current_head_sha or "",
+                    checks=[],
+                    elapsed_seconds=elapsed,
+                    interval_seconds=args.interval,
+                    timeout_seconds=args.timeout_seconds,
+                    error_code="head_sha_changed",
+                    message="head SHA changed while waiting for checks",
+                    exit_code=EXIT_NEGATIVE,
+                )
             return emit_result(
                 status="pending_timeout",
                 repo=args.repo,
@@ -453,6 +468,39 @@ def main(argv: list[str]) -> int:
         if last_missing and decision in ("passed", "skipped_only"):
             decision = "pending"
         if decision == "pending":
+            # Issue #2836 F3: a pending poll must still detect HEAD drift so that a
+            # stale SHA never waits out the full timeout as pending_timeout.
+            current_head_sha, head_error, head_message = get_current_head_sha(args.repo, args.pr_number)
+            if head_error:
+                return emit_result(
+                    status=head_error,
+                    repo=args.repo,
+                    pr_number=args.pr_number,
+                    head_sha=args.head_sha,
+                    current_head_sha="",
+                    checks=checks,
+                    elapsed_seconds=elapsed,
+                    interval_seconds=args.interval,
+                    timeout_seconds=args.timeout_seconds,
+                    error_code=head_error,
+                    message=head_message,
+                    exit_code=EXIT_RUNTIME,
+                )
+            if current_head_sha != args.head_sha:
+                return emit_result(
+                    status="head_sha_changed",
+                    repo=args.repo,
+                    pr_number=args.pr_number,
+                    head_sha=args.head_sha,
+                    current_head_sha=current_head_sha or "",
+                    checks=checks,
+                    elapsed_seconds=elapsed,
+                    interval_seconds=args.interval,
+                    timeout_seconds=args.timeout_seconds,
+                    error_code="head_sha_changed",
+                    message="head SHA changed while waiting for checks",
+                    exit_code=EXIT_NEGATIVE,
+                )
             time.sleep(args.interval)
             continue
 
