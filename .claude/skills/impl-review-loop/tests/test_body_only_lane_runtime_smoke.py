@@ -164,6 +164,19 @@ def test_ac8_counterfactual_option_detection_ignores_unrelated_baseline_options(
     assert runner_counterfactual_options("--counterfactual-base-ref REF --x") == ["--counterfactual-base-ref"]
 
 
-def test_ac8_the_real_runner_currently_exposes_no_counterfactual_option_so_the_live_smoke_cannot_pass() -> None:
-    """#2981 が land して runner に option が現れたら、この test が落ちて BASE 対照の配線が必要になる。"""
-    assert runner_counterfactual_options(_runner_help()) == []
+def test_ac8_the_real_runner_exposes_the_skill_text_counterfactual_options() -> None:
+    """#2981 で runner に導入された counterfactual option の存在だけを確認する（BASE 対照の成立は意味しない）。"""
+    options = runner_counterfactual_options(_runner_help())
+
+    assert "--skill-text-counterfactual-base-ref" in options
+    assert "--skill-text-counterfactual-skill" in options
+
+
+def test_ac8_option_presence_on_the_real_runner_is_not_base_discrimination() -> None:
+    """option が存在しても BASE 対照が未配線の間は PASS にせず exit 77（SKIP:）とする現行契約のみを検証する。"""
+    with pytest.raises(pytest.exit.Exception) as excinfo:
+        exit_77_unless_discrimination_is_available(_runner_help())
+
+    assert excinfo.value.returncode == EXIT_CAPABILITY_UNAVAILABLE == 77
+    assert str(excinfo.value) == BASE_NOT_WIRED_REASON
+    assert str(excinfo.value).startswith("SKIP:")
