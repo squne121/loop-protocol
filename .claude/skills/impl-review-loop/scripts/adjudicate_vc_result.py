@@ -704,8 +704,15 @@ def _runtime_only_current_head_binding_error(
     allowed_paths: list[str],
     expected_issue_number: Any = None,
     expected_pr_number: Any = None,
+    allow_delegated_nonpass: bool = False,
+    delegated_keys: frozenset[tuple[str, str]] = frozenset(),
 ) -> str | None:
-    """runtime_only current-head independent binding (Issue #2467)."""
+    """runtime_only current-head independent binding (Issue #2467).
+
+    Issue #2916: when a pr_review_only non-pass is delegated in the same report,
+    the report-level aggregate is legitimately fail / partial. The runtime_only
+    ACs' own executed-PASS requirement is enforced per item by the caller and
+    every non-delegated row's fallback is still checked on its own."""
     return _current_head_binding_error(
         reason_prefix="runtime_only",
         contract_snapshot=contract_snapshot,
@@ -716,6 +723,8 @@ def _runtime_only_current_head_binding_error(
         allowed_paths=allowed_paths,
         expected_issue_number=expected_issue_number,
         expected_pr_number=expected_pr_number,
+        allow_delegated_nonpass=allow_delegated_nonpass,
+        delegated_keys=delegated_keys,
     )
 
 
@@ -861,13 +870,15 @@ def _nonpass_facts_of(item: dict[str, Any]) -> dict[str, Any]:
 def _is_delegable_nonpass_facts(facts: dict[str, Any]) -> bool:
     """True only for COHERENT executed non-pass facts that a reviewer may judge.
 
-    Delegable: ``fail`` with a non-zero exit, ``skip`` with a non-zero exit
-    (the test-runner's own SKIP, exit 77), or ``pass`` / exit 0 that carries
-    ``fallback_detected: true``. Everything else stays fail-closed: contradictory
-    facts (``pass`` with a non-zero exit, ``fail`` / ``skip`` with exit 0 --
-    these look like a failure dressed up as success), unknown status values,
-    non-bool flags, and any ``human_review_required`` / ``stop_condition_triggered``
-    (explicit human / stop signals are never delegated to the reviewer)."""
+    Delegable (mirrors the test-runner classification table): ``fail`` /
+    ``skip`` with a non-zero exit, or ``fail`` with exit 0 that carries
+    ``fallback_detected: true`` (a fallback success is classified FAIL, never
+    PASS). Everything else stays fail-closed: ``fail`` / exit 0 WITHOUT a
+    fallback and ``skip`` / exit 0 (a failure dressed up as success), ``pass``
+    in any form (including ``pass`` + ``fallback_detected: true``, which the
+    producer never emits), unknown status values, non-bool flags, and any
+    ``human_review_required`` / ``stop_condition_triggered`` (explicit human /
+    stop signals are never delegated to the reviewer)."""
     exit_code = facts.get("exit_code")
     status = facts.get("status")
     if isinstance(exit_code, bool) or not isinstance(exit_code, int):
@@ -877,10 +888,10 @@ def _is_delegable_nonpass_facts(facts: dict[str, Any]) -> bool:
         return False
     if facts.get("human_review_required") is not False or facts.get("stop_condition_triggered") is not False:
         return False
-    if status in {"fail", "skip"}:
+    if status == "fail":
+        return exit_code != 0 or fallback is True
+    if status == "skip":
         return exit_code != 0
-    if status == "pass":
-        return exit_code == 0 and fallback is True
     return False
 
 
@@ -1676,6 +1687,8 @@ def adjudicate_vc_result(
             allowed_paths=normalized_allowed,
             expected_issue_number=expected_issue_number,
             expected_pr_number=expected_pr_number,
+            allow_delegated_nonpass=bool(delegated_nonpass_keys),
+            delegated_keys=frozenset(delegated_nonpass_keys),
         )
         if runtime_only_binding_error is not None:
             return _result(

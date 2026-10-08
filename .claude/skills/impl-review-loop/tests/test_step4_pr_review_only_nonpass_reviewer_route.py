@@ -92,12 +92,30 @@ $ rg -q fixture tracked.txt
 ```
 """
 
+BODY_RUNTIME_MIXED = """## Allowed Paths
+- tracked.txt
+- implemented.txt
+
+## Verification Commands
+
+```bash
+# AC1
+# preflight-scope: runtime_only
+$ rg -q fixture tracked.txt --max-count 1
+
+# AC2
+# preflight-scope: pr_review_only
+$ rg -q fixture tracked.txt
+```
+"""
+
 # Executed non-pass facts a reviewer may judge (row overrides of a passing row).
 DELEGABLE_ROWS: dict[str, dict[str, Any]] = {
     "fail_exit_1": {"exit_code": 1, "status": "fail"},
     "fail_exit_5": {"exit_code": 5, "status": "fail"},
     "skip_exit_77": {"exit_code": 77, "status": "skip"},
-    "fallback_detected": {"fallback_detected": True},
+    # test-runner classifies a fallback success as FAIL (exit 0 + status fail), never PASS.
+    "fail_exit_0_with_fallback": {"exit_code": 0, "status": "fail", "fallback_detected": True},
     "fail_with_fallback": {"exit_code": 1, "status": "fail", "fallback_detected": True},
 }
 
@@ -169,7 +187,10 @@ def _build_scenario(tmp_path_factory: pytest.TempPathFactory, name: str, body: s
     assert [(row["ac"], row["command_hash"]) for row in producer["results"]] == [
         (row["ac"], row["command_hash"]) for row in commands
     ]
-    kinds = ["pr_review_only" if row["scope_class"] == "pr_review_only" else "ordinary" for row in producer["results"]]
+    kinds = [
+        row["scope_class"] if row["scope_class"] in {"pr_review_only", "runtime_only"} else "ordinary"
+        for row in producer["results"]
+    ]
     snapshot = {
         "schema": "CONTRACT_REVIEW_RESULT_V1",
         "status": "go",
@@ -185,6 +206,13 @@ def _build_scenario(tmp_path_factory: pytest.TempPathFactory, name: str, body: s
         hashes=metadata["command_hashes"],
         kinds=kinds,
     )
+
+
+@pytest.fixture(scope="module")
+def runtime_mixed(tmp_path_factory: pytest.TempPathFactory) -> Scenario:
+    scenario = _build_scenario(tmp_path_factory, "runtime_mixed", BODY_RUNTIME_MIXED)
+    assert scenario.kinds == ["runtime_only", "pr_review_only"]
+    return scenario
 
 
 @pytest.fixture(scope="module")
@@ -606,7 +634,24 @@ FAIL_CLOSED_CASES: dict[str, dict[str, Any]] = {
         "errors": ["pr_review_only_current_execution_not_pass:AC1"],
     },
     "fail_status_with_zero_exit": {
-        "row": {"exit_code": 0, "status": "fail"},
+        "row": {"exit_code": 0, "status": "fail", "fallback_detected": False},
+        "errors": ["pr_review_only_current_execution_not_pass:AC1"],
+    },
+    # the producer never emits PASS for a fallback: that expression is contradictory
+    "pass_status_with_fallback": {
+        "row": {"exit_code": 0, "status": "pass", "fallback_detected": True},
+        "errors": ["pr_review_only_current_execution_not_pass:AC1"],
+    },
+    "skip_status_with_zero_exit_and_fallback": {
+        "row": {"exit_code": 0, "status": "skip", "fallback_detected": True},
+        "errors": ["pr_review_only_current_execution_not_pass:AC1"],
+    },
+    "fail_zero_exit_fallback_with_human_review": {
+        "row": {"exit_code": 0, "status": "fail", "fallback_detected": True, "human_review_required": True},
+        "errors": ["pr_review_only_current_execution_not_pass:AC1"],
+    },
+    "fail_zero_exit_fallback_with_stop_condition": {
+        "row": {"exit_code": 0, "status": "fail", "fallback_detected": True, "stop_condition_triggered": True},
         "errors": ["pr_review_only_current_execution_not_pass:AC1"],
     },
     "skip_status_with_zero_exit": {
@@ -632,7 +677,7 @@ FAIL_CLOSED_CASES: dict[str, dict[str, Any]] = {
         "errors": ["pr_review_only_nonpass_report_result_inconsistent"],
     },
     "report_result_pass_over_fallback_row": {
-        "row": {"fallback_detected": True},
+        "row": {"exit_code": 0, "status": "fail", "fallback_detected": True},
         "report": {"result": "PASS"},
         "errors": ["pr_review_only_nonpass_report_result_inconsistent"],
     },
@@ -854,7 +899,7 @@ def test_fail_closed_on_pass_conversion_or_forged_delegated_row_only_fallback_st
     # Existing behaviour is unchanged: when ONLY the delegated pr_review_only row carries fallback_detected,
     # the ordinary AC is clean and the reviewer dispatch is still permitted (and still not a pass).
     index = _pr_review_only_index(mixed)
-    report = _report(mixed, row_overrides={index: {"fallback_detected": True}})
+    report = _report(mixed, row_overrides={index: {"exit_code": 0, "status": "fail", "fallback_detected": True}})
     ws = Workspace(tmp_path, mixed)
 
     rc, payload = ws.adjudicate(report)
@@ -1022,3 +1067,124 @@ def test_asserts_reason_code_and_route_across_step4_and_terminal_gate(tmp_path, 
     rc, term = ws.terminal_gate(dispatch_seq=1, verdict=_reviewer_verdict(scenario.head, "REQUEST_CHANGES", ["x"]))
     assert rc == 1
     assert term["route"] == "continue_loop"
+
+
+# --- Issue #2916 review fix: runtime_only PASS + delegated pr_review_only non-pass ---
+
+RT_PASS_ROW: dict[str, Any] = {}  # default _row is an executed PASS
+PR_FAIL_ROWS: dict[str, dict[str, Any]] = {
+    "fail_exit_1": {"exit_code": 1, "status": "fail"},
+    "fail_exit_0_with_fallback": {"exit_code": 0, "status": "fail", "fallback_detected": True},
+}
+
+
+@pytest.mark.parametrize("report_result", ["FAIL", "PARTIAL"])
+@pytest.mark.parametrize("case", sorted(PR_FAIL_ROWS), ids=sorted(PR_FAIL_ROWS))
+def test_nonpass_facts_lossless_runtime_only_pass_mixed_with_delegated_pr_review_only_fail(
+    tmp_path, runtime_mixed, case, report_result
+):
+    ws = Workspace(tmp_path, runtime_mixed)
+    report = _report(runtime_mixed, row_overrides={1: PR_FAIL_ROWS[case]}, result=report_result)
+    rc, payload = ws.adjudicate(report)
+    assert rc == 0, payload
+    assert payload["invoke_pr_reviewer"] is True and payload["reason_code"] is None and payload["seq"] == 1
+    assert payload["adjudication"]["pr_review_only_nonpass_delegated"] == ["AC2"]
+    stored = ws.stored()
+    assert stored["overall_status"] == "indeterminate" and stored["blocking"] is True
+    by_ac = {entry["ac"]: entry for entry in stored["per_ac"]}
+    # runtime_only keeps its own executed PASS; only the pr_review_only AC is delegated (never PASS).
+    assert by_ac["AC1"]["reason_code"] == "runtime_only_current_head_binding_pass"
+    assert by_ac["AC2"]["reason_code"] == DELEGATED and by_ac["AC2"]["status"] == "indeterminate"
+    assert _decoded(by_ac["AC2"])["status"] == "fail"
+    # Reviewer dispatch is not AC achievement: no APPROVE -> no terminal approval.
+    rc, term = ws.terminal_gate(dispatch_seq=1, verdict=_reviewer_verdict(runtime_mixed.head, "REQUEST_CHANGES", ["x"]))
+    assert rc == 1 and term["route"] != "approved"
+    rc, term = ws.terminal_gate(dispatch_seq=1)
+    assert rc == 0 and term["route"] == "approved"
+
+    # Without the opt-in flag the legacy fail-closed behaviour is unchanged.
+    other = Workspace(tmp_path / "no_flag", runtime_mixed)
+    rc, payload = other.adjudicate(report, delegate=False)
+    _assert_no_dispatch(other, rc, payload, ["pr_review_only_current_execution_not_pass:AC2"])
+
+
+RUNTIME_ROW_REFUSED: dict[str, dict[str, Any]] = {
+    "runtime_only_fail": {"exit_code": 1, "status": "fail"},
+    "runtime_only_skip": {"exit_code": 77, "status": "skip"},
+    "runtime_only_pass_with_fallback": {"fallback_detected": True},
+    "runtime_only_fail_zero_exit_with_fallback": {"exit_code": 0, "status": "fail", "fallback_detected": True},
+}
+
+
+@pytest.mark.parametrize("case", sorted(RUNTIME_ROW_REFUSED), ids=sorted(RUNTIME_ROW_REFUSED))
+def test_fail_closed_on_pass_conversion_or_forged_runtime_only_nonpass_next_to_delegated_row(
+    tmp_path, runtime_mixed, case
+):
+    ws = Workspace(tmp_path, runtime_mixed)
+    report = _report(
+        runtime_mixed,
+        row_overrides={0: RUNTIME_ROW_REFUSED[case], 1: {"exit_code": 1, "status": "fail"}},
+    )
+    rc, payload = ws.adjudicate(report)
+    # runtime_only is never delegable: a delegated pr_review_only row cannot cover it.
+    _assert_no_dispatch(ws, rc, payload, ["runtime_only_current_execution_not_pass:AC1"])
+
+
+def test_fail_closed_on_pass_conversion_or_forged_runtime_mixed_bindings(tmp_path, runtime_mixed):
+    failing = {1: {"exit_code": 1, "status": "fail"}}
+    drifts: dict[str, tuple[dict[str, Any], dict[str, Any], list[str]]] = {
+        "stale_reviewed_head": ({"reviewed_head_sha": "e" * 40}, {}, ["pr_review_only_head_binding_mismatch"]),
+        "stale_body_digest": (
+            {"body_sha256": "sha256:" + "f" * 64},
+            {},
+            ["pr_review_only_source_body_sha256_mismatch"],
+        ),
+        "changed_path_outside_allowed": (
+            {},
+            {"diff_summary": _diff_summary(runtime_mixed, changed_paths=["src/outside.py"])},
+            ["pr_review_only_changed_paths_not_certified"],
+        ),
+    }
+    for name, (report_kwargs, adjudicate_kwargs, errors) in drifts.items():
+        ws = Workspace(tmp_path / name, runtime_mixed)
+        rc, payload = ws.adjudicate(_report(runtime_mixed, row_overrides=failing, **report_kwargs), **adjudicate_kwargs)
+        _assert_no_dispatch(ws, rc, payload, errors)
+
+
+def test_fail_closed_on_pass_conversion_or_forged_report_pass_over_runtime_mixed_failure(tmp_path, runtime_mixed):
+    ws = Workspace(tmp_path, runtime_mixed)
+    report = _report(runtime_mixed, row_overrides={1: {"exit_code": 1, "status": "fail"}}, result="PASS")
+    rc, payload = ws.adjudicate(report)
+    _assert_no_dispatch(ws, rc, payload, ["pr_review_only_nonpass_report_result_inconsistent"])
+
+
+@pytest.mark.parametrize(
+    "forged",
+    [
+        {"status": "pass"},
+        {"fallback_detected": False},
+        {"exit_code": 3, "status": "pass"},
+    ],
+    ids=["status_pass", "fallback_dropped", "pass_nonzero_exit"],
+)
+def test_fail_closed_on_pass_conversion_or_forged_persisted_fallback_fail_facts_tampered(tmp_path, single, forged):
+    ws = _dispatched_with_failure(
+        tmp_path, single, {"exit_code": 0, "status": "fail", "fallback_detected": True}
+    )
+    rc, gate = ws.step4_gate()
+    assert rc == 0 and gate["invoke_pr_reviewer"] is True
+
+    state = ws.state()
+    entry = state["vc_adjudication"][ws.binding_key()]["per_ac"][0]
+    facts = _decoded(entry) | forged
+    entry["failure_keys"] = [
+        {"kind": "pr_review_only_current_execution_fact", "key": f"{name}={json.dumps(value)}"}
+        for name, value in facts.items()
+    ]
+    ws.loop_state.write_text(json.dumps(state), encoding="utf-8")
+
+    rc, gate = ws.step4_gate()
+    assert rc == 1 and gate["invoke_pr_reviewer"] is False
+    assert gate["reason_code"] in {"adjudication_ac_not_resolved", "adjudication_blocking_true"}
+    rc, term = ws.terminal_gate(dispatch_seq=1)
+    assert rc == 1 and term["route"] == "continue_loop" and term["reason_code"] == "vc_gate_blocking"
