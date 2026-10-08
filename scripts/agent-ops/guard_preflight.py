@@ -32,9 +32,14 @@ from cleanup_contract_v3 import (  # noqa: E402
     load_contract_state,
 )
 from worktree_catalog import (  # noqa: E402
+    ACTIVE_ISSUE_CATALOG_CONFLICT,
     Deadline,
     GuardDeadlineExceeded,
-    list_worktrees,
+    best_effort_root,
+    find_containing_entry,
+    issue_number_from_entry,
+    resolve_canonical_root,
+    root_candidate,
     select_issue_worktree,
 )
 
@@ -42,11 +47,32 @@ SCHEMA = "AGENT_GUARD_PREFLIGHT_V1"
 
 
 def resolve_project_root() -> str:
-    env_root = os.environ.get("CLAUDE_PROJECT_DIR")
-    if env_root:
-        return os.path.realpath(env_root)
-    agent_ops = os.path.dirname(os.path.realpath(__file__))
-    return os.path.realpath(os.path.dirname(os.path.dirname(agent_ops)))
+    """Best-effort canonical root (never raises).
+
+    Priority: ``CLAUDE_PROJECT_DIR`` -> script location, each normalised to the
+    repository's primary root through the shared ``worktree_catalog`` helper
+    (Issue #2979). When normalisation fails the raw candidate is returned;
+    ``build_preflight`` re-runs the identity check and reports the structured
+    failure, so the raw candidate is never silently trusted as the root.
+    """
+    return best_effort_root(None, __file__)
+
+
+def _session_cwd() -> str:
+    """The session's current directory (an observation, never the root authority).
+
+    ``PWD`` is only used when it still names the same directory as the process
+    cwd (a stale inherited ``PWD`` must not override the real cwd); if the cwd
+    was deleted, ``PWD`` is the only remaining hint.
+    """
+    pwd = os.environ.get("PWD")
+    try:
+        real_cwd = os.path.realpath(os.getcwd())
+    except OSError:
+        return os.path.realpath(pwd) if pwd else os.getcwd()
+    if pwd and os.path.realpath(pwd) == real_cwd:
+        return os.path.realpath(pwd)
+    return real_cwd
 
 
 def _current_branch(project_root: str, deadline: Deadline) -> str | None:
@@ -106,10 +132,19 @@ def _classify_root(current: str | None, default: str) -> str:
     return "drifted"
 
 
-def _active_issue(cwd: str, current_branch: str | None) -> str | None:
+def _active_issue(cwd: str, current_branch: str | None, catalog_issue: str | None = None) -> str | None:
+    """Active Issue: ``LOOP_ISSUE_NUMBER`` -> catalog identity of the cwd -> cwd basename -> root branch.
+
+    ``catalog_issue`` is the Issue bound to the catalog entry that contains the
+    cwd (Issue #2979 AC9) so nested cwds such as ``<worktree>/src`` are identified
+    without relying on the cwd basename. Conflicts between the environment value
+    and the catalog identity are detected by the caller.
+    """
     env = os.environ.get("LOOP_ISSUE_NUMBER")
     if env and env.strip().isdigit():
         return env.strip()
+    if catalog_issue:
+        return catalog_issue
     base = os.path.basename(os.path.normpath(cwd))
     m = re.match(r"^issue-(\d+)-", base)
     if m:
@@ -168,26 +203,38 @@ def _contract_binds_to(root: str, entry: dict | None) -> bool:
 
 
 def build_preflight(project_root: str | None = None, cwd: str | None = None, budget_seconds: float = 30.0) -> dict:
-    root = os.path.realpath(project_root) if project_root else resolve_project_root()
-    cwd_real = os.path.realpath(cwd) if cwd else os.path.realpath(os.environ.get("PWD") or os.getcwd())
+    # Issue #2979: the root CANDIDATE (--project-root -> CLAUDE_PROJECT_DIR -> script
+    # location) is normalised to the repository's canonical primary root from Git
+    # identity. cwd is only an observation of "which worktree am I in".
+    candidate = root_candidate(project_root, __file__)
+    cwd_real = os.path.realpath(cwd) if cwd else _session_cwd()
     deadline = Deadline(budget_seconds)
 
     try:
+        resolution = resolve_canonical_root(candidate, deadline)
+        if not resolution.ok:
+            return _blocked_root_resolution(resolution.reason_code)
+        root = resolution.primary_root
+        catalog = resolution.catalog
         current = _current_branch(root, deadline)
         default = _default_branch(root, deadline)
-        catalog = list_worktrees(root, deadline)
     except GuardDeadlineExceeded:
-        return _blocked_deadline(root)
-    if catalog is None:
-        catalog = []
+        return _blocked_deadline(candidate)
 
     root_branch_state = _classify_root(current, default)
-    active_issue = _active_issue(cwd_real, current)
+    cwd_entry = find_containing_entry(catalog, cwd_real)
+    # Only a LINKED worktree entry carries an Issue identity for the session; the
+    # primary root is a prefix of every worktree and never identifies one.
+    catalog_issue = issue_number_from_entry(cwd_entry) if cwd_entry is not catalog[0] else None
+    active_issue = _active_issue(cwd_real, current, catalog_issue)
+    issue_conflict = bool(catalog_issue and active_issue and active_issue != catalog_issue)
     entry = _entry_for_issue(catalog, active_issue, root) if active_issue else None
     cwd_class = _cwd_classification(catalog, cwd_real, root)
 
     if active_issue is None:
         active_worktree_state = "none"
+    elif issue_conflict:
+        active_worktree_state = "mismatch"
     elif entry is not None and root_branch_state == "default":
         active_worktree_state = "matches"
     else:
@@ -205,7 +252,16 @@ def build_preflight(project_root: str | None = None, cwd: str | None = None, bud
 
     blocked: list[str] = []
     hints: list[dict] = []
-    if root_branch_state in ("drifted", "detached_or_unknown") and active_worktree_state == "mismatch":
+    if issue_conflict:
+        # LOOP_ISSUE_NUMBER contradicts the catalog identity of the cwd's worktree.
+        status = "human_required"
+        blocked.append(ACTIVE_ISSUE_CATALOG_CONFLICT)
+        hints.append({
+            "action": "resolve_active_issue_conflict",
+            "requires_human_override": True,
+            "detail": "LOOP_ISSUE_NUMBER contradicts the Issue bound to the current worktree in the catalog",
+        })
+    elif root_branch_state in ("drifted", "detached_or_unknown") and active_worktree_state == "mismatch":
         status = "human_required"
         blocked.append(ROOT_DRIFT_ACTIVE_WORKTREE_MISMATCH)
         hints.append({
@@ -245,6 +301,31 @@ def build_preflight(project_root: str | None = None, cwd: str | None = None, bud
         "safe_scratch_contract_path": SAFE_SCRATCH_CONTRACT_PATH,
         "allowed_next_commands": hints,
         "blocked_reason_codes": blocked,
+    }
+
+
+def _blocked_root_resolution(reason_code: str | None) -> dict:
+    """Structured failure when the canonical primary root cannot be verified (Issue #2979).
+
+    The candidate (possibly an issue worktree) is never silently used as the root.
+    Status is never ``ok``; the fixed reason literal is carried on the existing
+    ``blocked_reason_codes`` field.
+    """
+    return {
+        "schema": SCHEMA,
+        "status": "human_required",
+        "root_branch_state": "detached_or_unknown",
+        "active_worktree_state": "mismatch",
+        "cleanup_contract_state": "present_but_invalid",
+        "resolved_worktree": {"issue_number": None, "worktree_realpath": None, "branch_ref": None,
+                              "cwd_classification": "unknown", "git_common_dir": None},
+        "safe_scratch_contract_path": SAFE_SCRATCH_CONTRACT_PATH,
+        "allowed_next_commands": [{
+            "action": "resolve_canonical_root",
+            "requires_human_override": True,
+            "detail": "canonical primary root could not be verified; no cleanup was attempted",
+        }],
+        "blocked_reason_codes": [reason_code or "primary_root_unresolved"],
     }
 
 
