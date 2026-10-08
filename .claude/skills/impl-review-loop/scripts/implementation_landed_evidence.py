@@ -24,7 +24,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[4]
 _AGENT_OPS_DIR = _REPO_ROOT / "scripts" / "agent-ops"
 if str(_AGENT_OPS_DIR) not in sys.path:
     sys.path.insert(0, str(_AGENT_OPS_DIR))
+_AGENT_GUARDS_DIR = _REPO_ROOT / "scripts" / "agent-guards"
+if str(_AGENT_GUARDS_DIR) not in sys.path:
+    sys.path.insert(0, str(_AGENT_GUARDS_DIR))
 from allowed_paths_policy import is_no_path_marker  # noqa: E402
+from changed_file_matcher import AllowedPathsMatcher  # noqa: E402
 
 EVIDENCE_SCHEMA = "IMPLEMENTATION_LANDED_EVIDENCE_V1"
 COVERAGE_SCHEMA = "IMPLEMENTATION_SCOPE_COVERAGE_V1"
@@ -237,12 +241,34 @@ def coverage_from_pr_body(*, pr_body: str, issue_number: int, live_issue_body: s
 
 
 def _allowed_paths_covered(allowed_paths: list[str], files: Any) -> bool:
+    """Each entry must match a PR file; this is not a changed-file allowlist.
+
+    Wildcard-free entries retain the legacy exact/directory-prefix behavior.
+    Explicit wildcards use the shared matcher's safe segment grammar. Both
+    branches normalize repo-relative paths and reject invalid inputs.
+    """
     if not allowed_paths or not isinstance(files, list):
         return False
-    paths = [str(f.get("path")) for f in files if isinstance(f, Mapping) and isinstance(f.get("path"), str)]
-    return all(
-        any(path == entry or path.startswith(entry.rstrip("/") + "/") for path in paths) for entry in allowed_paths
-    )
+    paths = [
+        normalized
+        for file in files
+        if isinstance(file, Mapping) and isinstance(file.get("path"), str)
+        if (normalized := AllowedPathsMatcher.normalize_path(file["path"])) is not None
+    ]
+    for entry in allowed_paths:
+        if not isinstance(entry, str):
+            return False
+        if "*" in entry:
+            pattern = AllowedPathsMatcher.normalize_allowed_pattern(entry)
+            if pattern is None or not any(AllowedPathsMatcher.matches_pattern(path, pattern) for path in paths):
+                return False
+        else:
+            # A plain trailing slash retains the legacy directory-prefix rule;
+            # strip exactly one so repeated slashes still fail normalization.
+            plain = AllowedPathsMatcher.normalize_path(entry[:-1] if entry.endswith("/") else entry)
+            if plain is None or not any(path == plain or path.startswith(plain + "/") for path in paths):
+                return False
+    return True
 
 
 def _candidate_errors(candidate: Any, repo: str, issue_number: int) -> list[str]:
