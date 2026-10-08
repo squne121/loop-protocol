@@ -73,6 +73,48 @@ frontmatter 直下の説明と同一の要旨）:
 > 4 役すべての各 file を、Read tool で `<root>/<repository 相対 path>` として読む
 > （evaluator / matcher の file を省略しない。`cat` など Bash での代替は観測として数えない）。
 > これらを観測せずに `assessment: clear` を返してはならない。
+> (4) pinned body が repository 相対 path を列挙していない role（path が記載されていない、または一意に
+> 解決できない role）だけ、body に現れる named symbol を query にした bounded discovery で source を発見してから
+> Read する。path を列挙している role は検索せず直接読む（explicit path を持つ role を再探索しない）。
+> discovery の lane は session で実際に使える tool に従う。専用の Grep / Glob tool が使えるなら、それだけを使い、
+> `path` に `<root>` 配下の絶対 path を明示する。専用の Grep / Glob が使えない（`No such tool available` になる）
+> 場合は、Bash の `find` / `grep` で discovery する。専用 Grep / Glob が無いこと自体を理由に high にしない。
+> 専用の Grep / Glob の呼び出しが 1 回でも `No such tool available` になったら、以後は専用 tool を再試行せず、
+> Bash lane だけで discovery する（失敗した専用 tool の呼び出しも search call として数えられる）。Bash lane は
+> eligible な `grep -rl --include=<glob> <named symbol> <root 配下の絶対 path>` から始めることを推奨する。
+> reviewer 区間で許される Bash は、(1) の root 解決 command、(2) の HEAD 解決 command、eligible な find / grep の
+> 3 種類だけである。これ以外の Bash（`rg` / `ugrep` / `git grep` / `git ls-files` / `ls -R` / `env grep` /
+> `timeout 5 grep` / `cd <root> && grep` / `xargs grep` / `cat` / `sed` を含む）はすべて契約違反である。
+> eligible な find / grep は、単一の simple command（unquoted の `;` `&&` `||` `|` `>` `<` `&`・改行・コマンド置換を
+> 含まない。quote した引数内の `|` は可）で、検索対象に `<root>` 配下の絶対 path を明示する（相対 path・path の
+> 省略・`..`・root 外は禁止）。search path operand は literal resolved-root path。shell expansion で構築しない
+> （`$` `${...}`・brace expansion `{a,b}`・pathname glob `*` `?` `[`・`~` を path operand に含めない）。command のどの token でも、
+> unquoted の shell メタ文字
+> （`$` `{` `*` `?` `[` と語頭の `~`）、および backslash + 改行の行継続は使わない。pattern・`-e` の値・`-name` / `-path` の
+> glob・`--include=` の glob は quote する（例 `'SymA|SymB'` `-name '*.py'` `--include='*.py'`）。
+> grep は `-r` `-R` `-n` `-i` `-l` `-E` `-F` `-w` `-H` `-I` `-e` と `--include=X`・
+> `--exclude-dir=X` だけを使い（`-rn` のような連結は全文字が許可 flag の場合のみ。`--include X` の分離形式は禁止）、
+> find は `-type` `-name` `-iname` `-path` `-maxdepth` `-o` だけを使う（`-exec` `-delete` 等は禁止）。
+> 出力を小さく保つため、grep は `-l` と `--include=` / `--exclude-dir=` を併用することを推奨する。
+> 検索 query は、Grep / grep では未解決 role の named symbol を、Glob / find（`-name` / `-iname` / `-path`）では
+> 未解決 role の file 名断片を含める。いずれも pinned body に書かれた文字列を verbatim で使い、推測した名前を使わない
+> （grep の pattern は未解決 role の named symbol、Glob / find の name / path pattern は body が挙げる file 名断片）。
+> 複数 role・fixture・Issue に共通する prefix だけの pattern（例 `*<共通 prefix>*`）は、どの未解決 role の file 名断片でも
+> ないため関連しない検索であり、契約違反になるうえ 8 回の search budget も消費する。
+> 未解決 role は 1 件ずつ漏れなく解決する。decision-critical consumer も例外ではなく、consumer の path が未記載なら
+> consumer の named symbol も検索対象に含める。各 role の file は、その role の named symbol / file 名断片を含む検索の
+> 成功結果にその file の path が現れた場合だけ Read し、他 role の hit・同じ directory・命名規則から path を推測して
+> Read しない（path の推測 Read は禁止。ただし既に Read 済みの別 required-role target source の import / call-site から
+> target が一意に確定した場合は、帰属規則 (b) として search を省略して Read してよい。同じ directory・命名規則・共有 prefix・
+> 推測した path だけを根拠にした Read は契約違反）。未解決 role の symbol は quote した alternation で
+> 1 回にまとめてよい（例 `grep -rlE --include=<glob> '<symbol A>|<symbol B>' <root 配下の絶対 path>`）。
+> 成功した検索結果に target source の path が現れてから、その file を Read する。同名 symbol を持つ decoy が
+> あり得るため、最初の hit を盲目的に Read せず、decision-critical consumer の import / call-site から target を
+> 確定する。検索は専用 Grep / Glob と eligible な Bash find / grep の合計 8 回以内（`DISCOVERY_SEARCH_CALL_MAX: 8`）、
+> `bundle.json` と `body_file` 以外の Read は 8 回以内（`DISCOVERY_SOURCE_READ_MAX: 8`）とする。path が未記載で
+> あること自体を理由に high にしない。bounded discovery を尽くしても必要な source を発見・観測できなかった場合に
+> 限り、観測できなかった symbol と試行した検索を `evidence_refs` に残して high 以上の finding にする。
+> cross-contract な検証要求を持たない単純な docs-only Issue では discovery を行わない。
 > 生の semantic review schema に準拠する JSON オブジェクトを 1 つだけ返せ。
 
 SubAgent が返した raw JSON（`assessment`/`findings` のみ）をファイルへ保存する。
@@ -116,12 +158,73 @@ matcher に新しい検証責務を置く設計）がある場合に限り、`se
 - **観測不能は clear にしない**: 必要な source を観測できなかった場合（root / HEAD の解決失敗を含む）は
   `assessment: clear` にせず、high 以上の finding にする。その `evidence_refs` に観測できなかった
   path と理由を残す。
+- **path 未列挙 role の bounded discovery（#2973）**: discovery は required role（producer / parser /
+  evaluator / matcher / decision-critical consumer）単位に適用する。pinned body が repository 相対 path を
+  一意に記載している role は、その path を直接 Read し、検索しない（explicit path を持つ role を再探索しない）。
+  path の記載がない、または一意に解決できない role だけ、body に現れる named symbol / evaluator / caller 名を
+  query にして、repository root 配下に限定した Grep / Glob（専用 lane）または root 束縛の Bash find / grep
+  （Bash lane）で候補を発見し、Read で確認してから audit を続ける。lane は session の effective tool pool に
+  従う（frontmatter の `tools` 宣言は effective tool pool を保証しない）。専用 Grep / Glob があれば専用 lane、
+  無ければ Bash lane で discovery し、どちらも同一の bound・root scope・関連性・因果で判定する。
+- **discovery の bound（固定値）**: `DISCOVERY_SEARCH_CALL_MAX: 8`（reviewer 区間の eligible な discovery
+  tool_use と、eligible 形状を満たさない Bash の合計。専用 Grep / Glob の tool_use 1 件、または eligible な
+  Bash find / grep 1 件を 1 search call と数え、成功・失敗を問わず数える。専用 lane と Bash lane の混在は合算する）、
+  `DISCOVERY_SOURCE_READ_MAX: 8`（`bundle.json` と `body_file` を除く repository file の Read の合計）、
+  `SEARCH_SCOPE: repository_root_only`（全 lane の検索対象 path は resolved root 配下の明示 path とし、`path` の
+  省略・相対 path・root 外 path・`..` による脱出・root 外を指す絶対 pattern は違反）、
+  `DISCOVERY_TOOLS: [Grep, Glob]`（専用 lane の discovery tool）、`DISCOVERY_BASH_LANE: [find, grep]`
+  （Bash lane。eligible 形状を満たす find / grep だけが discovery。任意の Bash は discovery として数えない）。
+  新しい analyzer / generic shell parser / schema / registry / approval layer は追加しない。
+- **Bash discovery の eligible 形状と allowlist**: eligible な Bash は、先頭語が `find` または `grep` の単一
+  simple command であり、unquoted の `;` `&&` `||` `|` `>` `<` `&`・改行・コマンド置換を含まない（quote した
+  引数内の `|` は可）。検索対象 path は resolved root 配下の明示的な絶対 path で、相対 path・path の省略・`..`・
+  root 外は違反とする（cwd 暗黙依存に頼らない）。search path operand は literal resolved-root path であり、shell expansion で
+  構築しない（`$` `${...}`・brace expansion `{a,b}`・pathname glob `*` `?` `[`・`~` を path operand に含む command は
+  実行時 argv が root 外へ変わりうるため scope 違反とする）。command のどの token でも、unquoted の shell メタ文字
+  （`$` `{` `*` `?` `[` と語頭の `~`。brace expansion・`$IFS` の word splitting・pathname glob で search path を増やせる）と
+  backslash + 改行の行継続（`.\<改行>.` が `..` になる）は使わず不適格とする。pattern・`-e` の値・`-name` / `-path` の glob・
+  `--include=` の glob は quote する（例 `'SymA|SymB'` `-name '*.py'` `--include='*.py'`）。
+  grep が使える flag は `-r` `-R` `-n` `-i` `-l` `-E` `-F` `-w` `-H` `-I`
+  `-e` と `--include=X`・`--exclude-dir=X` だけ（`-rn` のような連結は全文字が許可 flag の場合のみ、値は
+  `--include=X` の形式のみ）、find が使える primary は `-type` `-name` `-iname` `-path` `-maxdepth` `-o` だけ
+  （`-exec` `-delete` 等は不可）。出力を小さく保つため grep は `-l` と `--include=` / `--exclude-dir=` の併用を推奨する。
+  reviewer 区間の Bash は allowlist で判定し、許可されるのは exact な root 解決 command、exact な HEAD 解決
+  command、eligible な find / grep だけである。それ以外の Bash（`rg` / `ugrep` / `git grep` / `git ls-files` /
+  `ls -R` / `env grep` / `timeout 5 grep` / `cd <root> && grep` / `xargs grep` / `cat` / `sed` による source 内容
+  取得、その他の任意 Bash）は discovery 成功と認めず、search call として数えたうえで違反とする。root / HEAD の
+  解決 command は non-discovery であり search bound に算入しない。
+- **検索の関連性と因果**: grep 系（専用 Grep と Bash grep）の pattern は path 未解決 role の named symbol を、
+  Glob と Bash find（`-name` / `-iname` / `-path`）は path 未解決 role の file 名断片を含める。いずれも pinned body に
+  書かれた文字列を verbatim で使う。複数 role・fixture・Issue に共通する prefix だけの pattern（例 `*<共通 prefix>*`）は
+  どの未解決 role の file 名断片でもないため関連しない検索であり、8 回の search budget を消費する。関連しない検索、
+  および path を明記済みの role だけに関連する検索は違反とする。未解決 role は 1 件ずつ漏れなく解決し、decision-critical
+  consumer の path が未記載ならその named symbol も検索対象に含める。各 role の file は、その role の named symbol /
+  file 名断片を含む検索の成功結果にその path が現れた場合だけ Read し、他 role の hit・同じ directory・命名規則から
+  path を推測して Read しない（path の推測 Read は禁止。ただし既に Read 済みの別 required-role target source の import /
+  call-site から target が一意に確定した場合は、帰属規則 (b) として search を省略して Read してよい。同じ directory・
+  命名規則・共有 prefix・推測した path だけを根拠にした Read は違反）。未解決 role の symbol は quote した
+  alternation で 1 回にまとめてよい（例 `grep -rlE --include=<glob> '<symbol A>|<symbol B>' <root 配下の絶対 path>`）。
+  成功した（error ではない）検索結果に target
+  source の path が現れてから、その file を Read する（grep では hit した file の path、Glob / find では結果の
+  path 行として現れることを要する）。検索結果が error の eligible call は bound に算入されるが discovery の
+  根拠には使わない。body・test・evaluator 内の自己参照 literal hit だけでは discovery 成功としない。同名 symbol を
+  持つ decoy があり得るため、最初の hit を盲目的に Read せず、decision-critical consumer の import / call-site から
+  decoy ではない target を確定する。
+- **path 未記載それ自体は high にしない**: discovery で必要な source が見つかった場合は通常どおり audit し、
+  path が未記載であること自体、および専用 Grep / Glob が session tool pool に無いこと自体を理由に high にしない
+  （Bash lane で続行する。専用 Grep / Glob が 1 回でも `No such tool available` になったら以後は専用 tool を再試行せず、
+  eligible な `grep -rl --include=<glob> <named symbol> <root 配下の絶対 path>` から始まる Bash lane だけを使う。失敗した
+  専用 tool の呼び出しも search call として数えられる）。bounded discovery（いずれの lane でも）を尽くしても必要な source を発見・
+  観測できなかった場合に限り `assessment: clear` にせず、観測できなかった symbol と試行した検索を
+  `evidence_refs` に残して high 以上の finding にする（上の「観測不能は clear にしない」と整合する）。
 - **clear の条件**: `assessment: clear` は必要な source をすべて観測できた場合に限る。schema は clear で
   `findings` を 0 件に強制するため evidence_refs を持てず、観測事実は raw result ではなく runtime の
   tool 実行記録で判定される（schema は変更しない）。
 - **範囲の限定**: 単純な docs-only / local-only Issue に repository-wide な consumer inventory を一律に
-  要求せず、blanket stop / approval も追加しない。persisted field の意味拡張に伴う reader / consumer
-  inventory は #2828 の責務であり、本節は検証証拠の到達性だけを扱う。
+  要求せず、blanket stop / approval も追加しない。cross-contract な検証要求を持たない単純な docs-only
+  Issue に discovery（専用 Grep / Glob、Bash find / grep のどちらも）や repository source の Read を
+  一律に要求しない。persisted field の意味拡張に
+  伴う reader / consumer inventory は #2828 の責務であり、本節は検証証拠の到達性だけを扱う。
 
 ## 3. 結果の検証・保存
 
