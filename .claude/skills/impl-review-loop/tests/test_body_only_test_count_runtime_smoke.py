@@ -14,10 +14,14 @@ from __future__ import annotations
 
 import importlib.util
 import re
-import shutil
 import subprocess
 import sys
+import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -26,7 +30,8 @@ SKILL_DIR = ROOT / ".claude" / "skills" / "impl-review-loop"
 RUNNER = ROOT / "scripts" / "agent-ops" / "run_worktree_agent_runtime_smoke.py"
 ADJUDICATOR_PATH = SKILL_DIR / "scripts" / "adjudicate_vc_result.py"
 PROMPT_FILE = ".claude/skills/impl-review-loop/tests/fixtures/body_only_test_count_runtime_smoke_prompt.md"
-OUTPUT_DIR = "artifacts/runtime-smoke/issue-2971-test-count"
+OUTPUT_PARENT = "artifacts/runtime-smoke"
+OUTPUT_DIR_PREFIX = "issue-2971-test-count"
 EXIT_CAPABILITY_UNAVAILABLE = 77
 FIXTURE_AC = "AC10"
 FIXTURE_TARGET = ".claude/skills/impl-review-loop/tests/test_label_authority_invariants.py"
@@ -51,7 +56,17 @@ def count_markers(passed: int) -> list[str]:
     ]
 
 
-def runner_argv(markers: list[str]) -> list[str]:
+def unique_output_dir() -> str:
+    """呼出しごとに固有の ``--output-dir`` 相対 path（UTC timestamp + UUID）を返す。
+
+    runner は ``--output-dir`` の exclusive create を要求するため、directory はここでは作らない
+    （``mkdir`` / ``tempfile.mkdtemp`` を使わない）。過去 run の evidence を削除・再利用しない。
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{OUTPUT_PARENT}/{OUTPUT_DIR_PREFIX}-{stamp}-{uuid.uuid4().hex}"
+
+
+def runner_argv(markers: list[str], output_dir: str) -> list[str]:
     argv = [
         sys.executable,
         str(RUNNER),
@@ -66,7 +81,7 @@ def runner_argv(markers: list[str]) -> list[str]:
         "--prompt-file",
         PROMPT_FILE,
         "--output-dir",
-        OUTPUT_DIR,
+        output_dir,
         "--timeout-seconds",
         "600",
         "--max-turns",
@@ -99,6 +114,40 @@ def measured_passed_count() -> int:
     return int(match.group(1))
 
 
+@dataclass(frozen=True)
+class SmokeRun:
+    """``run_test_count_smoke`` の結果。``summary_text`` は summary が無ければ ``None``。"""
+
+    result: subprocess.CompletedProcess[str]
+    output_dir: str
+    summary: Path
+    summary_text: str | None
+
+
+def run_test_count_smoke(
+    markers: list[str],
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    root: Path = ROOT,
+) -> SmokeRun:
+    """gh / claude を伴わない部分: 固有 output dir を一度だけ生成し、runner 起動と summary 読み出しに共通使用する。
+
+    live test と hermetic test が同じ実行単位を呼ぶ。``run`` は runner 起動点（``subprocess.run``）の差し替え口。
+    """
+    output_dir = unique_output_dir()
+    result = run(
+        runner_argv(markers, output_dir),
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        timeout=900,
+        check=False,
+    )
+    summary = root / output_dir / "summary.md"
+    summary_text = summary.read_text(encoding="utf-8") if summary.is_file() else None
+    return SmokeRun(result=result, output_dir=output_dir, summary=summary, summary_text=summary_text)
+
+
 # --- deterministic (non-live) checks ---------------------------------------------------------
 
 
@@ -125,7 +174,7 @@ def test_test_count_prompt_asks_for_the_flow_style_line_without_leaking_a_count(
 
 def test_test_count_markers_are_command_specific_and_runner_argv_uses_only_existing_options() -> None:
     markers = count_markers(10)
-    argv = runner_argv(markers)
+    argv = runner_argv(markers, unique_output_dir())
     help_text = subprocess.run(
         [sys.executable, str(RUNNER), "--help"], capture_output=True, text=True, check=False, timeout=60
     ).stdout
@@ -137,6 +186,66 @@ def test_test_count_markers_are_command_specific_and_runner_argv_uses_only_exist
     assert argv.count("--expect-marker") == len(markers)
 
 
+def _output_dir_of(argv: list[str]) -> str:
+    return argv[argv.index("--output-dir") + 1]
+
+
+class _FakeRunner:
+    """runner 起動点の fake。runner の exclusive create を模擬し、output dir が既存なら失敗させる。"""
+
+    def __init__(self) -> None:
+        self.output_dirs: list[str] = []
+        self.existed_at_launch: list[bool] = []
+
+    def __call__(self, argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        output_dir = _output_dir_of(argv)
+        target = Path(kwargs["cwd"]) / output_dir
+        self.output_dirs.append(output_dir)
+        self.existed_at_launch.append(target.exists())
+        target.mkdir(parents=True)  # 既存なら FileExistsError（exclusive create の模擬）
+        (target / "summary.md").write_text(f"summary for {output_dir}\n", encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, stdout="OK\n", stderr="")
+
+
+def test_unique_output_dir_test_count_is_fresh_and_not_created() -> None:
+    paths = [unique_output_dir() for _ in range(5)]
+
+    assert len(set(paths)) == len(paths)
+    for path in paths:
+        assert path.startswith("artifacts/runtime-smoke/"), path
+        assert path.split("/")[-1].startswith("issue-2971-test-count-"), path
+        assert not (ROOT / path).exists(), path  # 関数は directory を作らない
+
+
+def test_unique_output_dir_test_count_invocations_share_path_between_argv_and_summary(tmp_path: Path) -> None:
+    fake = _FakeRunner()
+
+    first = run_test_count_smoke(count_markers(3), run=fake, root=tmp_path)
+    second = run_test_count_smoke(count_markers(3), run=fake, root=tmp_path)
+
+    assert first.output_dir != second.output_dir
+    assert fake.output_dirs == [first.output_dir, second.output_dir]
+    assert fake.existed_at_launch == [False, False]  # runner 起動時点で未存在
+    for run_result in (first, second):
+        assert run_result.summary == tmp_path / run_result.output_dir / "summary.md"
+        assert run_result.summary_text == f"summary for {run_result.output_dir}\n"
+        assert run_result.result.returncode == 0
+
+
+def test_unique_output_dir_test_count_preserves_existing_evidence(tmp_path: Path) -> None:
+    legacy = tmp_path / "artifacts" / "runtime-smoke" / "issue-2971-test-count"
+    past_run = tmp_path / "artifacts" / "runtime-smoke" / f"{OUTPUT_DIR_PREFIX}-20200101T000000Z-{'0' * 32}"
+    sentinels = {legacy / "sentinel.txt": "legacy evidence", past_run / "sentinel.txt": "past run evidence"}
+    for path, content in sentinels.items():
+        path.parent.mkdir(parents=True)
+        path.write_text(content, encoding="utf-8")
+
+    run_test_count_smoke(count_markers(3), run=_FakeRunner(), root=tmp_path)
+
+    for path, content in sentinels.items():
+        assert path.read_text(encoding="utf-8") == content, path
+
+
 # --- live (claude_live) ----------------------------------------------------------------------
 
 
@@ -146,16 +255,9 @@ def test_ac10_test_runner_delegation_returns_a_command_specific_test_count() -> 
     assert RUNNER.is_file()
     passed = measured_passed_count()
 
-    # runner は --output-dir の exclusive create を要求する。前回実行の同名 artifact（git-ignored）だけを消す。
-    shutil.rmtree(ROOT / OUTPUT_DIR, ignore_errors=True)
-    result = subprocess.run(
-        runner_argv(count_markers(passed)),
-        cwd=str(ROOT),
-        capture_output=True,
-        text=True,
-        timeout=900,
-        check=False,
-    )
+    # output dir は run 固有（runner 起動前に未存在）。過去 run の evidence は削除・再利用しない。
+    smoke = run_test_count_smoke(count_markers(passed))
+    result = smoke.result
 
     # exit 77（capability unavailable）は SKIP ではなく fail。runtime AC の PASS を主張しない。
     assert result.returncode != EXIT_CAPABILITY_UNAVAILABLE, (
@@ -167,6 +269,5 @@ def test_ac10_test_runner_delegation_returns_a_command_specific_test_count() -> 
         f"worktree-agent-runtime-smoke did not report success (exit={result.returncode}).\n"
         f"stdout={result.stdout[-2000:]}\nstderr={result.stderr[-2000:]}"
     )
-    summary = ROOT / OUTPUT_DIR / "summary.md"
-    assert summary.is_file(), f"expected persisted evidence at {summary}"
-    assert summary.read_text(encoding="utf-8").strip()
+    assert smoke.summary_text is not None, f"expected persisted evidence at {smoke.summary}"
+    assert smoke.summary_text.strip()
