@@ -523,6 +523,47 @@ lifecycle、session 非永続化、worktree cwd binding の観測が必要な場
     lane では本要件は引き続き **opt-in**（`--require-subagent-causal-evidence` を明示した場合のみ exit を
     昇格）であり、interactive-lane 向け hook 出力チャネルの整備は別途 follow-up とする。
 
+### skill-invocation smoke の対照実行（任意の discrimination 証跡、Issue #2981）
+
+`skill-invocation-runtime-smoke` profile の `procedure_steps_executed_in_declared_order` は、候補 SKILL.md の
+手順文が挙動を駆動したことまでは示さない。実際に #2971 / PR #2976 の smoke は、対象 SKILL.md を変更前へ戻しても
+PASS した（同一 worktree の production script をモデルが探索して実行したため）。この false-green を検出する
+**任意（opt-in）の discrimination 証跡**として、runner の `skill_text_counterfactual` mode（
+`--skill-text-counterfactual-base-ref <ref>` と、単一の `.claude/skills/<name>/SKILL.md` を指す
+`--skill-text-counterfactual-skill <path>`）を使ってよい。この手順は既存 profile の assertion 集合・適用要否
+（#2775 の所有範囲）を一切変更せず、`docs/dev/extension-surface-runtime-policy.yaml` も変更しない。省略時の
+runner の argv・summary・exit code は従来と同一である。
+
+- treatment は対象 SKILL.md の blob 1 個だけである。候補 arm と BASE arm は、captured candidate HEAD を
+  `--detach` で checkout した runner 所有の ephemeral linked worktree（`.claude/worktrees/` 配下、高エントロピー名）で実行し、
+  BASE arm だけが runner 所有の clean な ephemeral Git state として BASE の SKILL.md blob を差し替える。plain
+  filesystem copy は使わない。BASE ref は preflight で一度だけ immutable な commit SHA へ resolve し、以降は再解決しない。
+- 両 arm は同一 prompt・同一 `--expect-skill-command`・同一 `--expect-ordered-marker`・同一の観測 flag
+  （`--require-clean-postcondition` を含む）で実行し、runner が生成した exact path の worktree だけを成功・失敗・例外の全経路で
+  回収する。回収に失敗した場合は判定が `discriminative` でも全体を非 PASS にする。
+- 判定は既存 summary field の closed mapping だけで行い、SKILL.md の意味解釈や LLM による判定は行わない。BASE arm が
+  有効な negative control になる条件は、process が timeout せず正常終了し、terminal event を観測し、期待した Skill
+  invocation を観測し、permission denial と runtime／capability failure が無く、clean postcondition が成立し、
+  evidence JSON が arm の head と prompt hash に束縛され、失敗が ordered assertion のみに起因することである。
+
+| 判定 | 条件 | exit code |
+|---|---|---|
+| `discriminative` | 候補 PASS、BASE control valid、BASE は ordered assertion のみ不成立 | 0 |
+| `non_discriminative` | 候補 PASS、BASE control valid、BASE も ordered assertion 成立 | 1 |
+| `control_invalid` | 候補 PASS だが BASE が timeout・terminal event 欠落・Skill invocation 未観測・permission／runtime error・postcondition failure・SKIP・evidence 欠落などで valid control でない | 1 |
+| 候補 FAIL | 候補 arm が PASS でない（BASE arm は実行しない）。候補 SKIP は 77 で、PASS へ昇格しない | 1（SKIP は 77） |
+
+preflight failure（BASE ref 解決失敗、対象 path 不正、候補 worktree が dirty、blob 同一、worktree 構築失敗等）と cleanup
+failure は fail-closed で非 0 exit になり、PASS へ昇格しない。
+
+限界として、次を必ず証跡と PR 本文に併記する。
+- 対象 SKILL.md 以外の repo 内 production script は BASE に戻らないため、それで marker に到達できる場合は
+  `non_discriminative` になり得る。treatment を複数 path へ広げた結果は `skill_text_counterfactual` の根拠にしない。
+- "deterministic" が指すのは入力同一性・closed classification・exit mapping だけである。各 arm は LLM の 1 sample であり、
+  1 sample の BASE failure は統計的・因果的証明ではない。N 回実行の harness は提供しない。
+- fixture skill の live 証跡は対照実行の分類が成立することの検証であり、`worktree-agent-runtime-smoke/SKILL.md` 自身の手順文が
+  挙動を駆動したことの因果的証明ではない。
+
 ## 11. Claude extension surface risk-trigger policy（拡張サーフェスの risk-trigger 判定）
 
 > 関連 Issue: #2259（OWNER レビュー P0-7 で明示）、#2283（本セクション新設）、#2290（enforcement 配線 follow-up）
