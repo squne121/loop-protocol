@@ -713,6 +713,142 @@ def test_collect_candidate_inputs_production_shaped_2727_sibling_cross_reference
 
 
 # ---------------------------------------------------------------------------
+# #2972: markerless open/draft PR whose populated `files` cover two exact
+# entries and a tests/** entry. The fake transport responds to the real
+# collection AND freshness-rebind command shapes.
+# ---------------------------------------------------------------------------
+
+_MARKERLESS_REPO = "squne121/loop-protocol"
+_MARKERLESS_ISSUE = 2963
+_MARKERLESS_PR = 2967
+_MARKERLESS_BODY = """## Allowed Paths
+- `.claude/agents/issue-design-reviewer.md`
+- `.claude/skills/issue-refinement-loop/references/semantic-design-review.md`
+- `.claude/skills/issue-refinement-loop/tests/**`
+"""
+_MARKERLESS_FILES = [
+    {"path": ".claude/agents/issue-design-reviewer.md"},
+    {"path": ".claude/skills/issue-refinement-loop/references/semantic-design-review.md"},
+    {"path": ".claude/skills/issue-refinement-loop/tests/test_semantic_design_review.py"},
+]
+
+
+def _markerless_glob_run(*, files: list[dict], draft: bool):
+    head_sha = "a" * 40
+    main_sha = "b" * 40
+    calls: list[list[str]] = []
+
+    def run(argv):
+        calls.append(argv)
+        if argv[:3] == ["gh", "pr", "list"]:
+            rows = [{"number": _MARKERLESS_PR, "closingIssuesReferences": [{"number": _MARKERLESS_ISSUE}]}]
+            return 0, json.dumps(rows), ""
+        if argv[:2] == ["gh", "api"] and "timeline" in argv[-1]:
+            return 0, "[]", ""
+        if argv[:3] == ["gh", "pr", "view"] and argv[3] == str(_MARKERLESS_PR):
+            if argv[-1] == _LIVE_CANDIDATE_REFRESH_FIELDS:
+                return (
+                    0,
+                    json.dumps(
+                        {
+                            "headRefOid": head_sha,
+                            "mergedAt": None,
+                            "mergeCommit": None,
+                            "body": "Closes #2963\n\nMarkerless legacy PR.",
+                            "closingIssuesReferences": [{"number": _MARKERLESS_ISSUE}],
+                        }
+                    ),
+                    "",
+                )
+            return (
+                0,
+                json.dumps(
+                    {
+                        "number": _MARKERLESS_PR,
+                        "url": f"https://github.com/{_MARKERLESS_REPO}/pull/{_MARKERLESS_PR}",
+                        "state": "OPEN",
+                        "isDraft": draft,
+                        "mergedAt": None,
+                        "mergeCommit": None,
+                        "headRefOid": head_sha,
+                        "closingIssuesReferences": [{"number": _MARKERLESS_ISSUE}],
+                        "body": "Closes #2963\n\nMarkerless legacy PR.",
+                        "files": files,
+                    }
+                ),
+                "",
+            )
+        if argv[:3] == ["gh", "issue", "view"]:
+            return 0, json.dumps({"body": _MARKERLESS_BODY}), ""
+        if argv[:2] == ["gh", "api"] and "commits/main" in argv[2]:
+            return 0, main_sha + "\n", ""
+        return 1, "", "unexpected argv: " + " ".join(argv)
+
+    return run, calls
+
+
+def test_markerless_glob_intake_positive(monkeypatch):
+    """GIVEN markerless open/draft PRs with all three entries covered WHEN intake runs THEN resume."""
+    landed_evidence = _load(LANDED_EVIDENCE, "landed_evidence_markerless_glob_positive")
+    build_capsule = _load(BUILD_CAPSULE, "build_intake_capsule_markerless_glob_positive")
+    assert landed_evidence.build_scope_manifest(_MARKERLESS_BODY)["allowed_paths"] == sorted(
+        [line[3:-1] for line in _MARKERLESS_BODY.splitlines()[1:]]
+    )
+    for draft in (False, True):
+        run, calls = _markerless_glob_run(files=_MARKERLESS_FILES + [{"path": "unrelated/extra.txt"}], draft=draft)
+        evidence = landed_evidence.collect_candidate_inputs(
+            repo=_MARKERLESS_REPO, issue_number=_MARKERLESS_ISSUE, current_scope=_MARKERLESS_BODY, run_command=run
+        )
+        assert len(evidence["candidates"]) == 1
+        candidate = evidence["candidates"][0]
+        assert candidate["lifecycle"] == ("draft" if draft else "open")
+        assert candidate["scope_coverage"]["status"] == "missing_marker"
+        assert candidate["current_scope_ownership"] is True
+        monkeypatch.setattr(build_capsule, "_run_command", run)
+        production = build_capsule._collect_implementation_landed_evidence(
+            issue_number=_MARKERLESS_ISSUE,
+            repo=_MARKERLESS_REPO,
+            issue_body=_MARKERLESS_BODY,
+            command_log=[],
+            next_action_route="proceed_to_step_1",
+        )
+        assert production["decision_time_rebind"] == {"status": "fresh"}
+        assert production["candidates"][0]["current_scope_ownership"] is True
+        assert production["landing_disposition"]["disposition"] == "existing_pr_resume"
+        assert production["landing_disposition"]["reason_codes"] == ["markerless_allowed_paths_coverage"]
+        assert production["pre_step1_data_plane"] == {"start_data_plane": False, "action": "resume_existing_pr"}
+        assert any(argv[:3] == ["gh", "pr", "view"] and "files" in argv[-1] for argv in calls)
+
+
+def test_markerless_glob_intake_negative(monkeypatch):
+    """GIVEN a markerless PR missing only tests/** WHEN intake runs THEN reconciliation, never resume."""
+    landed_evidence = _load(LANDED_EVIDENCE, "landed_evidence_markerless_glob_negative")
+    build_capsule = _load(BUILD_CAPSULE, "build_intake_capsule_markerless_glob_negative")
+    for draft in (False, True):
+        run, calls = _markerless_glob_run(files=_MARKERLESS_FILES[:2], draft=draft)
+        evidence = landed_evidence.collect_candidate_inputs(
+            repo=_MARKERLESS_REPO, issue_number=_MARKERLESS_ISSUE, current_scope=_MARKERLESS_BODY, run_command=run
+        )
+        assert evidence["candidates"][0]["scope_coverage"]["status"] == "missing_marker"
+        assert evidence["candidates"][0]["current_scope_ownership"] is False
+        monkeypatch.setattr(build_capsule, "_run_command", run)
+        production = build_capsule._collect_implementation_landed_evidence(
+            issue_number=_MARKERLESS_ISSUE,
+            repo=_MARKERLESS_REPO,
+            issue_body=_MARKERLESS_BODY,
+            command_log=[],
+            next_action_route="proceed_to_step_1",
+        )
+        assert production["decision_time_rebind"] == {"status": "fresh"}
+        assert production["candidates"][0]["current_scope_ownership"] is False
+        assert production["landing_disposition"]["disposition"] == "reconciliation_required"
+        assert production["landing_disposition"]["reason_codes"] == ["open_draft_scope_ownership_not_exact"]
+        assert production["pre_step1_data_plane"]["start_data_plane"] is False
+        assert production["pre_step1_data_plane"]["action"] != "resume_existing_pr"
+        assert any(argv[:3] == ["gh", "pr", "view"] and "files" in argv[-1] for argv in calls)
+
+
+# ---------------------------------------------------------------------------
 # #2893: historical merged `later_scope_expansion` candidate (PR #2851) vs a
 # unique current exact draft candidate (PR #2888) for target Issue #2843 --
 # the real incident shape, driven through the production producer/intake
