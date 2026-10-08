@@ -26,11 +26,12 @@ Input:
 
 Output:
     Artifact logged to stderr / local artifact file on failure.
-    On success: posts GitHub comment via the issue_comment.publish
+    On normal success: posts GitHub comment via the issue_comment.publish
     controlled mutation lane (never a raw `gh issue comment` call).
+    With --dry-run: validates without posting or emitting a Task Context signal.
 
 Exit codes:
-    0 - comment posted successfully
+    0 - comment posted successfully, or dry-run validation succeeded
     1 - failure (fail-closed, gh not called, or gh call failed)
     2 - usage error / missing required arguments / empty body
 """
@@ -541,17 +542,14 @@ def publish(
     repo: str,
     termination_reason: str | None = None,
     approved_body_sha256: str | None = None,
+    dry_run: bool = False,
 ) -> int:
-    """
-    Core publish flow: post `body` (already-assembled plain markdown) as a
-    GitHub issue comment. Returns 0 on successful post, 1 on fail-closed
-    (no gh call, or gh call failed).
-    """
+    """Publish a comment, or validate it without posting when dry_run is set."""
     if not isinstance(body, str) or not body.strip():
         _record_artifact(issue_number=issue_number, reason_code="empty_body")
         return 1
 
-    gh_exit = _post_github_comment(issue_number=issue_number, body=body, repo=repo)
+    gh_exit = _post_github_comment(issue_number=issue_number, body=body, repo=repo, dry_run=dry_run)
     if gh_exit != 0:
         reason = "gh_comment_timeout" if gh_exit == -1 else "gh_comment_failed"
         _record_artifact(
@@ -560,6 +558,13 @@ def publish(
             extra={"gh_exit_code": gh_exit},
         )
         return 1
+
+    if dry_run:
+        print(
+            f"[publish_termination_report] dry-run validation-only for issue #{issue_number}; no GitHub mutation",
+            file=sys.stderr,
+        )
+        return 0
 
     if termination_reason == "approved":
         signal_disposition, signal_reason = _emit_refinement_approved_signal(
@@ -737,7 +742,7 @@ def main() -> int:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Validate/render the human-history request without posting (forwarded to the controlled executor)",
+        help="Validate without posting or signaling (forwarded to the controlled executor).",
     )
     args = parser.parse_args()
 
@@ -776,6 +781,7 @@ def main() -> int:
         repo=args.repo,
         termination_reason=args.termination_reason,
         approved_body_sha256=args.approved_body_sha256,
+        dry_run=args.dry_run,
     )
 
 
