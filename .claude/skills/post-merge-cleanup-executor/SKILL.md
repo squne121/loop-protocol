@@ -130,18 +130,19 @@ if [ "$ROOT_STATE" != "default" ]; then
   echo "[STOP] canonical root が default branch ではない (root_branch_state=$ROOT_STATE)。同期せず human_required として停止" >&2
   exit 2
 fi
-STAGED=$(git diff --cached --name-only)
-if [ -n "$STAGED" ]; then
-  echo "[INFO] canonical root 自身の staged 変更を一時退避（git stash）"
-  git stash
-fi
-git pull origin main
+git pull --ff-only origin main || {
+  echo "[STOP] main を fast-forward 同期できない（incoming 変更と canonical root の変更が衝突、または non-ff）。状態は変更されていない。human_required として停止" >&2
+  exit 3
+}
 ```
 
 - `git checkout main` は実行しない（gate 通過 = canonical root は既に default branch 上にある。drift した primary をこのステップで切り替えない）
-- stash は canonical root 自身の staged 変更に対してのみ行う。issue worktree の変更を main へ carry over しない
+- **stash を使わない**。`git pull --ff-only` は fast-forward が incoming 変更と衝突しない限り、canonical root の
+  index（staged）・working tree（unstaged）・untracked file をそのまま保つ。衝突する場合は何も変更せず非 0 で終了するので、
+  state を残したまま `human_review_required: true` で停止する（変更を黙って持ち越す・消す・成功扱いにしない）
+- issue worktree の変更を main へ carry over しない
 - `ROOT_STATE` が `default` 以外、または取得できない場合は fail-closed で停止し `human_review_required: true` を返す
-- CONFLICT → 即停止し `human_review_required: true` を返す
+- pull 失敗（exit 3）→ 即停止し `human_review_required: true` を返す
 
 ### 3. worktree / branch を整理
 
@@ -164,8 +165,11 @@ enforcement 経路ではない。
 
 1. guard arbitration を機械判定する（mutation を行わない・`AGENT_GUARD_PREFLIGHT_V1` を返す）:
 ```bash
-uv run --locked python3 scripts/agent-ops/guard_preflight.py --json
+LOOP_ISSUE_NUMBER=<issue> uv run --locked python3 scripts/agent-ops/guard_preflight.py --json
 ```
+cwd は canonical root（primary）なので cwd からは対象 Issue を識別できない。`LOOP_ISSUE_NUMBER=<issue>` で cleanup 対象 Issue を
+束縛し、出力の `resolved_worktree.worktree_realpath` が次の `<絶対 worktree path>` と一致することを確認する
+（一致しない場合は `cleanup_exec` を実行せず `human_review_required: true`。削除認可自体は引き続き `cleanup_exec` の責務）。
 `status: ok` 以外（`blocked` / `human_required`）は `allowed_next_commands` の構造化 recovery hint に従う。
 `root_drift_active_worktree_mismatch` は policy B により自動 mutation せず人間承認を要する。
 canonical root は current worktree ではなく Git の primary worktree から解決される（Issue #2979）。解決できない場合は
@@ -315,7 +319,7 @@ fi
 `FOLLOW_UP_ISSUE_REQUEST_V1` の `dedupe_key` は `CHILD_MATERIALIZATION_PLAN_V2.children[*].dedupe_key` を使用する。
 スキーマ正本: `<canonical root>/docs/dev/agent-skill-boundaries.md#CHILD_MATERIALIZATION_PLAN_V2`
 
-### 7. Stash の復帰
+### 7. Stash の確認（復帰しない）
 
 実行コンテキストの cwd 固定行（canonical root）の後に実行する。
 
@@ -323,13 +327,8 @@ fi
 git stash list | grep "stash@{" | head -5
 ```
 
-ステップ 2 で canonical root 自身の変更を stash した entry があれば次を実行する（issue worktree の変更には使わない）:
-
-```bash
-git stash pop
-```
-
-CONFLICT → 即停止し `human_review_required: true` で返す。
+ステップ 2 は stash を作成しないため、本手順が復帰（`git stash pop` / `apply`）すべき entry は存在しない。既存の stash entry は
+他の session / 利用者のものなので pop / drop せず、一覧を報告するのみ（`stash_restored: "n/a"`）。
 
 ### 8. POST_MERGE_CLEANUP_REPORT_V1 を生成
 

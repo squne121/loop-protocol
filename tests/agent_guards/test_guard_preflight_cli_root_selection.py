@@ -544,7 +544,7 @@ def test_ac7_documented_guard_preflight_invocation_from_issue_worktree_session(t
     world = build_world(tmp_path)
     ctx = skill_section("3. worktree / branch を整理")
     block = block_containing(ctx, "scripts/agent-ops/guard_preflight.py --json")
-    script = render(block)
+    script = render(block, {"<issue>": str(ISSUE)})
     assert "guard_preflight.py" in script and "--project-root" not in script  # no root injection
     env = session_env(world, project_dir=world.worktree, cwd=world.worktree)
     done = run_bash(script, cwd=world.worktree, env=env)  # relative path -> the worktree's tracked copy

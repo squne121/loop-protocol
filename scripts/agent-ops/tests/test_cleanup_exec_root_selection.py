@@ -22,9 +22,12 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _HELPERS_PATH = _REPO_ROOT / "tests" / "agent_guards" / "test_guard_preflight_cli_root_selection.py"
@@ -232,7 +235,6 @@ def _step_blocks() -> dict[str, str]:
         "step4": H.block_containing(H.skill_section("4. parent issue"), "/parent"),
         "step5": H.block_containing(H.skill_section("5. Superseded PR"), "closedByPullRequestsReferences"),
         "step7_list": H.block_containing(H.skill_section("7. Stash"), "git stash list"),
-        "step7_pop": H.block_containing(H.skill_section("7. Stash"), "git stash pop"),
     }
 
 
@@ -276,27 +278,29 @@ def test_ac8_documented_eight_step_sequence_is_reachable_from_an_issue_worktree_
     upstream_tip = _advance_origin(world)
     (world.primary / "NOTES.txt").write_text("root-owned staged change\n", encoding="utf-8")
     H.git("add", "NOTES.txt", cwd=world.primary)  # the canonical root's OWN staged change
+    before_status = H.git("status", "--porcelain", cwd=world.primary)
     env = H.session_env(world, project_dir=world.worktree, cwd=world.worktree)
     env["linked_issue"] = str(ISSUE)
 
     blocks = _step_blocks()
-    order = ["step1", "step2", "step3_guard", "step3_exec", "step4", "step5", "step7_list", "step7_pop"]
+    order = ["step1", "step2", "step3_guard", "step3_exec", "step4", "step5", "step7_list"]
     script = _segments(world, [(n, blocks[n], _values(world)) for n in order], prefix=_prefix_rendered(world))
     done = H.run_bash(script, cwd=world.worktree, env=env)
     text, rcs = _split(done.stdout)
 
     assert [n for n in order if rcs.get(n) != 0] == [], (rcs, done.stderr[-800:])
     assert "branches" in text["step1"]  # classify-git-state output (YAML)
-    # Step 2: synced the canonical root only (fast-forward to origin), root's own staged change stashed
+    # Step 2: synced the canonical root only (fast-forward to origin); no stash is ever created
     assert H.git("rev-parse", "HEAD", cwd=world.primary) == upstream_tip
-    assert "stash@{0}" in text["step7_list"]
+    assert "stash@{" not in text["step7_list"]
     # Step 3: preflight ok from the canonical root, then cleanup_exec removed the SESSION's worktree
     assert json.loads(text["step3_guard"].strip().splitlines()[-1])["root_branch_state"] == "default"
     cleanup = json.loads(text["step3_exec"].strip().splitlines()[-1])
     assert cleanup["status"] == "ok" and cleanup["actions_taken"] == ["worktree_remove", "branch_delete"], cleanup
     assert not world.worktree.exists()
     assert not _branch_exists(world, world.branch)
-    # Step 7: the canonical root's own change is restored; nothing from the issue worktree was carried
+    # the canonical root's own staged change survived exactly (still STAGED, not unstaged)
+    assert H.git("status", "--porcelain", cwd=world.primary) == before_status == "A  NOTES.txt"
     assert H.git("diff", "--cached", "--name-only", cwd=world.primary) == "NOTES.txt"
     assert H.git("stash", "list", cwd=world.primary) == ""
     assert H.git("branch", "--show-current", cwd=world.primary) == "main"
@@ -335,7 +339,7 @@ def test_ac8_main_sync_is_gated_on_default_root_and_never_runs_in_a_linked_workt
     world = H.build_world(tmp_path)
     block = _step_blocks()["step2"]
     assert "git checkout" not in block  # no checkout at all (drifted primaries are not switched)
-    assert block.index("guard_preflight.py --json") < block.index("git pull origin main")
+    assert block.index("guard_preflight.py --json") < block.index("git pull --ff-only origin main")
     assert "root_branch_state" in block
 
     # the OLD Step 2 (checkout main inside the issue worktree) is unreachable: the primary owns main
@@ -360,7 +364,7 @@ def test_ac8_main_sync_is_gated_on_default_root_and_never_runs_in_a_linked_workt
     assert pre["status"] == "human_required" and "root_drift_active_worktree_mismatch" in pre["blocked_reason_codes"]
 
 
-def test_ac8_step2_stashes_only_the_canonical_roots_changes_and_never_carries_worktree_changes(tmp_path):
+def test_ac8_step2_never_stashes_and_never_carries_worktree_changes(tmp_path):
     world = H.build_world(tmp_path)
     (world.worktree / "wt_only.txt").write_text("issue worktree work\n", encoding="utf-8")
     H.git("add", "wt_only.txt", cwd=world.worktree)  # staged in the ISSUE worktree
@@ -396,6 +400,135 @@ def test_ac8_cleanup_exec_command_block_stays_a_single_relative_path_block():
     context_blocks = H.bash_blocks(H.skill_section("実行コンテキスト"))
     assert context_blocks and all("scripts/agent-ops/cleanup_exec.py" not in b for b in context_blocks)
     assert "scripts/agent-ops/cleanup_exec.py" not in H.skill_section("2. main を")
+
+
+# --------------------------------------------------------------------------------------
+# Finding 1/4 (PR #2990 owner review): Step 2 must preserve the canonical root's index,
+# working tree, untracked files and any pre-existing stash exactly.
+# --------------------------------------------------------------------------------------
+def _root_snapshot(world) -> dict:
+    def g(*a):
+        return H.git(*a, cwd=world.primary)
+
+    return {
+        "porcelain": g("status", "--porcelain"),
+        "cached": g("diff", "--cached"),
+        "worktree": g("diff"),
+        "stash": g("stash", "list"),
+        "head": g("rev-parse", "HEAD"),
+    }
+
+
+def _run_step2(world) -> subprocess.CompletedProcess:
+    env = H.session_env(world, project_dir=world.worktree, cwd=world.worktree)
+    block = H.render(_step_blocks()["step2"], _values(world))
+    script = f"(\n{_prefix_rendered(world)}\n{block}\n)\necho \"@@RC $?\"\n"
+    return H.run_bash(script, cwd=world.worktree, env=env)
+
+
+def _tracked_file(world) -> Path:
+    return world.primary / H.git("ls-files", cwd=world.primary).splitlines()[0]
+
+
+def _dirty_root(world, kind: str) -> None:
+    tracked = _tracked_file(world)
+    base = tracked.read_text(encoding="utf-8")
+    if kind in ("staged", "mixed"):
+        tracked.write_text("STAGED\n" + base, encoding="utf-8")
+        H.git("add", str(tracked.relative_to(world.primary)), cwd=world.primary)
+    if kind in ("unstaged", "mixed"):
+        tracked.write_text(tracked.read_text(encoding="utf-8") + "UNSTAGED\n", encoding="utf-8")
+    (world.primary / "untracked_note.txt").write_text("untracked\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("kind", ["staged", "unstaged", "mixed", "untracked"])
+def test_finding1_step2_preserves_index_worktree_untracked_exactly(tmp_path, kind):
+    world = H.build_world(tmp_path)
+    _advance_origin(world)  # independent remote update (touches only upstream.txt)
+    _dirty_root(world, kind)
+    before = _root_snapshot(world)
+    done = _run_step2(world)
+    after = _root_snapshot(world)
+    assert "@@RC 0" in done.stdout, (done.stdout, done.stderr)
+    assert after["head"] != before["head"]  # fast-forwarded
+    for key in ("porcelain", "cached", "worktree", "stash"):
+        assert after[key] == before[key], (kind, key, before[key], after[key])
+    if kind == "mixed":  # the same file is both staged AND unstaged -- must stay MM
+        assert any(line.startswith("MM ") for line in after["porcelain"].splitlines())
+
+
+def test_finding1_step2_leaves_preexisting_stash_untouched(tmp_path):
+    world = H.build_world(tmp_path)
+    (world.primary / "other.txt").write_text("someone else's work\n", encoding="utf-8")
+    H.git("add", "other.txt", cwd=world.primary)
+    H.git("stash", "push", "-m", "foreign-stash", cwd=world.primary)
+    _advance_origin(world)
+    before = _root_snapshot(world)
+    done = _run_step2(world)
+    after = _root_snapshot(world)
+    assert "@@RC 0" in done.stdout, (done.stdout, done.stderr)
+    assert after["stash"] == before["stash"] and "foreign-stash" in after["stash"]
+    assert after["porcelain"] == before["porcelain"] == ""
+
+
+def test_finding1_step2_conflicting_pull_stops_and_leaves_every_change_in_place(tmp_path):
+    world = H.build_world(tmp_path)
+    other = world.tmp / "other-clone"
+    H.git("clone", "-q", str(world.origin), str(other), cwd=world.tmp)
+    tracked = H.git("ls-files", cwd=other).splitlines()[0]
+    (other / tracked).write_text("upstream rewrite\n", encoding="utf-8")
+    H.git("commit", "-q", "-am", "conflicting upstream", cwd=other)
+    H.git("push", "-q", "origin", "main", cwd=other)
+    (world.primary / tracked).write_text("local edit that collides\n", encoding="utf-8")
+    H.git("add", tracked, cwd=world.primary)
+    before = _root_snapshot(world)
+    done = _run_step2(world)
+    assert "@@RC 3" in done.stdout and "[STOP]" in done.stderr, (done.stdout, done.stderr)
+    assert _root_snapshot(world) == before  # nothing dropped, nothing popped, nothing merged
+
+
+def test_finding1_skill_has_no_stash_mutation_command():
+    for block in H.bash_blocks(H.skill_text()):
+        for line in block.splitlines():
+            assert not re.match(r"\s*git stash(\s+(pop|apply|drop|push|save))?\s*$", line), line
+
+
+# --------------------------------------------------------------------------------------
+# Finding 3: the Step 3 guard is bound to the cleanup TARGET issue even though cwd is the
+# canonical root (which carries no Issue identity of its own).
+# --------------------------------------------------------------------------------------
+def test_finding3_step3_guard_binds_target_issue_from_canonical_root_cwd(tmp_path):
+    world = H.build_world(tmp_path)
+    block = _step_blocks()["step3_guard"]
+    assert "LOOP_ISSUE_NUMBER=<issue>" in block
+    env = H.session_env(world, project_dir=world.worktree, cwd=world.worktree)
+    env.pop("LOOP_ISSUE_NUMBER", None)
+    script = f"(\n{_prefix_rendered(world)}\n{H.render(block, _values(world))}\n)\n"
+    done = H.run_bash(script, cwd=world.worktree, env=env)
+    out = json.loads(done.stdout.strip().splitlines()[-1])
+    assert out["status"] == "ok" and out["active_worktree_state"] == "matches", out
+    assert out["resolved_worktree"]["worktree_realpath"] == str(world.worktree)
+    # negative control: without the binding, the canonical-root cwd identifies no Issue
+    unbound = H.render(block.replace("LOOP_ISSUE_NUMBER=<issue> ", ""), _values(world))
+    done2 = H.run_bash(f"(\n{_prefix_rendered(world)}\n{unbound}\n)\n", cwd=world.worktree, env=env)
+    out2 = json.loads(done2.stdout.strip().splitlines()[-1])
+    assert out2["resolved_worktree"]["worktree_realpath"] != str(world.worktree), out2
+
+
+# --------------------------------------------------------------------------------------
+# Finding 5: the production probe command runs UNMODIFIED (real ``uv run --locked``).
+# --------------------------------------------------------------------------------------
+def test_finding5_production_probe_command_runs_unmodified_with_real_uv():
+    if shutil.which("uv") is None:
+        pytest.skip("uv not installed in this environment")
+    probe = H.block_containing(H.skill_section("実行コンテキスト"), "git_worktree_probe.py --json")
+    assert probe.strip().startswith("uv run --locked python3 scripts/agent-ops/git_worktree_probe.py")
+    done = subprocess.run(["bash", "-c", probe], cwd=str(_REPO_ROOT), capture_output=True, text=True, timeout=240)
+    assert done.returncode == 0, done.stderr[-500:]
+    entries = json.loads(done.stdout)["entries"]
+    common = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                            cwd=str(_REPO_ROOT), capture_output=True, text=True).stdout.strip()
+    assert Path(entries[0]["worktree_realpath"]).resolve() == Path(common).parent.resolve()
 
 
 # ======================================================================================
