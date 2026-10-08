@@ -329,6 +329,78 @@ def test_candidate_discovery_dedupes_and_reconciles_conflicting_qualified_candid
     assert result["disposition"] == "existing_pr_resume"
 
 
+def test_markerless_plain_entry_legacy():
+    """GIVEN wildcard-free entries WHEN matching THEN exact and directory descendants retain legacy coverage."""
+    entry = "src/ui"
+    for path in ("src/ui", "src/ui/panel.py", "src/ui/deep/panel.py"):
+        assert mod._allowed_paths_covered([entry], [{"path": path}]) is True
+    for path in ("src/uix/panel.py", "src/ui.py", "src/other/panel.py"):
+        assert mod._allowed_paths_covered([entry], [{"path": path}]) is False
+    assert mod._allowed_paths_covered(["./src/ui/"], [{"path": "./src/ui/panel.py"}]) is True
+    # The shared matcher's literal-only exact semantics must NOT replace legacy prefix semantics.
+    assert mod._allowed_paths_covered(["src/ui"], [{"path": "src/ui/panel.py"}]) is True
+
+
+def test_markerless_wildcard_safe_subset():
+    """GIVEN explicit glob entries WHEN matching THEN the shared segment grammar covers their paths."""
+    cases = (
+        ("src/tests/**", "src/tests/deep/check.py"),
+        ("src/tests/**", "src/tests"),  # '**' matches zero segments.
+        ("src/*/check.py", "src/unit/check.py"),
+        ("src/**/check.py", "src/check.py"),
+        ("src/**/check.py", "src/a/b/check.py"),
+        ("./src/**/check.py", "./src/a/check.py"),
+    )
+    for entry, path in cases:
+        assert mod._allowed_paths_covered([entry], [{"path": path}]) is True, (entry, path)
+
+
+def test_markerless_wildcard_fail_closed():
+    """GIVEN invalid patterns, invalid files, or near misses WHEN matching THEN deny coverage."""
+    misses = (
+        ("src/tests/**", "src/tests-other/check.py"),
+        ("src/*/check.py", "src/check.py"),
+        ("src/*/check.py", "src/a/b/check.py"),
+        ("src/**/check.py", "src/check.py.bak"),
+        ("src/*.py", "src/check.py"),
+        ("src/test*", "src/tests"),
+        ("src/***/check.py", "src/a/check.py"),
+        ("../src/**", "src/check.py"),
+        ("/src/**", "src/check.py"),
+        ("src//**", "src/check.py"),
+        ("src/**/", "src/check.py"),
+        ("src/tests/**", "../src/tests/check.py"),
+        ("src/tests/**", "/src/tests/check.py"),
+        ("src/tests/**", "src/tests/../check.py"),
+        ("src/tests/**", "src/tests//check.py"),
+        ("src/tests/**", "src\\tests\\check.py"),
+        ("src/tests", "../src/tests/check.py"),
+        ("src/tests", "/src/tests/check.py"),
+        ("../src/tests", "src/tests/check.py"),
+    )
+    for entry, path in misses:
+        assert mod._allowed_paths_covered([entry], [{"path": path}]) is False, (entry, path)
+    assert mod._allowed_paths_covered(["src/tests/**"], None) is False
+    assert mod._allowed_paths_covered(["src/tests/**"], [{"path": None}]) is False
+
+
+def test_markerless_all_of_coverage():
+    """GIVEN multiple Allowed Paths WHEN one is absent THEN coverage fails, not PR file allowlisting."""
+    entries = ["src/core.py", "src/docs", "src/tests/**"]
+    files = [
+        {"path": "src/core.py"},
+        {"path": "src/docs/guide.md"},
+        {"path": "src/tests/unit/test_core.py"},
+    ]
+    assert mod._allowed_paths_covered(entries, files) is True
+    assert mod._allowed_paths_covered(entries, files + [{"path": "unrelated/extra.txt"}]) is True
+    for missing in range(len(files)):
+        assert mod._allowed_paths_covered(entries, files[:missing] + files[missing + 1 :]) is False
+    assert mod._allowed_paths_covered([], files) is False
+    assert mod._allowed_paths_covered(entries, []) is False
+    assert mod._allowed_paths_covered(entries + ["../invalid"], files) is False
+
+
 def test_markerless_open_draft_candidate_allowed_paths_coverage_determines_resume_or_reconciliation():
     """AC6: legacy resumable branches need explicit current Allowed Paths coverage."""
     resumable = _candidate(lifecycle="open", fresh=True, ownership=True)
