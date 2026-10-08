@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import hashlib
 import importlib.util
 import inspect
 import json
@@ -1528,15 +1529,69 @@ def _git(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True, check=False)
 
 
-def test_ac6_protected_scripts_are_not_modified_relative_to_the_base() -> None:
-    base = next(
-        (ref for ref in ("origin/main", "main") if _git("rev-parse", "--verify", "--quiet", ref).returncode == 0),
-        "HEAD",
-    )
+def _protected_snapshot(root: Path) -> dict[str, str | None]:
+    """Content hash of every protected script (``None`` when absent)."""
+    snapshot: dict[str, str | None] = {}
+    for relative in PROTECTED_SCRIPTS:
+        path = root / relative
+        snapshot[relative] = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+    return snapshot
 
-    completed = _git("diff", "--exit-code", base, "--", *PROTECTED_SCRIPTS)
 
-    assert completed.returncode == 0, completed.stdout
+def _protected_mutations(before: dict[str, str | None], after: dict[str, str | None]) -> list[str]:
+    return sorted(relative for relative in before if before[relative] != after.get(relative))
+
+
+def _seed_protected_scripts(root: Path) -> None:
+    for relative in PROTECTED_SCRIPTS:
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("# base\n", encoding="utf-8")
+
+
+def test_ac6_body_only_cli_does_not_modify_protected_scripts(tmp_path: Path) -> None:
+    """body-only 実行の副作用だけを観測する。branch 対 base の repository-wide diff は使わない
+    （別 Issue による protected script の正当な変更で false-fail するため。#2989）。"""
+    env = PlanEnv(tmp_path)
+    before = _protected_snapshot(ROOT)
+    assert all(digest is not None for digest in before.values()), before
+
+    rc, payload = env.plan()
+    assert rc == 0, payload
+    rc, _payload = env.guard()
+    assert rc == 0
+
+    assert env.gh_calls(), "fake gh was never invoked"
+    assert _protected_mutations(before, _protected_snapshot(ROOT)) == []
+
+
+def test_ac6_preexisting_legitimate_protected_script_change_is_not_a_mutation(tmp_path: Path) -> None:
+    """別 Issue の PR が protected script を変更済みでも、body-only 実行が触れていなければ PASS する
+    （base ref の有無・branch・head の偶然の差分に依存しない）。"""
+    _seed_protected_scripts(tmp_path)
+    legit = tmp_path / PROTECTED_SCRIPTS[2]
+    legit.write_text("# base\n# legitimate change owned by another Issue\n", encoding="utf-8")
+
+    before = _protected_snapshot(tmp_path)
+    after = _protected_snapshot(tmp_path)  # body-only run: no write
+
+    assert _protected_mutations(before, after) == []
+
+
+@pytest.mark.parametrize("how", ["append", "rewrite", "delete"])
+def test_ac6_mutation_of_a_protected_script_during_a_run_is_detected(tmp_path: Path, how: str) -> None:
+    _seed_protected_scripts(tmp_path)
+    before = _protected_snapshot(tmp_path)
+
+    victim = tmp_path / PROTECTED_SCRIPTS[0]
+    if how == "append":
+        victim.write_text(victim.read_text(encoding="utf-8") + "# injected\n", encoding="utf-8")
+    elif how == "rewrite":
+        victim.write_text("# replaced\n", encoding="utf-8")
+    else:
+        victim.unlink()
+
+    assert _protected_mutations(before, _protected_snapshot(tmp_path)) == [PROTECTED_SCRIPTS[0]]
 
 
 def test_ac6_production_module_never_edits_a_pr_body_directly() -> None:
