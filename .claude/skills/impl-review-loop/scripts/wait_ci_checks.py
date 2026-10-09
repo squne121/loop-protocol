@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 from typing import Any
+from urllib.parse import quote
 
 GH_ENV = {"GH_PROMPT_DISABLED": "1"}
 
@@ -91,12 +92,20 @@ def get_current_head_sha(repo: str, pr_number: int) -> tuple[str | None, str | N
     return head_sha, None, None
 
 
+_ZERO_ROW_STDERR_PHRASES = ("no required checks reported", "no checks reported")
+
+
 def fetch_checks(repo: str, pr_number: int) -> tuple[list[dict[str, Any]] | None, str | None, str | None]:
     fields = "name,bucket,state,workflow,link,startedAt,completedAt"
     rc, stdout, stderr = run_gh(
         ["pr", "checks", str(pr_number), "--repo", repo, "--required", "--json", fields]
     )
     if rc != 0:
+        # `gh pr checks` reports a zero-row result as an error exit. That is the
+        # normal "CI has not materialized yet" state, not a runtime failure.
+        lowered = f"{stderr}\n{stdout}".lower()
+        if any(phrase in lowered for phrase in _ZERO_ROW_STDERR_PHRASES):
+            return [], None, None
         return None, classify_gh_error(stderr, rc), stderr.strip() or stdout.strip()
     try:
         data = json.loads(stdout)
@@ -105,6 +114,110 @@ def fetch_checks(repo: str, pr_number: int) -> tuple[list[dict[str, Any]] | None
     if not isinstance(data, list):
         return None, "malformed_gh_response", "gh pr checks did not return a list"
     return data, None, None
+
+
+def get_base_branch(repo: str, pr_number: int) -> tuple[str | None, str | None, str | None]:
+    rc, stdout, stderr = run_gh(
+        ["pr", "view", str(pr_number), "--repo", repo, "--json", "baseRefName", "--jq", ".baseRefName"]
+    )
+    if rc != 0:
+        return None, classify_gh_error(stderr, rc), stderr.strip() or stdout.strip()
+    base = stdout.strip()
+    if not base:
+        return None, "malformed_gh_response", "empty baseRefName"
+    return base, None, None
+
+
+# context name -> set of source app IDs (Ruleset integration_id / Classic app_id).
+Inventory = dict[str, set[int | None]]
+
+
+def _add_context(inventory: Inventory, context: Any, app_id: Any, *, record_app_id: bool = True) -> bool:
+    if not isinstance(context, str) or not context:
+        return False
+    if app_id is not None and (isinstance(app_id, bool) or not isinstance(app_id, int)):
+        return False
+    ids = inventory.setdefault(context, set())
+    if record_app_id:
+        ids.add(app_id)  # None = source reported no app (e.g. Ruleset integration_id: null)
+    return True
+
+
+def _fetch_ruleset_contexts(
+    repo: str, base_encoded: str, inventory: Inventory
+) -> tuple[str | None, str | None]:
+    rc, stdout, stderr = run_gh(["api", f"repos/{repo}/rules/branches/{base_encoded}?per_page=100"])
+    if rc != 0:
+        return classify_gh_error(stderr, rc), stderr.strip() or stdout.strip()
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        return "malformed_gh_response", stdout[:400]
+    if not isinstance(data, list):
+        return "malformed_gh_response", "rules/branches did not return a list"
+    for rule in data:
+        if not isinstance(rule, dict):
+            return "malformed_gh_response", "rules/branches entry is not an object"
+        if rule.get("type") != "required_status_checks":
+            continue
+        params = rule.get("parameters")
+        entries = params.get("required_status_checks") if isinstance(params, dict) else None
+        if not isinstance(entries, list):
+            return "malformed_gh_response", "required_status_checks rule has unexpected shape"
+        for entry in entries:
+            if not isinstance(entry, dict) or not _add_context(
+                inventory, entry.get("context"), entry.get("integration_id")
+            ):
+                return "malformed_gh_response", "required_status_checks entry has unexpected shape"
+    return None, None
+
+
+def _fetch_classic_contexts(
+    repo: str, base_encoded: str, inventory: Inventory
+) -> tuple[str | None, str | None]:
+    rc, stdout, stderr = run_gh(
+        ["api", f"repos/{repo}/branches/{base_encoded}/protection/required_status_checks"]
+    )
+    if rc != 0:
+        if "branch not protected" in f"{stderr}\n{stdout}".lower():
+            return None, None  # Classic protection absent: this source is empty.
+        return classify_gh_error(stderr, rc), stderr.strip() or stdout.strip()
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        return "malformed_gh_response", stdout[:400]
+    if not isinstance(data, dict):
+        return "malformed_gh_response", "required_status_checks did not return an object"
+    checks = data.get("checks", [])
+    contexts = data.get("contexts", [])
+    if not isinstance(checks, list) or not isinstance(contexts, list):
+        return "malformed_gh_response", "required_status_checks has unexpected shape"
+    for entry in checks:
+        if not isinstance(entry, dict) or not _add_context(inventory, entry.get("context"), entry.get("app_id")):
+            return "malformed_gh_response", "required_status_checks.checks entry has unexpected shape"
+    for context in contexts:
+        if not _add_context(inventory, context, None, record_app_id=False):
+            return "malformed_gh_response", "required_status_checks.contexts entry has unexpected shape"
+    return None, None
+
+
+def fetch_required_inventory(repo: str, pr_number: int) -> tuple[Inventory | None, str | None, str | None]:
+    """Read-only effective required-check inventory for the PR base branch.
+
+    Union (by context name) of the active Ruleset required_status_checks and the
+    Classic branch protection required_status_checks. Any failure of either source
+    (other than Classic 404 "Branch not protected") fails closed.
+    """
+    base, error, message = get_base_branch(repo, pr_number)
+    if error or base is None:
+        return None, error, message
+    base_encoded = quote(base, safe="")
+    inventory: Inventory = {}
+    for fetch in (_fetch_ruleset_contexts, _fetch_classic_contexts):
+        error, message = fetch(repo, base_encoded, inventory)
+        if error:
+            return None, error, message
+    return inventory, None, None
 
 
 def decide_status(checks: list[dict[str, Any]]) -> tuple[str, str]:
@@ -120,6 +233,12 @@ def decide_status(checks: list[dict[str, Any]]) -> tuple[str, str]:
             return "skipped_only", "all required checks are skipped"
         return "failed", "required checks include skipped entries"
     return "passed", "all required checks passed"
+
+
+def _timeout_message(missing: list[str]) -> str:
+    if missing:
+        return "timeout waiting for required checks; missing required contexts: " + ", ".join(missing)
+    return "timeout waiting for required checks"
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -208,6 +327,24 @@ def main(argv: list[str]) -> int:
             exit_code=EXIT_NEGATIVE,
         )
 
+    inventory, inventory_error, inventory_message = fetch_required_inventory(args.repo, args.pr_number)
+    if inventory_error or inventory is None:
+        return emit_result(
+            status=inventory_error or "gh_error",
+            repo=args.repo,
+            pr_number=args.pr_number,
+            head_sha=args.head_sha,
+            current_head_sha=current_head_sha or "",
+            checks=[],
+            elapsed_seconds=int(time.time() - start_ts),
+            interval_seconds=args.interval,
+            timeout_seconds=args.timeout_seconds,
+            error_code=inventory_error or "gh_error",
+            message=inventory_message or "required-check inventory unavailable",
+            exit_code=EXIT_RUNTIME,
+        )
+    last_missing: list[str] = sorted(inventory)
+
     while True:
         elapsed = int(time.time() - start_ts)
         if elapsed >= args.timeout_seconds:
@@ -227,6 +364,21 @@ def main(argv: list[str]) -> int:
                     message=head_message,
                     exit_code=EXIT_RUNTIME,
                 )
+            if current_head_sha != args.head_sha:
+                return emit_result(
+                    status="head_sha_changed",
+                    repo=args.repo,
+                    pr_number=args.pr_number,
+                    head_sha=args.head_sha,
+                    current_head_sha=current_head_sha or "",
+                    checks=[],
+                    elapsed_seconds=elapsed,
+                    interval_seconds=args.interval,
+                    timeout_seconds=args.timeout_seconds,
+                    error_code="head_sha_changed",
+                    message="head SHA changed while waiting for checks",
+                    exit_code=EXIT_NEGATIVE,
+                )
             return emit_result(
                 status="pending_timeout",
                 repo=args.repo,
@@ -238,7 +390,7 @@ def main(argv: list[str]) -> int:
                 interval_seconds=args.interval,
                 timeout_seconds=args.timeout_seconds,
                 error_code="pending_timeout",
-                message="timeout waiting for required checks",
+                message=_timeout_message(last_missing),
                 exit_code=EXIT_NEGATIVE,
             )
 
@@ -275,7 +427,7 @@ def main(argv: list[str]) -> int:
                 exit_code=EXIT_RUNTIME,
             )
 
-        if not checks:
+        if not checks and not inventory:
             current_head_sha, head_error, head_message = get_current_head_sha(args.repo, args.pr_number)
             if head_error:
                 return emit_result(
@@ -307,8 +459,48 @@ def main(argv: list[str]) -> int:
                 exit_code=EXIT_NEGATIVE,
             )
 
-        decision, message = decide_status(checks)
+        if checks:
+            decision, message = decide_status(checks)
+        else:
+            decision, message = "pending", "required checks not yet reported"
+        materialized = {check.get("name") for check in checks}
+        last_missing = sorted(context for context in inventory if context not in materialized)
+        if last_missing and decision in ("passed", "skipped_only"):
+            decision = "pending"
         if decision == "pending":
+            # Issue #2836 F3: a pending poll must still detect HEAD drift so that a
+            # stale SHA never waits out the full timeout as pending_timeout.
+            current_head_sha, head_error, head_message = get_current_head_sha(args.repo, args.pr_number)
+            if head_error:
+                return emit_result(
+                    status=head_error,
+                    repo=args.repo,
+                    pr_number=args.pr_number,
+                    head_sha=args.head_sha,
+                    current_head_sha="",
+                    checks=checks,
+                    elapsed_seconds=elapsed,
+                    interval_seconds=args.interval,
+                    timeout_seconds=args.timeout_seconds,
+                    error_code=head_error,
+                    message=head_message,
+                    exit_code=EXIT_RUNTIME,
+                )
+            if current_head_sha != args.head_sha:
+                return emit_result(
+                    status="head_sha_changed",
+                    repo=args.repo,
+                    pr_number=args.pr_number,
+                    head_sha=args.head_sha,
+                    current_head_sha=current_head_sha or "",
+                    checks=checks,
+                    elapsed_seconds=elapsed,
+                    interval_seconds=args.interval,
+                    timeout_seconds=args.timeout_seconds,
+                    error_code="head_sha_changed",
+                    message="head SHA changed while waiting for checks",
+                    exit_code=EXIT_NEGATIVE,
+                )
             time.sleep(args.interval)
             continue
 
