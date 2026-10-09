@@ -1108,6 +1108,33 @@ def test_nonpass_facts_lossless_runtime_only_pass_mixed_with_delegated_pr_review
     _assert_no_dispatch(other, rc, payload, ["pr_review_only_current_execution_not_pass:AC2"])
 
 
+def test_fail_closed_on_pass_conversion_or_forged_sibling_entry_marked_blocking_next_to_delegated(
+    tmp_path, runtime_mixed
+):
+    """A delegated entry opens the gate only for itself: a sibling resolved entry that
+    persisted as ``blocking: true`` (e.g. tampered state) never rides along with it."""
+    ws = Workspace(tmp_path, runtime_mixed)
+    report = _report(runtime_mixed, row_overrides={1: PR_FAIL_ROWS["fail_exit_1"]}, result="FAIL")
+    rc, payload = ws.adjudicate(report)
+    assert rc == 0 and payload["invoke_pr_reviewer"] is True and payload["seq"] == 1, payload
+    # Sanity (normal axis): the untouched persisted adjudication opens the gate.
+    rc, gate = ws.step4_gate()
+    assert rc == 0 and gate["invoke_pr_reviewer"] is True
+
+    state = ws.state()
+    sibling = next(e for e in state["vc_adjudication"][ws.binding_key()]["per_ac"] if e["ac"] == "AC1")
+    assert sibling["reason_code"] != DELEGATED and sibling["status"] == "pass"
+    sibling["blocking"] = True
+    ws.loop_state.write_text(json.dumps(state), encoding="utf-8")
+
+    rc, gate = ws.step4_gate()
+    assert rc == 1
+    assert gate["invoke_pr_reviewer"] is False
+    assert gate["reason_code"] == "adjudication_blocking_true"
+    rc, term = ws.terminal_gate(dispatch_seq=1)
+    assert rc == 1 and term["route"] == "continue_loop" and term["reason_code"] == "vc_gate_blocking"
+
+
 RUNTIME_ROW_REFUSED: dict[str, dict[str, Any]] = {
     "runtime_only_fail": {"exit_code": 1, "status": "fail"},
     "runtime_only_skip": {"exit_code": 77, "status": "skip"},
