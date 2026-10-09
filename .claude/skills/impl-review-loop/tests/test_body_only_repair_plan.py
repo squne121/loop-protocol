@@ -1521,8 +1521,7 @@ PROTECTED_SCRIPTS = (
     ".claude/skills/open-pr/scripts/update_pr.py",
     ".claude/skills/impl-review-loop/scripts/route_loop_verdict_v2.py",
     ".claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py",
-    # wait_ci_checks.py は #2836 由来の暫定例外として保護対象から除外している。
-    # 恒久修正は #2989 / PR #2993 が所有し、そこで wait_ci_checks.py は再び対象に戻す。
+    ".claude/skills/impl-review-loop/scripts/wait_ci_checks.py",
 )
 
 
