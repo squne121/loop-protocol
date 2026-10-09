@@ -9,8 +9,10 @@ pre-fix regression cannot pass via an inert mock.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -19,21 +21,46 @@ import pytest
 
 
 _ROOT = Path(__file__).resolve().parents[4]
-_PUBLISHER = _ROOT / ".claude/skills/issue-refinement-loop/scripts/publish_termination_report.py"
+_PUBLISHER_REL = Path(".claude/skills/issue-refinement-loop/scripts/publish_termination_report.py")
+_BRIDGE_REL = Path(".claude/skills/issue-refinement-loop/scripts/isolation_issue_comment_bridge.py")
+_POLICY_REL = Path("scripts/agent-guards/controlled_skill_mutation_policy.py")
+_INPUT_REL = Path("artifacts/2988/issue-metadata/issue_comment.publish/issue_comment_publish_input.json")
 _EVIDENCE = _ROOT / "artifacts" / "runtime-verification-2988"
 _REPO = "squne121/loop-protocol"
 _SHA = "a" * 64
 _ISSUE = 2988
 _BODY = "## refinement の完了\n\n検証用の隔離されたコメントです。\n"
 
+
+def _fixture_repository(sandbox: Path) -> Path:
+    """Copy the real CLI and its real imports into one disposable repository root."""
+    root = sandbox / "repository"
+    root.mkdir(parents=True, exist_ok=True)
+    for relative in (_PUBLISHER_REL, _BRIDGE_REL, _POLICY_REL):
+        destination = root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if not destination.exists():
+            shutil.copy2(_ROOT / relative, destination)
+    return root
+
+
+def _checkout_input_snapshot() -> dict:
+    """Compare presence AND bytes, including when the checkout has no input."""
+    path = _ROOT / _INPUT_REL
+    return {
+        "exists": path.exists(),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None,
+    }
+
+
 # Written only under pytest's temporary sandbox; never imported by the parent.
 # The real CLI remains a file-backed Python subprocess, never `python -c`.
-_CHILD_INTERCEPTOR = r'''import json
+_CHILD_INTERCEPTOR = r"""import json
 import os
 from pathlib import Path
 import subprocess
 
-root = Path(os.environ["HARNESS_PROJECT_ROOT"])
+root = Path(os.environ["HARNESS_PROJECT_ROOT"]).resolve()
 events_file = Path(os.environ["HARNESS_EVENTS"])
 state_file = Path(os.environ["HARNESS_STATE"])
 Path(os.environ["HARNESS_LOADED"]).write_text("loaded", encoding="utf-8")
@@ -52,9 +79,12 @@ def fake_run(cmd, *args, **kwargs):
         assert argv[argv.index("--command-id") + 1] == "issue_comment.publish"
         assert argv[argv.index("--repo") + 1] == "squne121/loop-protocol"
         assert argv[argv.index("--issue-number") + 1] == "2988"
-        input_file = (root / argv[argv.index("--input-file") + 1]).resolve()
-        assert input_file.is_relative_to(root) and input_file.is_file()
+        relative_input = argv[argv.index("--input-file") + 1]
+        input_file = (root / relative_input).resolve()
+        assert relative_input == "artifacts/2988/issue-metadata/issue_comment.publish/issue_comment_publish_input.json"
+        assert input_file == root / relative_input and input_file.is_file()
         materialized = json.loads(input_file.read_text(encoding="utf-8"))
+        assert materialized["schema"] == "ISSUE_COMMENT_PUBLISH_INPUT_V1"
         assert materialized["issue_number"] == 2988
         assert materialized["marker"] in materialized["comment_body"]
         dry_run = "--dry-run" in argv
@@ -76,7 +106,8 @@ def fake_run(cmd, *args, **kwargs):
                 published.append(marker)
                 state_file.write_text(json.dumps(published), encoding="utf-8")
                 code, detail = 0, "created"
-        record("executor", argv=argv, exit=code, status_detail=detail)
+        record("executor", argv=argv, exit=code, status_detail=detail,
+               input_file=str(input_file), materialized=materialized)
         return subprocess.CompletedProcess(argv, code,
             stdout=json.dumps({"status_detail": detail, "exit_code": code}),
             stderr="fake controlled executor failure" if code else "")
@@ -93,7 +124,7 @@ def fake_run(cmd, *args, **kwargs):
     raise AssertionError("unrecognized subprocess: network calls forbidden " + repr(argv))
 
 subprocess.run = fake_run
-'''
+"""
 
 
 def _history_request() -> dict:
@@ -115,6 +146,24 @@ def _history_request() -> dict:
     }
 
 
+def _expected_history_payload() -> tuple[str, str]:
+    request = _history_request()
+    identity = request["identity"]
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    marker = f"<!-- loop-protocol/human-history:v1:sha256:{digest} -->"
+    body = (
+        "## review loop の作業履歴\n\n"
+        f"- 実施内容: {request['result']}\n"
+        f"- phase: {identity['phase']}\n"
+        f"- reviewed_ref: {identity['reviewed_ref']}\n"
+        f"- 推奨アクション: {request['recommended_action']}\n"
+        f"- 推奨する理由: {request['recommended_reason']}\n"
+        f"- 対応しない場合の影響: {request['impact_if_unaddressed']}\n"
+        f"- evidence refs: {'; '.join(request['evidence_refs'])}\n\n{marker}\n"
+    )
+    return marker, body
+
+
 def _run_cli(
     sandbox: Path,
     label: str,
@@ -128,6 +177,10 @@ def _run_cli(
     signal_failure: bool = False,
 ) -> dict:
     sandbox.mkdir(parents=True, exist_ok=True)
+    checkout_before = _checkout_input_snapshot()
+    execution_root = _fixture_repository(sandbox)
+    assert execution_root.resolve().is_relative_to(sandbox.resolve())
+    assert execution_root.resolve() != _ROOT.resolve()
     harness = sandbox / "interceptor"
     harness.mkdir(exist_ok=True)
     (harness / "sitecustomize.py").write_text(_CHILD_INTERCEPTOR, encoding="utf-8")
@@ -136,7 +189,7 @@ def _run_cli(
     loaded = sandbox / "interceptor-loaded"
     loaded.unlink(missing_ok=True)
 
-    argv = [sys.executable, str(_PUBLISHER), "--repo", _REPO]
+    argv = [sys.executable, str(execution_root / _PUBLISHER_REL), "--repo", _REPO]
     stdin = ""
     if human_history:
         request = sandbox / "human-history.json"
@@ -159,7 +212,7 @@ def _run_cli(
         argv.append("--dry-run")
     env = os.environ.copy()
     env["PYTHONPATH"] = str(harness)
-    env["HARNESS_PROJECT_ROOT"] = str(_ROOT)
+    env["HARNESS_PROJECT_ROOT"] = str(execution_root)
     env["HARNESS_EVENTS"] = str(events_file)
     env["HARNESS_STATE"] = str(sandbox / "remote-markers.json")
     env["HARNESS_LOADED"] = str(loaded)
@@ -173,23 +226,60 @@ def _run_cli(
         env["HARNESS_FAIL_EXEC"] = exec_failure
     if signal_failure:
         env["HARNESS_FAIL_SIGNAL"] = "1"
-    proc = subprocess.run(argv, input=stdin, text=True, capture_output=True,
-                          cwd=_ROOT, env=env, check=False, timeout=30)
+    proc = subprocess.run(
+        argv, input=stdin, text=True, capture_output=True, cwd=execution_root, env=env, check=False, timeout=30
+    )
+    checkout_after = _checkout_input_snapshot()
+    assert checkout_after == checkout_before, "fixture changed the original checkout's publisher input"
     assert loaded.read_text(encoding="utf-8") == "loaded", "subprocess interceptor did not load"
     event_lines = events_file.read_text(encoding="utf-8").splitlines() if events_file.exists() else []
-    events = [json.loads(line) for line in event_lines[len(before):]]
+    events = [json.loads(line) for line in event_lines[len(before) :]]
+    if human_history:
+        expected_marker, expected_body = _expected_history_payload()
+    else:
+        fallback_seed = f"{_REPO}\x00{_ISSUE}\x00{body}".encode("utf-8")
+        expected_marker = f"<!-- CONTROLLED_EXEC_MARKER:{hashlib.sha256(fallback_seed).hexdigest()[:32]} -->"
+        expected_body = body + f"\n{expected_marker}"
+    for event in events:
+        if event["kind"] != "executor":
+            continue
+        assert Path(event["input_file"]) == execution_root / _INPUT_REL
+        assert (execution_root / _INPUT_REL).is_file()
+        assert event["materialized"] == {
+            "schema": "ISSUE_COMMENT_PUBLISH_INPUT_V1",
+            "issue_number": _ISSUE,
+            "comment_body": expected_body,
+            "marker": expected_marker,
+        }
     artifacts_dir = sandbox / "publisher-artifacts"
-    artifacts = [json.loads(path.read_text(encoding="utf-8"))
-                 for path in artifacts_dir.glob("*.json")] if artifacts_dir.exists() else []
+    artifacts = (
+        [json.loads(path.read_text(encoding="utf-8")) for path in artifacts_dir.glob("*.json")]
+        if artifacts_dir.exists()
+        else []
+    )
+    source_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=_ROOT, text=True).strip()
+    materialized_path = execution_root / _INPUT_REL
     record = {
-        "tested_head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=_ROOT, text=True).strip(),
+        "tested_head": source_head,
+        "source_head": source_head,
+        "execution_root": str(execution_root),
+        "checkout_input_before": checkout_before,
+        "checkout_input_after": checkout_after,
+        "materialized_input_path": str(materialized_path) if materialized_path.is_file() else None,
         "cli_argv": argv,
         "cli_exit": proc.returncode,
         "cli_stdout": proc.stdout,
         "cli_stderr": proc.stderr,
-        "executor_argv_exit": [{"argv": event["argv"], "exit": event["exit"],
-                                "status_detail": event["status_detail"]}
-                               for event in events if event["kind"] == "executor"],
+        "executor_argv_exit": [
+            {
+                "argv": event["argv"],
+                "exit": event["exit"],
+                "status_detail": event["status_detail"],
+                "input_file": event["input_file"],
+            }
+            for event in events
+            if event["kind"] == "executor"
+        ],
         "mutation_count": sum(event["kind"] == "mutation" for event in events),
         "post_attempt_count": sum(event["kind"] == "post_attempt" for event in events),
         "signal_apply_count": sum(event["kind"] == "signal" for event in events),
@@ -234,8 +324,38 @@ def test_ac1_approved_dry_run_only_validates_and_positive_control_signals_after_
     assert "--dry-run" not in _executor(control)["argv"], control
     assert control["mutation_count"] == control["signal_apply_count"] == 1, control
     assert [entry["kind"] for entry in control["events_in_order"]] == [
-        "post_attempt", "mutation", "executor", "signal"
+        "post_attempt",
+        "mutation",
+        "executor",
+        "signal",
     ], control
+
+
+def test_ac1_separate_fixture_roots_do_not_replace_each_others_materialized_input(tmp_path: Path):
+    first = _run_cli(tmp_path / "first", "ac1-fixture-first", dry_run=True, body="最初の本文\n")
+    first_path = Path(first["materialized_input_path"])
+    first_bytes = first_path.read_bytes()
+    second = _run_cli(tmp_path / "second", "ac1-fixture-second", dry_run=True, body="別の本文\n")
+    second_path = Path(second["materialized_input_path"])
+    second_bytes = second_path.read_bytes()
+    assert first["cli_exit"] == second["cli_exit"] == 0
+    assert first_path != second_path
+    assert first_path.is_relative_to(Path(first["execution_root"]))
+    assert second_path.is_relative_to(Path(second["execution_root"]))
+    assert first_path.read_bytes() == first_bytes
+    assert first_bytes != second_bytes
+    assert _executor(first)["input_file"] == str(first_path)
+    assert _executor(second)["input_file"] == str(second_path)
+    _no_side_effect(first)
+    _no_side_effect(second)
+
+    # The same fixture root intentionally reuses its own input/remote state;
+    # replacing it must still leave the other fixture's input untouched.
+    replacement = _run_cli(tmp_path / "first", "ac1-fixture-first-replaced", dry_run=True, body="新しい本文\n")
+    assert replacement["materialized_input_path"] == str(first_path)
+    assert first_path.read_bytes() != first_bytes
+    assert second_path.read_bytes() == second_bytes
+    _no_side_effect(replacement)
 
 
 def test_ac2_human_history_dry_run_and_stable_identity_duplicate_noop(tmp_path: Path):
@@ -243,9 +363,9 @@ def test_ac2_human_history_dry_run_and_stable_identity_duplicate_noop(tmp_path: 
     dry = _run_cli(sandbox, "ac2-human-history-dry-run", dry_run=True, human_history=True)
     first = _run_cli(sandbox, "ac2-human-history-create", human_history=True)
     duplicate = _run_cli(sandbox, "ac2-human-history-duplicate", human_history=True)
-    assert dry["cli_exit"] == 0 and json.loads(dry["cli_stdout"]) == {
-        "status_detail": "dry_run_ok", "exit_code": 0
-    }, dry
+    assert dry["cli_exit"] == 0 and json.loads(dry["cli_stdout"]) == {"status_detail": "dry_run_ok", "exit_code": 0}, (
+        dry
+    )
     assert "--dry-run" in _executor(dry)["argv"], dry
     _no_side_effect(dry)
     assert first["cli_exit"] == 0 and _executor(first)["status_detail"] == "created", first
@@ -268,16 +388,21 @@ def test_ac3_normal_approved_post_failure_and_signal_failure(tmp_path: Path):
     assert any(artifact["reason_code"] == "gh_comment_failed" for artifact in failed_post["failure_artifacts"])
     assert failed_signal["cli_exit"] == 0 and failed_signal["mutation_count"] == 1, failed_signal
     assert failed_signal["signal_apply_count"] == 1, failed_signal
-    assert any(artifact["reason_code"] == "task_context_signal_not_applied"
-               for artifact in failed_signal["failure_artifacts"]), failed_signal
+    assert any(
+        artifact["reason_code"] == "task_context_signal_not_applied" for artifact in failed_signal["failure_artifacts"]
+    ), failed_signal
 
 
-@pytest.mark.parametrize("body_input,body", [
-    ("stdin", "  \n"), ("file", " \n"), ("missing", _BODY)
-])
+@pytest.mark.parametrize("body_input,body", [("stdin", "  \n"), ("file", " \n"), ("missing", _BODY)])
 def test_ac4_existing_empty_or_missing_body_fails_without_dispatch(tmp_path: Path, body_input: str, body: str):
-    result = _run_cli(tmp_path / body_input, f"ac4-empty-or-missing-{body_input}",
-                      body_input=body_input, body=body, dry_run=True, approved=True)
+    result = _run_cli(
+        tmp_path / body_input,
+        f"ac4-empty-or-missing-{body_input}",
+        body_input=body_input,
+        body=body,
+        dry_run=True,
+        approved=True,
+    )
     assert result["cli_exit"] != 0 and not result["executor_argv_exit"], result
     _no_side_effect(result)
 
@@ -300,8 +425,13 @@ def test_ac4_dry_run_stdin_validation_only_and_normal_post_distinct(tmp_path: Pa
 
 
 def test_ac4_dry_run_controlled_validation_failure_fails_closed(tmp_path: Path):
-    result = _run_cli(tmp_path / "validation-failure", "ac4-dry-run-validation-failure",
-                      dry_run=True, approved=True, exec_failure="validation")
+    result = _run_cli(
+        tmp_path / "validation-failure",
+        "ac4-dry-run-validation-failure",
+        dry_run=True,
+        approved=True,
+        exec_failure="validation",
+    )
     assert "--dry-run" in _executor(result)["argv"], result
     assert _executor(result)["exit"] != 0 and result["cli_exit"] != 0, result
     _no_side_effect(result)
