@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import shutil
 import subprocess
 import sys
 import uuid
@@ -26,6 +27,7 @@ from typing import Any
 import pytest
 
 ROOT = Path(__file__).resolve().parents[4]
+REAL_ROOT = ROOT  # hermetic fixture が ROOT を差し替えても、実 repo root を識別するための不変値
 SKILL_DIR = ROOT / ".claude" / "skills" / "impl-review-loop"
 RUNNER = ROOT / "scripts" / "agent-ops" / "run_worktree_agent_runtime_smoke.py"
 ADJUDICATOR_PATH = SKILL_DIR / "scripts" / "adjudicate_vc_result.py"
@@ -66,7 +68,9 @@ def unique_output_dir() -> str:
     return f"{OUTPUT_PARENT}/{OUTPUT_DIR_PREFIX}-{stamp}-{uuid.uuid4().hex}"
 
 
-def runner_argv(markers: list[str], output_dir: str) -> list[str]:
+def runner_argv(markers: list[str], output_dir: str, root: Path | None = None) -> list[str]:
+    """runner の argv。``--worktree`` は ``root``（省略時は呼出し時点の module global ``ROOT``）に束縛する。"""
+    worktree = ROOT if root is None else root
     argv = [
         sys.executable,
         str(RUNNER),
@@ -77,7 +81,7 @@ def runner_argv(markers: list[str], output_dir: str) -> list[str]:
         "--claude-adapter",
         "native",
         "--worktree",
-        str(ROOT),
+        str(worktree),
         "--prompt-file",
         PROMPT_FILE,
         "--output-dir",
@@ -136,7 +140,7 @@ def run_test_count_smoke(
     """
     output_dir = unique_output_dir()
     result = run(
-        runner_argv(markers, output_dir),
+        runner_argv(markers, output_dir, root),
         cwd=str(root),
         capture_output=True,
         text=True,
@@ -186,25 +190,61 @@ def test_test_count_markers_are_command_specific_and_runner_argv_uses_only_exist
     assert argv.count("--expect-marker") == len(markers)
 
 
-def _output_dir_of(argv: list[str]) -> str:
-    return argv[argv.index("--output-dir") + 1]
+def _arg_of(argv: list[str], option: str) -> str:
+    return argv[argv.index(option) + 1]
+
+
+@pytest.fixture
+def sandbox_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """hermetic test 用: module global ``ROOT`` を ``tmp_path`` へ差し替える（autouse ではない）。
+
+    live test の root semantics（実 repo root）は変えない。``run_test_count_smoke`` の ``root`` 既定値は
+    定義時に評価されるため、呼出し側は同じ ``tmp_path`` を ``root=`` へ明示的に渡すこと。
+    """
+    monkeypatch.setattr(sys.modules[__name__], "ROOT", tmp_path)
+    assert ROOT == tmp_path and tmp_path.resolve() != REAL_ROOT
+    return tmp_path
 
 
 class _FakeRunner:
-    """runner 起動点の fake。runner の exclusive create を模擬し、output dir が既存なら失敗させる。"""
+    """runner 起動点の fake。実 runner と同様に ``--worktree`` 基準で相対 ``--output-dir`` を解決し、
+    exclusive create を模擬する（output dir が既存なら失敗）。"""
 
     def __init__(self) -> None:
         self.output_dirs: list[str] = []
+        self.worktrees: list[str] = []
+        self.cwds: list[str] = []
         self.existed_at_launch: list[bool] = []
 
     def __call__(self, argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        output_dir = _output_dir_of(argv)
-        target = Path(kwargs["cwd"]) / output_dir
+        worktree = Path(_arg_of(argv, "--worktree"))
+        output_dir = _arg_of(argv, "--output-dir")
+        assert Path(kwargs["cwd"]) == worktree, (kwargs["cwd"], str(worktree))  # cwd == --worktree
+        assert not Path(output_dir).is_absolute(), output_dir
+        target = worktree / output_dir  # 実 runner: Path(worktree) / output_dir
         self.output_dirs.append(output_dir)
+        self.worktrees.append(str(worktree))
+        self.cwds.append(str(kwargs["cwd"]))
         self.existed_at_launch.append(target.exists())
         target.mkdir(parents=True)  # 既存なら FileExistsError（exclusive create の模擬）
         (target / "summary.md").write_text(f"summary for {output_dir}\n", encoding="utf-8")
         return subprocess.CompletedProcess(argv, 0, stdout="OK\n", stderr="")
+
+
+def _assert_sentinels_preserved(sentinels: dict[Path, str]) -> None:
+    for path, content in sentinels.items():
+        assert path.is_file(), f"sentinel lost: {path}"
+        assert path.read_text(encoding="utf-8") == content, f"sentinel content changed: {path}"
+
+
+def _seed_sentinels(root: Path) -> dict[Path, str]:
+    legacy = root / "artifacts" / "runtime-smoke" / "issue-2971-test-count"
+    past_run = root / "artifacts" / "runtime-smoke" / f"{OUTPUT_DIR_PREFIX}-20200101T000000Z-{'0' * 32}"
+    sentinels = {legacy / "sentinel.txt": "legacy evidence", past_run / "sentinel.txt": "past run evidence"}
+    for path, content in sentinels.items():
+        path.parent.mkdir(parents=True)
+        path.write_text(content, encoding="utf-8")
+    return sentinels
 
 
 def test_unique_output_dir_test_count_is_fresh_and_not_created() -> None:
@@ -217,33 +257,57 @@ def test_unique_output_dir_test_count_is_fresh_and_not_created() -> None:
         assert not (ROOT / path).exists(), path  # 関数は directory を作らない
 
 
-def test_unique_output_dir_test_count_invocations_share_path_between_argv_and_summary(tmp_path: Path) -> None:
+def test_unique_output_dir_test_count_invocations_share_path_between_argv_and_summary(sandbox_root: Path) -> None:
     fake = _FakeRunner()
 
-    first = run_test_count_smoke(count_markers(3), run=fake, root=tmp_path)
-    second = run_test_count_smoke(count_markers(3), run=fake, root=tmp_path)
+    first = run_test_count_smoke(count_markers(3), run=fake, root=sandbox_root)
+    second = run_test_count_smoke(count_markers(3), run=fake, root=sandbox_root)
 
     assert first.output_dir != second.output_dir
     assert fake.output_dirs == [first.output_dir, second.output_dir]
     assert fake.existed_at_launch == [False, False]  # runner 起動時点で未存在
+    # runner_argv の --worktree == subprocess cwd == sentinel 配置 root == summary 読み出し root
+    assert fake.worktrees == fake.cwds == [str(sandbox_root)] * 2
     for run_result in (first, second):
-        assert run_result.summary == tmp_path / run_result.output_dir / "summary.md"
+        assert run_result.summary == sandbox_root / run_result.output_dir / "summary.md"
+        assert run_result.summary.is_file()  # 解決済み output dir 配下に作られる
         assert run_result.summary_text == f"summary for {run_result.output_dir}\n"
         assert run_result.result.returncode == 0
 
 
-def test_unique_output_dir_test_count_preserves_existing_evidence(tmp_path: Path) -> None:
-    legacy = tmp_path / "artifacts" / "runtime-smoke" / "issue-2971-test-count"
-    past_run = tmp_path / "artifacts" / "runtime-smoke" / f"{OUTPUT_DIR_PREFIX}-20200101T000000Z-{'0' * 32}"
-    sentinels = {legacy / "sentinel.txt": "legacy evidence", past_run / "sentinel.txt": "past run evidence"}
-    for path, content in sentinels.items():
-        path.parent.mkdir(parents=True)
-        path.write_text(content, encoding="utf-8")
+def test_unique_output_dir_test_count_preserves_existing_evidence(sandbox_root: Path) -> None:
+    sentinels = _seed_sentinels(sandbox_root)
+    fake = _FakeRunner()
 
-    run_test_count_smoke(count_markers(3), run=_FakeRunner(), root=tmp_path)
+    smoke = run_test_count_smoke(count_markers(3), run=fake, root=sandbox_root)
 
-    for path, content in sentinels.items():
-        assert path.read_text(encoding="utf-8") == content, path
+    assert fake.worktrees == fake.cwds == [str(sandbox_root)]  # sentinel と同じ root で起動された
+    assert smoke.summary_text is not None
+    _assert_sentinels_preserved(sentinels)
+
+
+def test_unique_output_dir_test_count_destructive_mutation_is_detected_by_sentinel_loss(sandbox_root: Path) -> None:
+    """negative control: 起動前に sandbox root 基準で OUTPUT_PARENT / 旧固定 dir を削除する mutation を入れると、
+    保全 assertion が sentinel 喪失で FAIL する（fake の起動不能による FAIL とは区別する）。"""
+    sentinels = _seed_sentinels(sandbox_root)
+    fake = _FakeRunner()
+
+    def destructive_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        worktree = Path(_arg_of(argv, "--worktree"))
+        assert worktree.resolve() != REAL_ROOT and worktree == sandbox_root  # 実 repo の artifacts/ は消さない
+        shutil.rmtree(worktree / OUTPUT_PARENT, ignore_errors=True)  # mutation（sandbox root のみ）
+        shutil.rmtree(worktree / "artifacts" / "runtime-smoke" / "issue-2971-test-count", ignore_errors=True)
+        return fake(argv, **kwargs)
+
+    smoke = run_test_count_smoke(count_markers(3), run=destructive_run, root=sandbox_root)
+
+    # fake は正常に起動・完走している（FAIL 理由が起動不能ではないことの証明）
+    assert smoke.result.returncode == 0 and smoke.summary_text is not None
+    assert fake.existed_at_launch == [False]
+    # sentinel は実在しない -> 保全 assertion は sentinel 喪失で FAIL する
+    assert not any(path.exists() for path in sentinels)
+    with pytest.raises(AssertionError, match="sentinel lost"):
+        _assert_sentinels_preserved(sentinels)
 
 
 # --- live (claude_live) ----------------------------------------------------------------------
