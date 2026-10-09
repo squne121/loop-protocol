@@ -263,3 +263,226 @@ def select_issue_worktree(catalog: list[dict], issue: str, root_realpath: str | 
     """Return the single unambiguous worktree for ``issue`` (None if 0 or >1)."""
     matches = select_issue_worktrees(catalog, issue, root_realpath)
     return matches[0] if len(matches) == 1 else None
+
+
+# ---------------------------------------------------------------------------
+# Canonical primary-root resolution (Issue #2979)
+#
+# ADDITIVE shared helpers. ``list_worktrees()`` above is intentionally left
+# untouched (signature, ``None``-on-failure contract and the per-entry
+# ``git_common_dir`` copy) because ``worktree_bootstrap_exec`` /
+# ``git_worktree_probe`` / ``verified_*_merge_exec`` consume it unchanged.
+#
+# The helpers below decide "which checkout is the canonical repository root"
+# from Git repository identity rather than from the session's current worktree:
+#   * the FIRST ``git worktree list --porcelain -z`` entry is the primary
+#     worktree;
+#   * the candidate (linked worktree / primary / script location) and the
+#     primary each run their OWN ``git rev-parse --git-common-dir`` and the two
+#     realpaths are compared. The ``git_common_dir`` field that
+#     ``list_worktrees()`` copies onto every entry is NEVER trusted -- a
+#     comparison of that copied field would pass vacuously.
+# ---------------------------------------------------------------------------
+
+# Fixed reason-code literals (Issue #2979 Design Requirement 8). They are carried
+# on EXISTING response fields only (guard: ``blocked_reason_codes``; executor:
+# the existing refusal ``reason_code``); no new schema/field is introduced.
+WORKTREE_CATALOG_UNAVAILABLE = "worktree_catalog_unavailable"
+GIT_COMMON_DIR_UNAVAILABLE = "git_common_dir_unavailable"
+PRIMARY_ROOT_UNRESOLVED = "primary_root_unresolved"
+REPOSITORY_IDENTITY_MISMATCH = "repository_identity_mismatch"
+ACTIVE_ISSUE_CATALOG_CONFLICT = "active_issue_catalog_conflict"
+
+ROOT_RESOLUTION_REASON_CODES = (
+    WORKTREE_CATALOG_UNAVAILABLE,
+    GIT_COMMON_DIR_UNAVAILABLE,
+    PRIMARY_ROOT_UNRESOLVED,
+    REPOSITORY_IDENTITY_MISMATCH,
+    ACTIVE_ISSUE_CATALOG_CONFLICT,
+)
+
+
+class RootResolution:
+    """Outcome of :func:`resolve_canonical_root`.
+
+    ``ok`` is True only when ``primary_root`` is a verified canonical primary
+    work tree of the same repository as ``candidate``. ``catalog`` is the
+    catalog the decision was based on (``None`` when it could not be obtained);
+    callers must never replace a ``None`` catalog by ``[]``.
+    """
+
+    __slots__ = ("ok", "primary_root", "reason_code", "catalog", "candidate")
+
+    def __init__(
+        self,
+        ok: bool,
+        primary_root: str | None,
+        reason_code: str | None,
+        catalog: list[dict] | None,
+        candidate: str,
+    ) -> None:
+        self.ok = ok
+        self.primary_root = primary_root
+        self.reason_code = reason_code
+        self.catalog = catalog
+        self.candidate = candidate
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return (
+            f"RootResolution(ok={self.ok!r}, primary_root={self.primary_root!r}, "
+            f"reason_code={self.reason_code!r}, candidate={self.candidate!r})"
+        )
+
+
+def independent_git_common_dir(path: str, deadline: Deadline | None = None) -> str | None:
+    """Run ``git rev-parse --git-common-dir`` INSIDE ``path`` and return its realpath.
+
+    A relative answer (``.git``) is resolved against ``path`` -- the cwd the
+    command ran in. Returns ``None`` when git is missing or the command fails.
+    """
+    git = shutil.which("git")
+    if not git:
+        return None
+    return _git_common_dir(path, git, deadline)
+
+
+def _is_inside_work_tree(path: str, git: str, deadline: Deadline | None) -> bool:
+    timeout = deadline.subprocess_timeout(5.0) if deadline is not None else 5.0
+    try:
+        out = subprocess.run(
+            [git, "-C", path, "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return out.returncode == 0 and out.stdout.strip() == "true"
+
+
+def resolve_canonical_root(
+    candidate: str,
+    deadline: Deadline | None = None,
+    catalog: list[dict] | None = None,
+) -> RootResolution:
+    """Resolve the canonical primary worktree for ``candidate`` (Issue #2979).
+
+    ``candidate`` may be a linked worktree, the primary root or any directory
+    inside one of them. ``catalog`` is a test seam: when supplied it replaces the
+    ``list_worktrees()`` result (the module-level ``list_worktrees`` may also be
+    patched). Failure kinds are returned as fixed reason-code literals and never
+    silently fall back to ``candidate``:
+
+    * ``primary_root_unresolved``    -- candidate is not a Git work tree, the
+      catalog is empty, or the first catalog entry is not a usable work tree
+      (bare repository / missing directory);
+    * ``worktree_catalog_unavailable`` -- ``list_worktrees()`` returned ``None``;
+    * ``git_common_dir_unavailable``   -- an independent ``--git-common-dir`` failed;
+    * ``repository_identity_mismatch`` -- the independently obtained common-dir of
+      the candidate and of the primary differ.
+    """
+    candidate_real = os.path.realpath(candidate)
+    git = shutil.which("git")
+    if not git:
+        return RootResolution(False, None, WORKTREE_CATALOG_UNAVAILABLE, None, candidate_real)
+    if not os.path.isdir(candidate_real) or not _is_inside_work_tree(candidate_real, git, deadline):
+        return RootResolution(False, None, PRIMARY_ROOT_UNRESOLVED, None, candidate_real)
+
+    if catalog is None:
+        catalog = list_worktrees(candidate_real, deadline)
+    if catalog is None:
+        return RootResolution(False, None, WORKTREE_CATALOG_UNAVAILABLE, None, candidate_real)
+    if not catalog:
+        return RootResolution(False, None, PRIMARY_ROOT_UNRESOLVED, catalog, candidate_real)
+
+    primary_raw = catalog[0].get("worktree_realpath")
+    if not primary_raw:
+        return RootResolution(False, None, PRIMARY_ROOT_UNRESOLVED, catalog, candidate_real)
+    primary = os.path.realpath(primary_raw)
+    # A bare primary (no work tree) or a missing directory is "primary absent".
+    if not os.path.isdir(primary) or not _is_inside_work_tree(primary, git, deadline):
+        return RootResolution(False, None, PRIMARY_ROOT_UNRESOLVED, catalog, candidate_real)
+
+    candidate_common = _git_common_dir(candidate_real, git, deadline)
+    primary_common = _git_common_dir(primary, git, deadline)
+    if candidate_common is None or primary_common is None:
+        return RootResolution(False, None, GIT_COMMON_DIR_UNAVAILABLE, catalog, candidate_real)
+    if candidate_common != primary_common:
+        return RootResolution(False, None, REPOSITORY_IDENTITY_MISMATCH, catalog, candidate_real)
+    return RootResolution(True, primary, None, catalog, candidate_real)
+
+
+def root_candidate(explicit: str | None, script_file: str) -> str:
+    """Return the root CANDIDATE by priority: explicit -> CLAUDE_PROJECT_DIR -> script location.
+
+    ``script_file`` is ``__file__`` of a script that lives in ``scripts/agent-ops``.
+    The candidate is only a starting point; callers must normalise it with
+    :func:`resolve_canonical_root` (a candidate is never trusted as the root).
+    """
+    if explicit:
+        return os.path.realpath(explicit)
+    env_root = os.environ.get("CLAUDE_PROJECT_DIR")
+    if env_root:
+        return os.path.realpath(env_root)
+    agent_ops = os.path.dirname(os.path.realpath(script_file))
+    return os.path.realpath(os.path.dirname(os.path.dirname(agent_ops)))
+
+
+def best_effort_root(explicit: str | None, script_file: str, deadline: Deadline | None = None) -> str:
+    """Never-raising root path: the verified primary root when resolvable, else the raw candidate.
+
+    The raw candidate is returned on failure ONLY so that callers can proceed to
+    their existing structured-refusal path, which re-runs
+    :func:`resolve_canonical_root` and reports the fixed reason code. It must not
+    be used as a trusted root by itself.
+    """
+    cand = root_candidate(explicit, script_file)
+    try:
+        res = resolve_canonical_root(cand, deadline)
+    except Exception:  # noqa: BLE001 - best-effort path must never raise
+        return cand
+    return res.primary_root if res.ok and res.primary_root else cand
+
+
+def find_containing_entry(catalog: list[dict], path: str) -> dict | None:
+    """Return the catalog entry whose worktree contains ``path`` (Issue #2979 AC9).
+
+    Containment is decided on realpaths. Linked worktree entries (everything
+    after the first / primary entry) win over the primary because the primary
+    root is a path prefix of every ``.claude/worktrees/*`` entry; among several
+    linked matches the DEEPEST (longest path) wins; the primary is returned only
+    when nothing else matches.
+    """
+    if not catalog:
+        return None
+    target = os.path.realpath(path)
+
+    def _contains(entry: dict) -> bool:
+        wt = entry.get("worktree_realpath")
+        return bool(wt) and (target == wt or target.startswith(wt.rstrip(os.sep) + os.sep))
+
+    linked = [e for e in catalog[1:] if _contains(e)]
+    if linked:
+        return max(linked, key=lambda e: len(e["worktree_realpath"]))
+    return catalog[0] if _contains(catalog[0]) else None
+
+
+def issue_number_from_entry(entry: dict | None) -> str | None:
+    """Return the Issue number a catalog entry is bound to, or None.
+
+    Uses the same strict rule as :func:`select_issue_worktrees`: the branch
+    short-name AND the path basename must both match ``(worktree-)?issue-<N>-*``
+    and agree on ``<N>``.
+    """
+    if not entry:
+        return None
+    wt = entry.get("worktree_realpath")
+    if not wt:
+        return None
+    branch = branch_short_name(entry.get("branch_ref"))
+    base = os.path.basename(os.path.normpath(wt))
+    mb = re.match(r"^(?:worktree-)?issue-(\d+)-", branch or "")
+    mp = re.match(r"^issue-(\d+)-", base)
+    if mb and mp and mb.group(1) == mp.group(1):
+        return mb.group(1)
+    return None
