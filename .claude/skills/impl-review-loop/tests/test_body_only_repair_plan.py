@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import hashlib
 import importlib.util
 import inspect
 import json
@@ -1525,19 +1526,120 @@ PROTECTED_SCRIPTS = (
 )
 
 
+LEGIT_CHANGED_SCRIPT = PROTECTED_SCRIPTS[2]  # 別 Issue（#2916）が正当に変更する adjudicate_vc_result.py
+
+
 def _git(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True, check=False)
 
 
-def test_ac6_protected_scripts_are_not_modified_relative_to_the_base() -> None:
-    base = next(
-        (ref for ref in ("origin/main", "main") if _git("rev-parse", "--verify", "--quiet", ref).returncode == 0),
-        "HEAD",
-    )
+def _protected_snapshot(root: Path) -> dict[str, str | None]:
+    """Content hash of every protected script (``None`` when absent)."""
+    snapshot: dict[str, str | None] = {}
+    for relative in PROTECTED_SCRIPTS:
+        path = root / relative
+        snapshot[relative] = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+    return snapshot
 
-    completed = _git("diff", "--exit-code", base, "--", *PROTECTED_SCRIPTS)
 
-    assert completed.returncode == 0, completed.stdout
+def _protected_mutations(before: dict[str, str | None], after: dict[str, str | None]) -> list[str]:
+    return sorted(relative for relative in before if before[relative] != after.get(relative))
+
+
+def _watched_roots(env: "PlanEnv") -> dict[str, Path]:
+    """body-only 実行の副作用を観測する root。CLI が実際に cwd とする ``--worktree`` と、実行コードを
+    load している repository checkout（``ROOT``）の両方を監視する（#2989 P1）。"""
+    return {"worktree": env.repo, "root": ROOT}
+
+
+def _watch(env: "PlanEnv") -> dict[str, dict[str, str | None]]:
+    snapshots = {name: _protected_snapshot(path) for name, path in _watched_roots(env).items()}
+    # vacuous PASS 防止: 監視対象が空、または protected script が 1 件でも不在なら測定自体が成立しない。
+    assert snapshots and all(snapshots.values())
+    for name, snapshot in snapshots.items():
+        assert set(snapshot) == set(PROTECTED_SCRIPTS), name
+        assert all(digest is not None for digest in snapshot.values()), (name, snapshot)
+    return snapshots
+
+
+def _watch_mutations(env: "PlanEnv", before: dict[str, dict[str, str | None]]) -> dict[str, list[str]]:
+    after = {name: _protected_snapshot(path) for name, path in _watched_roots(env).items()}
+    return {name: _protected_mutations(before[name], after[name]) for name in before}
+
+
+def _run_body_only_cli(env: "PlanEnv") -> None:
+    """production body-only CLI（plan -> guard）を実行し、意図した path に到達したことを確認する。"""
+    rc, payload = env.plan()
+    assert rc == 0, payload
+    assert payload["eligible"] is True, payload
+    rc, payload = env.guard()
+    assert rc == 0, payload
+    assert sum(1 for call in env.gh_calls() if call[:2] == ["pr", "view"]) >= 2, env.gh_calls()
+
+
+def test_ac6_body_only_cli_does_not_modify_protected_scripts(tmp_path: Path) -> None:
+    """body-only 実行の副作用だけを観測する。branch 対 base の repository-wide diff は使わない
+    （別 Issue による protected script の正当な変更で false-fail するため。#2989）。"""
+    env = PlanEnv(tmp_path, seed_protected=True)
+    before = _watch(env)
+
+    _run_body_only_cli(env)
+
+    assert _watch_mutations(env, before) == {"worktree": [], "root": []}
+
+
+def test_ac6_preexisting_legitimate_protected_script_change_is_not_a_mutation(tmp_path: Path) -> None:
+    """別 Issue の PR が protected script を変更済み（base と feature branch に Git 差分あり）でも、
+    body-only CLI が触れていなければ PASS する。branch / base の差分を理由に FAIL しない（#2989 AC1/AC3）。"""
+    env = PlanEnv(tmp_path, seed_protected=True)
+    # 既存差分が実在すること（false-green 防止: 差分の無い環境では positive control にならない）。
+    diff = _git_run(env.repo, "diff", "--name-only", "main", "feature", "--", *PROTECTED_SCRIPTS)
+    assert diff.splitlines() == [LEGIT_CHANGED_SCRIPT], diff
+    before = _watch(env)
+
+    _run_body_only_cli(env)
+
+    assert _watch_mutations(env, before) == {"worktree": [], "root": []}
+    # CLI 実行後も既存の正当な差分は残っている（CLI が差分を消して PASS したのではない）。
+    assert _git_run(env.repo, "diff", "--name-only", "main", "feature", "--", *PROTECTED_SCRIPTS) == diff
+
+
+@pytest.mark.parametrize("target", PROTECTED_SCRIPTS)
+@pytest.mark.parametrize("how", ["append", "rewrite", "delete"])
+def test_ac6_mutation_of_a_protected_script_during_the_cli_run_is_detected(
+    tmp_path: Path, how: str, target: str
+) -> None:
+    """同一 hermetic 環境で、実 CLI が走っている測定区間内（fake gh の ``pr view`` 呼出し時）に worktree 側
+    protected script を書き換え、before/after 比較が「その script」を検出することを確認する。"""
+    env = PlanEnv(tmp_path, seed_protected=True)
+    env.inject_mutation(target, how)
+    before = _watch(env)
+
+    _run_body_only_cli(env)
+
+    log = env.mutation_log()
+    assert log and all(entry == [how, target] for entry in log), log
+    assert _watch_mutations(env, before) == {"worktree": [target], "root": []}
+
+
+def test_ac6_root_only_monitoring_would_miss_a_worktree_mutation(tmp_path: Path) -> None:
+    """監視対象を ``ROOT`` のみに戻した旧テストの false-green を固定する（mutation control）。"""
+    env = PlanEnv(tmp_path, seed_protected=True)
+    env.inject_mutation(PROTECTED_SCRIPTS[2], "rewrite")
+    before = _watch(env)
+
+    _run_body_only_cli(env)
+
+    assert _protected_mutations(before["root"], _protected_snapshot(ROOT)) == []  # ROOT のみでは見逃す
+    assert _watch_mutations(env, before)["worktree"] == [PROTECTED_SCRIPTS[2]]  # worktree 監視なら検出する
+
+
+def test_ac6_watch_refuses_a_vacuous_measurement(tmp_path: Path) -> None:
+    """protected script が worktree に無い環境では測定が成立しないため PASS ではなく失敗する。"""
+    env = PlanEnv(tmp_path)  # seed_protected=False: worktree に protected script が無い
+
+    with pytest.raises(AssertionError):
+        _watch(env)
 
 
 def test_ac6_production_module_never_edits_a_pr_body_directly() -> None:
@@ -1585,6 +1687,19 @@ state = json.load(open(os.environ["FAKE_GH_STATE"], encoding="utf-8"))
 with open(os.environ["FAKE_GH_LOG"], "a", encoding="utf-8") as handle:
     handle.write(json.dumps(sys.argv[1:]) + "\\n")
 args = sys.argv[1:]
+if args[:2] == ["pr", "view"] and os.environ.get("FAKE_GH_MUTATE"):
+    how, target = json.loads(os.environ["FAKE_GH_MUTATE"])
+    path = os.path.join(os.environ["FAKE_GH_MUTATE_ROOT"], target)
+    if how == "append":
+        text = open(path, encoding="utf-8").read()
+        if not text.endswith("# injected\\n"):
+            open(path, "w", encoding="utf-8").write(text + "# injected\\n")
+    elif how == "rewrite":
+        open(path, "w", encoding="utf-8").write("# replaced\\n")
+    elif os.path.exists(path):
+        os.unlink(path)
+    with open(os.environ["FAKE_GH_LOG"] + ".mutations", "a", encoding="utf-8") as handle:
+        handle.write(json.dumps([how, target]) + "\\n")
 if args[:2] == ["pr", "view"]:
     updated = state.get("updated_at", "2026-10-07T00:00:00Z")
     print(json.dumps({"headRefOid": state["head"], "body": state["body"], "updatedAt": updated}))
@@ -1654,16 +1769,25 @@ def _ci_wait_line(
 class PlanEnv:
     """tmp の git worktree・fake gh・実 ``step4-adjudicate`` で persist した LOOP_STATE を持つ plan 用環境。"""
 
-    def __init__(self, tmp_path: Path, *, live_body: str | None = None) -> None:
+    def __init__(self, tmp_path: Path, *, live_body: str | None = None, seed_protected: bool = False) -> None:
         self.root = tmp_path
         self.repo = tmp_path / "wt"
         self.repo.mkdir()
+        self.mutation: tuple[str, str] | None = None
         _git_run(self.repo, "init", "-q", "-b", "main")
         (self.repo / "README.md").write_text("base\n", encoding="utf-8")
+        if seed_protected:
+            for relative in PROTECTED_SCRIPTS:
+                (self.repo / relative).parent.mkdir(parents=True, exist_ok=True)
+                (self.repo / relative).write_text("# base\n", encoding="utf-8")
         _git_run(self.repo, "add", "-A")
         _git_run(self.repo, "commit", "-q", "-m", "base")
         _git_run(self.repo, "checkout", "-q", "-b", "feature")
         (self.repo / "feature.txt").write_text("feature\n", encoding="utf-8")
+        if seed_protected:  # 別 Issue による合法な protected-script 変更（feature branch 側の既存差分）
+            (self.repo / LEGIT_CHANGED_SCRIPT).write_text(
+                "# base\n# legitimate change owned by another Issue\n", encoding="utf-8"
+            )
         _git_run(self.repo, "add", "-A")
         _git_run(self.repo, "commit", "-q", "-m", "feature")
         self.head = _git_run(self.repo, "rev-parse", "HEAD")
@@ -1754,13 +1878,27 @@ class PlanEnv:
             return []
         return [json.loads(line) for line in self.gh_log.read_text(encoding="utf-8").splitlines() if line.strip()]
 
+    def inject_mutation(self, target: str, how: str) -> None:
+        """CLI 実行中（fake gh の ``pr view`` 呼出し時）に worktree 側 ``target`` を ``how`` で書き換える。"""
+        self.mutation = (how, target)
+
+    def mutation_log(self) -> list[list[str]]:
+        path = Path(str(self.gh_log) + ".mutations")
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
     def environment(self) -> dict[str, str]:
-        return {
+        env = {
             **os.environ,
             "PATH": f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}",
             "FAKE_GH_STATE": str(self.gh_state),
             "FAKE_GH_LOG": str(self.gh_log),
         }
+        if self.mutation is not None:
+            env["FAKE_GH_MUTATE"] = json.dumps(list(self.mutation))
+            env["FAKE_GH_MUTATE_ROOT"] = str(self.repo)
+        return env
 
     # -- production CLI wrappers -----------------------------------------------
 
