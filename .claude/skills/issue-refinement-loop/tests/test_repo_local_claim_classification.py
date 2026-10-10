@@ -320,6 +320,16 @@ VC: GitHub API rate-limit response must be checked against the official docs bef
             "GitHub GraphQL errors are covered in official docs before approval",
         ),
         (
+            "Do not verify local fixtures and GitHub GraphQL errors are to be checked "
+            "against official docs before approval.",
+            "GitHub GraphQL errors are to be checked against official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors must match "
+            "official docs no later than release.",
+            "GitHub GraphQL errors must match official docs no later than release",
+        ),
+        (
             "Do not verify local fixtures and GitHub GraphQL errors match "
             "official docs before approval.",
             "GitHub GraphQL errors match official docs before approval",
@@ -406,6 +416,18 @@ def test_independent_noun_start_external_claims_remain_dispositive(phrase, expec
         assert _consumer().route_web_research_result(routing_input)["next_action"] == "proceed"
 
 
+def test_affirmative_deadline_does_not_negate_external_dependency():
+    phrase = "GitHub GraphQL errors must match official docs no later than release."
+    for body, comments in [
+        (_body(ac=f"- AC1: {phrase}"), None),
+        (_body(), [{"id": 96, "body": phrase}]),
+    ]:
+        policy = _web(_plan(body, comments))
+        assert policy["required"] is True
+        assert len(policy["critical_external_claims"]) == 1
+        assert phrase in policy["critical_external_claims"][0]["claim"]
+
+
 @pytest.mark.parametrize(
     "phrase",
     [
@@ -416,6 +438,9 @@ def test_independent_noun_start_external_claims_remain_dispositive(phrase, expec
         "Do not verify local fixtures and do not check GitHub GraphQL errors against official docs.",
         "Do not verify local fixtures and GitHub GraphQL errors have to not match official docs.",
         "Do not verify local fixtures and GitHub GraphQL errors must not match official docs.",
+        "Do not verify local fixtures and GitHub GraphQL errors are not to be checked against official docs.",
+        "No later than release, do not verify GitHub GraphQL errors against official docs.",
+        "GitHub GraphQL errors must not match official docs no later than release.",
         "Previously quoted: Do not verify local fixtures and GitHub GraphQL errors "
         "must match official docs before approval.",
         "Previously quoted: Do not verify local fixtures and GitHub GraphQL errors "

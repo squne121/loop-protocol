@@ -614,7 +614,7 @@ _REPO_CHECK_RE = re.compile(
     r"search|trace|must)\b|検証|確認|調査|探[すし]|照合|直接実行|必要", re.I,
 )
 _NEGATED_REQUEST_RE = re.compile(
-    r"\b(?:do\s+not|does\s+not|don't|not|no|never|without|unrelated|"
+    r"\b(?:do\s+not|does\s+not|don't|not|no(?!\s+later\s+than\b)|never|without|unrelated|"
     r"out\s+of\s+scope)\b|不要|参照しない|確認しない|検証しない|対象外|"
     r"非ゴール|変更しない|禁止|単なる|言及のみ", re.I,
 )
@@ -628,7 +628,8 @@ _FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 _NOUN_CLAUSE_PREDICATE_RE = re.compile(
     r"\b(?:must|should|shall|needs?|require[ds]?|depends?|"
     r"(?:has|have)\s+to|"
-    r"(?:is|are)\s+(?:specified|defined|documented|described|covered|"
+    r"(?:is|are)\s+(?:to\s+be\s+(?:checked|verified|validated|compared)|"
+    r"specified|defined|documented|described|covered|"
     r"outlined|listed|explained|required|expected|stated|published)|"
     r"match(?:es)?|agree(?:s)?|follow(?:s)?|conform(?:s)?|align(?:s)?)\b", re.I,
 )

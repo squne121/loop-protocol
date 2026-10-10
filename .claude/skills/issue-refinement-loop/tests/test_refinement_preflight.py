@@ -1727,6 +1727,20 @@ def test_repo_local_no_web_preflight_handoff_preserves_unverified_anchor_warning
             "GitHub GraphQL errors are covered in official docs before approval",
         ),
         (
+            "Do not verify local fixtures and GitHub GraphQL errors are to be checked "
+            "against official docs before approval.",
+            "GitHub GraphQL errors are to be checked against official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors must match "
+            "official docs no later than release.",
+            "GitHub GraphQL errors must match official docs no later than release",
+        ),
+        (
+            "GitHub GraphQL errors must match official docs no later than release.",
+            "GitHub GraphQL errors must match official docs no later than release",
+        ),
+        (
             "Do not inspect repository call chain and GitHub GraphQL data/errors "
             "require validation against the official specification before approval.",
             "GitHub GraphQL data/errors require validation against the official specification",
