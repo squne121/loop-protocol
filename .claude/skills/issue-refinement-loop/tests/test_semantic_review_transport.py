@@ -15,6 +15,7 @@ execution.
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -490,6 +491,202 @@ def test_record_result_current_body_sha256_is_a_required_keyword_argument():
 
     sig = inspect.signature(transport.record_result)
     assert sig.parameters["current_body_sha256"].default is inspect.Parameter.empty
+
+
+# ---------------------------------------------------------------------------
+# Issue #3007: bare / "sha256:"-prefixed current_body_sha256 equivalence and
+# invalid-format vs genuine-drift separation.
+# ---------------------------------------------------------------------------
+
+_TRANSPORT_SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "semantic_review_transport.py"
+_JOIN_SCRIPT_DIR = Path(__file__).resolve().parent.parent / "scripts"
+
+_HIGH_FINDING = {
+    "severity": "high",
+    "summary": "AC が検証不能な設計になっている",
+}
+
+
+def _pin_and_wait(d: str, body_text: str = "sha256 notation body", issue_number: int = 3007):
+    """pin a bundle and wait so completed_at / mtime satisfy the join barrier."""
+    bundle = transport.pin_bundle(
+        issue_number=issue_number,
+        body_text=body_text,
+        prompt_version="v1",
+        requested_model="sonnet",
+        artifacts_root=Path(d) / "artifacts",
+    )
+    time.sleep(1.05)
+    return bundle
+
+
+def _record(bundle, d: str, digest: str, assessment: str = "clear", findings=None):
+    result_file = Path(d) / "result.json"
+    _fake_agent_writes_result(result_file, assessment, findings)
+    return transport.record_result(
+        invocation_dir=bundle["invocation_dir"],
+        result_file=result_file,
+        completed_at=_now_str(),
+        current_body_sha256=digest,
+    )
+
+
+def test_record_result_equivalent_prefixed_and_bare_sha256():
+    """AC1: bare and sha256:-prefixed forms of the same digest are equivalent."""
+    with tempfile.TemporaryDirectory() as d:
+        bundle = _pin_and_wait(d)
+        bare = bundle["body_sha256"]
+        for digest in (bare, "sha256:" + bare):
+            outcome = _record(bundle, d, digest)
+            assert outcome["transport_status"] == "ok", digest
+            assert outcome["reason_code"] is None
+            assert outcome["artifact"]["freshness_valid"] is True
+            # persisted / returned body_sha256 is always the bare form.
+            assert outcome["artifact"]["body_sha256"] == bare
+
+
+def test_record_result_distinguishes_invalid_format_from_real_body_drift():
+    """AC2: a different well-formed digest is stale; malformed digests are
+    error/invalid_current_body_sha256 and keep the validated findings."""
+    with tempfile.TemporaryDirectory() as d:
+        bundle = _pin_and_wait(d)
+        bare = bundle["body_sha256"]
+        other = "0" * 64
+        for digest in (other, "sha256:" + other):
+            outcome = _record(bundle, d, digest)
+            assert outcome["transport_status"] == "stale", digest
+            assert outcome["reason_code"] is None
+            assert outcome["artifact"]["freshness_valid"] is False
+
+        invalid_digests = [
+            "",
+            bare[:63],
+            bare + "0",
+            bare.upper(),
+            "sha256:" + bare.upper(),
+            " " + bare,
+            bare + " ",
+            bare + "\n",
+            "sha256:" + bare + "\n",
+            "SHA256:" + bare,
+            "sha256:",
+            "sha256: " + bare,
+            "sha512:" + bare,
+            "sha256:sha256:" + bare,
+            "not-a-digest",
+            "g" * 64,
+        ]
+        for digest in invalid_digests:
+            outcome = _record(bundle, d, digest, assessment="findings", findings=[dict(_HIGH_FINDING)])
+            assert outcome["transport_status"] == "error", repr(digest)
+            assert outcome["reason_code"] == "invalid_current_body_sha256", repr(digest)
+            artifact = outcome["artifact"]
+            assert artifact is not None, repr(digest)
+            assert artifact["freshness_valid"] is False
+            assert artifact["artifact_valid"] is True
+            assert artifact["body_sha256"] == bare
+            assert artifact["findings"] == [_HIGH_FINDING]
+            persisted = json.loads(
+                (Path(bundle["invocation_dir"]) / "semantic_review_result.json").read_text(encoding="utf-8")
+            )
+            assert persisted == artifact
+
+        # An invalid raw reviewer result keeps its existing rejection reason
+        # even when the caller digest is also malformed.
+        outcome = _record(bundle, d, "garbage", assessment="clear", findings=[dict(_HIGH_FINDING)])
+        assert outcome["transport_status"] == "error"
+        assert outcome["reason_code"] == "assessment_findings_mismatch:clear_with_findings"
+        assert outcome["artifact"] is None
+
+
+def _run_record_cli(bundle, result_file: Path, completed_at: str, digest=None, omit_digest=False):
+    cmd = [
+        sys.executable,
+        str(_TRANSPORT_SCRIPT),
+        "record-result",
+        "--invocation-dir",
+        bundle["invocation_dir"],
+        "--result-file",
+        str(result_file),
+        "--completed-at",
+        completed_at,
+    ]
+    if not omit_digest:
+        cmd += ["--current-body-sha256", digest]
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def test_record_result_cli_exit_codes_and_persisted_artifact():
+    """AC2/AC3: real CLI subprocess -- exit codes, stdout JSON, persisted artifact."""
+    with tempfile.TemporaryDirectory() as d:
+        bundle = _pin_and_wait(d)
+        bare = bundle["body_sha256"]
+        result_file = Path(d) / "result.json"
+        _fake_agent_writes_result(result_file, "findings", [dict(_HIGH_FINDING)])
+        completed_at = _now_str()
+        persisted_path = Path(bundle["invocation_dir"]) / "semantic_review_result.json"
+
+        for digest in (bare, "sha256:" + bare):
+            proc = _run_record_cli(bundle, result_file, completed_at, digest)
+            assert proc.returncode == 0, proc.stderr
+            out = json.loads(proc.stdout)
+            assert out["transport_status"] == "ok"
+            assert out["artifact"]["freshness_valid"] is True
+
+        for digest in ("1" * 64, "sha256:" + "1" * 64):
+            proc = _run_record_cli(bundle, result_file, completed_at, digest)
+            assert proc.returncode == 0, proc.stderr
+            out = json.loads(proc.stdout)
+            assert out["transport_status"] == "stale"
+            assert out["artifact"]["freshness_valid"] is False
+
+        for digest in ("", bare.upper(), bare[:10], bare + "\n", "nonsense"):
+            proc = _run_record_cli(bundle, result_file, completed_at, digest)
+            assert proc.returncode == 1, (digest, proc.stdout, proc.stderr)
+            out = json.loads(proc.stdout)
+            assert out["transport_status"] == "error"
+            assert out["reason_code"] == "invalid_current_body_sha256"
+            assert out["artifact"]["freshness_valid"] is False
+            assert out["artifact"]["artifact_valid"] is True
+            assert out["artifact"]["findings"] == [_HIGH_FINDING]
+            persisted = json.loads(persisted_path.read_text(encoding="utf-8"))
+            assert persisted == out["artifact"]
+            assert persisted["body_sha256"] == bare
+            assert persisted["findings"] == [_HIGH_FINDING]
+
+        # missing required option keeps the argparse usage error (exit 2).
+        proc = _run_record_cli(bundle, result_file, completed_at, omit_digest=True)
+        assert proc.returncode == 2
+        assert "--current-body-sha256" in proc.stderr
+
+
+def test_invalid_digest_preserves_high_finding_through_join():
+    """AC3: transport error caused only by a malformed caller digest must not
+    drop a validated high finding -- the joiner still returns needs-fix."""
+    sys.path.insert(0, str(_JOIN_SCRIPT_DIR))
+    import join_review_results as joiner
+
+    with tempfile.TemporaryDirectory() as d:
+        bundle = _pin_and_wait(d)
+        outcome = _record(bundle, d, "NOT-A-DIGEST", assessment="findings", findings=[dict(_HIGH_FINDING)])
+        assert outcome["transport_status"] == "error"
+        assert outcome["reason_code"] == "invalid_current_body_sha256"
+        artifact = outcome["artifact"]
+        assert artifact is not None
+
+        for policy in ("best_effort", "required"):
+            joined = joiner.join_review_results(
+                deterministic_verdict="approve",
+                semantic_assessment=artifact["assessment"],
+                transport_status=outcome["transport_status"],
+                findings=artifact["findings"],
+                transport_policy=policy,
+                source_artifact=str(Path(bundle["invocation_dir"]) / "semantic_review_result.json"),
+                checked_body_sha256=artifact["body_sha256"],
+            )
+            assert joined["effective_verdict"] == "needs-fix", policy
+            assert joined["effective_verdict"] != "approve"
+            assert joined["rewrite_lane"] == "semantic"
 
 
 if __name__ == "__main__":
