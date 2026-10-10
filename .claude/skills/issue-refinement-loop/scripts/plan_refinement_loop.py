@@ -627,7 +627,10 @@ _FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 # is still one negated request, not a second affirmative dependency.
 _NOUN_CLAUSE_PREDICATE_RE = re.compile(
     r"\b(?:must|should|shall|needs?|require[ds]?|depends?|"
-    r"(?:is|are)\s+(?:specified|defined|documented|required|expected))\b", re.I,
+    r"(?:has|have)\s+to|"
+    r"(?:is|are)\s+(?:specified|defined|documented|described|covered|"
+    r"outlined|listed|explained|required|expected|stated|published)|"
+    r"match(?:es)?|agree(?:s)?|follow(?:s)?|conform(?:s)?|align(?:s)?)\b", re.I,
 )
 
 

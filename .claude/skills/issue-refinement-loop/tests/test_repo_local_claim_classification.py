@@ -305,6 +305,36 @@ VC: GitHub API rate-limit response must be checked against the official docs bef
             "GitHub GraphQL errors must match official docs before approval",
         ),
         (
+            "Do not verify local fixtures and GitHub GraphQL errors have to match "
+            "official docs before approval.",
+            "GitHub GraphQL errors have to match official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors are described "
+            "in official docs before approval.",
+            "GitHub GraphQL errors are described in official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors are covered "
+            "in official docs before approval.",
+            "GitHub GraphQL errors are covered in official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors match "
+            "official docs before approval.",
+            "GitHub GraphQL errors match official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors have to match "
+            "official docs before approval and do not change tests.",
+            "GitHub GraphQL errors have to match official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures and API authentication behavior has to "
+            "agree with published specification before approval.",
+            "API authentication behavior has to agree with published specification",
+        ),
+        (
             "Do not verify local fixtures and GitHub GraphQL errors must match "
             "official docs before approval and do not change tests.",
             "GitHub GraphQL errors must match official docs before approval",
@@ -382,10 +412,14 @@ def test_independent_noun_start_external_claims_remain_dispositive(phrase, expec
         "Do not verify local fixtures.",
         "Do not verify local fixtures and check repository tests instead.",
         "Do not verify local fixtures and GitHub GraphQL errors against official docs.",
+        "Do not verify local fixtures and API authentication behavior from published specification.",
         "Do not verify local fixtures and do not check GitHub GraphQL errors against official docs.",
+        "Do not verify local fixtures and GitHub GraphQL errors have to not match official docs.",
         "Do not verify local fixtures and GitHub GraphQL errors must not match official docs.",
         "Previously quoted: Do not verify local fixtures and GitHub GraphQL errors "
         "must match official docs before approval.",
+        "Previously quoted: Do not verify local fixtures and GitHub GraphQL errors "
+        "have to match official docs before approval.",
         "Literal example: Do not verify local fixtures and GitHub GraphQL errors "
         "must match official docs before approval.",
         "リポジトリ fixtures の検証は不要、GitHub GraphQL は例示のみ。",

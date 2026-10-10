@@ -1712,6 +1712,21 @@ def test_repo_local_no_web_preflight_handoff_preserves_unverified_anchor_warning
             "GitHub GraphQL errors must match official docs before approval",
         ),
         (
+            "Do not verify local fixtures and GitHub GraphQL errors have to match "
+            "official docs before approval.",
+            "GitHub GraphQL errors have to match official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors are described "
+            "in official docs before approval.",
+            "GitHub GraphQL errors are described in official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors are covered "
+            "in official docs before approval.",
+            "GitHub GraphQL errors are covered in official docs before approval",
+        ),
+        (
             "Do not inspect repository call chain and GitHub GraphQL data/errors "
             "require validation against the official specification before approval.",
             "GitHub GraphQL data/errors require validation against the official specification",
@@ -1812,6 +1827,8 @@ def test_repo_local_no_web_handoff_rejects_foreign_issue_url_host(tmp_path):
         "## Revised AC\n- AC2: trusted fixture directive [truncated: remaining text]\n",
         "## Revised AC\n- AC2: Do not verify local fixtures and GitHub GraphQL "
         "errors must match official docs [truncated: remaining text]\n",
+        "## Revised AC\n- AC2: Do not verify local fixtures and GitHub GraphQL "
+        "errors have to match official docs [truncated: remaining text]\n",
         "## Revised AC\n- AC2: 公式ドキュメントで外部 API の仕様を検証する必要がある\n",
         "## Revised AC\n- AC2: Do not verify local fixtures and verify GitHub GraphQL "
         "errors against official docs before approval.\n",
