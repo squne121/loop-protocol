@@ -1145,3 +1145,80 @@ def test_step4_gate_cli_malformed_loop_state_file_exit_2(tmp_path: Path):
     )
 
     assert result.returncode == 2
+
+
+# --- Issue #2996: ensure_contract_snapshot envelope resolution (unit level) -------
+
+_ENVELOPE_BODY = "sha256:" + "5" * 64
+
+
+def _dry_run_envelope() -> dict:
+    return {
+        "schema": "CONTRACT_SNAPSHOT_ENSURE_RESULT_V1",
+        "issue_number": 2996,
+        "repo": "squne121/loop-protocol",
+        "status": "dry_run_would_post",
+        "source": "materialized_go",
+        "contract_snapshot_url": None,
+        "body_sha256_at_check": _ENVELOPE_BODY,
+        "contract_review_once_result": {
+            "schema": "CONTRACT_REVIEW_ONCE_RESULT_V1",
+            "issue_number": 2996,
+            "status": "go",
+            "body_sha256": _ENVELOPE_BODY,
+            "vc_preflight_classifications": [_payload_item("AC1")],
+        },
+    }
+
+
+def test_resolve_envelope_builds_one_canonical_object_used_by_every_stage():
+    resolved, errors = mod.resolve_step4_contract_snapshot(
+        _dry_run_envelope(), producer_exit_code="20", expected_contract_body_sha256=_ENVELOPE_BODY
+    )
+    assert errors == []
+    assert resolved["schema"] == "CONTRACT_REVIEW_RESULT_V1"
+    assert resolved["status"] == "go"
+    assert resolved["body_sha256"] == _ENVELOPE_BODY
+    items, normalize_errors, schema = mod._normalize_list_payload(resolved)
+    assert normalize_errors == [] and schema == "CONTRACT_REVIEW_RESULT_V1"
+    assert [item["ac"] for item in items] == ["AC1"]
+    integrity = mod._extract_source_integrity(
+        contract_snapshot=resolved,
+        current_vc_result=None,
+        diff_summary=None,
+        allowed_paths=None,
+        normalized_allowed=[],
+        baseline_schema=schema,
+        current_items_count=0,
+        baseline_items_count=len(items),
+        changed_paths_present=False,
+    )
+    assert integrity["contract_body_sha256"] == _ENVELOPE_BODY
+
+
+def test_resolve_envelope_fail_closed_returns_no_partial_snapshot():
+    envelope = _dry_run_envelope()
+    for exit_code in (None, "", "x", "0", "10", "40"):
+        resolved, errors = mod.resolve_step4_contract_snapshot(envelope, producer_exit_code=exit_code)
+        assert resolved is None
+        assert errors, exit_code
+    human = dict(envelope, status="human_judgment")
+    resolved, errors = mod.resolve_step4_contract_snapshot(human, producer_exit_code="20")
+    assert resolved is None
+    assert errors == ["producer_status_not_handoff_eligible:human_judgment"]
+
+
+def test_resolve_non_envelope_snapshot_is_unchanged_and_rejects_exit_code():
+    legacy = {"schema": "CONTRACT_REVIEW_RESULT_V1", "status": "go", "body_sha256": _ENVELOPE_BODY}
+    assert mod.resolve_step4_contract_snapshot(legacy) == (legacy, [])
+    assert mod.resolve_step4_contract_snapshot(legacy, producer_exit_code="0") == (
+        None,
+        ["producer_exit_code_requires_envelope_snapshot"],
+    )
+    assert mod.resolve_step4_contract_snapshot(None) == (None, [])
+
+
+def test_envelope_is_still_not_a_plain_adjudicate_input():
+    """`adjudicate` / `step4-gate` stay envelope-unaware (Issue #2996 AC1)."""
+    _, errors, _ = mod._normalize_list_payload(_dry_run_envelope())
+    assert errors == ["unsupported_schema:CONTRACT_SNAPSHOT_ENSURE_RESULT_V1"]
