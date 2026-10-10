@@ -379,19 +379,37 @@ def _rows(contexts: list[str], bucket: str = "pass") -> list[dict[str, Any]]:
     return [{"name": c, "bucket": bucket} for c in contexts]
 
 
+RULESET_PAGINATION_ARGS = ("--paginate", "--slurp")
+
+
 class FakeGh:
-    """Routes `run_gh` calls. `checks` is a list of (rc, stdout, stderr) per poll (last repeats)."""
+    """Routes `run_gh` calls. `checks` is a list of (rc, stdout, stderr) per poll (last repeats).
+
+    Ruleset (`rules/branches`) responses model the real `gh api` pagination contract (Issue #2998):
+
+    - with both `--paginate` and `--slurp` in argv: an outer JSON array holding one array per page;
+    - without them: only the first page as a flat JSON array (what GitHub returns for one request).
+
+    A pre-concatenated flat array is never returned for a paginated request. `ruleset` (legacy,
+    single response) is wrapped as one page when it is a successful JSON array; any other
+    response (errors / garbage) is passed through verbatim. `ruleset_pages` supplies explicit
+    pages; `ruleset_slurp_response` replaces the paginated response (later-page failure injection).
+    """
 
     def __init__(
         self,
         *,
         ruleset: tuple[int, str, str] | None = None,
+        ruleset_pages: list[list[dict[str, Any]]] | None = None,
+        ruleset_slurp_response: tuple[int, str, str] | None = None,
         classic: tuple[int, str, str] | None = None,
         checks: list[tuple[int, str, str]] | None = None,
         base: str = "main",
         head: str = HEAD_SHA,
     ) -> None:
         self.ruleset = ruleset if ruleset is not None else (0, _ruleset_body(RULESET_CONTEXTS), "")
+        self.ruleset_pages = ruleset_pages
+        self.ruleset_slurp_response = ruleset_slurp_response
         self.classic = classic if classic is not None else (0, _classic_body(CLASSIC_CONTEXTS), "")
         self.checks = checks if checks is not None else [(0, "[]", "")]
         self.base = base
@@ -407,7 +425,7 @@ class FakeGh:
             return 0, self.head + "\n", ""
         if args[0] == "api":
             if "/rules/branches/" in args[1]:
-                return self.ruleset
+                return self._ruleset_response(args)
             if args[1].endswith("/protection/required_status_checks"):
                 return self.classic
         if args[:2] == ["pr", "checks"]:
@@ -416,8 +434,29 @@ class FakeGh:
             return self.checks[idx]
         raise AssertionError(f"unexpected gh call: {args}")
 
+    def _ruleset_response(self, args: list[str]) -> tuple[int, str, str]:
+        paginated = all(option in args for option in RULESET_PAGINATION_ARGS)
+        if self.ruleset_pages is not None:
+            if not paginated:
+                return 0, json.dumps(self.ruleset_pages[0]), ""  # one request = first page only
+            if self.ruleset_slurp_response is not None:
+                return self.ruleset_slurp_response
+            return 0, json.dumps(self.ruleset_pages), ""
+        rc, stdout, stderr = self.ruleset
+        if paginated and rc == 0:
+            try:
+                parsed = json.loads(stdout)
+            except json.JSONDecodeError:
+                return self.ruleset
+            if isinstance(parsed, list):
+                return 0, json.dumps([parsed]), stderr  # single page, slurped
+        return self.ruleset
+
     def api_paths(self) -> list[str]:
         return [c[1] for c in self.calls if c[0] == "api"]
+
+    def api_calls(self) -> list[list[str]]:
+        return [c for c in self.calls if c[0] == "api"]
 
 
 def _checks_ok(rows: list[dict[str, Any]]) -> tuple[int, str, str]:
@@ -473,9 +512,14 @@ def test_effective_inventory_is_union_of_ruleset_and_classic_by_context(
         assert inventory[context] == {None, 15368}  # Ruleset integration_id null + Classic app_id
     assert inventory["validate-generated-artifact"] == {15368}
     # Branch is the PR base (URL-encoded), never a hard-coded main.
-    assert fake.api_paths() == [
-        "repos/owner/repo/rules/branches/release%2F2026.1?per_page=100",
-        "repos/owner/repo/branches/release%2F2026.1/protection/required_status_checks",
+    assert fake.api_calls() == [
+        [
+            "api",
+            "repos/owner/repo/rules/branches/release%2F2026.1?per_page=100",
+            "--paginate",
+            "--slurp",
+        ],
+        ["api", "repos/owner/repo/branches/release%2F2026.1/protection/required_status_checks"],
     ]
     assert not any("/main" in path for path in fake.api_paths())
 
@@ -854,3 +898,314 @@ def test_head_fetch_error_during_pending_is_not_success_or_head_changed(
     assert payload["status"] == expected_status
     assert payload["status"] not in {"passed", "skipped_only", "head_sha_changed", "pending_timeout"}
     assert payload["current_head_sha"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Issue #2998: Ruleset `rules/branches` pagination completeness
+# ---------------------------------------------------------------------------
+#
+# These tests run `main()` -> real `fetch_required_inventory()` -> real
+# `_fetch_ruleset_contexts()` -> `run_gh()`; only `run_gh` (FakeGh) and the clock are faked.
+# FakeGh returns the per-page outer array only when argv carries `--paginate --slurp`; a request
+# without them yields page 1 only, exactly like a single GitHub REST call.
+
+RULESET_PATH = "repos/owner/repo/rules/branches/main?per_page=100"
+PAGINATED_RULESET_CALL = ["api", RULESET_PATH, "--paginate", "--slurp"]
+
+
+def _filler_rules(count: int, offset: int = 0) -> list[dict[str, Any]]:
+    """Applicable branch rules that are NOT required_status_checks (production-shaped)."""
+    kinds = ("deletion", "non_fast_forward", "required_linear_history", "creation")
+    return [
+        {"type": kinds[i % len(kinds)], "ruleset_id": 16796903 + offset + i, "ruleset_source": "owner/repo"}
+        for i in range(count)
+    ]
+
+
+def _required_rule(entries: list[tuple[str, int | None]]) -> dict[str, Any]:
+    return {
+        "type": "required_status_checks",
+        "ruleset_id": 16796903,
+        "ruleset_source_type": "Repository",
+        "parameters": {
+            "strict_required_status_checks_policy": False,
+            "required_status_checks": [{"context": c, "integration_id": i} for c, i in entries],
+        },
+    }
+
+
+def _page2_fixture(**kwargs: Any) -> FakeGh:
+    """Main fixture: page 1 = 100 non-required rules, page 2 = `python-test`; Classic = `build` only."""
+    return FakeGh(
+        ruleset_pages=[_filler_rules(100), [_required_rule([("python-test", None)])]],
+        classic=(0, _classic_body(["build"]), ""),
+        **kwargs,
+    )
+
+
+def _ruleset_calls(fake: FakeGh) -> list[list[str]]:
+    return [c for c in fake.api_calls() if "/rules/branches/" in c[1]]
+
+
+def test_ruleset_page2_required_context_stays_pending_until_it_materializes(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC1: a required context only on Ruleset page 2 keeps the wait pending (never passed)."""
+    fake = _page2_fixture(checks=[_checks_ok(_rows(["build"]))])
+    sleeps = _install(monkeypatch, fake)
+
+    exit_code, payload = _run(capsys)
+
+    assert exit_code == wait_ci_checks.EXIT_NEGATIVE
+    assert payload["status"] == "pending_timeout"
+    assert payload["status"] not in {"passed", "skipped_only"}
+    assert payload["error_code"] == "pending_timeout"
+    assert "python-test" in payload["message"]
+    assert "build" not in payload["message"].split("missing required contexts:")[1]
+    assert payload["current_head_sha"] == HEAD_SHA
+    assert fake.checks_calls >= 2
+    assert sleeps
+    assert _ruleset_calls(fake) == [PAGINATED_RULESET_CALL]
+
+
+def test_ruleset_page2_required_context_passes_once_it_materializes(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC1: same HEAD, `python-test` = pass appears on a later poll -> passed only then (exit 0)."""
+    fake = _page2_fixture(
+        checks=[
+            _checks_ok(_rows(["build"])),
+            _checks_ok(_rows(["build"])),
+            _checks_ok(_rows(["build", "python-test"])),
+        ]
+    )
+    sleeps = _install(monkeypatch, fake)
+
+    exit_code, payload = _run(capsys, "--timeout-seconds", "600")
+
+    assert exit_code == wait_ci_checks.EXIT_PASS
+    assert payload["status"] == "passed"
+    assert payload["current_head_sha"] == HEAD_SHA
+    assert fake.checks_calls == 3  # passed only at poll 3, when `python-test` materialized
+    assert len(sleeps) == 2  # polls 1 and 2 (python-test absent) did not resolve
+    assert {c["name"] for c in payload["checks"]} == {"build", "python-test"}
+    assert _ruleset_calls(fake) == [PAGINATED_RULESET_CALL]
+
+
+_LATER_PAGE_FAILURES = [
+    ((1, "", "gh: Resource not accessible by integration (HTTP 403)"), "auth_error"),
+    ((1, "", "gh: Server Error (HTTP 502)"), "gh_error"),
+    ((1, "", "gh: Server Error (HTTP 500)"), "gh_error"),
+    # Invalid JSON after a valid first page.
+    ((0, json.dumps([[_required_rule([("build", None)])]])[:-1] + ", not-json{", ""), "malformed_gh_response"),
+    # Outer array holds a non-array page (error object / string / scalar).
+    ((0, json.dumps([[_required_rule([("build", None)])], {"message": "boom"}]), ""), "malformed_gh_response"),
+    ((0, json.dumps([[_required_rule([("build", None)])], "page2"]), ""), "malformed_gh_response"),
+    # Outer value is not an array of pages (flat concatenation / object / string).
+    ((0, json.dumps([_required_rule([("build", None)])]), ""), "malformed_gh_response"),
+    ((0, json.dumps({"message": "x"}), ""), "malformed_gh_response"),
+    # Later page entries / rules have an unexpected shape.
+    ((0, json.dumps([[_required_rule([("build", None)])], [1]]), ""), "malformed_gh_response"),
+    (
+        (
+            0,
+            json.dumps([[_required_rule([("build", None)])], [{"type": "required_status_checks", "parameters": {}}]]),
+            "",
+        ),
+        "malformed_gh_response",
+    ),
+    (
+        (
+            0,
+            json.dumps(
+                [
+                    [_required_rule([("build", None)])],
+                    [{"type": "required_status_checks", "parameters": {"required_status_checks": [{"context": 7}]}}],
+                ]
+            ),
+            "",
+        ),
+        "malformed_gh_response",
+    ),
+]
+
+
+@pytest.mark.parametrize(("slurp_response", "expected_status"), _LATER_PAGE_FAILURES)
+def test_ruleset_later_page_failure_is_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    slurp_response: tuple[int, str, str],
+    expected_status: str,
+) -> None:
+    """AC2: page 1 is fine but page 2+ fails / is malformed -> exit 2, never success on page 1 alone."""
+    fake = FakeGh(
+        ruleset_pages=[[_required_rule([("build", None)])], [_required_rule([("python-test", None)])]],
+        ruleset_slurp_response=slurp_response,
+        classic=(0, _classic_body(["build"]), ""),
+        # `build` alone is materialized+pass: only the page-2 failure can stop `passed`.
+        checks=[_checks_ok(_rows(["build"]))],
+    )
+    _install(monkeypatch, fake)
+
+    exit_code, payload = _run(capsys)
+
+    assert exit_code == wait_ci_checks.EXIT_RUNTIME
+    assert payload["status"] == expected_status
+    assert payload["status"] not in {"passed", "skipped_only", "pending_timeout"}
+    assert fake.checks_calls == 0
+    assert set(payload) == RESULT_KEYS
+
+
+def test_ruleset_pagination_third_page_sentinel_is_detected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC3: a sentinel required context that exists only on page 3 reaches the inventory."""
+    fake = FakeGh(
+        ruleset_pages=[
+            _filler_rules(100),
+            _filler_rules(100, offset=100),
+            [*_filler_rules(3, offset=200), _required_rule([("sentinel-page3", 15368)])],
+        ],
+        classic=NOT_PROTECTED,
+    )
+    _install(monkeypatch, fake)
+
+    inventory, error, message = wait_ci_checks.fetch_required_inventory("owner/repo", 1)
+
+    assert (error, message) == (None, None)
+    assert inventory == {"sentinel-page3": {15368}}
+    assert _ruleset_calls(fake) == [PAGINATED_RULESET_CALL]
+
+
+def test_ruleset_pagination_single_page_and_empty_ruleset_compat(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC3: one page, an empty first page and an empty page list keep their previous meaning."""
+    # One page (slurped as a single-element outer array).
+    fake = FakeGh(
+        ruleset_pages=[[*_filler_rules(2), _required_rule([("build", None), ("lint", 7)])]],
+        classic=NOT_PROTECTED,
+    )
+    _install(monkeypatch, fake)
+    inventory, error, _message = wait_ci_checks.fetch_required_inventory("owner/repo", 1)
+    assert error is None
+    assert inventory == {"build": {None}, "lint": {7}}
+
+    # Empty ruleset: `[[]]` (one empty page) and `[]` (no page) + Classic 404 -> empty inventory.
+    for pages in ([[]], []):
+        fake = FakeGh(ruleset_pages=[[]], ruleset_slurp_response=(0, json.dumps(pages), ""), classic=NOT_PROTECTED)
+        _install(monkeypatch, fake)
+        inventory, error, _message = wait_ci_checks.fetch_required_inventory("owner/repo", 1)
+        assert (inventory, error) == ({}, None)
+
+    # Empty inventory keeps the no_checks / bucket-only contract end to end.
+    fake = FakeGh(ruleset_pages=[[]], classic=NOT_PROTECTED, checks=[_zero_rows()])
+    sleeps = _install(monkeypatch, fake)
+    exit_code, payload = _run(capsys)
+    assert (exit_code, payload["status"]) == (wait_ci_checks.EXIT_NEGATIVE, "no_checks")
+    assert not sleeps
+
+    fake = FakeGh(ruleset_pages=[[]], classic=NOT_PROTECTED, checks=[_checks_ok(_rows(["visual-impact-policy"]))])
+    _install(monkeypatch, fake)
+    exit_code, payload = _run(capsys)
+    assert (exit_code, payload["status"]) == (wait_ci_checks.EXIT_PASS, "passed")
+
+
+def test_ruleset_pagination_dedupes_and_keeps_app_ids_across_sources(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC3: context names dedupe across pages and Classic; integration_id / app_id sets are kept."""
+    fake = FakeGh(
+        ruleset_pages=[
+            [*_filler_rules(1), _required_rule([("build", 15368), ("lint", None)])],
+            [_required_rule([("build", None), ("python-test", 15368)]), *_filler_rules(1, offset=50)],
+            [_required_rule([("build", 15368), ("only-page3", 99)])],
+        ],
+        classic=(
+            0,
+            json.dumps(
+                {
+                    "strict": False,
+                    "contexts": ["lint", "contexts-only"],
+                    "checks": [
+                        {"context": "build", "app_id": 15368},
+                        {"context": "python-test", "app_id": 4242},
+                        {"context": "lint", "app_id": 15368},
+                    ],
+                }
+            ),
+            "",
+        ),
+    )
+    _install(monkeypatch, fake)
+
+    inventory, error, message = wait_ci_checks.fetch_required_inventory("owner/repo", 1)
+
+    assert (error, message) == (None, None)
+    assert inventory == {
+        "build": {15368, None},
+        "lint": {None, 15368},
+        "python-test": {15368, 4242},
+        "only-page3": {99},
+        "contexts-only": set(),  # Classic `contexts` strings carry no app ID
+    }
+
+
+def test_ruleset_pagination_url_encodes_base_branch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC3: the (URL-encoded) PR base branch is used for every paginated request, never `main`."""
+    fake = FakeGh(
+        base="release/2026.1 #hot",
+        ruleset_pages=[_filler_rules(100), [_required_rule([("python-test", None)])]],
+        classic=NOT_PROTECTED,
+    )
+    _install(monkeypatch, fake)
+
+    inventory, error, _message = wait_ci_checks.fetch_required_inventory("owner/repo", 1)
+
+    assert error is None
+    assert inventory == {"python-test": {None}}
+    assert fake.api_calls() == [
+        [
+            "api",
+            "repos/owner/repo/rules/branches/release%2F2026.1%20%23hot?per_page=100",
+            "--paginate",
+            "--slurp",
+        ],
+        ["api", "repos/owner/repo/branches/release%2F2026.1%20%23hot/protection/required_status_checks"],
+    ]
+
+
+def _legacy_single_page_fetch_ruleset_contexts(
+    repo: str, base_encoded: str, inventory: wait_ci_checks.Inventory
+) -> tuple[str | None, str | None]:
+    """Pre-#2998 behaviour: one `rules/branches` request, first page only (no pagination)."""
+    rc, stdout, stderr = wait_ci_checks.run_gh(["api", f"repos/{repo}/rules/branches/{base_encoded}?per_page=100"])
+    if rc != 0:
+        return wait_ci_checks.classify_gh_error(stderr, rc), stderr.strip() or stdout.strip()
+    rules = json.loads(stdout)
+    for rule in rules:
+        if rule.get("type") != "required_status_checks":
+            continue
+        for entry in rule["parameters"]["required_status_checks"]:
+            inventory.setdefault(entry["context"], set()).add(entry.get("integration_id"))
+    return None, None
+
+
+def test_ruleset_pagination_negative_control_single_page_fetch_passes_falsely(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC4: the main fixture discriminates the defect: single-page fetch => false `passed`; fixed => pending."""
+    # Control: swap in the pre-fix single-page fetch. `python-test` (page 2) is invisible, Classic only
+    # has `build` (materialized+pass), so the wait falsely reports `passed` (the defect being fixed).
+    fake = _page2_fixture(checks=[_checks_ok(_rows(["build"]))])
+    _install(monkeypatch, fake)
+    monkeypatch.setattr(wait_ci_checks, "_fetch_ruleset_contexts", _legacy_single_page_fetch_ruleset_contexts)
+    exit_code, payload = _run(capsys)
+    assert (exit_code, payload["status"]) == (wait_ci_checks.EXIT_PASS, "passed")
+    assert fake.checks_calls == 1
+    assert [c[2:] for c in _ruleset_calls(fake)] == [[]]  # no pagination options were sent
+
+    # Same fixture against the real implementation must NOT pass.
+    monkeypatch.undo()
+    fake = _page2_fixture(checks=[_checks_ok(_rows(["build"]))])
+    _install(monkeypatch, fake)
+    exit_code, payload = _run(capsys)
+    assert exit_code == wait_ci_checks.EXIT_NEGATIVE
+    assert payload["status"] == "pending_timeout"
+    assert "python-test" in payload["message"]

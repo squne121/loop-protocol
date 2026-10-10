@@ -146,15 +146,25 @@ def _add_context(inventory: Inventory, context: Any, app_id: Any, *, record_app_
 def _fetch_ruleset_contexts(
     repo: str, base_encoded: str, inventory: Inventory
 ) -> tuple[str | None, str | None]:
-    rc, stdout, stderr = run_gh(["api", f"repos/{repo}/rules/branches/{base_encoded}?per_page=100"])
+    # `rules/branches` is paginated (per_page max 100). `--paginate --slurp` makes gh read every
+    # page and print one outer JSON array holding one array per page. Any page failure makes gh
+    # exit non-zero, so a partial inventory is never accepted.
+    rc, stdout, stderr = run_gh(
+        ["api", f"repos/{repo}/rules/branches/{base_encoded}?per_page=100", "--paginate", "--slurp"]
+    )
     if rc != 0:
         return classify_gh_error(stderr, rc), stderr.strip() or stdout.strip()
     try:
-        data = json.loads(stdout)
+        pages = json.loads(stdout)
     except json.JSONDecodeError:
         return "malformed_gh_response", stdout[:400]
-    if not isinstance(data, list):
-        return "malformed_gh_response", "rules/branches did not return a list"
+    if not isinstance(pages, list):
+        return "malformed_gh_response", "rules/branches --slurp did not return an array of pages"
+    data: list[Any] = []
+    for page in pages:
+        if not isinstance(page, list):
+            return "malformed_gh_response", "rules/branches page is not a list"
+        data.extend(page)
     for rule in data:
         if not isinstance(rule, dict):
             return "malformed_gh_response", "rules/branches entry is not an object"
