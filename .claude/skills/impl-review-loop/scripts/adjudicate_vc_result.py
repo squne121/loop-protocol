@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -2215,6 +2216,242 @@ def _record_dispatch(loop_state: dict[str, Any], *, binding_key: str) -> int:
     return seq
 
 
+# --- Issue #2996: ensure_contract_snapshot envelope -> Step 4 handoff --------
+#
+# ``ensure_contract_snapshot.py --artifact-dir`` saves the whole
+# CONTRACT_SNAPSHOT_ENSURE_RESULT_V1 envelope, which is not one of the shapes
+# ``_normalize_list_payload()`` accepts. ``resolve_step4_contract_snapshot()``
+# resolves such an envelope ONCE, inside the ``step4-adjudicate`` input
+# pre-processing, into a CONTRACT_REVIEW_RESULT_V1-shaped canonical object
+# (top-level ``status`` / ``body_sha256`` / ``checks.vc_preflight.
+# classifications``). That single object is what classification, source
+# integrity and the current-head binding all read, so none of them can see a
+# different view of the snapshot. Any failure returns ``(None, errors)``: the
+# caller passes NO partial snapshot, so the normal adjudication / persist path
+# still runs and invalidates a PASS stored for the same binding (Issue #2837).
+# No new schema, ledger, state writer or approval layer is introduced, and the
+# producer's published schema / exit codes are consumed as-is.
+
+ENSURE_ENVELOPE_SCHEMA = "CONTRACT_SNAPSHOT_ENSURE_RESULT_V1"
+ENSURE_ONCE_RESULT_SCHEMA = "CONTRACT_REVIEW_ONCE_RESULT_V1"
+CANONICAL_CONTRACT_REVIEW_SCHEMA = "CONTRACT_REVIEW_RESULT_V1"
+# The only (status -> producer exit code) pairs that may be handed off. A
+# ``human_judgment`` envelope also exits 20 but is never eligible, so it is
+# intentionally absent from this table.
+_ENVELOPE_HANDOFF_EXIT_CODES = {"ok": 0, "dry_run_would_post": 20}
+_ENVELOPE_OK_SOURCES = frozenset({"existing_go", "materialized_go"})
+_CONTRACT_COMMENT_URL_RE = re.compile(
+    r"\Ahttps://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/issues/([0-9]+)#issuecomment-([0-9]+)\Z"
+)
+_REPO_SLUG_RE = re.compile(r"\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+_CONTRACT_PARSER_PATH = (
+    _REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts" / "contract_review_result_parser.py"
+)
+_CONTRACT_PARSER_UNIQUE_NAME = "contract_review_result_parser_loaded_by_adjudicate_vc_result"
+_CONTRACT_PARSER: Any = None
+
+
+def _load_contract_result_parser() -> Any:
+    """Load the shared trusted-comment parser by path (never a bare import: a
+    same-named module elsewhere in a shared pytest session would collide)."""
+    global _CONTRACT_PARSER
+    if _CONTRACT_PARSER is not None:
+        return _CONTRACT_PARSER
+    spec = importlib.util.spec_from_file_location(_CONTRACT_PARSER_UNIQUE_NAME, _CONTRACT_PARSER_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError("contract_review_result_parser_unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_CONTRACT_PARSER_UNIQUE_NAME] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(_CONTRACT_PARSER_UNIQUE_NAME, None)
+        raise
+    _CONTRACT_PARSER = module
+    return module
+
+
+def _parse_producer_exit_code(raw: Any) -> tuple[int | None, str | None]:
+    """Return ``(exit_code, None)`` for a plain non-negative integer, else
+    ``(None, reason)``. bool / float / signed / empty values are rejected so a
+    malformed code can never be coerced into a match."""
+    if raw is None:
+        return None, "producer_exit_code_missing"
+    if isinstance(raw, bool):
+        return None, "producer_exit_code_not_integer"
+    if isinstance(raw, int):
+        return (raw, None) if raw >= 0 else (None, "producer_exit_code_not_integer")
+    if isinstance(raw, str) and re.fullmatch(r"[0-9]+", raw):
+        return int(raw), None
+    return None, "producer_exit_code_not_integer"
+
+
+def _canonical_contract_review_result(
+    *, body_sha256: str, classifications: list[Any]
+) -> dict[str, Any]:
+    """The single CONTRACT_REVIEW_RESULT_V1-shaped object every later stage reads."""
+    return {
+        "schema": CANONICAL_CONTRACT_REVIEW_SCHEMA,
+        "status": "go",
+        "body_sha256": body_sha256,
+        "checks": {"vc_preflight": {"classifications": classifications}},
+    }
+
+
+def _resolve_dry_run_candidate(
+    envelope: dict[str, Any], *, expected_contract_body_sha256: str | None
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """(1) ``dry_run_would_post`` + ``materialized_go``: the nested candidate
+    result is the evidence authority (nothing was posted, so there is no
+    comment). It is a candidate only -- never a published trusted snapshot."""
+    if envelope.get("source") != "materialized_go":
+        return None, [f"envelope_source_not_allowed:dry_run_would_post:{envelope.get('source')}"]
+    if envelope.get("contract_snapshot_url") is not None:
+        return None, ["envelope_dry_run_contract_snapshot_url_not_null"]
+    nested = envelope.get("contract_review_once_result")
+    if not isinstance(nested, dict) or nested.get("schema") != ENSURE_ONCE_RESULT_SCHEMA:
+        return None, ["envelope_nested_result_missing_or_wrong_schema"]
+    if nested.get("status") != "go":
+        return None, [f"envelope_nested_result_not_go:{nested.get('status')}"]
+    body_sha256 = nested.get("body_sha256")
+    if not _is_nonempty_string(body_sha256):
+        return None, ["envelope_nested_body_sha256_missing"]
+    if body_sha256 != envelope.get("body_sha256_at_check"):
+        return None, ["envelope_nested_body_sha256_binding_mismatch"]
+    if nested.get("issue_number") != envelope.get("issue_number"):
+        return None, ["envelope_nested_issue_number_mismatch"]
+    if expected_contract_body_sha256 is not None and body_sha256 != expected_contract_body_sha256:
+        return None, ["snapshot_body_sha256_mismatch"]
+    classifications = nested.get("vc_preflight_classifications")
+    if not isinstance(classifications, list):
+        return None, ["envelope_nested_vc_preflight_classifications_missing"]
+    return _canonical_contract_review_result(
+        body_sha256=body_sha256, classifications=classifications
+    ), []
+
+
+def _resolve_posted_snapshot_comment(
+    envelope: dict[str, Any],
+    *,
+    repo: str | None,
+    expected_issue_number: Any,
+    expected_contract_body_sha256: str | None,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """(2) ``ok`` + ``existing_go`` / (3) ``ok`` + ``materialized_go``: the
+    ``contract_snapshot_url`` comment is the evidence authority and is
+    re-verified with the shared trusted-comment parser. The envelope's nested
+    result is never the authority here (it is null for ``existing_go``)."""
+    if envelope.get("source") not in _ENVELOPE_OK_SOURCES:
+        return None, [f"envelope_source_not_allowed:ok:{envelope.get('source')}"]
+    if not isinstance(repo, str) or _REPO_SLUG_RE.fullmatch(repo) is None:
+        return None, ["repo_required_for_ok_snapshot"]
+    if not _is_positive_int(expected_issue_number):
+        return None, ["expected_issue_number_required_for_ok_snapshot"]
+    envelope_repo = envelope.get("repo")
+    if not isinstance(envelope_repo, str) or envelope_repo.casefold() != repo.casefold():
+        return None, ["envelope_repo_mismatch"]
+    if envelope.get("issue_number") != expected_issue_number:
+        return None, ["envelope_issue_number_mismatch"]
+    url = envelope.get("contract_snapshot_url")
+    match = _CONTRACT_COMMENT_URL_RE.fullmatch(url) if isinstance(url, str) else None
+    if match is None:
+        return None, ["contract_snapshot_url_missing_or_malformed"]
+    url_owner_repo = f"{match.group(1)}/{match.group(2)}"
+    if url_owner_repo.casefold() != repo.casefold():
+        return None, ["contract_snapshot_url_repo_mismatch"]
+    if int(match.group(3)) != expected_issue_number:
+        return None, ["contract_snapshot_url_issue_mismatch"]
+    url_comment_id = int(match.group(4))
+
+    try:
+        parser = _load_contract_result_parser()
+        comments, fetch_error = parser.fetch_issue_comments(expected_issue_number, repo)
+        if fetch_error:
+            return None, [f"contract_snapshot_comments_fetch_failed:{fetch_error}"]
+        results = parser.parse_contract_review_results(
+            comments, expected_issue_url=f"https://github.com/{repo}/issues/{expected_issue_number}"
+        )
+        latest = parser.find_latest_result(results, trusted_only=True)
+        latest_go = parser.find_latest_go(results, trusted_only=True, fingerprint_ready_only=True)
+    except Exception as exc:  # fail closed on any parser / transport failure
+        return None, [f"contract_snapshot_resolution_error:{type(exc).__name__}"]
+
+    if not isinstance(latest, dict):
+        return None, ["contract_snapshot_no_trusted_result"]
+    if latest.get("comment_id") != url_comment_id:
+        return None, ["contract_snapshot_comment_not_latest_trusted_result"]
+    if latest.get("status") != "go":
+        return None, ["contract_snapshot_latest_trusted_result_not_go"]
+    if not isinstance(latest_go, dict) or latest_go.get("comment_id") != url_comment_id:
+        return None, ["contract_snapshot_comment_not_latest_fingerprint_ready_go"]
+    inner = latest_go.get("inner")
+    if not isinstance(inner, dict):
+        return None, ["contract_snapshot_inner_result_missing"]
+    body_sha256 = inner.get("body_sha256")
+    if not _is_nonempty_string(body_sha256):
+        return None, ["contract_snapshot_body_sha256_missing"]
+    if expected_contract_body_sha256 is not None and body_sha256 != expected_contract_body_sha256:
+        return None, ["snapshot_body_sha256_mismatch"]
+    checks = inner.get("checks")
+    vc_preflight = checks.get("vc_preflight") if isinstance(checks, dict) else None
+    classifications = vc_preflight.get("classifications") if isinstance(vc_preflight, dict) else None
+    if not isinstance(classifications, list):
+        return None, ["contract_snapshot_vc_preflight_classifications_missing"]
+    return _canonical_contract_review_result(
+        body_sha256=body_sha256, classifications=classifications
+    ), []
+
+
+def resolve_step4_contract_snapshot(
+    snapshot: Any,
+    *,
+    producer_exit_code: Any = None,
+    repo: str | None = None,
+    expected_issue_number: Any = None,
+    expected_contract_body_sha256: str | None = None,
+) -> tuple[Any, list[str]]:
+    """Resolve a ``--contract-snapshot-file`` payload for ``step4-adjudicate``.
+
+    A non-envelope snapshot is returned unchanged (existing behaviour) and may
+    not be combined with ``producer_exit_code``. A
+    CONTRACT_SNAPSHOT_ENSURE_RESULT_V1 envelope requires ``producer_exit_code``
+    and is resolved per the allowed ``(status, source)`` table; every other
+    combination fails closed with ``(None, errors)`` -- never a partial object.
+    """
+    is_envelope = isinstance(snapshot, dict) and snapshot.get("schema") == ENSURE_ENVELOPE_SCHEMA
+    if not is_envelope:
+        if producer_exit_code is not None:
+            return None, ["producer_exit_code_requires_envelope_snapshot"]
+        return snapshot, []
+
+    exit_code, exit_code_error = _parse_producer_exit_code(producer_exit_code)
+    if exit_code_error is not None:
+        return None, [exit_code_error]
+    status = snapshot.get("status")
+    if status not in _ENVELOPE_HANDOFF_EXIT_CODES:
+        # human_judgment (also exit 20), blocked_needs_refinement,
+        # runtime_error, stale_or_conflicting_snapshot,
+        # controlled_publisher_binding_failed and any unknown status.
+        return None, [f"producer_status_not_handoff_eligible:{status}"]
+    if exit_code != _ENVELOPE_HANDOFF_EXIT_CODES[status]:
+        return None, [f"producer_exit_code_mismatch:status={status}:exit_code={exit_code}"]
+    if not _is_positive_int(snapshot.get("issue_number")):
+        return None, ["envelope_issue_number_missing"]
+    if _is_positive_int(expected_issue_number) and snapshot["issue_number"] != expected_issue_number:
+        return None, ["envelope_issue_number_mismatch"]
+
+    if status == "dry_run_would_post":
+        return _resolve_dry_run_candidate(
+            snapshot, expected_contract_body_sha256=expected_contract_body_sha256
+        )
+    return _resolve_posted_snapshot_comment(
+        snapshot,
+        repo=repo,
+        expected_issue_number=expected_issue_number,
+        expected_contract_body_sha256=expected_contract_body_sha256,
+    )
+
+
 def step4_adjudicate(
     loop_state: dict[str, Any],
     *,
@@ -2733,6 +2970,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--producer-exit-code",
+        help=(
+            "step4-adjudicate (Issue #2996): the ensure_contract_snapshot.py process exit code "
+            "that produced --contract-snapshot-file. Required when that file is a "
+            "CONTRACT_SNAPSHOT_ENSURE_RESULT_V1 envelope (status ok <=> 0, dry_run_would_post "
+            "<=> 20; human_judgment is never accepted even though it also exits 20); rejected "
+            "for any other snapshot shape and together with --reuse-stored. Parsed as a plain "
+            "non-negative integer; anything else is a fail-closed input error."
+        ),
+    )
+    parser.add_argument(
+        "--repo",
+        help=(
+            "step4-adjudicate (Issue #2996): owner/repo used to re-verify the trusted "
+            "contract_snapshot_url comment of an ok envelope (required for status ok, with "
+            "--expected-issue-number; unused for dry_run_would_post). Rejected together with "
+            "--reuse-stored."
+        ),
+    )
+    parser.add_argument(
         "--reviewer-verdict-file",
         help="step5-terminal-gate: JSON reviewer_verdict (first input of route_loop_verdict_v2()).",
     )
@@ -2749,6 +3006,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     args = parser.parse_args(argv)
+    if args.command != "step4-adjudicate" and (
+        args.producer_exit_code is not None or args.repo is not None
+    ):
+        parser.error("--producer-exit-code and --repo are only accepted by step4-adjudicate")
     if args.command == "adjudicate":
         if not args.contract_snapshot_file or not args.current_vc_result_file:
             parser.error(
@@ -2777,6 +3038,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         missing = [flag for flag, value in required if not value]
         if missing:
             parser.error(f"step4-adjudicate requires: {', '.join(missing)}")
+        if args.reuse_stored and (args.producer_exit_code is not None or args.repo is not None):
+            # --reuse-stored never re-reads a snapshot, so a handoff argument
+            # alongside it would silently claim a verification that did not run.
+            parser.error("step4-adjudicate --reuse-stored cannot be combined with --producer-exit-code or --repo")
     elif args.command == "step5-terminal-gate":
         missing = [
             flag
@@ -3062,6 +3327,18 @@ def _run_step4_adjudicate(args: argparse.Namespace) -> int:
 
     test_verdict, test_verdict_errors = _load_json_file(args.test_verdict_file)
     contract_snapshot, contract_errors = _load_json_file(args.contract_snapshot_file)
+    # Issue #2996: the envelope handoff lives INSIDE this input pre-processing.
+    # A failure yields contract_snapshot=None plus structured errors, so the
+    # adjudicate -> persist path below still runs and invalidates a stale PASS
+    # stored for this binding (never an early return before persist).
+    contract_snapshot, resolve_errors = resolve_step4_contract_snapshot(
+        contract_snapshot,
+        producer_exit_code=args.producer_exit_code,
+        repo=args.repo,
+        expected_issue_number=args.expected_issue_number,
+        expected_contract_body_sha256=args.expected_contract_body_sha256,
+    )
+    contract_errors = list(contract_errors or []) + resolve_errors
     diff_summary, diff_errors = _load_json_file(args.diff_summary_file)
     allowed_paths, allowed_errors = _load_allowed_paths(args.allowed_paths_file)
 
