@@ -46,6 +46,7 @@ TEST_VERDICT comment/artifact（存在する場合）は diagnostics-only であ
 | `--expected-contract-body-sha256` | live Issue 本文の SHA-256（`sha256:` 付き） | `gh issue view <issue_number> --json body \| jq -j .body \| sha256sum`（`ensure_contract_snapshot.py` の `sha256_of(body)` と同じ digest） |
 | `--expected-command-hashes-file` | literal Verification Command の SHA-256 を宣言順に並べた JSON 配列 | live Issue 本文を独立取得して保存したファイルから `adjudicate_vc_result.py extract-vc-metadata --body-file <live body>` で再導出した `command_hashes[]`（parse-only で VC を実行しない。`baseline_vc_preflight.py` は executor のため hash 取得に使わない。contract snapshot の値を使い回さない） |
 | `--expected-issue-number` / `--expected-pr-number` | runtime_only または pr_review_only VC を含む場合は必須（未指定は拒否される。下記の単文を参照） | 呼び出し元が `gh issue view` / `gh pr view` で独立取得した live 値 |
+| `--delegate-pr-review-only-nonpass` | 任意の opt-in flag（値なし）。`pr_review_only` の実行失敗を reviewer へ委譲したい場合のみ付ける（下記「`pr_review_only` の実行失敗を reviewer へ委譲する条件（Issue #2916）」） | root が Step 4 で `pr_review_only` VC の executed non-pass を reviewer 判断へ回すと決めたときに指定する。未指定の既定動作は fail-closed のまま |
 
 `--expected-issue-number` / `--expected-pr-number` は runtime_only または pr_review_only VC を含む場合は必須である（未指定は `runtime_only_expected_*_number_missing` / `pr_review_only_expected_*_number_missing` で拒否され、reviewer dispatch は開かない）。
 
@@ -114,7 +115,25 @@ uv run python3 .claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py s
 
 `step4-adjudicate` の exit 0 は reviewer dispatch の許可であり、terminal approval ではない。AC 達成の証明でもなく、reviewer の意味判断（実行事実・AC・diff の照合）は pr-reviewer が行う。terminal approval（`termination_reason: approved` / `merge_ready: true`）の確定は `step5-terminal-gate` の exit 0 のみを根拠とする。`route_loop_verdict_v2()` を直接呼んだ結果から終端承認を確定してはならない（`step-5-feedback-and-termination.md` の terminal gate 節参照）。
 
-`pr_review_only` VC を含む場合、`step4-adjudicate` は baseline の scope 認可（producer skip envelope）と current-head の実行事実（test-runner の独立 report）を別の状態として扱う。経路の判定（独立経路 / legacy 経路）、独立経路が受理する executed PASS item、`pr_review_only_*` の reason code と fail-closed の扱いは `step-2-verification.md` の「`pr_review_only` AC の current-head 証跡の取得と経路判定」節を正本とする。独立経路は GitHub 固有 trust marker を省略した report を入力とし、`--require-producer-receipt` 指定時と marker のキーが 1 つでも存在する report は legacy 経路で検証される。`pr_review_only` AC の実行失敗（FAIL / SKIP / fallback / 非 0 exit）は `pr_review_only_current_execution_not_pass:<AC>` で fail-closed になり、reviewer を起動せず dispatch seq も記録しない（実行失敗を reviewer 判断へ委譲する route は follow-up #2916 の所有）。
+`pr_review_only` VC を含む場合、`step4-adjudicate` は baseline の scope 認可（producer skip envelope）と current-head の実行事実（test-runner の独立 report）を別の状態として扱う。経路の判定（独立経路 / legacy 経路）、独立経路が受理する executed PASS item、`pr_review_only_*` の reason code と fail-closed の扱いは `step-2-verification.md` の「`pr_review_only` AC の current-head 証跡の取得と経路判定」節を正本とする。独立経路は GitHub 固有 trust marker を省略した report を入力とし、`--require-producer-receipt` 指定時と marker のキーが 1 つでも存在する report は legacy 経路で検証される。`pr_review_only` AC の実行失敗（FAIL / SKIP / fallback / 非 0 exit）は、既定では `pr_review_only_current_execution_not_pass:<AC>` で fail-closed になり、reviewer を起動せず dispatch seq も記録しない。root が `--delegate-pr-review-only-nonpass` を指定した場合に限り、実行失敗の事実を保持したまま reviewer へ委譲できる（次節、Issue #2916）。
+
+#### `pr_review_only` の実行失敗を reviewer へ委譲する条件（Issue #2916）
+
+`step4-adjudicate --delegate-pr-review-only-nonpass` は、独立経路の `pr_review_only` item が **実行済みの non-pass** だったときに、その事実を失わずに reviewer を起動できる状態へ進める opt-in である。次の 3 つを別々の状態として扱い、混同しない。
+
+1. **実行事実**: `exit_code` / `status` / `fallback_detected` / `human_review_required` / `stop_condition_triggered` を、永続化される adjudication の `per_ac[].failure_keys`（既存 field。`kind: pr_review_only_current_execution_fact`、`key: <name>=<JSON 値>` の行）へ逐語で残す。PASS へ書き換えず、skip metadata で覆わない。新しい schema / ledger / artifact は作らない。
+2. **reviewer dispatch 許可**: `step4-adjudicate` の `invoke_pr_reviewer: true`（exit 0）と `seq` の記録。該当 entry は `status: indeterminate` / `blocking: true` / `reason_code: pr_review_only_nonpass_delegated_to_reviewer` のままで、adjudication 全体も `overall_status: indeterminate` / `blocking: true` / `rerun_required: false` である。つまり dispatch 許可は **AC 達成ではない**。stdout の `adjudication.pr_review_only_nonpass_delegated` に委譲された AC が列挙されるので、root は reviewer へ「この AC は実行失敗の事実を保持したまま意味判断を委ねる」と伝える。
+3. **terminal approval**: reviewer の verdict を `step5-terminal-gate` に渡して exit 0 になった場合のみ。reviewer が REQUEST_CHANGES / 未判断 / verdict なしの間は到達しない（`step-5-feedback-and-termination.md` 参照）。
+
+委譲が許可される条件（すべて必要）:
+
+- `pr_review_only` の独立経路であり、skip envelope の echo ではなく executed item であること。
+- 事実が整合した non-pass であること: `status: fail` かつ `exit_code != 0`、`status: skip` かつ `exit_code != 0`、または `status: fail` かつ `exit_code: 0` で `fallback_detected: true`（test-runner の分類規則どおり、fallback 経由の成功は FAIL であり PASS ではない）。
+- `human_review_required` / `stop_condition_triggered` が false であること（明示的な human / stop 信号は reviewer へ委譲しない）。
+- report 全体の `result` が `FAIL` または `PARTIAL` であること（`PASS` や未知の値が失敗 row の隣にある入力は `pr_review_only_nonpass_report_result_inconsistent` で fail-closed）。
+- head / Issue body digest / Issue 番号 / PR 番号 / changed paths の binding が、通常の独立経路と同じく完全に一致していること。
+
+次は引き続き fail-closed で、reviewer を起動せず dispatch seq も記録しない: skip envelope の echo（`pr_review_only_independent_requires_executed_item:<AC>`）、整合しない事実（`status: pass` の全形態（`fallback_detected: true` を伴う `pass` を含む）、`fallback_detected: false` で `status: fail` / `skip` かつ exit 0、`status: skip` で exit 0、未知の `status`、非 bool の flag。`pr_review_only_current_execution_not_pass:<AC>`）、GitHub 固有 trust marker のキーが 1 つでもある report（legacy 経路になり `pr_review_only_current_authorization_mismatch:<AC>`）、binding 不一致、通常 AC の失敗が混在して `rerun_required` になる場合、委譲対象の `(ac, command_hash)` 以外の row が `fallback_detected: true` を持つ場合（委譲時は report 全体の `fallback_detected` 集約値を使わず、委譲対象以外の全 row を行単位で検査する。違反は委譲なしと同じ `pr_review_only_fallback_detected` で fail-closed になり、他 row の委譲では免除されない）。永続化済み adjudication の entry が改ざんされて事実が non-pass として整合しない、あるいは `pass` / `blocking: false` を名乗る場合も、`evaluate_step4_vc_gate()` が gate を開かない（`adjudication_ac_not_resolved` / `adjudication_blocking_true`）。`runtime_only` AC と混在する report では、report 全体の status が `fail` / `partial` でも、その原因が検証済みの委譲対象 `pr_review_only` non-pass だけであれば runtime_only 側の binding を拒否しない（runtime_only AC 自体の executed PASS 要件、および委譲対象以外の全 row の行単位 fallback 検査は維持する。runtime_only の FAIL / SKIP / fallback は委譲されず従来どおり fail-closed）。`--delegate-pr-review-only-nonpass` なしの既定動作、通常 VC、runtime_only の挙動は変わらない。
 
 #### reviewer 起動前の `seq` の保存
 
