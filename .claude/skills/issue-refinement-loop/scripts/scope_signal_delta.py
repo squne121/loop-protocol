@@ -197,11 +197,7 @@ def _find_section_line_offset(text: str, section_name: str) -> int:
     for index, line in enumerate(text.splitlines(), start=1):
         if not in_fence:
             opener = _parse_fence_opener(line)
-            # GFM 4.5: a backtick fence's info string may not contain a
-            # backtick (that is an inline code span, not a fence opener).
-            if opener is not None and not (
-                opener[0] == "`" and "`" in line.lstrip(" ")[opener[1] :]
-            ):
+            if opener is not None:
                 fence_char, fence_len = opener
                 in_fence = True
                 continue
