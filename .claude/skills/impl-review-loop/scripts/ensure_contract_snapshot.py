@@ -583,6 +583,7 @@ def verify_snapshot_authority_postcondition(
     expected_comment_body_sha256: str,
     expected_fingerprint: dict[str, Any],
     timeout: int = _DEFAULT_TIMEOUT,
+    observed_updated_at_out: Optional[dict[str, Any]] = None,
 ) -> tuple[bool, Optional[str]]:
     """Re-read every authority input immediately before returning ``status: ok``.
 
@@ -591,14 +592,28 @@ def verify_snapshot_authority_postcondition(
     issue source, the exact trusted comment, its parsed fingerprint, and a
     single-response default-branch ref/tip pair.  Any drift or incomplete
     readback is deliberately fail-closed.
+
+    The comment authority is decided over the *entire* final-readback comment
+    set (Issue #3004): the canonical parser's trusted filtering and
+    authoritative-result priority apply, so a later trusted ``blocked`` (or a
+    later trusted ``go``) supersedes the expected comment.  Untrusted and
+    ordinary comments never reject by themselves.
+
+    ``observed_updated_at_out`` (optional) receives the ``updatedAt`` value this
+    call actually read under the key ``"updated_at"``; it is an observation
+    only and never alters the comparison.
     """
     body, updated_at, issue_err = fetch_issue_snapshot(issue_number, repo, timeout)
     if issue_err:
         return False, f"authority_issue_readback_failed:{issue_err}"
+    if observed_updated_at_out is not None:
+        observed_updated_at_out["updated_at"] = updated_at
     if sha256_of(body or "") != expected_body_sha256:
         return False, "authority_issue_body_sha256_mismatch"
-    if updated_at != expected_updated_at:
-        return False, "authority_issue_updated_at_mismatch"
+    # The timestamp difference is held, not returned: every non-time authority
+    # input below is verified first, so a time-only mismatch is the only case
+    # that reports ``authority_issue_updated_at_mismatch`` (Issue #3004).
+    updated_at_mismatch = updated_at != expected_updated_at
 
     live_base_ref, live_base_sha = capture_base_ref_and_sha(repo, timeout)
     if not live_base_ref or not live_base_sha:
@@ -636,7 +651,7 @@ def verify_snapshot_authority_postcondition(
         return False, f"authority_comment_binding_failed:{binding_err}"
 
     issue_url = f"https://github.com/{repo}/issues/{issue_number}"
-    parsed = parser_mod.parse_contract_review_results([comment], issue_url)
+    parsed = parser_mod.parse_contract_review_results(comments, issue_url)
     go_result = next(
         (
             item
@@ -648,6 +663,27 @@ def verify_snapshot_authority_postcondition(
     )
     if not isinstance(go_result, dict):
         return False, "authority_comment_not_current_go"
+    # Authoritative-result priority over the whole comment set (same rules as
+    # existing_go adoption): the latest *trusted* result decides go/blocked, and
+    # the latest trusted fingerprint-ready go must be this exact comment.
+    # A trusted go that is not fingerprint-ready is never adoptable, so it must
+    # not take over "latest" and hide an earlier trusted blocked.
+    adoptable = [
+        item
+        for item in parsed
+        if item.get("status") != "go" or item.get("is_fingerprint_ready") is True
+    ]
+    latest_trusted = parser_mod.find_latest_result(adoptable, trusted_only=True)
+    if isinstance(latest_trusted, dict) and latest_trusted.get("status") == "blocked":
+        return False, "authority_latest_trusted_result_blocked"
+    latest_trusted_go = parser_mod.find_latest_go(
+        parsed, trusted_only=True, fingerprint_ready_only=True
+    )
+    if (
+        isinstance(latest_trusted_go, dict)
+        and latest_trusted_go.get("comment_id") != expected_comment_id
+    ):
+        return False, "authority_superseded_by_later_trusted_go"
     inner = go_result.get("inner")
     if (
         not is_go_current(go_result, expected_body_sha256)
@@ -660,7 +696,66 @@ def verify_snapshot_authority_postcondition(
         return False, "authority_comment_fingerprint_mismatch"
     if not is_go_base_binding_current(go_result, live_base_ref, live_base_sha):
         return False, "authority_comment_base_binding_drift"
+    if updated_at_mismatch:
+        return False, "authority_issue_updated_at_mismatch"
     return True, None
+
+
+# Issue #3004: bounded read-only reconciliation limited to the freshly
+# materialized go.  The re-verification count is a fixed cap; reaching it is a
+# failure, never a success.
+_MATERIALIZED_GO_UPDATED_AT_RECONCILE_MAX_ATTEMPTS = 3
+
+
+def reconcile_materialized_go_updated_at_race(
+    *,
+    issue_number: int,
+    repo: str,
+    expected_body_sha256: str,
+    observed_updated_at: str,
+    expected_comment_id: int,
+    expected_comment_body_sha256: str,
+    expected_fingerprint: dict[str, Any],
+) -> tuple[bool, Optional[str]]:
+    """Resolve an ``Issue.updatedAt``-only difference after our own POST/PATCH.
+
+    Called only from the ``materialized_go`` path, after
+    ``verify_snapshot_authority_postcondition`` failed with
+    ``authority_issue_updated_at_mismatch`` and reported the value it actually
+    read (``observed_updated_at``).  Each attempt is a complete, read-only
+    re-run of the shared verifier (Issue body SHA, comment id, final comment
+    body SHA, fingerprint, base ref/SHA and authoritative-result priority are
+    all re-checked) expecting that observed value.  Success therefore requires
+    the timestamp to be read identically on two consecutive reads *and* every
+    other authority input to hold.
+
+    * Any failure other than the timestamp itself is returned immediately; an
+      observed real mismatch is never cancelled by a later match.
+    * A timestamp that keeps changing exhausts the fixed cap and fails.
+    * Never POSTs/PATCHes and never changes the shared verifier's comparison.
+    """
+    expected_updated_at = observed_updated_at
+    for _ in range(_MATERIALIZED_GO_UPDATED_AT_RECONCILE_MAX_ATTEMPTS):
+        observation: dict[str, Any] = {}
+        ok, err = verify_snapshot_authority_postcondition(
+            issue_number=issue_number,
+            repo=repo,
+            expected_body_sha256=expected_body_sha256,
+            expected_updated_at=expected_updated_at,
+            expected_comment_id=expected_comment_id,
+            expected_comment_body_sha256=expected_comment_body_sha256,
+            expected_fingerprint=expected_fingerprint,
+            observed_updated_at_out=observation,
+        )
+        if ok:
+            return True, None
+        if err != "authority_issue_updated_at_mismatch":
+            return False, err
+        next_observed = observation.get("updated_at")
+        if not isinstance(next_observed, str) or not next_observed:
+            return False, err
+        expected_updated_at = next_observed
+    return False, "authority_issue_updated_at_mismatch"
 
 
 def compute_comments_digest(comments: list[dict]) -> str:
@@ -1707,6 +1802,7 @@ def ensure_contract_snapshot(
             result["contract_snapshot_url"] = None
             result["errors"].append("materialized_go_issue_body_changed_before_authority_check")
             return result
+        authority_observation: dict[str, Any] = {}
         authority_ok, authority_err = verify_snapshot_authority_postcondition(
             issue_number=issue_number,
             repo=repo,
@@ -1715,7 +1811,27 @@ def ensure_contract_snapshot(
             expected_comment_id=expected_comment_id,
             expected_comment_body_sha256=final_persisted_body_sha256,
             expected_fingerprint=expected_contract_fingerprint,
+            observed_updated_at_out=authority_observation,
         )
+        # Issue #3004: only on this freshly materialized path (our own POST and
+        # PATCH are already done and independently bound) an Issue.updatedAt-only
+        # difference gets a bounded, read-only reconciliation.  check-only and
+        # existing_go keep rejecting any updatedAt drift.
+        if (
+            not authority_ok
+            and authority_err == "authority_issue_updated_at_mismatch"
+            and isinstance(authority_observation.get("updated_at"), str)
+            and authority_observation["updated_at"]
+        ):
+            authority_ok, authority_err = reconcile_materialized_go_updated_at_race(
+                issue_number=issue_number,
+                repo=repo,
+                expected_body_sha256=body_sha256,
+                observed_updated_at=authority_observation["updated_at"],
+                expected_comment_id=expected_comment_id,
+                expected_comment_body_sha256=final_persisted_body_sha256,
+                expected_fingerprint=expected_contract_fingerprint,
+            )
         if not authority_ok:
             result["status"] = "stale_or_conflicting_snapshot"
             result["contract_snapshot_url"] = None

@@ -57,6 +57,10 @@ _real_verify_controlled_publisher_comment_id_binding = (
 # ``_ecs_mod.patch_comment`` to a success-only lambda, so a focused test can
 # restore the real POST/PATCH/GET orchestration end-to-end.
 _real_patch_comment = _ecs_mod.patch_comment
+# Issue #3004: captured before the autouse fixture stubs it, so the
+# post-publish race regressions can run the real base ref/sha capture against
+# a fake ``gh`` remote.
+_real_capture_base_ref_and_sha = _ecs_mod.capture_base_ref_and_sha
 
 _PARSER_PATH = (
     _HERE.parent.parent / "issue-contract-review" / "scripts"
@@ -2360,22 +2364,36 @@ class TestFinalAuthorityPostcondition:
 
 
 class TestAuthorityPostconditionReadback:
-    def test_issue_updated_at_drift_is_rejected(self):
+    def test_issue_updated_at_drift_is_rejected(self, monkeypatch):
+        # Time-only difference: every other authority input holds, so the
+        # shared verifier (evaluated last) must still reject on updatedAt.
+        remote = _PostPublishRaceRemote(updated_at_for=lambda n: _RACE_U0)
+        first = _run_ensure_against_race_remote(monkeypatch, remote)
+        assert first["status"] == "ok", first
+        cid = remote.own_comment_ids()[0]
+        comment_body = remote.comments[cid]["body"]
+        parsed = _real_parser_mod_for_fp_tests.parse_contract_review_results(
+            [{**remote.comments[cid], "author": "squne121", "author_id": 63350259,
+              "author_type": "User", "author_association": "OWNER"}],
+            _ISSUE_URL,
+        )
+        fingerprint = parsed[0]["inner"]["expected_contract_fingerprint"]
+        remote.updated_at_for = lambda n: _RACE_U1
+        remote.arm()
+
         with patch.object(
             _ecs_mod,
-            "fetch_issue_snapshot",
-            return_value=(_SAMPLE_BODY, "2026-06-13T09:00:00Z", None),
+            "_import_parser_module",
+            return_value=_real_parser_mod_for_fp_tests,
         ):
             ok, reason = _real_verify_snapshot_authority_postcondition(
                 issue_number=_ISSUE_NUMBER,
                 repo=_REPO,
                 expected_body_sha256=_SAMPLE_BODY_SHA256,
-                expected_updated_at=_SAMPLE_UPDATED_AT,
-                expected_comment_id=1001,
-                expected_comment_body_sha256=sha256_of(_GO_COMMENT["body"]),
-                expected_fingerprint=_fresh_inner(_SAMPLE_BODY_SHA256)[
-                    "expected_contract_fingerprint"
-                ],
+                expected_updated_at=_RACE_U0,
+                expected_comment_id=cid,
+                expected_comment_body_sha256=sha256_of(comment_body),
+                expected_fingerprint=fingerprint,
             )
 
         assert ok is False
@@ -4058,3 +4076,552 @@ class TestPostCommentTransportAndReconciliation:
         assert remote["staging_body"] != remote["final_body"]
         assert sha256_of(remote["staging_body"]) != sha256_of(remote["final_body"])
         assert remote["comments"][remote_comment_id]["body"] == remote["final_body"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #3004: post-publish Issue.updatedAt race (false-stale on a verified
+# self-posted snapshot) -- regressions run the REAL ensure_contract_snapshot(),
+# REAL verify_snapshot_authority_postcondition(), REAL canonical parser, REAL
+# fetch_issue_snapshot()/capture_base_ref_and_sha()/patch_comment()/
+# post_comment()/verify_controlled_publisher_comment_id_binding(). Only the
+# external ``gh`` subprocess boundary and the remote GitHub state are faked.
+# ---------------------------------------------------------------------------
+
+_RACE_U0 = "2026-06-13T08:00:00Z"
+_RACE_U1 = "2026-06-13T08:00:05Z"
+_RACE_U2 = "2026-06-13T08:00:10Z"
+_RACE_COMMENT_ID = 3004001
+_RACE_TRUSTED_USER = {"login": "squne121", "id": 63350259, "type": "User"}
+_RACE_UNTRUSTED_USER = {"login": "mallory", "id": 4242, "type": "User"}
+
+
+def _race_blocked_body() -> str:
+    return (
+        "```yaml\n"
+        "CONTRACT_REVIEW_RESULT_V1:\n"
+        "  status: blocked\n"
+        '  generated_at: "2026-06-13T10:00:00Z"\n'
+        "  generated_by: issue-contract-review\n"
+        f"  issue_url: {_ISSUE_URL}\n"
+        "```\n"
+    )
+
+
+def _race_not_ready_go_body() -> str:
+    """Schema-valid trusted ``go`` without a fingerprint (not fingerprint-ready)."""
+    return (
+        "```yaml\n"
+        "CONTRACT_REVIEW_RESULT_V1:\n"
+        "  status: go\n"
+        '  generated_at: "2026-06-13T11:00:00Z"\n'
+        "  generated_by: issue-contract-review\n"
+        f"  issue_url: {_ISSUE_URL}\n"
+        f'  body_sha256: "{_SAMPLE_BODY_SHA256}"\n'
+        "```\n"
+    )
+
+
+class _PostPublishRaceRemote:
+    """Stateful fake of the ``gh`` boundary for one Issue.
+
+    ``updated_at_for(n)`` gives the Issue.updatedAt returned by the n-th
+    ``gh issue view`` read after the fingerprint PATCH (n starts at 1 = the
+    authority anchor read).  ``hooks[n]`` runs just before that read answers,
+    so a test can inject a remote mutation at an exact point of the sequence.
+    """
+
+    def __init__(self, updated_at_for=None):
+        self.body = _SAMPLE_BODY
+        self.base_sha = "a" * 40
+        self.base_ref = "main"
+        self.updated_at_for = updated_at_for or (lambda n: _RACE_U0)
+        self.hooks: dict = {}
+        self.comments: dict = {}
+        self.next_id = _RACE_COMMENT_ID
+        self.post_count = 0
+        self.patch_count = 0
+        self.patched_comment_ids: list = []
+        self.armed = False
+        self.read_n = 0
+        self.fail_issue_view_at: set = set()
+        self.fail_comment_list = False
+
+    def arm(self):
+        self.armed = True
+        self.read_n = 0
+
+    def add_comment(self, *, body, user, association, created_at, comment_id=None):
+        cid = comment_id if comment_id is not None else self.next_id
+        if comment_id is None:
+            self.next_id += 1
+        self.comments[cid] = {
+            "id": cid,
+            "html_url": f"{_ISSUE_URL}#issuecomment-{cid}",
+            "issue_url": f"https://api.github.com/repos/{_REPO}/issues/{_ISSUE_NUMBER}",
+            "created_at": created_at,
+            "updated_at": created_at,
+            "body": body,
+            "user": user,
+            "author_association": association,
+        }
+        return cid
+
+    def add_trusted_blocked(self):
+        return self.add_comment(
+            body=_race_blocked_body(),
+            user=_RACE_TRUSTED_USER,
+            association="OWNER",
+            created_at="2026-06-13T10:00:00Z",
+            comment_id=9001,
+        )
+
+    def add_trusted_not_ready_go(self):
+        return self.add_comment(
+            body=_race_not_ready_go_body(),
+            user=_RACE_TRUSTED_USER,
+            association="OWNER",
+            created_at="2026-06-13T11:00:00Z",
+            comment_id=9004,
+        )
+
+    def add_untrusted_blocked(self):
+        return self.add_comment(
+            body=_race_blocked_body(),
+            user=_RACE_UNTRUSTED_USER,
+            association="NONE",
+            created_at="2026-06-13T10:00:00Z",
+            comment_id=9002,
+        )
+
+    def add_ordinary_comment(self):
+        return self.add_comment(
+            body="ordinary discussion comment",
+            user=_RACE_UNTRUSTED_USER,
+            association="NONE",
+            created_at="2026-06-13T10:30:00Z",
+            comment_id=9003,
+        )
+
+    def own_comment_ids(self):
+        return [
+            cid
+            for cid, c in self.comments.items()
+            if "CONTRACT_REVIEW_RESULT_V1" in c["body"]
+            and c["user"] == _RACE_TRUSTED_USER
+        ]
+
+    def run(self, command, *, input=None, **kwargs):
+        if command[:3] == ["gh", "issue", "view"]:
+            if self.armed:
+                self.read_n += 1
+                hook = self.hooks.get(self.read_n)
+                if hook is not None:
+                    hook(self)
+                if self.read_n in self.fail_issue_view_at:
+                    return MagicMock(returncode=1, stdout="", stderr="HTTP 502")
+                updated_at = self.updated_at_for(self.read_n)
+            else:
+                updated_at = _RACE_U0
+            return MagicMock(
+                returncode=0,
+                stdout=json.dumps({"body": self.body, "updatedAt": updated_at}),
+                stderr="",
+            )
+        if command[:3] == ["gh", "api", "graphql"]:
+            payload = {
+                "data": {
+                    "repository": {
+                        "defaultBranchRef": {
+                            "name": self.base_ref,
+                            "target": {"oid": self.base_sha},
+                        }
+                    }
+                }
+            }
+            return MagicMock(returncode=0, stdout=json.dumps(payload), stderr="")
+
+        endpoints = [
+            arg
+            for arg in command[2:]
+            if isinstance(arg, str) and arg.startswith("repos/")
+        ]
+        assert len(endpoints) == 1, command
+        endpoint = endpoints[0]
+
+        if "--method" in command:
+            method = command[command.index("--method") + 1]
+            if method == "POST":
+                assert endpoint == f"repos/{_REPO}/issues/{_ISSUE_NUMBER}/comments"
+                self.post_count += 1
+                payload = json.loads(input.decode("utf-8"))
+                cid = self.add_comment(
+                    body=payload["body"],
+                    user=_RACE_TRUSTED_USER,
+                    association="OWNER",
+                    created_at="2026-06-13T08:00:00Z",
+                )
+                return MagicMock(
+                    returncode=0,
+                    stdout=self.comments[cid]["html_url"].encode("utf-8"),
+                    stderr=b"",
+                )
+            if method == "PATCH":
+                cid = int(endpoint.rsplit("/", 1)[-1])
+                self.patch_count += 1
+                self.patched_comment_ids.append(cid)
+                self.comments[cid]["body"] = json.loads(input.decode("utf-8"))["body"]
+                self.comments[cid]["updated_at"] = "2026-06-13T09:00:00Z"
+                self.arm()
+                return MagicMock(returncode=0, stdout=b"", stderr=b"")
+            raise AssertionError(f"unexpected gh api --method {method}")
+
+        if "--paginate" in command:
+            if self.armed and self.fail_comment_list:
+                return MagicMock(returncode=1, stdout="", stderr="HTTP 502")
+            lines = [
+                json.dumps(
+                    {
+                        "id": c["id"],
+                        "html_url": c["html_url"],
+                        "created_at": c["created_at"],
+                        "updated_at": c["updated_at"],
+                        "body": c["body"],
+                        "author": c["user"]["login"],
+                        "author_id": c["user"]["id"],
+                        "author_type": c["user"]["type"],
+                        "author_association": c["author_association"],
+                    }
+                )
+                for c in self.comments.values()
+            ]
+            return MagicMock(returncode=0, stdout="\n".join(lines), stderr="")
+
+        m = re.match(rf"repos/{re.escape(_REPO)}/issues/comments/(\d+)$", endpoint)
+        if m:
+            c = self.comments.get(int(m.group(1)))
+            if c is None:
+                return MagicMock(returncode=1, stdout="", stderr="HTTP 404")
+            payload = {
+                "id": c["id"],
+                "issue_url": c["issue_url"],
+                "html_url": c["html_url"],
+                "user": c["user"],
+                "author_association": c["author_association"],
+                "body": c["body"],
+            }
+            return MagicMock(returncode=0, stdout=json.dumps(payload), stderr="")
+        raise AssertionError(f"unexpected gh command: {command}")
+
+
+def _run_ensure_against_race_remote(monkeypatch, remote, *, mode="auto", do_post=True):
+    """Drive the REAL ensure_contract_snapshot() through the fake remote."""
+    monkeypatch.setattr(_ecs_mod.subprocess, "run", remote.run)
+    monkeypatch.setattr(
+        _ecs_mod,
+        "verify_controlled_publisher_comment_id_binding",
+        _real_verify_controlled_publisher_comment_id_binding,
+    )
+    monkeypatch.setattr(_ecs_mod, "patch_comment", _real_patch_comment)
+    monkeypatch.setattr(
+        _ecs_mod,
+        "verify_snapshot_authority_postcondition",
+        _real_verify_snapshot_authority_postcondition,
+    )
+    monkeypatch.setattr(
+        _ecs_mod, "capture_base_ref_and_sha", _real_capture_base_ref_and_sha
+    )
+    with patch.object(
+        _ecs_mod,
+        "_import_parser_module",
+        return_value=_real_parser_mod_for_fp_tests,
+    ):
+        with patch.object(
+            _ecs_mod,
+            "run_contract_review_once",
+            return_value=(_make_review_result("go"), None),
+        ):
+            return ensure_contract_snapshot(
+                issue_number=_ISSUE_NUMBER, repo=_REPO, mode=mode, do_post=do_post
+            )
+
+
+def _flip_after_anchor(n):
+    """U0 on the anchor read (n == 1), U1 on every later read (U0 -> U1 -> U1)."""
+    return _RACE_U0 if n == 1 else _RACE_U1
+
+
+def _flip_twice_then_stable(n):
+    """U0 -> U1 -> U2 -> U2: the timestamp still changes on the first re-read."""
+    return {1: _RACE_U0, 2: _RACE_U1}.get(n, _RACE_U2)
+
+
+def _assert_fail_closed_single_publish(result, remote):
+    assert result["status"] == "stale_or_conflicting_snapshot", result
+    assert result["contract_snapshot_url"] is None
+    assert remote.post_count == 1
+    assert remote.patch_count == 1
+
+
+class TestPostPublishUpdatedAtRace:
+    """Issue #3004: a verified self-posted go must not be false-stale because
+    of an Issue.updatedAt read-time difference, while every real conflict
+    (later trusted blocked, body/comment/fingerprint/base drift, incomplete
+    readback, unstable timestamps) stays fail-closed."""
+
+    def test_post_publish_updated_at_race_u0_u1_u1_returns_ok_without_republish(
+        self, monkeypatch
+    ):
+        remote = _PostPublishRaceRemote(updated_at_for=_flip_after_anchor)
+
+        result = _run_ensure_against_race_remote(monkeypatch, remote)
+
+        assert result["status"] == "ok", result
+        assert result["source"] == "materialized_go"
+        only_id = remote.own_comment_ids()
+        assert len(only_id) == 1
+        assert result["contract_snapshot_url"] == f"{_ISSUE_URL}#issuecomment-{only_id[0]}"
+        assert remote.post_count == 1
+        assert remote.patch_count == 1
+        assert remote.patched_comment_ids == only_id
+        assert len(remote.comments) == 1
+
+    def test_post_publish_updated_at_race_later_trusted_blocked_fails_with_matching_updated_at(
+        self, monkeypatch
+    ):
+        remote = _PostPublishRaceRemote(updated_at_for=lambda n: _RACE_U0)
+        remote.hooks[1] = lambda r: r.add_trusted_blocked()
+
+        result = _run_ensure_against_race_remote(monkeypatch, remote)
+
+        _assert_fail_closed_single_publish(result, remote)
+        assert any("authority_latest_trusted_result_blocked" in e for e in result["errors"]), result
+        assert not any("updated_at_mismatch" in e for e in result["errors"]), result
+
+    def test_post_publish_updated_at_race_later_trusted_blocked_fails_during_reconciliation(
+        self, monkeypatch
+    ):
+        remote = _PostPublishRaceRemote(updated_at_for=_flip_after_anchor)
+        remote.hooks[3] = lambda r: r.add_trusted_blocked()
+
+        result = _run_ensure_against_race_remote(monkeypatch, remote)
+
+        _assert_fail_closed_single_publish(result, remote)
+        assert any("authority_latest_trusted_result_blocked" in e for e in result["errors"]), result
+
+    def test_post_publish_updated_at_race_ordinary_and_untrusted_blocked_comments_do_not_reject(
+        self, monkeypatch
+    ):
+        for timeline in (lambda n: _RACE_U0, _flip_after_anchor):
+            remote = _PostPublishRaceRemote(updated_at_for=timeline)
+
+            def inject(r):
+                r.add_ordinary_comment()
+                r.add_untrusted_blocked()
+
+            remote.hooks[1] = inject
+
+            result = _run_ensure_against_race_remote(monkeypatch, remote)
+
+            assert result["status"] == "ok", result
+            assert result["source"] == "materialized_go"
+            assert remote.post_count == 1
+            assert remote.patch_count == 1
+
+    def test_post_publish_updated_at_race_real_drift_is_not_cancelled_by_later_match(
+        self, monkeypatch
+    ):
+        def drift_body(r):
+            r.body = _SAMPLE_BODY + "\nedited by someone else\n"
+
+        def restore_body(r):
+            r.body = _SAMPLE_BODY
+
+        def drift_comment_body(r):
+            cid = r.own_comment_ids()[0]
+            r.comments[cid]["body"] += "\n<!-- tampered -->\n"
+
+        def drift_base(r):
+            r.base_sha = "b" * 40
+
+        def delete_comment(r):
+            r.comments.pop(r.own_comment_ids()[0])
+
+        scenarios = {
+            "body_drift_first_recheck": (
+                {2: drift_body},
+                "authority_issue_body_sha256_mismatch",
+            ),
+            # body changes during reconciliation and is restored right after (ABA)
+            "body_aba": (
+                {3: drift_body, 4: restore_body},
+                "authority_issue_body_sha256_mismatch",
+            ),
+            "comment_body_drift": ({3: drift_comment_body}, "authority_comment_body_sha256_mismatch"),
+            "base_drift": ({3: drift_base}, "authority_base_binding_drift"),
+            "base_drift_then_restored": (
+                {3: drift_base, 4: lambda r: setattr(r, "base_sha", "a" * 40)},
+                "authority_base_binding_drift",
+            ),
+            "comment_missing": ({3: delete_comment}, "authority_comment_missing"),
+        }
+        for name, (hooks, reason) in scenarios.items():
+            remote = _PostPublishRaceRemote(updated_at_for=_flip_after_anchor)
+            remote.hooks.update(hooks)
+
+            result = _run_ensure_against_race_remote(monkeypatch, remote)
+
+            assert result["status"] == "stale_or_conflicting_snapshot", (name, result)
+            assert result["contract_snapshot_url"] is None, name
+            assert any(reason in e for e in result["errors"]), (name, result["errors"])
+            assert remote.post_count == 1, name
+            assert remote.patch_count == 1, name
+
+    def test_post_publish_updated_at_race_non_time_drift_during_changing_timestamp_fails(
+        self, monkeypatch
+    ):
+        # U0 -> U1 -> U2 -> U2: the drift is injected on a read whose updatedAt
+        # differs from the expected one, and restored on the next read.
+        def drift_comment_body(r):
+            r.comments[r.own_comment_ids()[0]]["body"] += "\n<!-- tampered -->\n"
+
+        def restore_comment_body(r):
+            cid = r.own_comment_ids()[0]
+            r.comments[cid]["body"] = r.comments[cid]["body"].replace(
+                "\n<!-- tampered -->\n", ""
+            )
+
+        scenarios = {
+            "base_drift_restored": (
+                {
+                    3: lambda r: setattr(r, "base_sha", "b" * 40),
+                    4: lambda r: setattr(r, "base_sha", "a" * 40),
+                },
+                "authority_base_binding_drift",
+            ),
+            "comment_body_drift_restored": (
+                {3: drift_comment_body, 4: restore_comment_body},
+                "authority_comment_body_sha256_mismatch",
+            ),
+            "trusted_blocked_during_time_change": (
+                {3: lambda r: r.add_trusted_blocked()},
+                "authority_latest_trusted_result_blocked",
+            ),
+        }
+        for name, (hooks, reason) in scenarios.items():
+            remote = _PostPublishRaceRemote(updated_at_for=_flip_twice_then_stable)
+            remote.hooks.update(hooks)
+
+            result = _run_ensure_against_race_remote(monkeypatch, remote)
+
+            _assert_fail_closed_single_publish(result, remote)
+            assert any(reason in e for e in result["errors"]), (name, result["errors"])
+
+    def test_post_publish_updated_at_race_u0_u1_u2_u2_without_drift_returns_ok(
+        self, monkeypatch
+    ):
+        remote = _PostPublishRaceRemote(updated_at_for=_flip_twice_then_stable)
+
+        result = _run_ensure_against_race_remote(monkeypatch, remote)
+
+        assert result["status"] == "ok", result
+        assert (remote.post_count, remote.patch_count) == (1, 1)
+
+    def test_post_publish_updated_at_race_not_ready_later_go_does_not_hide_trusted_blocked(
+        self, monkeypatch
+    ):
+        # [G, B, P]: G = materialized go, B = later trusted blocked, P = later
+        # trusted go that is not fingerprint-ready.  P is not adoptable and must
+        # not cancel B.
+        for timeline in (lambda n: _RACE_U0, _flip_after_anchor):
+            remote = _PostPublishRaceRemote(updated_at_for=timeline)
+
+            def inject(r):
+                r.add_trusted_blocked()
+                r.add_trusted_not_ready_go()
+
+            remote.hooks[1] = inject
+
+            result = _run_ensure_against_race_remote(monkeypatch, remote)
+
+            _assert_fail_closed_single_publish(result, remote)
+            assert any(
+                "authority_latest_trusted_result_blocked" in e for e in result["errors"]
+            ), result["errors"]
+
+    def test_post_publish_updated_at_race_not_ready_go_without_blocked_does_not_reject(
+        self, monkeypatch
+    ):
+        # Control: a later not-ready trusted go alone (no blocked) is ignored.
+        for timeline in (lambda n: _RACE_U0, _flip_after_anchor):
+            remote = _PostPublishRaceRemote(updated_at_for=timeline)
+            remote.hooks[1] = lambda r: r.add_trusted_not_ready_go()
+
+            result = _run_ensure_against_race_remote(monkeypatch, remote)
+
+            assert result["status"] == "ok", result
+            assert (remote.post_count, remote.patch_count) == (1, 1)
+
+    def test_post_publish_updated_at_race_incomplete_readback_fails_closed(
+        self, monkeypatch
+    ):
+        remote = _PostPublishRaceRemote(updated_at_for=_flip_after_anchor)
+        remote.fail_issue_view_at = {3}
+        result = _run_ensure_against_race_remote(monkeypatch, remote)
+        _assert_fail_closed_single_publish(result, remote)
+        assert any("authority_issue_readback_failed" in e for e in result["errors"])
+
+        remote = _PostPublishRaceRemote(updated_at_for=_flip_after_anchor)
+        remote.hooks[3] = lambda r: setattr(r, "fail_comment_list", True)
+        result = _run_ensure_against_race_remote(monkeypatch, remote)
+        _assert_fail_closed_single_publish(result, remote)
+        assert any("authority_comments_readback_failed" in e for e in result["errors"])
+
+    def test_post_publish_updated_at_race_reconciliation_cap_reached_fails_closed(
+        self, monkeypatch
+    ):
+        remote = _PostPublishRaceRemote(
+            updated_at_for=lambda n: f"2026-06-13T08:{n // 60:02d}:{n % 60:02d}Z"
+        )
+
+        result = _run_ensure_against_race_remote(monkeypatch, remote)
+
+        _assert_fail_closed_single_publish(result, remote)
+        assert any("authority_issue_updated_at_mismatch" in e for e in result["errors"])
+        # bounded: the anchor read plus a small fixed number of re-reads
+        assert remote.read_n <= 10, remote.read_n
+
+    def test_post_publish_updated_at_race_check_only_existing_go_keeps_stale_rejection(
+        self, monkeypatch
+    ):
+        # Phase 1: materialize a real trusted go with a stable timeline.
+        remote = _PostPublishRaceRemote(updated_at_for=lambda n: _RACE_U0)
+        first = _run_ensure_against_race_remote(monkeypatch, remote)
+        assert first["status"] == "ok", first
+        assert remote.post_count == 1 and remote.patch_count == 1
+
+        # Phase 2: check-only reuse where the authority re-read sees a different
+        # updatedAt than the two reads that selected the existing go.
+        remote.updated_at_for = lambda n: _RACE_U0 if n <= 2 else _RACE_U1
+        remote.arm()
+        second = _run_ensure_against_race_remote(
+            monkeypatch, remote, mode="check-only", do_post=False
+        )
+
+        assert second["status"] != "ok", second
+        assert second["contract_snapshot_url"] is None
+        assert second["source"] != "existing_go"
+        assert remote.post_count == 1 and remote.patch_count == 1
+        assert len(remote.own_comment_ids()) == 1
+
+    def test_post_publish_updated_at_race_publish_counts_and_target_comment_unchanged(
+        self, monkeypatch
+    ):
+        remote = _PostPublishRaceRemote(updated_at_for=_flip_after_anchor)
+
+        result = _run_ensure_against_race_remote(monkeypatch, remote)
+
+        assert result["status"] == "ok", result
+        assert (remote.post_count, remote.patch_count) == (1, 1)
+        assert remote.patched_comment_ids == [_RACE_COMMENT_ID]
+        assert list(remote.comments) == [_RACE_COMMENT_ID]
+        assert result["contract_snapshot_url"].endswith(f"#issuecomment-{_RACE_COMMENT_ID}")
