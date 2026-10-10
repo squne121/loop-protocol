@@ -228,11 +228,18 @@ def _load_json_file(path: str | None) -> tuple[Any, list[str]]:
         return None, [f"input_file_not_found:{path}"]
     except OSError as exc:
         return None, [f"input_read_error:{path}:{type(exc).__name__}"]
+    except UnicodeDecodeError as exc:
+        # 非 UTF-8 バイト列。未処理例外にせず構造化拒否として persist・失効経路へ流す。
+        return None, [f"input_read_error:{path}:{type(exc).__name__}"]
 
     try:
         return json.loads(text), []
     except json.JSONDecodeError as exc:
         return None, [f"input_json_error:{path}:{exc}"]
+    except (RecursionError, ValueError) as exc:
+        # 過大ネスト (RecursionError) / 過大な整数リテラル (ValueError: 4300 桁超) は
+        # 未処理例外にせず、例外型名のみを持つ構造化エラーとして返す（成功へは変換しない）。
+        return None, [f"input_json_error:{path}:{type(exc).__name__}"]
 
 
 def _normalize_list_payload(payload: Any) -> tuple[list[Any], list[str], str | None]:

@@ -1226,6 +1226,53 @@ def test_non_object_envelope_values_are_structured_rejections(world: World, prod
         assert rc == 0
 
 
+_UNREADABLE_SNAPSHOT_CASES = [
+    # (id, raw bytes, expected structured error prefix)
+    ("non_utf8", b"\xff\xfe\x80 not utf-8 \xc3\x28", "input_read_error:"),
+    ("deeply_nested", b"[" * 200000 + b"]" * 200000, "input_json_error:"),
+    ("oversized_int_literal", b'{"status": ' + b"9" * 5000 + b"}", "input_json_error:"),
+]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_prefix"),
+    [pytest.param(r, e, id=i) for i, r, e in _UNREADABLE_SNAPSHOT_CASES],
+)
+def test_unreadable_snapshot_file_is_a_structured_rejection_that_invalidates_only_its_binding(
+    world: World, produced: dict[str, Any], raw: bytes, expected_prefix: str
+) -> None:
+    """Non-UTF-8 / over-nested / over-long-integer snapshot files must not escape the persist path."""
+    rc_producer, _, artifact = produced["dry"]
+    good_code = str(rc_producer)
+    key_a, key_b = _store_two_passes(world, artifact, good_code)
+
+    bad = world.root / "unreadable.json"
+    bad.write_bytes(raw)
+    rc, payload, stderr = world.run_consumer(bad, producer_exit_code=good_code, head=HEAD_A)
+    assert "Traceback" not in stderr, stderr
+    assert rc == 1, f"expected structured rejection, got rc={rc} payload={payload} stderr={stderr}"
+    assert payload["invoke_pr_reviewer"] is False
+    errors = payload["adjudication"]["errors"]
+    assert any(e.startswith(expected_prefix) for e in errors), errors
+    # state mutation: the stale PASS of binding A was invalidated by the persist path, B is kept
+    assert key_a not in world.stored_keys()
+    assert key_b in world.stored_keys()
+
+    # the stale PASS of binding A can no longer be reused ...
+    rc, payload, _ = world.run_consumer(artifact, reuse_stored=True, head=HEAD_A)
+    assert rc == 1
+    assert payload["invoke_pr_reviewer"] is False
+    assert payload["reason_code"] == "adjudication_missing_or_malformed"
+    # ... the unrelated binding B still can ...
+    rc, payload, stderr = world.run_consumer(artifact, reuse_stored=True, head=HEAD_B)
+    assert rc == 0, f"payload={payload} stderr={stderr}"
+    assert payload["invoke_pr_reviewer"] is True
+    # ... and a well-formed envelope still re-opens binding A (backward compatible)
+    rc, payload, stderr = world.run_consumer(artifact, producer_exit_code=good_code, head=HEAD_A)
+    assert rc == 0, f"payload={payload} stderr={stderr}"
+    assert key_a in world.stored_keys()
+
+
 # --- (g) provisional GO: producer `existing_go` is consumed with the same precedence --------
 
 
