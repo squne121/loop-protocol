@@ -243,31 +243,56 @@ VC: GitHub API rate-limit response must be checked against the official docs bef
     })
     assert unresolved["next_action"] == "human_judgment_required"
 
-    and_request = (
-        "Do not verify local fixtures and verify GitHub GraphQL errors "
-        "against official docs before approval."
-    )
-    for body, comments, source_hint in [
-        (_body(ac=f"- AC1: {and_request}"), None, None),
-        (_body(ac="- AC1: Run current-main repository tests."),
-         [{"id": 93, "body": and_request}], "comment_93"),
-    ]:
-        and_plan = _plan(body, comments)
-        and_claims = _web(and_plan)["critical_external_claims"]
-        assert _web(and_plan)["required"] and len(and_claims) == 1, and_claims
-        assert "verify GitHub GraphQL errors against official docs" in and_claims[0]["claim"]
-        assert "Do not verify local fixtures" not in and_claims[0]["claim"]
-        assert and_claims[0]["source_hint"] == source_hint
-        assert and_claims[0]["role"] == "dispositive"
-        assert _consumer().route_web_research_result({
-            "schema": "WEB_RESEARCH_ROUTING_INPUT_V1",
-            "repository_decision": {"status": "inconclusive", "disposition": None},
-            "critical_external_claims": and_claims,
-            "web_research": {"status": "inconclusive", "failure_class": None,
-                             "verification_route": "grounded_research", "claims": [], "unresolved_risks": []},
-        })["next_action"] == "human_judgment_required"
-    quoted = _plan(_body(), [{"id": 94, "body": f"Previously quoted: {and_request}"}])
+    mixed_requests = [
+        (
+            "Do not verify local fixtures and verify GitHub GraphQL errors "
+            "against official docs before approval.",
+            "verify GitHub GraphQL errors against official docs",
+        ),
+        (
+            "Do not verify local fixtures and verify GitHub GraphQL errors "
+            "against official docs before approval and do not change tests.",
+            "verify GitHub GraphQL errors against official docs",
+        ),
+        (
+            "リポジトリ fixtures の検証は不要、GitHub GraphQL の data/errors を"
+            "公式仕様と照合する必要がある。",
+            "GitHub GraphQL の data/errors を公式仕様と照合する必要がある",
+        ),
+        (
+            "Verify GitHub GraphQL errors against official docs before approval "
+            "and do not change repository tests.",
+            "Verify GitHub GraphQL errors against official docs",
+        ),
+    ]
+    for request, expected in mixed_requests:
+        for body, comments, source_hint in [
+            (_body(ac=f"- AC1: {request}"), None, None),
+            (_body(ac="- AC1: Run current-main repository tests."),
+             [{"id": 93, "body": request}], "comment_93"),
+        ]:
+            mixed_plan = _plan(body, comments)
+            mixed_claims = _web(mixed_plan)["critical_external_claims"]
+            assert _web(mixed_plan)["required"] and len(mixed_claims) == 1, mixed_claims
+            assert expected in mixed_claims[0]["claim"]
+            assert "Do not verify local fixtures" not in mixed_claims[0]["claim"]
+            assert "do not change" not in mixed_claims[0]["claim"]
+            assert "不要" not in mixed_claims[0]["claim"]
+            assert mixed_claims[0]["source_hint"] == source_hint
+            assert mixed_claims[0]["role"] == "dispositive"
+            assert _consumer().route_web_research_result({
+                "schema": "WEB_RESEARCH_ROUTING_INPUT_V1",
+                "repository_decision": {"status": "inconclusive", "disposition": None},
+                "critical_external_claims": mixed_claims,
+                "web_research": {"status": "inconclusive", "failure_class": None,
+                                 "verification_route": "grounded_research", "claims": [], "unresolved_risks": []},
+            })["next_action"] == "human_judgment_required"
+    quoted = _plan(_body(), [{"id": 94, "body": f"Previously quoted: {mixed_requests[0][0]}"}])
     assert not _web(quoted)["required"]
+    jp_quote = _plan(_body(), [{"id": 95, "body": f"過去の引用: {mixed_requests[2][0]}"}])
+    assert not _web(jp_quote)["required"]
+    noise = _plan(_body(ac="- AC1: リポジトリ fixtures の検証は不要、GitHub GraphQL は例示のみ。"))
+    assert not _web(noise)["required"]
 
 
 def test_planner_output_routes_without_manual_role_rewrite_or_web_skip():

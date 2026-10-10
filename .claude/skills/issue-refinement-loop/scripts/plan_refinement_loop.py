@@ -673,17 +673,17 @@ def _claim_sentences(line: str) -> list[str]:
     split_sentences = []
     for sentence in sentences:
         clauses = re.split(
-            r"\s+and\s+(?=(?:verify|check|validate|compare|confirm)\b)",
-            sentence, maxsplit=1, flags=re.I,
+            r"\s+and\s+(?=(?:(?:do|does)\s+not|don't|never|no|without|"
+            r"verify|check|validate|compare|confirm)\b)|[、，]",
+            sentence, flags=re.I,
         )
         if (
-            len(clauses) == 2
-            and _NEGATED_REQUEST_RE.search(clauses[0])
-            and _REPO_TOPIC_RE.search(clauses[0])
+            len(clauses) > 1
             and not _QUOTED_CONTEXT_RE.search(sentence)
-            and _is_external_dependency(clauses[1])
+            and any(_NEGATED_REQUEST_RE.search(c) and _REPO_TOPIC_RE.search(c) for c in clauses)
+            and any(_is_external_dependency(c) for c in clauses)
         ):
-            split_sentences.extend(clause.strip() for clause in clauses)
+            split_sentences.extend(clause.strip() for clause in clauses if clause.strip())
         else:
             split_sentences.append(sentence)
     return split_sentences
