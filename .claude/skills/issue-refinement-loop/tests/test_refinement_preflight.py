@@ -1648,6 +1648,168 @@ class TestB3WarnReachable:
         assert code == wrapper.EXIT_ENVIRONMENT_FAILURE
 
 
+def _ac8_repo_local_anchor_fixture(anchor_body: str) -> tuple[dict, str]:
+    issue_number = 2857
+    anchor_url = f"https://github.com/testowner/testrepo/issues/{issue_number}#issuecomment-7"
+    fixture = make_minimal_fixture(
+        issue_number=issue_number,
+        body=VALID_ISSUE_BODY,
+        comments=[
+            {
+                "id": 7,
+                "body": anchor_body,
+                "issue_url": f"https://api.github.com/repos/testowner/testrepo/issues/{issue_number}",
+            }
+        ],
+    )
+    fixture["anchor_comments"] = [
+        {
+            **fixture["comments"][0],
+            "html_url": anchor_url,
+            "url": "https://api.github.com/repos/testowner/testrepo/issues/comments/7",
+            "author_association": "OWNER",
+            "user": {"login": "owner", "type": "User"},
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+        }
+    ]
+    return fixture, anchor_url
+
+
+def test_repo_local_no_web_preflight_handoff_preserves_unverified_anchor_warning(tmp_path):
+    fixture, anchor_url = _ac8_repo_local_anchor_fixture("## Revised AC\n- AC2: trusted fixture directive\n")
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+
+    with (
+        mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path),
+        mock.patch.object(wrapper, "_invoke_planner", wraps=wrapper._invoke_planner) as invoke,
+    ):
+        result, exit_code = wrapper.run_preflight(
+            issue_number=2857,
+            repo="testowner/testrepo",
+            anchor_comment_urls=[anchor_url],
+            fixture_path=fixture_path,
+        )
+
+    assert (result["status"], exit_code) == ("pass", wrapper.EXIT_PASS)
+    assert result["next_action"] == "proceed"
+    assert len(invoke.call_args_list) == 2
+    sanitized = invoke.call_args_list[0].args[0]
+    full = invoke.call_args_list[1].args[0]
+    assert sanitized["comments"][0]["body"] == "[redacted: anchor comment snapshot stored in artifact]"
+    assert full["comments"][0]["body"] == fixture["comments"][0]["body"]
+    assert result["planner_fail_closed"] is False
+    assert result["must_read"] == ["scripts/example.py"]
+
+
+@pytest.mark.parametrize(
+    "anchor_body",
+    [
+        "[redacted: anchor comment snapshot stored in artifact]",
+        "## Revised AC\n- AC2: trusted fixture directive [truncated: remaining text]\n",
+        "## Revised AC\n- AC2: 公式ドキュメントで外部 API の仕様を検証する必要がある\n",
+    ],
+)
+def test_repo_local_no_web_handoff_rejects_unverified_anchor(tmp_path, anchor_body):
+    fixture, anchor_url = _ac8_repo_local_anchor_fixture(anchor_body)
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+    with mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path):
+        result, exit_code = wrapper.run_preflight(
+            issue_number=2857,
+            repo="testowner/testrepo",
+            anchor_comment_urls=[anchor_url],
+            fixture_path=fixture_path,
+        )
+    assert result["status"] != "pass"
+    assert exit_code != wrapper.EXIT_PASS
+
+
+def test_repo_local_no_web_handoff_rejects_unbound_crosscheck(tmp_path):
+    fixture, anchor_url = _ac8_repo_local_anchor_fixture("## Revised AC\n- AC2: trusted fixture directive\n")
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+    invoke = wrapper._invoke_planner
+
+    def corrupt_full_anchor_source(planner_input, **kwargs):
+        plan, exit_code, stderr, stdout = invoke(planner_input, **kwargs)
+        if not kwargs and plan is not None:
+            plan["source"]["comments_sha256"] = "unverified"
+        return plan, exit_code, stderr, stdout
+
+    with (
+        mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path),
+        mock.patch.object(wrapper, "_invoke_planner", side_effect=corrupt_full_anchor_source),
+    ):
+        result, exit_code = wrapper.run_preflight(
+            issue_number=2857,
+            repo="testowner/testrepo",
+            anchor_comment_urls=[anchor_url],
+            fixture_path=fixture_path,
+        )
+    assert (result["status"], exit_code) == ("warn", wrapper.EXIT_WARN)
+
+
+def test_repo_local_no_web_handoff_requires_complete_anchor_ranges(tmp_path):
+    fixture, anchor_url = _ac8_repo_local_anchor_fixture("## Revised AC\n- AC2: trusted fixture directive\n")
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+    with (
+        mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path),
+        mock.patch.object(wrapper.anchor_context, "compute_source_ranges_covered", return_value=False),
+    ):
+        result, exit_code = wrapper.run_preflight(
+            issue_number=2857,
+            repo="testowner/testrepo",
+            anchor_comment_urls=[anchor_url],
+            fixture_path=fixture_path,
+        )
+    assert (result["status"], exit_code) == ("warn", wrapper.EXIT_WARN)
+
+
+@pytest.mark.parametrize(
+    "required,reason,claims",
+    [
+        (True, "external_claim", [{"claim": "official API"}]),
+        (False, "unknown", []),
+        (False, "no_critical_external_claim", ["unverified"]),
+    ],
+)
+def test_repo_local_no_web_handoff_rejects_conflicting_policy(required, reason, claims):
+    plan = {
+        "decisions": {
+            "web_research_policy": {
+                "required": required,
+                "reason_code": reason,
+                "critical_external_claims": claims,
+                "evidence_spans": [],
+                "confidence": "unknown",
+            },
+            "investigation_policy": {"required": True, "repo_claims": ["local"], "confidence": "deterministic"},
+        }
+    }
+    assert wrapper._has_unknown_confidence(plan, resolved_no_web=True) is True
+    assert wrapper._apply_exit_code_mapping(0, False, [], plan=plan)[0] == "warn"
+
+
+def test_repo_local_no_web_handoff_keeps_other_unknown_decisions():
+    plan = {
+        "decisions": {
+            "web_research_policy": {
+                "required": False,
+                "reason_code": "no_critical_external_claim",
+                "critical_external_claims": [],
+                "evidence_spans": [],
+                "confidence": "unknown",
+            },
+            "investigation_policy": {"required": False, "repo_claims": [], "confidence": "unknown"},
+        }
+    }
+    assert wrapper._has_unknown_confidence(plan, resolved_no_web=True) is True
+    assert wrapper._apply_exit_code_mapping(0, False, [], plan=plan, verified_repo_local_no_web=True)[0] == "warn"
+
+
 # ---------------------------------------------------------------------------
 # B4: planner_input artifact saved
 # ---------------------------------------------------------------------------
