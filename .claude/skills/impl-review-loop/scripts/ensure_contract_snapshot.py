@@ -610,8 +610,10 @@ def verify_snapshot_authority_postcondition(
         observed_updated_at_out["updated_at"] = updated_at
     if sha256_of(body or "") != expected_body_sha256:
         return False, "authority_issue_body_sha256_mismatch"
-    if updated_at != expected_updated_at:
-        return False, "authority_issue_updated_at_mismatch"
+    # The timestamp difference is held, not returned: every non-time authority
+    # input below is verified first, so a time-only mismatch is the only case
+    # that reports ``authority_issue_updated_at_mismatch`` (Issue #3004).
+    updated_at_mismatch = updated_at != expected_updated_at
 
     live_base_ref, live_base_sha = capture_base_ref_and_sha(repo, timeout)
     if not live_base_ref or not live_base_sha:
@@ -664,7 +666,14 @@ def verify_snapshot_authority_postcondition(
     # Authoritative-result priority over the whole comment set (same rules as
     # existing_go adoption): the latest *trusted* result decides go/blocked, and
     # the latest trusted fingerprint-ready go must be this exact comment.
-    latest_trusted = parser_mod.find_latest_result(parsed, trusted_only=True)
+    # A trusted go that is not fingerprint-ready is never adoptable, so it must
+    # not take over "latest" and hide an earlier trusted blocked.
+    adoptable = [
+        item
+        for item in parsed
+        if item.get("status") != "go" or item.get("is_fingerprint_ready") is True
+    ]
+    latest_trusted = parser_mod.find_latest_result(adoptable, trusted_only=True)
     if isinstance(latest_trusted, dict) and latest_trusted.get("status") == "blocked":
         return False, "authority_latest_trusted_result_blocked"
     latest_trusted_go = parser_mod.find_latest_go(
@@ -687,6 +696,8 @@ def verify_snapshot_authority_postcondition(
         return False, "authority_comment_fingerprint_mismatch"
     if not is_go_base_binding_current(go_result, live_base_ref, live_base_sha):
         return False, "authority_comment_base_binding_drift"
+    if updated_at_mismatch:
+        return False, "authority_issue_updated_at_mismatch"
     return True, None
 
 

@@ -2364,22 +2364,36 @@ class TestFinalAuthorityPostcondition:
 
 
 class TestAuthorityPostconditionReadback:
-    def test_issue_updated_at_drift_is_rejected(self):
+    def test_issue_updated_at_drift_is_rejected(self, monkeypatch):
+        # Time-only difference: every other authority input holds, so the
+        # shared verifier (evaluated last) must still reject on updatedAt.
+        remote = _PostPublishRaceRemote(updated_at_for=lambda n: _RACE_U0)
+        first = _run_ensure_against_race_remote(monkeypatch, remote)
+        assert first["status"] == "ok", first
+        cid = remote.own_comment_ids()[0]
+        comment_body = remote.comments[cid]["body"]
+        parsed = _real_parser_mod_for_fp_tests.parse_contract_review_results(
+            [{**remote.comments[cid], "author": "squne121", "author_id": 63350259,
+              "author_type": "User", "author_association": "OWNER"}],
+            _ISSUE_URL,
+        )
+        fingerprint = parsed[0]["inner"]["expected_contract_fingerprint"]
+        remote.updated_at_for = lambda n: _RACE_U1
+        remote.arm()
+
         with patch.object(
             _ecs_mod,
-            "fetch_issue_snapshot",
-            return_value=(_SAMPLE_BODY, "2026-06-13T09:00:00Z", None),
+            "_import_parser_module",
+            return_value=_real_parser_mod_for_fp_tests,
         ):
             ok, reason = _real_verify_snapshot_authority_postcondition(
                 issue_number=_ISSUE_NUMBER,
                 repo=_REPO,
                 expected_body_sha256=_SAMPLE_BODY_SHA256,
-                expected_updated_at=_SAMPLE_UPDATED_AT,
-                expected_comment_id=1001,
-                expected_comment_body_sha256=sha256_of(_GO_COMMENT["body"]),
-                expected_fingerprint=_fresh_inner(_SAMPLE_BODY_SHA256)[
-                    "expected_contract_fingerprint"
-                ],
+                expected_updated_at=_RACE_U0,
+                expected_comment_id=cid,
+                expected_comment_body_sha256=sha256_of(comment_body),
+                expected_fingerprint=fingerprint,
             )
 
         assert ok is False
@@ -4075,6 +4089,7 @@ class TestPostCommentTransportAndReconciliation:
 
 _RACE_U0 = "2026-06-13T08:00:00Z"
 _RACE_U1 = "2026-06-13T08:00:05Z"
+_RACE_U2 = "2026-06-13T08:00:10Z"
 _RACE_COMMENT_ID = 3004001
 _RACE_TRUSTED_USER = {"login": "squne121", "id": 63350259, "type": "User"}
 _RACE_UNTRUSTED_USER = {"login": "mallory", "id": 4242, "type": "User"}
@@ -4088,6 +4103,20 @@ def _race_blocked_body() -> str:
         '  generated_at: "2026-06-13T10:00:00Z"\n'
         "  generated_by: issue-contract-review\n"
         f"  issue_url: {_ISSUE_URL}\n"
+        "```\n"
+    )
+
+
+def _race_not_ready_go_body() -> str:
+    """Schema-valid trusted ``go`` without a fingerprint (not fingerprint-ready)."""
+    return (
+        "```yaml\n"
+        "CONTRACT_REVIEW_RESULT_V1:\n"
+        "  status: go\n"
+        '  generated_at: "2026-06-13T11:00:00Z"\n'
+        "  generated_by: issue-contract-review\n"
+        f"  issue_url: {_ISSUE_URL}\n"
+        f'  body_sha256: "{_SAMPLE_BODY_SHA256}"\n'
         "```\n"
     )
 
@@ -4144,6 +4173,15 @@ class _PostPublishRaceRemote:
             association="OWNER",
             created_at="2026-06-13T10:00:00Z",
             comment_id=9001,
+        )
+
+    def add_trusted_not_ready_go(self):
+        return self.add_comment(
+            body=_race_not_ready_go_body(),
+            user=_RACE_TRUSTED_USER,
+            association="OWNER",
+            created_at="2026-06-13T11:00:00Z",
+            comment_id=9004,
         )
 
     def add_untrusted_blocked(self):
@@ -4312,6 +4350,11 @@ def _flip_after_anchor(n):
     return _RACE_U0 if n == 1 else _RACE_U1
 
 
+def _flip_twice_then_stable(n):
+    """U0 -> U1 -> U2 -> U2: the timestamp still changes on the first re-read."""
+    return {1: _RACE_U0, 2: _RACE_U1}.get(n, _RACE_U2)
+
+
 def _assert_fail_closed_single_publish(result, remote):
     assert result["status"] == "stale_or_conflicting_snapshot", result
     assert result["contract_snapshot_url"] is None
@@ -4432,6 +4475,91 @@ class TestPostPublishUpdatedAtRace:
             assert any(reason in e for e in result["errors"]), (name, result["errors"])
             assert remote.post_count == 1, name
             assert remote.patch_count == 1, name
+
+    def test_post_publish_updated_at_race_non_time_drift_during_changing_timestamp_fails(
+        self, monkeypatch
+    ):
+        # U0 -> U1 -> U2 -> U2: the drift is injected on a read whose updatedAt
+        # differs from the expected one, and restored on the next read.
+        def drift_comment_body(r):
+            r.comments[r.own_comment_ids()[0]]["body"] += "\n<!-- tampered -->\n"
+
+        def restore_comment_body(r):
+            cid = r.own_comment_ids()[0]
+            r.comments[cid]["body"] = r.comments[cid]["body"].replace(
+                "\n<!-- tampered -->\n", ""
+            )
+
+        scenarios = {
+            "base_drift_restored": (
+                {
+                    3: lambda r: setattr(r, "base_sha", "b" * 40),
+                    4: lambda r: setattr(r, "base_sha", "a" * 40),
+                },
+                "authority_base_binding_drift",
+            ),
+            "comment_body_drift_restored": (
+                {3: drift_comment_body, 4: restore_comment_body},
+                "authority_comment_body_sha256_mismatch",
+            ),
+            "trusted_blocked_during_time_change": (
+                {3: lambda r: r.add_trusted_blocked()},
+                "authority_latest_trusted_result_blocked",
+            ),
+        }
+        for name, (hooks, reason) in scenarios.items():
+            remote = _PostPublishRaceRemote(updated_at_for=_flip_twice_then_stable)
+            remote.hooks.update(hooks)
+
+            result = _run_ensure_against_race_remote(monkeypatch, remote)
+
+            _assert_fail_closed_single_publish(result, remote)
+            assert any(reason in e for e in result["errors"]), (name, result["errors"])
+
+    def test_post_publish_updated_at_race_u0_u1_u2_u2_without_drift_returns_ok(
+        self, monkeypatch
+    ):
+        remote = _PostPublishRaceRemote(updated_at_for=_flip_twice_then_stable)
+
+        result = _run_ensure_against_race_remote(monkeypatch, remote)
+
+        assert result["status"] == "ok", result
+        assert (remote.post_count, remote.patch_count) == (1, 1)
+
+    def test_post_publish_updated_at_race_not_ready_later_go_does_not_hide_trusted_blocked(
+        self, monkeypatch
+    ):
+        # [G, B, P]: G = materialized go, B = later trusted blocked, P = later
+        # trusted go that is not fingerprint-ready.  P is not adoptable and must
+        # not cancel B.
+        for timeline in (lambda n: _RACE_U0, _flip_after_anchor):
+            remote = _PostPublishRaceRemote(updated_at_for=timeline)
+
+            def inject(r):
+                r.add_trusted_blocked()
+                r.add_trusted_not_ready_go()
+
+            remote.hooks[1] = inject
+
+            result = _run_ensure_against_race_remote(monkeypatch, remote)
+
+            _assert_fail_closed_single_publish(result, remote)
+            assert any(
+                "authority_latest_trusted_result_blocked" in e for e in result["errors"]
+            ), result["errors"]
+
+    def test_post_publish_updated_at_race_not_ready_go_without_blocked_does_not_reject(
+        self, monkeypatch
+    ):
+        # Control: a later not-ready trusted go alone (no blocked) is ignored.
+        for timeline in (lambda n: _RACE_U0, _flip_after_anchor):
+            remote = _PostPublishRaceRemote(updated_at_for=timeline)
+            remote.hooks[1] = lambda r: r.add_trusted_not_ready_go()
+
+            result = _run_ensure_against_race_remote(monkeypatch, remote)
+
+            assert result["status"] == "ok", result
+            assert (remote.post_count, remote.patch_count) == (1, 1)
 
     def test_post_publish_updated_at_race_incomplete_readback_fails_closed(
         self, monkeypatch
