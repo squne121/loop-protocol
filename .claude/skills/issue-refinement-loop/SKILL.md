@@ -272,7 +272,7 @@ deterministic `VERDICT: approve` 確定後、`semantic_review_trigger.py` で `s
 
 `issue-editor` SubAgent に opaque forwarding payload を渡して本文を更新する（Issue #1734: `issue-author` は `issue-creator` / `issue-editor` に分割済み。既存 Issue の書き換えは `issue-editor` が担う）。AC/VC の baseline fail expectation と review 時の扱いを取り違えないこと。詳細な reflection guard は `references/ac-vc-reflection.md` を参照する。
 
-issue-editor 起動前に、現在本文に対して pre-edit static readiness check を実行する。
+issue-editor 起動前に、**現在本文**に対して pre-edit static readiness check を実行する。root Step 4 はこの existing-body readiness と feedback を `issue-editor` に転送し、変更候補を生成しない。`preflight-static` の `go` は、これから editor が生成する候補の edit-ready（kind-aware write guard 受理可能）を証明しない。候補生成・body-change-only full guard / LP017 修復・最終候補の transaction handoff は同一 editor invocation で `edit-issue/SKILL.md` の手順に従う。
 
 ```bash
 uv run --locked python3 .claude/skills/issue-contract-review/scripts/contract_readiness_check.py \
