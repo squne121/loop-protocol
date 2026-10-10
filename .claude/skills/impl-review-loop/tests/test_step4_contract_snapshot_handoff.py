@@ -1384,3 +1384,245 @@ def test_consumer_declares_the_new_optional_arguments() -> None:
     assert completed.returncode == 0
     assert "--producer-exit-code" in completed.stdout
     assert "--repo" in completed.stdout
+
+
+# --- Issue #3012: a trusted fingerprint-unready go newer than a trusted blocked ----------------
+#
+# G = fingerprint-ready trusted go, B = trusted blocked, P = schema-valid trusted go that is NOT
+# fingerprint-ready.  G, P and the stored envelope come from the real producer CLI (the `provisional`
+# fixture builds `[G, P]`); only B's posting time is hand-set so that it sits strictly between G and P.
+
+
+def _nr_parser() -> Any:
+    import importlib.util
+
+    path = ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts" / "contract_review_result_parser.py"
+    spec = importlib.util.spec_from_file_location("contract_review_result_parser_for_nonready_go_tests", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return module
+
+
+def _nr_add_comment_at(
+    w: World,
+    created_at: str,
+    body: str,
+    *,
+    user: dict[str, Any] | None = None,
+    association: str = "OWNER",
+    comment_id: int | None = None,
+) -> int:
+    state = w.read_state()
+    if comment_id is None:
+        cid = state["next_comment_id"]
+        state["next_comment_id"] += 1
+    else:
+        cid = comment_id
+        assert all(c["id"] != cid for c in state["comments"])
+    state["comments"].append(
+        {
+            "id": cid,
+            "html_url": f"https://github.com/{REPO}/issues/{ISSUE}#issuecomment-{cid}",
+            "created_at": created_at,
+            "updated_at": created_at,
+            "body": body,
+            "user": user or {"login": "squne121", "id": 63350259, "type": "User"},
+            "author_association": association,
+        }
+    )
+    w.write_state(state)
+    return cid
+
+
+def _nr_blocked_body() -> str:
+    return (
+        "## Contract Review Result\n\n```yaml\nCONTRACT_REVIEW_RESULT_V1:\n"
+        "  status: blocked\n"
+        '  generated_at: "2026-10-10T00:30:00Z"\n'
+        "  generated_by: issue-contract-review\n"
+        f"  issue_url: https://github.com/{REPO}/issues/{ISSUE}\n"
+        f'  body_sha256: "{BODY_SHA256}"\n```\n'
+    )
+
+
+def _nr_stamp(w: World, comment_id: int) -> str:
+    return next(c["created_at"] for c in w.read_state()["comments"] if c["id"] == comment_id)
+
+
+def _nr_add_blocked_between(w: World, earlier_id: int, later_id: int) -> int:
+    """A trusted blocked comment whose created_at lies strictly between two existing comments."""
+    import datetime
+
+    lo, hi = _nr_stamp(w, earlier_id), _nr_stamp(w, later_id)
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    lo_dt, hi_dt = datetime.datetime.strptime(lo, fmt), datetime.datetime.strptime(hi, fmt)
+    mid = (lo_dt + (hi_dt - lo_dt) / 2).strftime(fmt)
+    assert lo < mid < hi, (lo, mid, hi)
+    return _nr_add_comment_at(w, mid, _nr_blocked_body())
+
+
+def _nr_assert_shape(w: World, *, go_id: int | None, blocked_id: int | None, nonready_id: int | None) -> None:
+    """After the real parser G/B/P are trusted + schema-valid, P is not fingerprint-ready, G is."""
+    parser = _nr_parser()
+    comments = [
+        {
+            "id": c["id"],
+            "html_url": c["html_url"],
+            "created_at": c["created_at"],
+            "updated_at": c["updated_at"],
+            "body": c["body"],
+            "author": c["user"]["login"],
+            "author_id": c["user"]["id"],
+            "author_type": c["user"]["type"],
+            "author_association": c["author_association"],
+        }
+        for c in w.read_state()["comments"]
+    ]
+    by_id = {
+        r["comment_id"]: r
+        for r in parser.parse_contract_review_results(
+            comments, expected_issue_url=f"https://github.com/{REPO}/issues/{ISSUE}"
+        )
+    }
+    for cid in (go_id, blocked_id, nonready_id):
+        if cid is not None:
+            assert by_id[cid]["is_trusted_author"] is True
+    if go_id is not None:
+        assert (by_id[go_id]["status"], by_id[go_id]["is_fingerprint_ready"]) == ("go", True)
+    if blocked_id is not None:
+        assert by_id[blocked_id]["status"] == "blocked"
+    if nonready_id is not None:
+        assert (by_id[nonready_id]["status"], by_id[nonready_id]["is_fingerprint_ready"]) == ("go", False)
+
+
+def _nr_assert_gate_closed_by_blocked(rc: int, payload: dict[str, Any]) -> None:
+    assert rc == 1, payload
+    assert payload["invoke_pr_reviewer"] is False
+    assert "contract_snapshot_latest_trusted_result_blocked" in payload["adjudication"]["errors"]
+
+
+def test_nonready_go_after_blocked_closes_gate_and_invalidates_stored_pass(
+    provisional_world: World, provisional: dict[str, Any]
+) -> None:
+    rc_producer, envelope, artifact = provisional["producer"]
+    code = str(rc_producer)
+    assert envelope["contract_snapshot_url"].endswith(f"#issuecomment-{provisional['go_a_id']}")
+
+    # precondition: with [G, P] the stored envelope points at G and the gate opens (PASS is stored)
+    rc, payload, stderr = provisional_world.run_consumer(artifact, producer_exit_code=code, repo=REPO)
+    _assert_opened(rc, payload, stderr, provisional_world)
+    key = payload["binding_key"]
+
+    blocked_id = _nr_add_blocked_between(provisional_world, provisional["go_a_id"], provisional["provisional_id"])
+    _nr_assert_shape(
+        provisional_world,
+        go_id=provisional["go_a_id"],
+        blocked_id=blocked_id,
+        nonready_id=provisional["provisional_id"],
+    )
+    ordered_ids = (provisional["go_a_id"], blocked_id, provisional["provisional_id"])
+    stamps = [_nr_stamp(provisional_world, i) for i in ordered_ids]
+    assert stamps == sorted(stamps) and len(set(stamps)) == 3  # genuinely [G, B, P]
+
+    rc, payload, _ = provisional_world.run_consumer(artifact, producer_exit_code=code, repo=REPO)
+    _nr_assert_gate_closed_by_blocked(rc, payload)
+    # the stale PASS of the same binding was invalidated, and --reuse-stored cannot re-open the gate
+    assert key not in provisional_world.stored_keys()
+    rc, payload, _ = provisional_world.run_consumer(artifact, reuse_stored=True)
+    assert rc == 1
+    assert payload["invoke_pr_reviewer"] is False
+
+
+def test_nonready_go_after_blocked_input_order_and_same_created_at_do_not_change_result(
+    provisional_world: World, provisional: dict[str, Any]
+) -> None:
+    rc_producer, _, artifact = provisional["producer"]
+    code = str(rc_producer)
+    # B shares P's created_at but has the SMALLER numeric comment id: by the raw tie-break P would be
+    # latest, yet P is not an adoptable result so B must still close the gate
+    blocked_id = _nr_add_comment_at(
+        provisional_world,
+        _nr_stamp(provisional_world, provisional["provisional_id"]),
+        _nr_blocked_body(),
+        comment_id=provisional["go_a_id"] - 1,
+    )
+    assert blocked_id < provisional["provisional_id"]
+    _nr_assert_shape(
+        provisional_world,
+        go_id=provisional["go_a_id"],
+        blocked_id=blocked_id,
+        nonready_id=provisional["provisional_id"],
+    )
+    rc, payload, _ = provisional_world.run_consumer(artifact, producer_exit_code=code, repo=REPO)
+    _nr_assert_gate_closed_by_blocked(rc, payload)
+
+    # the same comments in reversed input order give the same verdict
+    state = provisional_world.read_state()
+    state["comments"].reverse()
+    provisional_world.write_state(state)
+    rc, payload, _ = provisional_world.run_consumer(artifact, producer_exit_code=code, repo=REPO)
+    _nr_assert_gate_closed_by_blocked(rc, payload)
+
+
+def test_nonready_go_after_blocked_without_ready_go_behaves_like_blocked_alone(
+    provisional_world: World, provisional: dict[str, Any]
+) -> None:
+    rc_producer, _, artifact = provisional["producer"]
+    state = provisional_world.read_state()
+    state["comments"] = [c for c in state["comments"] if c["id"] != provisional["go_a_id"]]
+    provisional_world.write_state(state)  # [P] only
+    blocked_id = _nr_add_comment_at(provisional_world, "2026-10-10T00:00:02Z", _nr_blocked_body())
+    _nr_assert_shape(provisional_world, go_id=None, blocked_id=blocked_id, nonready_id=provisional["provisional_id"])
+    p_id = provisional["provisional_id"]
+    assert _nr_stamp(provisional_world, blocked_id) < _nr_stamp(provisional_world, p_id)  # [B, P]
+
+    rc, payload, _ = provisional_world.run_consumer(artifact, producer_exit_code=str(rc_producer), repo=REPO)
+    _nr_assert_gate_closed_by_blocked(rc, payload)
+
+
+def test_nonready_go_after_blocked_later_ready_go_than_blocked_still_opens_gate(
+    provisional_world: World, provisional: dict[str, Any]
+) -> None:
+    """[G, B, P, G2]: a ready go posted after the blocked one is authoritative again.
+
+    G2 is G re-posted under a new comment id (fingerprint source id rewritten accordingly)."""
+    rc_producer, _, artifact = provisional["producer"]
+    _nr_add_blocked_between(provisional_world, provisional["go_a_id"], provisional["provisional_id"])
+    state = provisional_world.read_state()
+    go_a = next(c for c in state["comments"] if c["id"] == provisional["go_a_id"])
+    g2_id = state["next_comment_id"]
+    g2_body = go_a["body"].replace(str(provisional["go_a_id"]), str(g2_id))
+    assert g2_body != go_a["body"]
+    g2 = _nr_add_comment_at(provisional_world, "2026-10-10T00:00:30Z", g2_body)
+    assert g2 == g2_id
+    _nr_assert_shape(provisional_world, go_id=g2_id, blocked_id=None, nonready_id=provisional["provisional_id"])
+
+    def to_g2(value: dict[str, Any]) -> None:
+        value["contract_snapshot_url"] = value["contract_snapshot_url"].replace(
+            str(provisional["go_a_id"]), str(g2_id)
+        )
+
+    snapshot = _artifact_copy(provisional_world, artifact, "to-g2.json", to_g2)
+    rc, payload, stderr = provisional_world.run_consumer(snapshot, producer_exit_code=str(rc_producer), repo=REPO)
+    _assert_opened(rc, payload, stderr, provisional_world)
+
+
+def test_nonready_go_after_blocked_untrusted_blocked_and_plain_comments_do_not_close_gate(
+    provisional_world: World, provisional: dict[str, Any]
+) -> None:
+    rc_producer, _, artifact = provisional["producer"]
+    untrusted = {"login": "mallory", "id": 4242, "type": "User"}
+    mid_blocked = _nr_add_blocked_between(provisional_world, provisional["go_a_id"], provisional["provisional_id"])
+    # turn the in-between blocked into an UNTRUSTED one, and add a plain comment between as well
+    state = provisional_world.read_state()
+    for comment in state["comments"]:
+        if comment["id"] == mid_blocked:
+            comment["user"] = untrusted
+            comment["author_association"] = "NONE"
+    provisional_world.write_state(state)
+    _nr_add_comment_at(provisional_world, _nr_stamp(provisional_world, mid_blocked), "ordinary discussion")
+
+    rc, payload, stderr = provisional_world.run_consumer(artifact, producer_exit_code=str(rc_producer), repo=REPO)
+    _assert_opened(rc, payload, stderr, provisional_world)
+

@@ -2394,7 +2394,20 @@ def _resolve_posted_snapshot_comment(
         results = parser.parse_contract_review_results(
             comments, expected_issue_url=f"https://github.com/{repo}/issues/{expected_issue_number}"
         )
-        latest = parser.find_latest_result(results, trusted_only=True)
+        # #3012: a trusted ``go`` that is not fingerprint-ready is never
+        # adoptable and must not become "latest" ahead of an earlier trusted
+        # blocked (same ``adoptable`` semantics as
+        # verify_snapshot_authority_postcondition). When no adoptable trusted
+        # result exists at all, keep the unfiltered latest so the existing
+        # ``contract_snapshot_no_fingerprint_ready_go`` classification holds.
+        adoptable = [
+            item
+            for item in results
+            if item.get("status") != "go" or item.get("is_fingerprint_ready") is True
+        ]
+        latest = parser.find_latest_result(adoptable, trusted_only=True) or parser.find_latest_result(
+            results, trusted_only=True
+        )
         latest_go = parser.find_latest_go(results, trusted_only=True, fingerprint_ready_only=True)
     except Exception as exc:  # fail closed on any parser / transport failure
         return None, [f"contract_snapshot_resolution_error:{type(exc).__name__}"]

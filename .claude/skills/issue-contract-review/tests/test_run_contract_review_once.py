@@ -12,6 +12,8 @@ B1: run_once() から check_blockers.sh / check_product_spec_contract.py /
 from __future__ import annotations
 
 import importlib.util
+import json
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -1104,3 +1106,254 @@ class TestSchemaOutput:
         assert "blockers" in result["checks"]
         assert "product_spec" in result["checks"]
         assert "vc_preflight" in result["checks"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #3012: a trusted fingerprint-NON-ready ``go`` that is newer than a
+# trusted ``blocked`` must not hide that blocked result from
+# check_existing_go_comment().  These tests call the REAL
+# check_existing_go_comment() and the REAL shared parser; only the external
+# ``gh api --paginate`` comment listing (the GitHub read boundary) is faked.
+# Timeline notation: G = fingerprint-ready trusted go, B = trusted blocked,
+# P = schema-valid trusted go that is NOT fingerprint-ready.
+# ---------------------------------------------------------------------------
+
+_NR_ISSUE_BODY = "## Test Issue Body\n\n## Allowed Paths\n- tracked.txt\n"
+_NR_TRUSTED = {
+    "author": "squne121",
+    "author_id": 63350259,
+    "author_type": "User",
+    "author_association": "OWNER",
+}
+_NR_UNTRUSTED = {
+    "author": "mallory",
+    "author_id": 4242,
+    "author_type": "User",
+    "author_association": "NONE",
+}
+
+_nr_ecs_spec = importlib.util.spec_from_file_location(
+    "ensure_contract_snapshot_for_nonready_go_tests",
+    _HERE.parent.parent / "impl-review-loop" / "scripts" / "ensure_contract_snapshot.py",
+)
+assert _nr_ecs_spec is not None and _nr_ecs_spec.loader is not None
+_nr_ecs = importlib.util.module_from_spec(_nr_ecs_spec)
+_nr_ecs_spec.loader.exec_module(_nr_ecs)  # type: ignore[union-attr]
+
+_nr_parser_spec = importlib.util.spec_from_file_location(
+    "contract_review_result_parser_for_nonready_go_tests",
+    _SCRIPTS_DIR / "contract_review_result_parser.py",
+)
+assert _nr_parser_spec is not None and _nr_parser_spec.loader is not None
+_nr_parser = importlib.util.module_from_spec(_nr_parser_spec)
+_nr_parser_spec.loader.exec_module(_nr_parser)  # type: ignore[union-attr]
+
+
+def _nr_comment(cid, created_at, body, identity=None):
+    identity = identity or _NR_TRUSTED
+    return {
+        "id": cid,
+        "html_url": f"{_ISSUE_URL}#issuecomment-{cid}",
+        "created_at": created_at,
+        "updated_at": created_at,
+        "body": body,
+        **identity,
+    }
+
+
+def _nr_ready_go(cid, created_at, identity=None):
+    body_sha = _nr_ecs.sha256_of(_NR_ISSUE_BODY)
+    fingerprint = _nr_ecs.compute_expected_contract_fingerprint(
+        issue_number=_ISSUE_NUMBER,
+        contract_source_id=str(cid),
+        contract_body_sha256=body_sha,
+        allowed_paths=["tracked.txt"],
+        base_ref="main",
+        base_sha_at_snapshot="a" * 40,
+    )
+    review_result = {
+        "checks": {
+            "readiness": "go",
+            "blockers": "pass",
+            "product_spec": "pass",
+            "product_spec_check": {
+                "schema": "product_spec_check/v1",
+                "applicability": "applicable",
+                "decision": "pass",
+                "triggers": {},
+                "conditions": {},
+                "blocked_reasons": [],
+                "body_sha256": body_sha,
+                "source_provenance": {"source_type": "github_issue_body", "body_file": None},
+            },
+            "vc_preflight": "pass",
+        },
+        "vc_preflight_classifications": [{"ac": "AC1", "decision": "pass"}],
+    }
+    body = _nr_ecs._build_contract_review_comment(
+        issue_number=_ISSUE_NUMBER,
+        repo=_REPO,
+        review_result=review_result,
+        idempotency_marker="<!-- marker -->",
+        body_sha256=body_sha,
+        expected_contract_fingerprint=fingerprint,
+    )
+    return _nr_comment(cid, created_at, body, identity)
+
+
+def _nr_blocked(cid, created_at, identity=None):
+    body = (
+        "```yaml\nCONTRACT_REVIEW_RESULT_V1:\n  status: blocked\n"
+        '  generated_at: "2026-06-13T10:00:00Z"\n  generated_by: issue-contract-review\n'
+        f"  issue_url: {_ISSUE_URL}\n```\n"
+    )
+    return _nr_comment(cid, created_at, body, identity)
+
+
+def _nr_nonready_go(cid, created_at, identity=None):
+    body = (
+        "```yaml\nCONTRACT_REVIEW_RESULT_V1:\n  status: go\n"
+        '  generated_at: "2026-06-13T11:00:00Z"\n  generated_by: issue-contract-review\n'
+        f"  issue_url: {_ISSUE_URL}\n"
+        f'  body_sha256: "{_nr_ecs.sha256_of(_NR_ISSUE_BODY)}"\n```\n'
+    )
+    return _nr_comment(cid, created_at, body, identity)
+
+
+def _nr_parsed(comments):
+    return _nr_parser.parse_contract_review_results(comments, expected_issue_url=_ISSUE_URL)
+
+
+def _nr_assert_fixture_shape(comments, *, go_id=None, blocked_id=None, nonready_id=None):
+    """Assert, after passing through the real parser, that G/B/P are what they claim to be."""
+    by_id = {r["comment_id"]: r for r in _nr_parsed(comments)}
+    for cid in (go_id, blocked_id, nonready_id):
+        if cid is not None:
+            assert by_id[cid]["is_trusted_author"] is True
+    if go_id is not None:
+        assert by_id[go_id]["status"] == "go"
+        assert by_id[go_id]["is_fingerprint_ready"] is True
+    if blocked_id is not None:
+        assert by_id[blocked_id]["status"] == "blocked"
+    if nonready_id is not None:
+        assert by_id[nonready_id]["status"] == "go"
+        assert by_id[nonready_id]["is_fingerprint_ready"] is False
+
+
+def _nr_check(monkeypatch, comments, *, body=_NR_ISSUE_BODY):
+    def fake_run(command, *args, **kwargs):
+        assert command[:3] == ["gh", "api", "--paginate"], command
+        return subprocess.CompletedProcess(
+            command, 0, stdout="\n".join(json.dumps(c) for c in comments), stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return _rcr_mod.check_existing_go_comment(
+        _ISSUE_NUMBER, _REPO, current_body_sha256=_rcr_mod.sha256_of(body)
+    )
+
+
+_NR_T = "2026-06-13T08:00:0{}Z"
+
+
+class TestNonreadyGoAfterBlocked:
+    """Issue #3012 AC1/AC5 for run_contract_review_once.check_existing_go_comment()."""
+
+    def test_nonready_go_after_blocked_does_not_resurrect_older_ready_go(self, monkeypatch):
+        comments = [
+            _nr_ready_go(101, _NR_T.format(1)),
+            _nr_blocked(102, _NR_T.format(2)),
+            _nr_nonready_go(103, _NR_T.format(3)),
+        ]
+        _nr_assert_fixture_shape(comments, go_id=101, blocked_id=102, nonready_id=103)
+        assert _nr_check(monkeypatch, comments) == (None, None)
+
+    def test_nonready_go_after_blocked_positive_control_ready_go_alone_is_returned(self, monkeypatch):
+        comments = [_nr_ready_go(101, _NR_T.format(1))]
+        _nr_assert_fixture_shape(comments, go_id=101)
+        go, err = _nr_check(monkeypatch, comments)
+        assert err is None
+        assert go is not None and go["comment_id"] == 101
+
+    def test_nonready_go_after_blocked_positive_control_nonready_go_alone_does_not_hide_ready_go(
+        self, monkeypatch
+    ):
+        comments = [_nr_ready_go(101, _NR_T.format(1)), _nr_nonready_go(103, _NR_T.format(3))]
+        _nr_assert_fixture_shape(comments, go_id=101, nonready_id=103)
+        go, err = _nr_check(monkeypatch, comments)
+        assert err is None
+        assert go is not None and go["comment_id"] == 101
+
+    def test_nonready_go_after_blocked_positive_control_stale_body_binding_still_rejects(
+        self, monkeypatch
+    ):
+        comments = [_nr_ready_go(101, _NR_T.format(1))]
+        assert _nr_check(monkeypatch, comments, body=_NR_ISSUE_BODY + "edited\n") == (None, None)
+
+    def test_nonready_go_after_blocked_blocked_then_ready_go_prefers_later_ready_go(self, monkeypatch):
+        comments = [
+            _nr_ready_go(101, _NR_T.format(1)),
+            _nr_blocked(102, _NR_T.format(2)),
+            _nr_ready_go(104, _NR_T.format(4)),
+        ]
+        _nr_assert_fixture_shape(comments, go_id=104, blocked_id=102)
+        go, err = _nr_check(monkeypatch, comments)
+        assert err is None
+        assert go is not None and go["comment_id"] == 104
+
+    def test_nonready_go_after_blocked_blocked_without_older_go_stays_none(self, monkeypatch):
+        comments = [_nr_blocked(102, _NR_T.format(2)), _nr_nonready_go(103, _NR_T.format(3))]
+        _nr_assert_fixture_shape(comments, blocked_id=102, nonready_id=103)
+        assert _nr_check(monkeypatch, comments) == (None, None)
+
+    def test_nonready_go_after_blocked_blocked_directly_after_ready_go_rejects(self, monkeypatch):
+        comments = [_nr_ready_go(101, _NR_T.format(1)), _nr_blocked(102, _NR_T.format(2))]
+        assert _nr_check(monkeypatch, comments) == (None, None)
+
+    def test_nonready_go_after_blocked_untrusted_blocked_and_plain_comments_do_not_reject(
+        self, monkeypatch
+    ):
+        comments = [
+            _nr_ready_go(101, _NR_T.format(1)),
+            _nr_blocked(102, _NR_T.format(2), identity=_NR_UNTRUSTED),
+            _nr_comment(105, _NR_T.format(3), "ordinary discussion", identity=_NR_UNTRUSTED),
+            _nr_comment(106, _NR_T.format(3), "trusted but plain comment"),
+        ]
+        go, err = _nr_check(monkeypatch, comments)
+        assert err is None
+        assert go is not None and go["comment_id"] == 101
+
+    def test_nonready_go_after_blocked_input_order_does_not_change_result(self, monkeypatch):
+        comments = [
+            _nr_ready_go(101, _NR_T.format(1)),
+            _nr_blocked(102, _NR_T.format(2)),
+            _nr_nonready_go(103, _NR_T.format(3)),
+        ]
+        assert _nr_check(monkeypatch, list(reversed(comments))) == (None, None)
+        assert _nr_check(monkeypatch, [comments[2], comments[0], comments[1]]) == (None, None)
+
+    def test_nonready_go_after_blocked_same_created_at_uses_numeric_comment_id(self, monkeypatch):
+        same = _NR_T.format(5)
+        blocked_wins = [
+            _nr_ready_go(101, _NR_T.format(1)),
+            _nr_ready_go(110, same),
+            _nr_blocked(120, same),
+        ]
+        assert _nr_check(monkeypatch, blocked_wins) == (None, None)
+        go_wins = [
+            _nr_ready_go(101, _NR_T.format(1)),
+            _nr_blocked(9, same),
+            _nr_ready_go(10, same),
+        ]
+        go, err = _nr_check(monkeypatch, go_wins)
+        assert err is None
+        assert go is not None and go["comment_id"] == 10
+
+    def test_nonready_go_after_blocked_pending_only_comment_returns_none(self, monkeypatch):
+        pending = _nr_comment(
+            107,
+            _NR_T.format(2),
+            "```yaml\nCONTRACT_SNAPSHOT_MATERIALIZATION_PENDING_V1:\n"
+            f"  issue_number: {_ISSUE_NUMBER}\n  phase: awaiting_comment_id_binding\n```\n",
+        )
+        assert _nr_check(monkeypatch, [pending]) == (None, None)
