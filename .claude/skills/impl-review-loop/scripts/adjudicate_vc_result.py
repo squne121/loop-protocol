@@ -2240,6 +2240,9 @@ CANONICAL_CONTRACT_REVIEW_SCHEMA = "CONTRACT_REVIEW_RESULT_V1"
 # intentionally absent from this table.
 _ENVELOPE_HANDOFF_EXIT_CODES = {"ok": 0, "dry_run_would_post": 20}
 _ENVELOPE_OK_SOURCES = frozenset({"existing_go", "materialized_go"})
+# A real process exit code is tiny; bound the digit count well below the
+# interpreter int/str conversion limit so int() can never raise.
+_PRODUCER_EXIT_CODE_MAX_DIGITS = 9
 _CONTRACT_COMMENT_URL_RE = re.compile(
     r"\Ahttps://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/issues/([0-9]+)#issuecomment-([0-9]+)\Z"
 )
@@ -2282,7 +2285,14 @@ def _parse_producer_exit_code(raw: Any) -> tuple[int | None, str | None]:
     if isinstance(raw, int):
         return (raw, None) if raw >= 0 else (None, "producer_exit_code_not_integer")
     if isinstance(raw, str) and re.fullmatch(r"[0-9]+", raw):
-        return int(raw), None
+        if len(raw) > _PRODUCER_EXIT_CODE_MAX_DIGITS:
+            # A huge decimal string would raise ValueError in int() (the
+            # interpreter's int/str digit limit) -- reject it structurally.
+            return None, "producer_exit_code_not_integer"
+        try:
+            return int(raw), None
+        except ValueError:
+            return None, "producer_exit_code_not_integer"
     return None, "producer_exit_code_not_integer"
 
 
@@ -2304,8 +2314,11 @@ def _resolve_dry_run_candidate(
     """(1) ``dry_run_would_post`` + ``materialized_go``: the nested candidate
     result is the evidence authority (nothing was posted, so there is no
     comment). It is a candidate only -- never a published trusted snapshot."""
-    if envelope.get("source") != "materialized_go":
-        return None, [f"envelope_source_not_allowed:dry_run_would_post:{envelope.get('source')}"]
+    source = envelope.get("source")
+    if not isinstance(source, str):
+        return None, [f"envelope_source_not_string:{type(source).__name__}"]
+    if source != "materialized_go":
+        return None, [f"envelope_source_not_allowed:dry_run_would_post:{source}"]
     if envelope.get("contract_snapshot_url") is not None:
         return None, ["envelope_dry_run_contract_snapshot_url_not_null"]
     nested = envelope.get("contract_review_once_result")
@@ -2341,8 +2354,11 @@ def _resolve_posted_snapshot_comment(
     ``contract_snapshot_url`` comment is the evidence authority and is
     re-verified with the shared trusted-comment parser. The envelope's nested
     result is never the authority here (it is null for ``existing_go``)."""
-    if envelope.get("source") not in _ENVELOPE_OK_SOURCES:
-        return None, [f"envelope_source_not_allowed:ok:{envelope.get('source')}"]
+    source = envelope.get("source")
+    if not isinstance(source, str):
+        return None, [f"envelope_source_not_string:{type(source).__name__}"]
+    if source not in _ENVELOPE_OK_SOURCES:
+        return None, [f"envelope_source_not_allowed:ok:{source}"]
     if not isinstance(repo, str) or _REPO_SLUG_RE.fullmatch(repo) is None:
         return None, ["repo_required_for_ok_snapshot"]
     if not _is_positive_int(expected_issue_number):
@@ -2376,13 +2392,23 @@ def _resolve_posted_snapshot_comment(
     except Exception as exc:  # fail closed on any parser / transport failure
         return None, [f"contract_snapshot_resolution_error:{type(exc).__name__}"]
 
+    # Same authoritative-result precedence as the producer
+    # (ensure_contract_snapshot.py): a latest trusted ``blocked`` wins; otherwise
+    # the authority is the latest trusted AND fingerprint-ready ``go``. A newer
+    # fingerprint-unready (provisional / orphan) ``go`` is not an authoritative
+    # GO and must not invalidate an existing fingerprint-ready GO, so the latest
+    # trusted result's comment id is deliberately NOT compared with the URL.
     if not isinstance(latest, dict):
         return None, ["contract_snapshot_no_trusted_result"]
-    if latest.get("comment_id") != url_comment_id:
-        return None, ["contract_snapshot_comment_not_latest_trusted_result"]
-    if latest.get("status") != "go":
-        return None, ["contract_snapshot_latest_trusted_result_not_go"]
-    if not isinstance(latest_go, dict) or latest_go.get("comment_id") != url_comment_id:
+    latest_status = latest.get("status")
+    if latest_status == "blocked":
+        return None, ["contract_snapshot_latest_trusted_result_blocked"]
+    if latest_status != "go":
+        # Unknown status: stricter than the producer (fail closed).
+        return None, [f"contract_snapshot_latest_trusted_result_status_unsupported:{str(latest_status)[:40]}"]
+    if not isinstance(latest_go, dict):
+        return None, ["contract_snapshot_no_fingerprint_ready_go"]
+    if latest_go.get("comment_id") != url_comment_id:
         return None, ["contract_snapshot_comment_not_latest_fingerprint_ready_go"]
     inner = latest_go.get("inner")
     if not isinstance(inner, dict):
@@ -2428,6 +2454,10 @@ def resolve_step4_contract_snapshot(
     if exit_code_error is not None:
         return None, [exit_code_error]
     status = snapshot.get("status")
+    if not isinstance(status, str):
+        # list / dict / number would raise TypeError (unhashable) in the
+        # membership test below; reject it as a structured input error.
+        return None, [f"envelope_status_not_string:{type(status).__name__}"]
     if status not in _ENVELOPE_HANDOFF_EXIT_CODES:
         # human_judgment (also exit 20), blocked_needs_refinement,
         # runtime_error, stale_or_conflicting_snapshot,
@@ -3331,13 +3361,17 @@ def _run_step4_adjudicate(args: argparse.Namespace) -> int:
     # A failure yields contract_snapshot=None plus structured errors, so the
     # adjudicate -> persist path below still runs and invalidates a stale PASS
     # stored for this binding (never an early return before persist).
-    contract_snapshot, resolve_errors = resolve_step4_contract_snapshot(
-        contract_snapshot,
-        producer_exit_code=args.producer_exit_code,
-        repo=args.repo,
-        expected_issue_number=args.expected_issue_number,
-        expected_contract_body_sha256=args.expected_contract_body_sha256,
-    )
+    try:
+        contract_snapshot, resolve_errors = resolve_step4_contract_snapshot(
+            contract_snapshot,
+            producer_exit_code=args.producer_exit_code,
+            repo=args.repo,
+            expected_issue_number=args.expected_issue_number,
+            expected_contract_body_sha256=args.expected_contract_body_sha256,
+        )
+    except Exception as exc:  # defense in depth: fail closed, never skip persist
+        contract_snapshot = None
+        resolve_errors = [f"contract_snapshot_resolution_error:{type(exc).__name__}"]
     contract_errors = list(contract_errors or []) + resolve_errors
     diff_summary, diff_errors = _load_json_file(args.diff_summary_file)
     allowed_paths, allowed_errors = _load_allowed_paths(args.allowed_paths_file)

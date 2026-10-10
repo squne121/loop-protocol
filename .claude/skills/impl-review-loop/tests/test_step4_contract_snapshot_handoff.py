@@ -287,7 +287,13 @@ def main():
             if method == "PATCH":
                 payload = json.loads(sys.stdin.read())
                 state["clock"] += 1
-                comment["body"] = payload["body"]
+                new_body = payload["body"]
+                if state.get("comment_patch_strips_fingerprint"):
+                    # Injected lossy PATCH: GitHub accepts the update but the stored comment lacks the
+                    # source-bound fingerprint (a trusted go that is NOT fingerprint-ready). GET still
+                    # works, so the producer's readback sees a body hash mismatch.
+                    new_body = re.sub(r"(?m)^  expected_contract_fingerprint: .*\n", "", new_body)
+                comment["body"] = new_body
                 save(state)
                 if "--silent" not in rest:
                     sys.stdout.write(json.dumps(comment_view(state, comment)))
@@ -347,6 +353,7 @@ class World:
                 "base_ref": "main",
                 "base_sha": "d" * 40,
                 "comment_get_fails": False,
+                "comment_patch_strips_fingerprint": False,
                 "comments_list_fails": False,
             }
         )
@@ -609,6 +616,54 @@ def produced(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
     }
 
 
+def _variant_body(body: str, tag: str) -> str:
+    return body.rstrip("\n") + f"\n\n<!-- fixture variant {tag} -->\n"
+
+
+@pytest.fixture(scope="module")
+def provisional(tmp_path_factory: pytest.TempPathFactory, produced: dict[str, Any]) -> dict[str, Any]:
+    """AC2/AC4 (g): a trusted, fingerprint-UNREADY go that is newer than a trusted fingerprint-ready go.
+
+    Everything is produced by the real producer CLI (`--post`); no authoritative GO comment is
+    hand-built. Sequence: go A (fingerprint-ready, body0) exists -> the Issue body is edited and
+    the producer is run with `--post` while the fake GitHub drops the fingerprint from the PATCH of
+    the second phase (GET still works), which leaves a trusted but fingerprint-unready go B (body1)
+    behind -> the body is restored to body0. The producer
+    then adopts A as `existing_go` even though B is the newest trusted result.
+    """
+    base = tmp_path_factory.mktemp("handoff-provisional")
+    w = World(base / "w")
+    w.write_state(copy.deepcopy(produced["posted_state"]))
+    state = w.read_state()
+    go_a_id = max(c["id"] for c in state["comments"])
+    state["body"] = _variant_body(ISSUE_BODY, "provisional")
+    state["comment_patch_strips_fingerprint"] = True
+    w.write_state(state)
+    rc_fail, env_fail, _ = w.run_producer("--mode", "auto", "--post")
+    assert (rc_fail, env_fail["status"]) == (60, "controlled_publisher_binding_failed")
+    state = w.read_state()
+    state["body"] = ISSUE_BODY
+    state["comment_patch_strips_fingerprint"] = False
+    w.write_state(state)
+    provisional_id = max(c["id"] for c in state["comments"])
+    assert provisional_id > go_a_id
+    rc, envelope, artifact = w.run_producer("--mode", "check-only")
+    saved = copy.deepcopy(w.read_state())
+    return {
+        "state": saved,
+        "go_a_id": go_a_id,
+        "provisional_id": provisional_id,
+        "producer": (rc, envelope, artifact),
+    }
+
+
+@pytest.fixture
+def provisional_world(tmp_path: Path, provisional: dict[str, Any]) -> World:
+    w = World(tmp_path / "provisional-world")
+    w.write_state(copy.deepcopy(provisional["state"]))
+    return w
+
+
 @pytest.fixture
 def world(tmp_path: Path, produced: dict[str, Any]) -> World:
     """A fresh consumer-side world holding the producer-generated trusted go comment."""
@@ -714,7 +769,7 @@ def test_newer_trusted_blocked_than_url_go_closes_gate(tmp_path: Path, produced:
         rc, payload, _ = w.run_consumer(artifact, producer_exit_code=str(rc_producer), repo=REPO)
         assert rc == 1, key
         assert payload["invoke_pr_reviewer"] is False
-        assert "contract_snapshot_comment_not_latest_trusted_result" in payload["adjudication"]["errors"]
+        assert "contract_snapshot_latest_trusted_result_blocked" in payload["adjudication"]["errors"]
 
 
 def test_url_pointing_to_a_different_comment_is_rejected(world: World, produced: dict[str, Any]) -> None:
@@ -726,7 +781,7 @@ def test_url_pointing_to_a_different_comment_is_rejected(world: World, produced:
     snapshot = _artifact_copy(world, artifact, "retargeted.json", retarget)
     rc, payload, _ = world.run_consumer(snapshot, producer_exit_code=str(rc_producer), repo=REPO)
     assert rc == 1
-    assert "contract_snapshot_comment_not_latest_trusted_result" in payload["adjudication"]["errors"]
+    assert "contract_snapshot_comment_not_latest_fingerprint_ready_go" in payload["adjudication"]["errors"]
 
 
 def test_comment_fetch_failure_is_fail_closed(world: World, produced: dict[str, Any]) -> None:
@@ -1072,6 +1127,198 @@ def test_every_handoff_failure_class_invalidates_a_stored_pass(world: World, pro
     rc, payload, _ = world.run_consumer(post_artifact, producer_exit_code="0", repo=REPO)
     assert rc == 1
     assert key not in world.stored_keys()
+
+
+# --- (f) type-invalid envelopes: structured rejection + persist/invalidation path ------------
+
+
+def _store_two_passes(world: World, artifact: Path, code: str) -> tuple[str, str]:
+    rc, payload_a, stderr = world.run_consumer(artifact, producer_exit_code=code, head=HEAD_A)
+    assert rc == 0, f"payload={payload_a} stderr={stderr}"
+    rc, payload_b, stderr = world.run_consumer(artifact, producer_exit_code=code, head=HEAD_B)
+    assert rc == 0, f"payload={payload_b} stderr={stderr}"
+    key_a, key_b = payload_a["binding_key"], payload_b["binding_key"]
+    assert key_a != key_b and {key_a, key_b} <= world.stored_keys()
+    return key_a, key_b
+
+
+_TYPE_INVALID_CASES = [
+    # (id, producer artifact, mutate, producer exit code override, expected structured error)
+    ("status_list", "dry", lambda v: v.update(status=[]), None, "envelope_status_not_string:list"),
+    ("status_dict", "dry", lambda v: v.update(status={}), None, "envelope_status_not_string:dict"),
+    ("status_int", "dry", lambda v: v.update(status=20), None, "envelope_status_not_string:int"),
+    ("status_null", "dry", lambda v: v.update(status=None), None, "envelope_status_not_string:NoneType"),
+    ("source_list_dry", "dry", lambda v: v.update(source=[]), None, "envelope_source_not_string:list"),
+    ("source_dict_dry", "dry", lambda v: v.update(source={}), None, "envelope_source_not_string:dict"),
+    ("source_list_ok", "post", lambda v: v.update(source=["materialized_go"]), "0", "envelope_source_not_string:list"),
+    ("source_dict_ok", "existing", lambda v: v.update(source={"a": 1}), "0", "envelope_source_not_string:dict"),
+    ("huge_exit_code", "dry", None, "9" * 5000, "producer_exit_code_not_integer"),
+    ("long_exit_code", "dry", None, "0" * 40 + "20", "producer_exit_code_not_integer"),
+    ("nested_result_list", "dry", lambda v: v.update(contract_review_once_result=[]), None,
+     "envelope_nested_result_missing_or_wrong_schema"),
+    ("nested_result_string", "dry", lambda v: v.update(contract_review_once_result="go"), None,
+     "envelope_nested_result_missing_or_wrong_schema"),
+    ("nested_status_list", "dry", lambda v: v["contract_review_once_result"].update(status=["go"]), None,
+     "envelope_nested_result_not_go:['go']"),
+    ("nested_body_sha_dict", "dry", lambda v: v["contract_review_once_result"].update(body_sha256={}), None,
+     "envelope_nested_body_sha256_missing"),
+    ("nested_classifications_dict", "dry",
+     lambda v: v["contract_review_once_result"].update(vc_preflight_classifications={}), None,
+     "envelope_nested_vc_preflight_classifications_missing"),
+]
+
+
+@pytest.mark.parametrize(
+    ("which", "mutate", "code_override", "expected_error"),
+    [pytest.param(w, m, c, e, id=i) for i, w, m, c, e in _TYPE_INVALID_CASES],
+)
+def test_type_invalid_envelope_is_a_structured_rejection_that_invalidates_only_its_binding(
+    world: World,
+    produced: dict[str, Any],
+    which: str,
+    mutate: Any,
+    code_override: str | None,
+    expected_error: str,
+) -> None:
+    rc_producer, _, artifact = produced["dry"]
+    good_code = str(rc_producer)
+    key_a, key_b = _store_two_passes(world, artifact, good_code)
+
+    source_artifact = produced[which][2]
+    bad = _artifact_copy(world, source_artifact, "type-invalid.json", mutate)
+    code = code_override if code_override is not None else str(produced[which][0])
+    # A new canonical adjudication for binding A with a type-invalid envelope.
+    rc, payload, stderr = world.run_consumer(bad, producer_exit_code=code, repo=REPO, head=HEAD_A)
+    assert "Traceback" not in stderr, stderr
+    assert rc == 1, f"expected structured rejection, got rc={rc} payload={payload} stderr={stderr}"
+    assert payload["invoke_pr_reviewer"] is False
+    assert expected_error in payload["adjudication"]["errors"], payload["adjudication"]["errors"]
+    # state mutation: the stale PASS of binding A was invalidated by the persist path, B is kept
+    assert key_a not in world.stored_keys()
+    assert key_b in world.stored_keys()
+
+    # the stale PASS of binding A can no longer be reused ...
+    rc, payload, _ = world.run_consumer(artifact, reuse_stored=True, head=HEAD_A)
+    assert rc == 1
+    assert payload["invoke_pr_reviewer"] is False
+    assert payload["reason_code"] == "adjudication_missing_or_malformed"
+    # ... the unrelated binding B still can ...
+    rc, payload, stderr = world.run_consumer(artifact, reuse_stored=True, head=HEAD_B)
+    assert rc == 0, f"payload={payload} stderr={stderr}"
+    assert payload["invoke_pr_reviewer"] is True
+    # ... and a well-formed envelope still re-opens binding A (backward compatible)
+    rc, payload, stderr = world.run_consumer(artifact, producer_exit_code=good_code, head=HEAD_A)
+    assert rc == 0, f"payload={payload} stderr={stderr}"
+    assert key_a in world.stored_keys()
+
+
+def test_non_object_envelope_values_are_structured_rejections(world: World, produced: dict[str, Any]) -> None:
+    rc_producer, _, artifact = produced["dry"]
+    key_a, _ = _store_two_passes(world, artifact, str(rc_producer))
+    for name, value in (("list.json", "[]"), ("string.json", '"x"'), ("number.json", "7")):
+        bad = world.write_json(name, value)
+        rc, payload, stderr = world.run_consumer(bad, producer_exit_code="20", head=HEAD_A)
+        assert "Traceback" not in stderr, stderr
+        assert rc == 1, f"{name}: payload={payload} stderr={stderr}"
+        assert payload["invoke_pr_reviewer"] is False
+        assert key_a not in world.stored_keys()
+        rc, _, _ = world.run_consumer(artifact, producer_exit_code="20", head=HEAD_A)
+        assert rc == 0
+
+
+# --- (g) provisional GO: producer `existing_go` is consumed with the same precedence --------
+
+
+def test_producer_returns_existing_go_a_although_a_newer_provisional_go_exists(
+    provisional: dict[str, Any],
+) -> None:
+    rc, envelope, _ = provisional["producer"]
+    assert (rc, envelope["status"], envelope["source"]) == (0, "ok", "existing_go")
+    assert envelope["contract_snapshot_url"].endswith(f"#issuecomment-{provisional['go_a_id']}")
+    assert provisional["provisional_id"] > provisional["go_a_id"]
+    provisional_comment = next(c for c in provisional["state"]["comments"] if c["id"] == provisional["provisional_id"])
+    assert "status: go" in provisional_comment["body"]
+    assert "expected_contract_fingerprint" not in provisional_comment["body"]
+
+
+def test_consumer_accepts_the_producer_existing_go_despite_a_newer_provisional_go(
+    provisional_world: World, provisional: dict[str, Any]
+) -> None:
+    rc_producer, _, artifact = provisional["producer"]
+    rc, payload, stderr = provisional_world.run_consumer(artifact, producer_exit_code=str(rc_producer), repo=REPO)
+    _assert_opened(rc, payload, stderr, provisional_world)
+
+
+def test_provisional_go_does_not_open_the_gate_by_itself(
+    provisional_world: World, provisional: dict[str, Any]
+) -> None:
+    """The URL of the provisional (fingerprint-unready) go is never accepted as the authority."""
+    rc_producer, _, artifact = provisional["producer"]
+
+    def to_provisional(value: dict[str, Any]) -> None:
+        value["contract_snapshot_url"] = value["contract_snapshot_url"].replace(
+            str(provisional["go_a_id"]), str(provisional["provisional_id"])
+        )
+
+    snapshot = _artifact_copy(provisional_world, artifact, "to-provisional.json", to_provisional)
+    rc, payload, _ = provisional_world.run_consumer(snapshot, producer_exit_code=str(rc_producer), repo=REPO)
+    assert rc == 1
+    assert payload["invoke_pr_reviewer"] is False
+    assert "contract_snapshot_comment_not_latest_fingerprint_ready_go" in payload["adjudication"]["errors"]
+
+
+def test_newer_trusted_blocked_after_provisional_go_closes_gate(
+    provisional_world: World, provisional: dict[str, Any]
+) -> None:
+    rc_producer, _, artifact = provisional["producer"]
+    provisional_world.add_trusted_blocked_comment()
+    rc, payload, _ = provisional_world.run_consumer(artifact, producer_exit_code=str(rc_producer), repo=REPO)
+    assert rc == 1
+    assert payload["invoke_pr_reviewer"] is False
+    assert "contract_snapshot_latest_trusted_result_blocked" in payload["adjudication"]["errors"]
+
+
+def test_newer_fingerprint_ready_go_than_the_url_go_closes_gate(
+    provisional_world: World, provisional: dict[str, Any]
+) -> None:
+    """A newer trusted AND fingerprint-ready go (produced by the real `--post`) makes the old URL stale."""
+    rc_producer, _, artifact = provisional["producer"]
+    state = provisional_world.read_state()
+    state["body"] = _variant_body(ISSUE_BODY, "newer-ready-go")
+    provisional_world.write_state(state)
+    rc_new, env_new, _ = provisional_world.run_producer("--mode", "auto", "--post")
+    assert (rc_new, env_new["status"], env_new["source"]) == (0, "ok", "materialized_go")
+    newer_id = int(env_new["contract_snapshot_url"].rsplit("-", 1)[1])
+    assert newer_id > provisional["provisional_id"]
+    state = provisional_world.read_state()
+    state["body"] = ISSUE_BODY
+    provisional_world.write_state(state)
+    rc, payload, _ = provisional_world.run_consumer(artifact, producer_exit_code=str(rc_producer), repo=REPO)
+    assert rc == 1
+    assert payload["invoke_pr_reviewer"] is False
+    assert "contract_snapshot_comment_not_latest_fingerprint_ready_go" in payload["adjudication"]["errors"]
+
+
+def test_provisional_scenario_keeps_every_other_binding(provisional_world: World, provisional: dict[str, Any]) -> None:
+    rc_producer, _, artifact = provisional["producer"]
+    code = str(rc_producer)
+    rc, payload, _ = provisional_world.run_consumer(
+        artifact, producer_exit_code=code, repo=REPO, body_sha256="sha256:" + "9" * 64
+    )
+    assert rc == 1 and "snapshot_body_sha256_mismatch" in payload["adjudication"]["errors"]
+    rc, payload, _ = provisional_world.run_consumer(artifact, producer_exit_code=code, repo="other-owner/other-repo")
+    assert rc == 1 and "envelope_repo_mismatch" in payload["adjudication"]["errors"]
+    rc, payload, _ = provisional_world.run_consumer(
+        artifact, producer_exit_code=code, repo=REPO, expected_issue_number=ISSUE + 1
+    )
+    assert rc == 1 and "envelope_issue_number_mismatch" in payload["adjudication"]["errors"]
+    state = provisional_world.read_state()
+    state["comments_list_fails"] = True
+    provisional_world.write_state(state)
+    rc, payload, _ = provisional_world.run_consumer(artifact, producer_exit_code=code, repo=REPO)
+    assert rc == 1
+    assert "contract_snapshot_comments_fetch_failed:gh_other_error" in payload["adjudication"]["errors"]
+    assert payload["invoke_pr_reviewer"] is False
 
 
 # --- CLI wiring facts ------------------------------------------------------------------------
