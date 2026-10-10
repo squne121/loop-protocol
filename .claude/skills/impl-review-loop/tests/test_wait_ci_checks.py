@@ -1027,6 +1027,21 @@ _LATER_PAGE_FAILURES = [
         ),
         "malformed_gh_response",
     ),
+    # Later page rule objects whose `type` is missing / null / non-string / empty must not be skipped.
+    *[
+        (
+            (0, json.dumps([[_required_rule([("build", None)])], [bad_rule]]), ""),
+            "malformed_gh_response",
+        )
+        for bad_rule in (
+            {},
+            {"message": "unexpected response"},
+            {"type": 123},
+            {"type": None},
+            {"type": ""},
+            {"type": ["required_status_checks"]},
+        )
+    ],
 ]
 
 
@@ -1054,6 +1069,20 @@ def test_ruleset_later_page_failure_is_runtime_error(
     assert payload["status"] not in {"passed", "skipped_only", "pending_timeout"}
     assert fake.checks_calls == 0
     assert set(payload) == RESULT_KEYS
+
+
+def test_ruleset_unknown_string_rule_type_is_still_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Negative control: a well-formed but unknown rule type (future GitHub extension) is ignored."""
+    fake = FakeGh(
+        ruleset_pages=[[_required_rule([("build", None)])], [{"type": "future_rule_type", "parameters": {}}]],
+        classic=NOT_PROTECTED,
+    )
+    _install(monkeypatch, fake)
+
+    inventory, error, message = wait_ci_checks.fetch_required_inventory("owner/repo", 1)
+
+    assert (error, message) == (None, None)
+    assert inventory == {"build": {None}}
 
 
 def test_ruleset_pagination_third_page_sentinel_is_detected(monkeypatch: pytest.MonkeyPatch) -> None:

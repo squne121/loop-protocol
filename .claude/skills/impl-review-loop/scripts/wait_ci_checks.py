@@ -168,8 +168,11 @@ def _fetch_ruleset_contexts(
     for rule in data:
         if not isinstance(rule, dict):
             return "malformed_gh_response", "rules/branches entry is not an object"
-        if rule.get("type") != "required_status_checks":
-            continue
+        rule_type = rule.get("type")
+        if not isinstance(rule_type, str) or not rule_type:
+            return "malformed_gh_response", "rules/branches entry has no valid type"
+        if rule_type != "required_status_checks":
+            continue  # Unknown but well-formed rule types are ignored (forward compatible).
         params = rule.get("parameters")
         entries = params.get("required_status_checks") if isinstance(params, dict) else None
         if not isinstance(entries, list):
