@@ -623,6 +623,12 @@ _QUOTED_CONTEXT_RE = re.compile(
     r"(?<![/.])\bexample\b|過去|引用|貼付|例示", re.I,
 )
 _FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
+# A noun-start RHS needs its own predicate; "fixtures and API errors against docs"
+# is still one negated request, not a second affirmative dependency.
+_NOUN_CLAUSE_PREDICATE_RE = re.compile(
+    r"\b(?:must|should|shall|needs?|require[ds]?|depends?|"
+    r"(?:is|are)\s+(?:specified|defined|documented|required|expected))\b", re.I,
+)
 
 
 def _claim_prose_lines(text: str, *, vc: bool = False) -> list[str]:
@@ -677,9 +683,27 @@ def _claim_sentences(line: str) -> list[str]:
             r"verify|check|validate|compare|confirm)\b)|[、，]",
             sentence, flags=re.I,
         )
+        quoted = bool(_QUOTED_CONTEXT_RE.search(sentence))
+        if not quoted:
+            expanded = []
+            for clause in clauses:
+                for boundary in re.finditer(r"\s+and\s+", clause, flags=re.I):
+                    local = clause[:boundary.start()].strip()
+                    external = clause[boundary.end():].strip()
+                    if (
+                        _NEGATED_REQUEST_RE.search(local)
+                        and _REPO_TOPIC_RE.search(local)
+                        and _NOUN_CLAUSE_PREDICATE_RE.search(external)
+                        and _is_external_dependency(external)
+                    ):
+                        expanded.extend((local, external))
+                        break
+                else:
+                    expanded.append(clause)
+            clauses = expanded
         if (
             len(clauses) > 1
-            and not _QUOTED_CONTEXT_RE.search(sentence)
+            and not quoted
             and any(_NEGATED_REQUEST_RE.search(c) and _REPO_TOPIC_RE.search(c) for c in clauses)
             and any(_is_external_dependency(c) for c in clauses)
         ):

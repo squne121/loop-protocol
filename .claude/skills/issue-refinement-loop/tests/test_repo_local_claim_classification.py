@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import jsonschema
+import pytest
 
 SKILL = Path(__file__).resolve().parents[1]
 SCRIPT = SKILL / "scripts" / "plan_refinement_loop.py"
@@ -293,6 +294,118 @@ VC: GitHub API rate-limit response must be checked against the official docs bef
     assert not _web(jp_quote)["required"]
     noise = _plan(_body(ac="- AC1: リポジトリ fixtures の検証は不要、GitHub GraphQL は例示のみ。"))
     assert not _web(noise)["required"]
+
+
+@pytest.mark.parametrize(
+    "phrase,expected",
+    [
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors must match "
+            "official docs before approval.",
+            "GitHub GraphQL errors must match official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors must match "
+            "official docs before approval and do not change tests.",
+            "GitHub GraphQL errors must match official docs before approval",
+        ),
+        (
+            "Do not inspect repository call chain and GitHub GraphQL data/errors "
+            "require validation against the official specification before approval.",
+            "GitHub GraphQL data/errors require validation against the official specification",
+        ),
+        (
+            "Do not verify local fixtures and API authentication behavior must "
+            "agree with published specification before approval.",
+            "API authentication behavior must agree with published specification",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors and API rate "
+            "limits must match official docs before approval.",
+            "GitHub GraphQL errors and API rate limits must match official docs",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors are documented "
+            "in the official API specification before approval.",
+            "GitHub GraphQL errors are documented in the official API specification",
+        ),
+        (
+            "GitHub GraphQL errors must match official docs before approval "
+            "and do not verify repository fixtures.",
+            "GitHub GraphQL errors must match official docs before approval",
+        ),
+        (
+            "リポジトリ fixtures の検証は不要、GitHub GraphQL のエラーは"
+            "公式仕様と照合が必要である。",
+            "GitHub GraphQL のエラーは公式仕様と照合が必要",
+        ),
+    ],
+)
+def test_independent_noun_start_external_claims_remain_dispositive(phrase, expected):
+    for body, comments, source_hint in [
+        (_body(ac=f"- AC1: {phrase}"), None, None),
+        (_body(ac="- AC1: Run current-main repository tests."),
+         [{"id": 93, "body": phrase}], "comment_93"),
+    ]:
+        plan = _plan(body, comments)
+        claims = _web(plan)["critical_external_claims"]
+        assert _web(plan)["required"] and len(claims) == 1, claims
+        claim = claims[0]
+        assert expected in claim["claim"]
+        assert "Do not" not in claim["claim"]
+        assert "不要" not in claim["claim"]
+        assert claim["source_hint"] == source_hint
+        assert claim["role"] == "dispositive"
+        assert set(claim) == {"claim", "affects", "source_hint", "role"}
+        routing_input = {
+            "schema": "WEB_RESEARCH_ROUTING_INPUT_V1",
+            "repository_decision": {"status": "inconclusive", "disposition": None},
+            "critical_external_claims": claims,
+            "web_research": {"status": "inconclusive", "failure_class": None,
+                             "verification_route": "grounded_research", "claims": [], "unresolved_risks": []},
+        }
+        assert _consumer().route_web_research_result(routing_input)["next_action"] == "human_judgment_required"
+        routing_input["web_research"] = {
+            "status": "ok", "failure_class": None, "verification_route": "grounded_research",
+            "claims": [{"claim_id": "0", "text": claim["claim"], "type": "external_spec",
+                        "critical": True, "verdict": "supported",
+                        "evidence": [{"kind": "web", "ref": "https://docs.github.com/example",
+                                      "summary": "Verified against an official source."}]}],
+            "unresolved_risks": [],
+        }
+        assert _consumer().route_web_research_result(routing_input)["next_action"] == "proceed"
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "Do not verify local fixtures.",
+        "Do not verify local fixtures and check repository tests instead.",
+        "Do not verify local fixtures and GitHub GraphQL errors against official docs.",
+        "Do not verify local fixtures and do not check GitHub GraphQL errors against official docs.",
+        "Do not verify local fixtures and GitHub GraphQL errors must not match official docs.",
+        "Previously quoted: Do not verify local fixtures and GitHub GraphQL errors "
+        "must match official docs before approval.",
+        "Literal example: Do not verify local fixtures and GitHub GraphQL errors "
+        "must match official docs before approval.",
+        "リポジトリ fixtures の検証は不要、GitHub GraphQL は例示のみ。",
+    ],
+)
+def test_noun_start_mixed_clause_negative_controls_do_not_require_web(phrase):
+    for body, comments in [
+        (_body(ac=f"- AC1: {phrase}"), None),
+        (_body(ac="- AC1: Run current-main repository tests."),
+         [{"id": 94, "body": phrase}]),
+    ]:
+        policy = _web(_plan(body, comments))
+        assert policy["required"] is False
+        assert policy["critical_external_claims"] == []
+
+    fenced = _body(ac="- AC1: Run current-main repository tests.", vc=(
+        "```text\nDo not verify local fixtures and GitHub GraphQL errors "
+        "must match official docs before approval.\n```"
+    ))
+    assert not _web(_plan(fenced))["required"]
 
 
 def test_planner_output_routes_without_manual_role_rewrite_or_web_skip():
