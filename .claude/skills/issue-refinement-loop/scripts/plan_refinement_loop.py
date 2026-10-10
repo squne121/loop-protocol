@@ -665,11 +665,28 @@ def _claim_sentences(line: str) -> list[str]:
     A negated local clause must not suppress a later external dependency in
     the same sentence ("do not check fixtures, but verify official docs").
     """
-    return [part.strip() for part in re.split(
+    sentences = [part.strip() for part in re.split(
         r"(?<=[。！？])|(?<=[.!?])\s+(?=[A-Z])|[;；]|"
         r"(?:,\s*|\s+)(?:but|however|yet)\s+|(?:、|，)\s*(?:しかし|一方で?)\s*",
         line, flags=re.I,
     ) if part.strip()]
+    split_sentences = []
+    for sentence in sentences:
+        clauses = re.split(
+            r"\s+and\s+(?=(?:verify|check|validate|compare|confirm)\b)",
+            sentence, maxsplit=1, flags=re.I,
+        )
+        if (
+            len(clauses) == 2
+            and _NEGATED_REQUEST_RE.search(clauses[0])
+            and _REPO_TOPIC_RE.search(clauses[0])
+            and not _QUOTED_CONTEXT_RE.search(sentence)
+            and _is_external_dependency(clauses[1])
+        ):
+            split_sentences.extend(clause.strip() for clause in clauses)
+        else:
+            split_sentences.append(sentence)
+    return split_sentences
 
 
 def _is_external_dependency(text: str, *, comment: bool = False) -> bool:

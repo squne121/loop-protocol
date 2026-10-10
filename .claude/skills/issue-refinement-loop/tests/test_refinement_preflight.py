@@ -1703,12 +1703,54 @@ def test_repo_local_no_web_preflight_handoff_preserves_unverified_anchor_warning
     assert result["must_read"] == ["scripts/example.py"]
 
 
+@pytest.mark.parametrize("api_url", [True, False])
+def test_repo_local_no_web_handoff_accepts_case_variant_issue_url(tmp_path, api_url):
+    fixture, anchor_url = _ac8_repo_local_anchor_fixture("## Revised AC\n- AC2: trusted fixture directive\n")
+    fixture["repo"] = "TestOwner/TestRepo"
+    issue_url = (
+        "https://api.github.com/repos/testowner/testrepo/issues/2857"
+        if api_url else "https://github.com/testowner/testrepo/issues/2857"
+    )
+    fixture["comments"][0]["issue_url"] = issue_url
+    fixture["anchor_comments"][0]["issue_url"] = issue_url
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+
+    with mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path):
+        result, exit_code = wrapper.run_preflight(
+            issue_number=2857,
+            repo="TestOwner/TestRepo",
+            anchor_comment_urls=[anchor_url],
+            fixture_path=fixture_path,
+        )
+    assert (result["status"], exit_code) == ("pass", wrapper.EXIT_PASS)
+
+
+def test_repo_local_no_web_handoff_rejects_foreign_issue_url_host(tmp_path):
+    fixture, anchor_url = _ac8_repo_local_anchor_fixture("## Revised AC\n- AC2: trusted fixture directive\n")
+    foreign_url = "https://example.com/repos/testowner/testrepo/issues/2857"
+    fixture["comments"][0]["issue_url"] = foreign_url
+    fixture["anchor_comments"][0]["issue_url"] = foreign_url
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+    with mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path):
+        result, exit_code = wrapper.run_preflight(
+            issue_number=2857,
+            repo="testowner/testrepo",
+            anchor_comment_urls=[anchor_url],
+            fixture_path=fixture_path,
+        )
+    assert (result["status"], exit_code) == ("warn", wrapper.EXIT_WARN)
+
+
 @pytest.mark.parametrize(
     "anchor_body",
     [
         "[redacted: anchor comment snapshot stored in artifact]",
         "## Revised AC\n- AC2: trusted fixture directive [truncated: remaining text]\n",
         "## Revised AC\n- AC2: 公式ドキュメントで外部 API の仕様を検証する必要がある\n",
+        "## Revised AC\n- AC2: Do not verify local fixtures and verify GitHub GraphQL "
+        "errors against official docs before approval.\n",
     ],
 )
 def test_repo_local_no_web_handoff_rejects_unverified_anchor(tmp_path, anchor_body):

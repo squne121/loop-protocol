@@ -5715,13 +5715,26 @@ def _verified_repo_local_no_web_handoff(
         or (matches[0].get("html_url") is not None and matches[0]["html_url"] != anchor_url)
     ):
         return False
-    # The anchor was structurally validated before the planner ran. Check its
-    # issue binding here without resolving the same comment a third time.
+    # The anchor was structurally validated before the planner ran. Bind its
+    # issue URL without resolving the comment again; GitHub paths preserve
+    # repository identity across harmless owner/repo casing differences.
     issue_url = matches[0].get("issue_url")
-    if issue_url not in (
-        f"https://api.github.com/repos/{repo}/issues/{issue_number}",
-        f"https://github.com/{repo}/issues/{issue_number}",
+    parsed_issue_url = urlparse(issue_url) if isinstance(issue_url, str) else None
+    if (
+        parsed_issue_url is None
+        or parsed_issue_url.scheme != "https"
+        or parsed_issue_url.netloc.lower() not in ("api.github.com", "github.com")
+        or parsed_issue_url.params
+        or parsed_issue_url.query
+        or parsed_issue_url.fragment
     ):
+        return False
+    expected_path = (
+        f"/repos/{repo}/issues/{issue_number}"
+        if parsed_issue_url.netloc.lower() == "api.github.com"
+        else f"/{repo}/issues/{issue_number}"
+    )
+    if parsed_issue_url.path.rstrip("/").casefold() != expected_path.casefold():
         return False
     for raw, sanitized in zip(comments, planner_comments):
         if not isinstance(raw, dict) or not isinstance(sanitized, dict):
