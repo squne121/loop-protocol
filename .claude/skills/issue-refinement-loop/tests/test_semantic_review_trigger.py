@@ -340,6 +340,48 @@ _POSITIVE_SEVERITY_MATRIX = [
         "<details>\n<summary>x</summary>\n\n### P1-1\n\nbody\n</details>\n",
         ["P1-1"],
     ),
+    # OWNER review on PR #3011 (P1-1 / P2-1): symbols written as literal text,
+    # not syntax, must not hide a real heading that follows.
+    (
+        "closed_code_span_with_comment_opener_then_heading",
+        "開始記号 `<!--` の処理を確認する。\n\n### P1-1 実在する不具合\n",
+        ["P1-1"],
+    ),
+    (
+        "escaped_comment_opener_then_heading",
+        "開始記号 \\<!-- の処理を確認する。\n\n### P1-1 実在する不具合\n",
+        ["P1-1"],
+    ),
+    (
+        "double_backtick_code_span_with_comment_opener_then_heading",
+        "``a <!-- b`` text\n\n### P1-1 x\n",
+        ["P1-1"],
+    ),
+    (
+        "triple_backtick_inline_code_span_line_then_heading",
+        "```literal```\n\n### P1-1 実在する不具合\n",
+        ["P1-1"],
+    ),
+    (
+        "backtick_info_string_with_backtick_is_not_fence_then_heading",
+        "```text `example`\n\n### P1-1 実在する不具合\n",
+        ["P1-1"],
+    ),
+    (
+        "tilde_info_string_with_backtick_is_still_fence_then_heading_after",
+        "~~~ text `x`\n### P0-9\n~~~\n### P2-1\n",
+        ["P2-1"],
+    ),
+    (
+        "closed_code_span_comment_then_real_comment_hides_inner_heading",
+        "`<!--` ok <!--\n### P0-9\n-->\n### P2-1\n",
+        ["P2-1"],
+    ),
+    (
+        "four_backtick_fence_with_inner_three_backtick_line_then_heading",
+        "````\n```\n### P0-9\n````\n### P1-1\n",
+        ["P1-1"],
+    ),
 ]
 
 
@@ -378,6 +420,11 @@ _NEGATIVE_SEVERITY_MATRIX = [
     ("nested_four_backtick_fence", "````\n```\n### P1-1\n```\n````\n"),
     ("multiline_html_comment", "<!--\n### P1-1\n-->\n"),
     ("single_line_html_comment", "<!-- ### P1-1 -->\n"),
+    (
+        "real_unclosed_comment_after_closed_code_span_runs_to_eof",
+        "`code` then <!--\n### P1-1\nmore\n",
+    ),
+    ("tilde_fence_info_string_with_backtick", "~~~ a`b\n### P1-1\n~~~\n"),
     ("unclosed_html_comment_until_eof", "text\n<!--\n### P1-1\nmore\n"),
     (
         "unrelated_html_and_gfm_structures",

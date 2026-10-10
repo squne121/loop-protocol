@@ -197,7 +197,11 @@ def _find_section_line_offset(text: str, section_name: str) -> int:
     for index, line in enumerate(text.splitlines(), start=1):
         if not in_fence:
             opener = _parse_fence_opener(line)
-            if opener is not None:
+            # GFM 4.5: a backtick fence's info string may not contain a
+            # backtick (that is an inline code span, not a fence opener).
+            if opener is not None and not (
+                opener[0] == "`" and "`" in line.lstrip(" ")[opener[1] :]
+            ):
                 fence_char, fence_len = opener
                 in_fence = True
                 continue
@@ -1115,6 +1119,46 @@ def _severity_tag_from_heading_text(heading_text: str) -> "str | None":
     return (match.group(1) or match.group(2)).upper()
 
 
+def _find_html_comment_opener(line: str, start: int = 0) -> int:
+    """Index of the first real ``<!--`` at/after ``start`` or -1 (#2994).
+
+    A ``<!--`` is NOT an opener when it sits inside a closed same-line code span
+    (a backtick run closed by a run of the exact same length) or when its ``<``
+    is backslash-escaped. An unmatched backtick run is literal text.
+    """
+    i = start
+    n = len(line)
+    while i < n:
+        ch = line[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "`":
+            run_end = i
+            while run_end < n and line[run_end] == "`":
+                run_end += 1
+            run = run_end - i
+            j = run_end
+            closed_at = -1
+            while j < n:
+                if line[j] == "`":
+                    k = j
+                    while k < n and line[k] == "`":
+                        k += 1
+                    if k - j == run:
+                        closed_at = k
+                        break
+                    j = k
+                else:
+                    j += 1
+            i = closed_at if closed_at != -1 else run_end
+            continue
+        if line.startswith("<!--", i):
+            return i
+        i += 1
+    return -1
+
+
 def _scan_markdown_severity_tags(text: str) -> "set[str]":
     """Line-oriented Markdown scanner for severity headings (#2994).
 
@@ -1125,7 +1169,10 @@ def _scan_markdown_severity_tags(text: str) -> "set[str]":
     comments (``<!--`` .. first ``-->``, an unclosed comment runs to EOF). A
     ``<!--`` inside a fence is not a comment opener and a fence opener inside a
     comment is ignored (comment detection happens outside fences only). Text
-    following a closing ``-->`` on the same line is still examined.
+    following a closing ``-->`` on the same line is still examined. A backtick
+    "fence" whose info string contains a backtick is an inline code span, not an
+    opener, and a ``<!--`` inside a closed code span or after a backslash is
+    literal text, not a comment opener.
     """
     tags: "set[str]" = set()
     in_fence = False
@@ -1145,7 +1192,11 @@ def _scan_markdown_severity_tags(text: str) -> "set[str]":
             line = line[close + 3 :]
         else:
             opener = _parse_fence_opener(line)
-            if opener is not None:
+            # GFM 4.5: a backtick fence's info string may not contain a
+            # backtick (that is an inline code span, not a fence opener).
+            if opener is not None and not (
+                opener[0] == "`" and "`" in line.lstrip(" ")[opener[1] :]
+            ):
                 fence_char, fence_len = opener
                 in_fence = True
                 continue
@@ -1153,7 +1204,7 @@ def _scan_markdown_severity_tags(text: str) -> "set[str]":
         visible: "list[str]" = []
         rest = line
         while True:
-            open_at = rest.find("<!--")
+            open_at = _find_html_comment_opener(rest)
             if open_at == -1:
                 visible.append(rest)
                 break
