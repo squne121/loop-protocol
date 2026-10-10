@@ -199,6 +199,243 @@ def test_build_semantic_review_trigger_input_all_defaults_not_applicable():
     assert result["semantic_review_applicable"] is False
 
 
+# ---------------------------------------------------------------------------
+# Issue #2994: HTML-only / bracketed severity headings (trusted OWNER review)
+# ---------------------------------------------------------------------------
+# The fixture below mirrors the *shape* of the observed #2836 OWNER anchor
+# (comment 6058171888): a CF_HTML clipboard envelope (outer html/body +
+# StartFragment ... first EndFragment) that carries HTML only -- there is no
+# Markdown tail after <!--EndFragment--> -- and whose finding headings look like
+# ``<h3><span>1. </span><span>[P1] </span><span>...</span></h3>`` (leading
+# number, text split across several inline spans, bracketed severity). The body
+# text is shortened/anonymized; the structure is what matters.
+
+_OWNER_HTML_ONLY_ANCHOR = (
+    "<html>\n<body>\n"
+    "<!--StartFragment--><html><head></head><body><div><div></div><div><div>"
+    "<h1><span>Issue </span><span>#2836 </span><span>敵対的レビュー</span></h1>"
+    "<div>P1 — 実装前の契約修正を推奨</div>"
+    "<p><span>判定：</span><span>修正の優先度は高い。</span></p>"
+    "<h2><span>Findings</span></h2>"
+    "<h3><span>1. </span><span>[P1] </span><span>Required-check </span>"
+    "<span>inventory </span><span>の正本が未定義</span></h3>"
+    "<p><span>問題</span></p>"
+    "<h3><span>2. </span><span>[P1] </span><span>stale run </span>"
+    "<span>の扱い</span></h3>"
+    "<p><span>詳細</span></p>"
+    "</div></div></div></body></html><!--EndFragment-->\n"
+    "</body>\n</html>"
+)
+
+_ONLY_SEVERITY_SIGNAL = ["severity_tagged_anchor_findings"]
+_SEVERITY_OFF = {
+    "user_requested": False,
+    "semantic_rewrite_requested": False,
+    "checker_gap_count": False,
+    "heuristic_concern_count": False,
+    "owner_decision_conflict": False,
+    "cross_contract_change": False,
+}
+
+
+def _trigger_for_anchor(body):
+    """Build the trigger input from ONE raw anchor body (no hand-set flags)
+    and evaluate it through the canonical producer + evaluator."""
+    raw = trig.build_semantic_review_trigger_input(anchor_comment_bodies=[body])
+    return raw, trig.evaluate_semantic_review_applicable(raw)
+
+
+def test_owner_html_only_bracketed_p1_triggers_semantic_review():
+    """GIVEN an HTML-only CF_HTML fragment shaped like the #2836 OWNER anchor
+    (numbered <h3>, several inline spans, [P1], no Markdown tail)
+    WHEN severity tags are extracted and the canonical trigger is evaluated
+    THEN tags == ["P1"] and semantic_review_applicable is True, triggered
+    only by severity_tagged_anchor_findings (no hand-set user_requested)."""
+    import scope_signal_delta as delta
+
+    # The fixture must keep the observed structure (not be sanitized away).
+    assert "<span>1. </span><span>[P1] </span>" in _OWNER_HTML_ONLY_ANCHOR
+    assert _OWNER_HTML_ONLY_ANCHOR.count("[P1]") == 2
+    after_end = _OWNER_HTML_ONLY_ANCHOR.split("<!--EndFragment-->", 1)[1]
+    assert after_end.strip() == "</body>\n</html>"  # no Markdown tail
+    assert "#" not in _OWNER_HTML_ONLY_ANCHOR.replace("#2836", "")
+
+    assert delta.extract_severity_tags(_OWNER_HTML_ONLY_ANCHOR) == ["P1"]
+
+    raw, result = _trigger_for_anchor(_OWNER_HTML_ONLY_ANCHOR)
+    assert raw["user_requested"] is False
+    assert raw["severity_tagged_anchor_findings"] == ["P1"]
+    assert result["semantic_review_applicable"] is True
+    assert result["triggered_by"] == _ONLY_SEVERITY_SIGNAL
+
+
+_ENV_OPEN = "<html>\n<body>\n<!--StartFragment-->"
+_ENV_CLOSE = "<!--EndFragment-->\n</body>\n</html>"
+
+_POSITIVE_SEVERITY_MATRIX = [
+    ("markdown_p1_1", "### P1-1\n\nSomething is broken.\n", ["P1-1"]),
+    ("markdown_p0_1", "## P0-1\n\n- fix it\n", ["P0-1"]),
+    ("markdown_bracketed_p1", "### [P1]\n\nBody.\n", ["P1"]),
+    ("markdown_numbered_bracketed", "### 1. [P1] Title\n\nBody.\n", ["P1"]),
+    ("markdown_lowercase_bracketed", "### [p2] Title\n", ["P2"]),
+    ("html_only_owner_numbered_bracketed", _OWNER_HTML_ONLY_ANCHOR, ["P1"]),
+    (
+        "html_only_p1_1_existing_form",
+        _ENV_OPEN + "<h3><span>P1-1 — Title</span></h3>" + _ENV_CLOSE,
+        ["P1-1"],
+    ),
+    (
+        "html_only_entities_and_inline_spans",
+        _ENV_OPEN
+        + "<h2><span>2) </span><span>&#91;P2&#93; </span><span>A &amp; B</span></h2>"
+        + _ENV_CLOSE,
+        ["P2"],
+    ),
+    (
+        "html_only_details_with_legit_heading",
+        _ENV_OPEN
+        + "<details><summary>x</summary><h3><span>[P0] </span><span>Blocker</span></h3></details>"
+        + _ENV_CLOSE,
+        ["P0"],
+    ),
+    (
+        "complete_envelope_markdown_tail_heading",
+        _ENV_OPEN + "<p>intro</p>" + "<!--EndFragment-->\n</body>\n</html>\n\n### P1-2\n\nTail.\n",
+        ["P1-2"],
+    ),
+    (
+        "complete_envelope_html_and_markdown_tail",
+        _ENV_OPEN
+        + "<h3><span>[P1] </span><span>x</span></h3>"
+        + "<!--EndFragment-->\n</body>\n</html>\n\n## P0-1\n",
+        ["P0-1", "P1"],
+    ),
+    (
+        "incomplete_envelope_real_markdown_heading_companion",
+        _ENV_OPEN + "<h3><span>[P1] </span><span>x</span></h3>\n\n### P1-1\n\nreal.\n",
+        ["P1-1"],
+    ),
+    (
+        "fence_contains_comment_opener_heading_after_fence_counts",
+        "```\n<!--\n```\n### P1-1\n",
+        ["P1-1"],
+    ),
+    (
+        "comment_contains_fence_opener_is_ignored",
+        "<!--\n```\n-->\n### P1-1\n",
+        ["P1-1"],
+    ),
+    (
+        "heading_on_same_line_after_comment_close",
+        "<!--\nnote\n--> ### P1-1\n",
+        ["P1-1"],
+    ),
+    (
+        "heading_after_closed_fence_and_closed_comment",
+        "```\n### P0-9\n```\n<!-- ### P0-8 -->\n### P2-1\n",
+        ["P2-1"],
+    ),
+    (
+        "details_with_markdown_heading_stays_detected",
+        "<details>\n<summary>x</summary>\n\n### P1-1\n\nbody\n</details>\n",
+        ["P1-1"],
+    ),
+]
+
+
+def test_severity_positive_matrix_triggers_only_severity_signal():
+    """GIVEN each supported Markdown / HTML-only severity heading form
+    WHEN the canonical trigger is built and evaluated
+    THEN the expected tags are extracted, semantic_review_applicable is True
+    and triggered_by contains ONLY severity_tagged_anchor_findings (all other
+    signals stay false)."""
+    import scope_signal_delta as delta
+
+    for label, body, expected in _POSITIVE_SEVERITY_MATRIX:
+        assert delta.extract_severity_tags(body) == expected, label
+        raw, result = _trigger_for_anchor(body)
+        assert raw["severity_tagged_anchor_findings"] == expected, label
+        assert result["semantic_review_applicable"] is True, label
+        assert result["triggered_by"] == _ONLY_SEVERITY_SIGNAL, label
+        breakdown = dict(result["signal_breakdown"])
+        assert breakdown.pop("severity_tagged_anchor_findings") is True, label
+        assert breakdown == _SEVERITY_OFF, label
+
+
+_NEGATIVE_SEVERITY_MATRIX = [
+    ("general_prose_with_bracketed_p1", "This is prose. We discussed [P1] items today.\n"),
+    ("bold_bracketed_not_heading", "**[P1]** bold text, not a heading\n"),
+    ("list_item_not_heading", "- [ ] P1-1 item in a task list\n"),
+    ("embedded_bracketed_in_heading", "### Notes about [P1] policy\n\nBody.\n"),
+    ("heading_prose_p1_without_dash_number", "### P1 policy discussion\n"),
+    (
+        "raw_html_heading_without_envelope",
+        "<h3><span>1. </span><span>[P1] </span><span>Finding</span></h3>\n",
+    ),
+    ("backtick_fence", "```\n### P1-1\n```\n"),
+    ("tilde_fence", "~~~\n### P1-1\n~~~\n"),
+    ("unclosed_fence_until_eof", "intro\n\n```\n### P1-1\nmore\n"),
+    ("nested_four_backtick_fence", "````\n```\n### P1-1\n```\n````\n"),
+    ("multiline_html_comment", "<!--\n### P1-1\n-->\n"),
+    ("single_line_html_comment", "<!-- ### P1-1 -->\n"),
+    ("unclosed_html_comment_until_eof", "text\n<!--\n### P1-1\nmore\n"),
+    (
+        "unrelated_html_and_gfm_structures",
+        "<details><summary>x</summary>\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n</details>\n",
+    ),
+    (
+        "complete_envelope_pre_code_line_start_heading",
+        _ENV_OPEN
+        + "<pre><code>\n### P1-1\n</code></pre><p>unrelated</p>"
+        + _ENV_CLOSE,
+    ),
+    (
+        "complete_envelope_unrelated_details",
+        _ENV_OPEN
+        + "<details><summary>x</summary><p>[P1] mentioned in prose</p></details>"
+        + _ENV_CLOSE,
+    ),
+    (
+        "incomplete_envelope_html_heading_only",
+        _ENV_OPEN + "<h3><span>1. </span><span>[P1] </span><span>x</span></h3>",
+    ),
+]
+
+
+def test_severity_negative_matrix_does_not_trigger():
+    """GIVEN inputs that must NOT be read as severity findings (plain prose,
+    embedded [P1], envelope-less raw HTML, fenced / commented headings,
+    <pre><code> inside an envelope, incomplete envelope with HTML heading only)
+    WHEN the canonical trigger is built and evaluated
+    THEN no severity signal is produced and semantic_review_applicable stays
+    False with an empty triggered_by (other signals fixed to false/0)."""
+    import scope_signal_delta as delta
+
+    for label, body in _NEGATIVE_SEVERITY_MATRIX:
+        assert delta.extract_severity_tags(body) == [], label
+        raw, result = _trigger_for_anchor(body)
+        assert raw["severity_tagged_anchor_findings"] == [], label
+        assert raw["checker_gap_count"] == 0, label
+        assert raw["heuristic_concern_count"] == 0, label
+        assert result["semantic_review_applicable"] is False, label
+        assert result["triggered_by"] == [], label
+
+
+def test_fence_opener_limited_rules_four_space_indent_and_container_prefix():
+    """The fence scanner follows only the basic GFM opener rule (0-3 space
+    indent). A 4-space-indented opener and a ``> `` container-prefixed opener
+    are NOT fence openers, so a real heading that follows is still detected.
+    (Container structure is intentionally not tracked.)"""
+    import scope_signal_delta as delta
+
+    four_space = "    ```\n### P1-1\n"
+    container = "> ```\n### P1-1\n"
+    assert delta.extract_severity_tags(four_space) == ["P1-1"]
+    assert delta.extract_severity_tags(container) == ["P1-1"]
+    # control: a genuine 3-space-indented opener DOES start a fence.
+    assert delta.extract_severity_tags("   ```\n### P1-1\n   ```\n") == []
+
+
 if __name__ == "__main__":
     import pytest
 

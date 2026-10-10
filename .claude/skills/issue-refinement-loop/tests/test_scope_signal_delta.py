@@ -652,3 +652,82 @@ def test_classify_directive_confidence_marker_only_line_does_not_promote_to_expl
     assert delta._BULLET_LINE_RE.search(text) is None, label
     confidence = delta.classify_directive_confidence(text)
     assert confidence == delta.DIRECTIVE_CONFIDENCE_AMBIGUOUS, label
+
+
+# ---------------------------------------------------------------------------
+# Issue #2994 AC4: severity extraction never changes directive authority
+# ---------------------------------------------------------------------------
+
+_HTML_ONLY_SEVERITY_ANCHOR = (
+    "<html>\n<body>\n"
+    "<!--StartFragment--><html><head></head><body><div>"
+    "<h3><span>1. </span><span>[P1] </span><span>Required-check </span>"
+    "<span>inventory </span><span>の正本が未定義</span></h3>"
+    "<p><span>問題</span></p>"
+    "</div></body></html><!--EndFragment-->\n"
+    "</body>\n</html>"
+)
+_MARKDOWN_TAIL_DIRECTIVE_ANCHOR = (
+    "## Revised Acceptance Criteria\n\n"
+    "1. AC9: 新しい受入条件を追加する。\n"
+)
+
+
+def _build_authority_evidence_for(body: str, comment_id: int) -> dict:
+    preflight = importlib.import_module("run_refinement_preflight")
+    evidence = preflight._build_scope_delta_authority_evidence(
+        comment_payload={
+            "id": comment_id,
+            "author_association": "OWNER",
+            "user": {"login": "owner-user", "type": "User"},
+        },
+        comment_body=body,
+        repo="squne121/loop-protocol",
+        issue_number=2994,
+        anchor_url=f"https://github.com/squne121/loop-protocol/issues/2994#issuecomment-{comment_id}",
+        captured_at="2026-10-10T00:00:00Z",
+    )
+    assert evidence is not None
+    return evidence
+
+
+def test_html_only_severity_input_does_not_change_directive_authority():
+    """GIVEN the HTML-only [P1] fixture (severity IS extractable)
+    WHEN it flows through the directive-authority producer and
+    derive_contract_patch_operations()
+    THEN directive markers / extracted directives / contract patch operations
+    are empty and boundary flags / confidence stay at their baseline values
+    (severity extraction grants no directive authority); a legitimate Markdown
+    directive still derives its operation as before."""
+    # severity extraction itself sees the finding ...
+    assert delta.extract_severity_tags(_HTML_ONLY_SEVERITY_ANCHOR) == ["P1"]
+
+    # ... but the directive-authority view is unchanged (baseline values).
+    assert delta.extract_directive_markers(_HTML_ONLY_SEVERITY_ANCHOR) == []
+    assert delta.extract_directive_items(_HTML_ONLY_SEVERITY_ANCHOR) == []
+    assert delta._canonicalize_cf_html_envelope(_HTML_ONLY_SEVERITY_ANCHOR) is None
+    assert delta._cf_html_canonical_text(_HTML_ONLY_SEVERITY_ANCHOR) == ""
+
+    evidence = _build_authority_evidence_for(_HTML_ONLY_SEVERITY_ANCHOR, 1)
+    assert evidence["directive_markers"] == []
+    assert evidence["extracted_directives"] == []
+    assert evidence["boundary_flags"] == []
+    assert evidence["confidence"] == delta.DIRECTIVE_CONFIDENCE_INFERRED == "inferred"
+    assert delta.derive_contract_patch_operations([evidence]) == []
+    assert (
+        delta.derive_contract_patch_operations(
+            [evidence], source_body=_HTML_ONLY_SEVERITY_ANCHOR
+        )
+        == []
+    )
+
+    # positive control: a genuine Markdown directive still derives operations.
+    directive_evidence = _build_authority_evidence_for(
+        _MARKDOWN_TAIL_DIRECTIVE_ANCHOR, 2
+    )
+    assert directive_evidence["confidence"] == delta.DIRECTIVE_CONFIDENCE_EXPLICIT
+    operations = delta.derive_contract_patch_operations([directive_evidence])
+    assert [(op["section"], op["op"]) for op in operations] == [
+        ("Acceptance Criteria", "append")
+    ]
+    assert operations[0]["text"] == "- AC9: 新しい受入条件を追加する。"
