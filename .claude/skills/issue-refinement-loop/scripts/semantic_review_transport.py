@@ -57,6 +57,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -108,6 +109,21 @@ def _strict_json_loads(raw: str) -> Any:
 
 def _sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+# Issue #3007: strict accepted representations of ``current_body_sha256`` are
+# bare lowercase 64-hex or ``sha256:`` + lowercase 64-hex. ``re.fullmatch``
+# ensures no leading/trailing whitespace, trailing newline, or case variants
+# are tolerated (``$`` would accept a trailing newline, so it is not used).
+_CURRENT_BODY_SHA256_RE = re.compile(r"(?:sha256:)?([0-9a-f]{64})")
+
+
+def _normalize_current_body_sha256(value: Any) -> "str | None":
+    """Return the bare lowercase 64-hex digest, or ``None`` if malformed."""
+    if not isinstance(value, str):
+        return None
+    match = _CURRENT_BODY_SHA256_RE.fullmatch(value)
+    return match.group(1) if match else None
 
 
 def _invocation_id(body_sha256: str, prompt_version: str, requested_model: str) -> str:
@@ -196,7 +212,11 @@ def record_result(
 
     ``current_body_sha256`` is mandatory (P1-2): freshness must always be
     explicitly checked against the invocation's pinned ``body_sha256``, it
-    is never optionally skipped.
+    is never optionally skipped. Accepted representations (#3007): bare
+    lowercase 64-hex or ``sha256:`` + lowercase 64-hex (``re.fullmatch``);
+    both are normalized to bare for comparison. Any other form yields
+    ``transport_status: error`` / ``reason_code: invalid_current_body_sha256``
+    while the validated artifact (``freshness_valid: false``) is retained.
     """
     inv_dir = Path(invocation_dir)
     bundle = _load_bundle(inv_dir)
@@ -262,7 +282,14 @@ def record_result(
     if assessment == "findings" and not findings:
         return _error_result(bundle, reason_code="assessment_findings_mismatch:findings_empty")
 
-    freshness_valid = current_body_sha256 == bundle["body_sha256"]
+    # Issue #3007: the caller digest is validated only AFTER the raw reviewer
+    # result passed every check above, so an invalid raw result keeps its
+    # existing rejection reason. A malformed caller digest is a distinct
+    # input error (not body drift), but the validated assessment/findings are
+    # still persisted so a blocker/high finding is never silently dropped.
+    normalized_current = _normalize_current_body_sha256(current_body_sha256)
+    digest_format_valid = normalized_current is not None
+    freshness_valid = digest_format_valid and normalized_current == bundle["body_sha256"]
 
     artifact = {
         "schema": SCHEMA,
@@ -287,6 +314,15 @@ def record_result(
     (inv_dir / "semantic_review_result.json").write_text(
         json.dumps(artifact, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8"
     )
+    if not digest_format_valid:
+        return {
+            "schema": "SEMANTIC_REVIEW_TRANSPORT_RESULT_V1",
+            "transport_status": "error",
+            "reason_code": "invalid_current_body_sha256",
+            "artifact": artifact,
+            "issue_number": bundle.get("issue_number"),
+            "invocation_id": bundle.get("invocation_id"),
+        }
     transport_status = "ok" if freshness_valid else "stale"
     return {
         "schema": "SEMANTIC_REVIEW_TRANSPORT_RESULT_V1",
