@@ -39,7 +39,8 @@ TEST_VERDICT comment/artifact（存在する場合）は diagnostics-only であ
 | 入力 | 必須 field | 取得元 |
 |---|---|---|
 | `--test-verdict-file` | `step-2-verification.md` の委譲契約どおりの `TEST_VERDICT_MACHINE/v2`（`generated_at` と per-command `command_hash` を含む。`pr_review_only` の独立経路では GitHub 固有 trust marker のキーを含めない） | Step 2 で取得した test-runner の final result（read-only report）。final result が不在なら存在しないファイルのまま渡してよい（失効して exit 1） |
-| `--contract-snapshot-file` | `status: go`、`body_sha256`（`sha256:` 付き）、baseline の VC classification（`results[]` または `checks.vc_preflight.classifications[]`） | `ensure_contract_snapshot.py` が trusted source に保存した `CONTRACT_REVIEW_RESULT_V1`（または baseline producer の `baseline_vc_preflight/v1`）。`body_sha256` は live Issue 本文の digest と一致させる |
+| `--contract-snapshot-file` | `status: go`、`body_sha256`（`sha256:` 付き）、baseline の VC classification（`results[]` または `checks.vc_preflight.classifications[]`）。または `ensure_contract_snapshot.py --artifact-dir` が保存した `CONTRACT_SNAPSHOT_ENSURE_RESULT_V1` envelope をそのまま（加工せず）渡す | `ensure_contract_snapshot.py` が trusted source に保存した `CONTRACT_REVIEW_RESULT_V1`（または baseline producer の `baseline_vc_preflight/v1`）。envelope の場合は次節「`ensure_contract_snapshot.py` の出力の渡し方（Issue #2996）」に従い `--producer-exit-code` / `--repo` を添える。`body_sha256` は live Issue 本文の digest と一致させる |
+| `--producer-exit-code` / `--repo` | envelope を渡すときの `--producer-exit-code`（必須）。`status: ok` の envelope では `--repo`（`owner/repo`）と `--expected-issue-number` も必須 | `ensure_contract_snapshot.py` プロセスの実際の終了コード（`$?`）と、呼び出し元が独立に決めた `owner/repo`。envelope 内の `repo` 値は信用の根拠にしない |
 | `--diff-summary-file` | `head_sha`（PR current head）、`pr_number`、changed paths（`changed_paths[]`） | `gh pr view <pr_number> --json headRefOid,number,files` による独立取得（`gh pr diff --name-only` でも可） |
 | `--allowed-paths-file` | live Issue の `## Allowed Paths` を並べた JSON 配列 | `gh issue view <issue_number> --json body` で取得した本文の Allowed Paths |
 | `--expected-head-sha` | PR current head SHA | `gh pr view <pr_number> --json headRefOid,mergeable,mergeStateStatus` の 1 回の応答の `headRefOid`。Step 5 の `--expected-head-sha` と live mergeability file も同じ応答から作る（`step-5-feedback-and-termination.md` 参照）。HEAD を別々に取得して混ぜない |
@@ -53,6 +54,41 @@ TEST_VERDICT comment/artifact（存在する場合）は diagnostics-only であ
 `step4-adjudicate` が current evidence として consume するのは `--test-verdict-file`（内部で adapter を通す）と `--contract-snapshot-file` / `--diff-summary-file` / `--allowed-paths-file` / `--expected-*` である。`--current-vc-result-file` は `adjudicate` / `step4-gate` 用であり、`step4-adjudicate` は読まない。
 
 手組みの入力（上記の取得元を経ない JSON）は正規経路ではなく、保存済み PASS の根拠として扱わない。
+
+#### `ensure_contract_snapshot.py` の出力の渡し方（Issue #2996）
+
+`ensure_contract_snapshot.py --artifact-dir <dir>` は全 status で `<dir>/contract-snapshot-<issue_number>.json` に `CONTRACT_SNAPSHOT_ENSURE_RESULT_V1` envelope 全体を保存する。envelope は `CONTRACT_REVIEW_RESULT_V1` ではないため、手作業の `jq`（例: `.contract_review_once_result` の抽出）や手組み JSON といった前置 normalizer を経由して `--contract-snapshot-file` に渡してはならない。前置で加工すると、変換に失敗した時点で `step4-adjudicate` に到達せず、同一 binding の保存済み PASS が失効しないまま `--reuse-stored` で再利用されうる。envelope は保存されたファイルをそのまま `--contract-snapshot-file` に渡し、解決（unwrap・trusted comment の再検証）は `step4-adjudicate` の入力処理の内側で一度だけ行わせる。
+
+producer の終了コードは stdout の JSON からは復元できないため、root は producer を起動した直後の `$?` をその場で保存し、`--producer-exit-code` として渡す。
+
+```bash
+# 1) envelope を保存する（終了コードは 0 / 10 / 20 / 40 / 50 / 60 になりうるので、その場で保存する）
+set +e
+uv run --locked python3 .claude/skills/impl-review-loop/scripts/ensure_contract_snapshot.py \
+  --issue-number "$ISSUE_NUMBER" --repo "$REPO" --mode auto --post \
+  --evidence-mode baseline --artifact-dir "$SNAPSHOT_DIR" > /dev/null
+PRODUCER_EXIT_CODE=$?
+set -e
+CONTRACT_SNAPSHOT="$SNAPSHOT_DIR/contract-snapshot-$ISSUE_NUMBER.json"
+
+# 2) 上の「呼び出し」の step4-adjudicate に次の 2 引数を追加する（envelope を渡すときのみ）
+#    --producer-exit-code "$PRODUCER_EXIT_CODE" --repo "$REPO"
+```
+
+受理する `(status, source, producer 終了コード, nested result, contract_snapshot_url)` の組は次の 3 つだけで、これ以外は fail-closed で拒否する。
+
+| status | source | `--producer-exit-code` | evidence の authority |
+|---|---|---|---|
+| `dry_run_would_post` | `materialized_go` | `20`（`contract_snapshot_url` は null、nested `contract_review_once_result.status: go`） | nested result。**候補 evidence** であり、投稿済み trusted snapshot でも implementation authorization でもない。`--repo` は使わない |
+| `ok` | `existing_go` | `0`（`contract_review_once_result` は baseline mode では null が正常。非 null でも authority にしない） | `contract_snapshot_url` の comment |
+| `ok` | `materialized_go` | `0`（`--post` 成功。`contract_snapshot_url` あり） | `contract_snapshot_url` の comment |
+
+- `dry_run_would_post` の終了コード 20 と `human_judgment` の終了コード 20 は同じ値だが、`status` で区別する。`human_judgment` は終了コードが 20 でも常に拒否される。`blocked_needs_refinement`（10）、`runtime_error`（40）、`stale_or_conflicting_snapshot`（50）、`controlled_publisher_binding_failed`（60）、未知の status も常に拒否される。終了コードの欠落・非整数（桁数が過大な値を含む）・status との不一致も拒否される。`status` / `source` が文字列でない型不正な envelope も未処理例外にならず、構造化された `contract_snapshot_errors` として拒否され、既存の persist・失効経路を通る。入力ファイル（`--contract-snapshot-file` を含む）が非 UTF-8 のバイト列、過大なネストの JSON、4300 桁を超える整数リテラルを含む JSON の場合も、未処理例外にならず `input_read_error:` / `input_json_error:` の構造化エラー（例外型名を含む）として拒否され、同じ persist・失効経路を通る。
+- `ok` の envelope は `contract_snapshot_url` の comment を shared parser（`contract_review_result_parser.py`）で再検証する。producer（`ensure_contract_snapshot.py`）と同じ優先順位で選択する。最新の trusted result が `blocked` の場合は拒否し（URL の go より新しい trusted blocked comment がある場合も同じ）、そうでなければ URL の comment id が `find_latest_go(trusted_only=True, fingerprint_ready_only=True)` の返す最新の fingerprint-ready な trusted go と一致することを要求する（より新しい fingerprint-ready な go があり URL が古い場合は拒否）。fingerprint 未完成の provisional / orphan な go は authoritative な GO として扱わず、それだけでは既存の fingerprint-ready go（producer が `existing_go` として返した URL）を失効させない（最新 trusted result の comment id と URL の comment id の一致は要求しない）。最新 trusted result が `go` / `blocked` 以外の status の場合も fail-closed で拒否する。さらに author が trusted publisher であること、`body_sha256` が `--expected-contract-body-sha256` と一致することを確認する。repo は envelope ではなく `--repo` から取り、envelope の `issue_number` と URL の issue を `--expected-issue-number` に束縛する（別 repo / 別 Issue の comment は拒否）。
+- 解決後の object（`status` / `body_sha256` / `checks.vc_preflight.classifications` を持つ `CONTRACT_REVIEW_RESULT_V1` 相当）は一度だけ構築され、baseline classification・source integrity・current-head binding のすべてが同じ object を読む。head / Issue body digest / 宣言順の command hash / `pr_review_only` / `runtime_only` の既存 binding は緩まない。
+- envelope 以外の snapshot に `--producer-exit-code` を指定した場合、および `--reuse-stored` と `--producer-exit-code` / `--repo` を併用した場合は拒否される。`adjudicate` / `step4-gate` は envelope を扱わない。
+
+handoff が失敗した場合（producer の status / 終了コード不整合、trusted comment の再検証失敗、body digest 不一致、malformed envelope、outer failure の envelope に inner go が残っているだけの場合を含む）、`step4-adjudicate` は部分的な snapshot を渡さず `contract_snapshot=None` と構造化 errors（stdout の `adjudication.errors`、例: `producer_exit_code_mismatch:status=ok:exit_code=20`）で通常の adjudicate -> persist 経路を通り、`exit 1` を返して同一 binding の保存済み PASS を失効させる。是正は producer の再実行（または Step 2 の再実行）であり、envelope・`LOOP_STATE` の手編集ではない。
 
 `--test-verdict-file` の `runtime_ac_results[].ac` は、contract snapshot の baseline classification（`results[].ac`。fallback リテラル `AC_UNKNOWN` とカンマ連結ラベルを含む）と逐語で一致しなければならない。root は Step 2 の委譲時にその `(ac label, literal command)` の組を test-runner へ渡し（`step-2-verification.md` の「`ac` label の出所と verbatim echo 規則」参照）、受領後に label を付け替えない。`(ac, command_hash)` 集合が baseline と異なる report は `baseline_current_mapping_mismatch`（exit 1）で gate を閉じる。是正は正確な label での test-runner 再起動であり、report の手編集ではない。
 
@@ -69,6 +105,8 @@ uv run python3 .claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py e
   --body-file "$LIVE_ISSUE_BODY" > "$VC_METADATA" && jq '.command_hashes' "$VC_METADATA" > "$EXPECTED_COMMAND_HASHES"
 
 # 1) 通常起動 / 再検証: adapt -> adjudicate -> persist -> gate を単一 process で実行する
+#    $CONTRACT_SNAPSHOT が ensure_contract_snapshot.py の envelope（CONTRACT_SNAPSHOT_ENSURE_RESULT_V1）の場合のみ、
+#    末尾に --producer-exit-code "$PRODUCER_EXIT_CODE" --repo "$REPO" を追加する（前節「ensure_contract_snapshot.py の出力の渡し方」）
 uv run python3 .claude/skills/impl-review-loop/scripts/adjudicate_vc_result.py step4-adjudicate \
   --loop-state-file "$LOOP_STATE_FILE" \
   --test-verdict-file "$TEST_RUNNER_REPORT" \
