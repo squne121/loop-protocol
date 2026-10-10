@@ -327,13 +327,51 @@ control-plane が本 CLI の構造化結果を読んでから実施する運用�
 `run_refinement_preflight.py` の `_classify_heavy_mutation_gate()` は、`known_context.mutation_category` が heavy mutation カテゴリ（`close` / `not_planned` / `replacement_issue_creation` / `dependency_removal` / `parent_child_change`）に該当する場合、`scope_delta_decision` が owner 発言由来の明示的決定（`status: approved_by_trusted_anchor` かつ `anchor_author_association: OWNER`）でない限り `status: blocked` / `fail_closed: true` を返す。非 heavy な通常改善・追加調査・review 継続カテゴリは、owner 明示的決定がなくても `status: warn` で継続する。
 
 
-### Severity-tagged 見出しの構造化抽出（#2296 AC9、fix_delta iteration 6 で P1-4 修正）
+### Severity-tagged 見出しの構造化抽出（#2296 AC9、fix_delta iteration 6 で P1-4 修正、#2994 で HTML-only / bracketed 対応）
 
-Owner の敵対的レビューコメントで頻出する `## P0-1` / `### P1-3` のような
-severity-tagged 見出し（`^#+\s*P[0-9]+-[0-9]+` 形式、大文字小文字を区別しない）は、
-`scope_signal_delta.py` の **独立した専用関数** `extract_severity_tags()` が
-`_SEVERITY_TAGGED_HEADING_RE` で抽出し、マッチしたタグ（例: `P0-1`）を大文字化・
-ソートして返す。
+Owner の敵対的レビューコメントで頻出する `## P0-1` / `### P1-3` / `### [P1]` のような
+severity-tagged 見出しは、`scope_signal_delta.py` の **独立した専用関数**
+`extract_severity_tags()` が抽出し、マッチしたタグ（例: `P0-1` / `P1`）を大文字化・
+ソートして返す。この関数が severity 抽出の唯一の owner であり、
+`extract_directive_markers()` とは戻り値・呼び出し元ともに分離されている。
+
+#### 抽出文法（bracketed severity を含む）
+
+見出し text（Markdown は `#` 以降、HTML は見出し内 inline text を連結したもの）が、
+任意の番号 prefix（`1.` / `2)` 形式）の後に bracketed severity `[P<n>]`（タグ `P<n>`）または
+既存形式 `P<n>-<n>`（タグ `P<n>-<n>`）で **始まる** 場合に限りタグを返す（大文字小文字を区別しない）。
+見出し中に埋め込まれた `[P1]`（例: `### Notes about [P1] policy`）や通常の文中の `[P1]` は
+severity finding ではない。`P2` のように `-<n>` も括弧も無い表記は対象外。
+
+#### 走査領域（HTML-only severity heading の抽出は envelope 限定）
+
+- 完全な CF_HTML envelope（outer `html` / `body` 直後の `<!--StartFragment-->` と、その後の
+  最初の `<!--EndFragment-->` が成立するもの）: **HTML-only severity heading** は Start から
+  最初の End までの内部だけを標準ライブラリ `HTMLParser` で走査し、`h1`〜`h6` の inline text
+  （entity decode 済み）から抽出する。`<!--EndFragment-->` の後ろに Markdown tail が無い
+  HTML-only fragment も正常な抽出対象である。Markdown 見出し scanner は envelope 内部を
+  走査せず、最初の `<!--EndFragment-->` 以降の Markdown tail（`</body></html>` を除く）だけを対象とする。
+  `<pre><code>` 内の行頭 `### P1-1` は finding と解釈しない。
+- 不完全 envelope（incomplete envelope: open は成立するが `<!--EndFragment-->` が無い）:
+  HTML 領域の境界を決められないため、HTML 見出し抽出だけを行わない。body 内の通常 Markdown
+  見出しは従来どおり fence / comment 除外の上で抽出する。HTML 部分は適用判定の対象外であり、
+  必要なら Owner が `user_requested` で上書きする運用とする（真の fragment 異常と
+  Markdown tail 不在を区別し、正規化不能な入力から成功した semantic assessment を捏造しない）。
+- envelope が無い場合: body 全体を Markdown scanner の対象とする。envelope に属さない
+  raw HTML の `<h3>[P1]…</h3>` は severity finding として扱わない。
+
+#### fence / comment 除外
+
+Markdown scanner は `scope_signal_delta.py` 内の小さな line-oriented scanner で、
+fenced code block（backtick / tilde）と HTML comment 内の見出しを抽出対象外とする。
+fence は GFM の基本 opener 規則（同一文字 3 個以上、行頭インデント 0〜3 スペース、closer は同一文字で
+opener 以上の長さ、未閉鎖は EOF まで）に従い、4 スペース以上の opener と blockquote / list の
+container prefix 付き opener は認識しない（container の内部構造は追跡しない）。
+HTML comment は fence 外でのみ判定し、最初の `-->` までを除外、閉じない `<!--` は EOF まで除外する。
+fence 内の `<!--` は comment 開始とみなさず、comment 内の fence 開始は無視する。
+同一行で `-->` の後ろに続く見出しは対象とする。
+
+#### directive authority との分離
 
 当初の実装（#2296 AC9 初版）は `extract_directive_markers()` 自体を拡張してこの
 抽出を組み込んでいたが、OWNER adversarial review（PR #2305, fix_delta iteration 6,
@@ -345,9 +383,11 @@ directive として誤分類してしまう（例: `## P0-1` 見出し + 無関�
 Acceptance Criteria への追記ディレクティブとして扱われる）。
 
 修正後は `extract_directive_markers()` は severity heading を一切含まない
-（既存の固定 `_DIRECTIVE_SECTION_MARKERS` 判定のみ）。`extract_severity_tags()`
-は正規表現定数 `_SEVERITY_TAGGED_HEADING_RE` を共有するのみで、戻り値・呼び出し元
-は完全に分離されている。
+（既存の固定 `_DIRECTIVE_SECTION_MARKERS` 判定のみ）。#2994 の HTML-only / bracketed 対応でも
+`extract_directive_markers()` / `_canonicalize_cf_html_envelope()` / `_cf_html_canonical_text()` の
+戻り値・意味は変更せず、envelope 境界の正規表現定数を severity 専用に読み取るだけである。
+HTML-only fragment から severity が抽出できても、directive markers・contract patch operations・
+boundary flags・confidence は従来値のまま（severity 抽出は directive authority を持たない）。
 
 severity-tagged 見出し抽出は、`semantic_review_trigger.build_semantic_review_trigger_input()`
 （#2296 fix_delta iteration 6, P1-3）が `anchor_comment_bodies` を受け取って
