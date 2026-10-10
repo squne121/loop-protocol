@@ -18,6 +18,7 @@ import json
 import re
 import sys
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from typing import Any
 
 # #2048 regression follow-up (#1877/PR #1884): decide_scope_reframe_contract_route()
@@ -1065,9 +1066,18 @@ def _has_explicit_exact_allowed_path_expansion(evidence: dict) -> bool:
     return False
 
 
-_SEVERITY_TAGGED_HEADING_RE = re.compile(
-    r"^\s*#+\s*(P[0-9]+-[0-9]+)\b", re.MULTILINE | re.IGNORECASE
+# #2994: severity grammar. A heading's TEXT (Markdown: everything after the
+# leading ``#``s; HTML: the concatenated inline text of an ``h1``-``h6``) must
+# START with an optional number prefix (``1.`` / ``2)``) followed by either a
+# bracketed severity ``[P<n>]`` (tag ``P<n>``) or the pre-existing
+# ``P<n>-<n>`` form (tag ``P<n>-<n>``). A severity token embedded later in a
+# heading (``### Notes about [P1] policy``) or in ordinary prose is NOT a
+# finding heading.
+_SEVERITY_HEADING_TEXT_RE = re.compile(
+    r"^\s*(?:[0-9]+[.)]\s*)?(?:\[(P[0-9]+)\]|(P[0-9]+-[0-9]+)\b)",
+    re.IGNORECASE,
 )
+_MARKDOWN_HEADING_LINE_RE = re.compile(r"^\s*#+\s*(.*)$")
 
 
 def extract_directive_markers(text: "str | None") -> list:
@@ -1098,24 +1108,175 @@ def extract_directive_markers(text: "str | None") -> list:
     return sorted(markers)
 
 
+def _severity_tag_from_heading_text(heading_text: str) -> "str | None":
+    match = _SEVERITY_HEADING_TEXT_RE.match(heading_text)
+    if match is None:
+        return None
+    return (match.group(1) or match.group(2)).upper()
+
+
+def _scan_markdown_severity_tags(text: str) -> "set[str]":
+    """Line-oriented Markdown scanner for severity headings (#2994).
+
+    Skips (a) fenced code blocks -- GFM basic opener rule only: 3+ backticks or
+    tildes at 0-3 spaces of indent, a closer of the same character and at least
+    the opener length, an unclosed fence runs to EOF, and 4-space-indented or
+    container-prefixed (``> ``) openers are NOT recognized -- and (b) HTML
+    comments (``<!--`` .. first ``-->``, an unclosed comment runs to EOF). A
+    ``<!--`` inside a fence is not a comment opener and a fence opener inside a
+    comment is ignored (comment detection happens outside fences only). Text
+    following a closing ``-->`` on the same line is still examined.
+    """
+    tags: "set[str]" = set()
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+    in_comment = False
+    for line in text.splitlines():
+        if in_fence:
+            if _is_fence_closer(line, fence_char, fence_len):
+                in_fence = False
+            continue
+        if in_comment:
+            close = line.find("-->")
+            if close == -1:
+                continue
+            in_comment = False
+            line = line[close + 3 :]
+        else:
+            opener = _parse_fence_opener(line)
+            if opener is not None:
+                fence_char, fence_len = opener
+                in_fence = True
+                continue
+        # Remove every HTML comment span from the visible part of the line.
+        visible: "list[str]" = []
+        rest = line
+        while True:
+            open_at = rest.find("<!--")
+            if open_at == -1:
+                visible.append(rest)
+                break
+            visible.append(rest[:open_at])
+            close = rest.find("-->", open_at + 4)
+            if close == -1:
+                in_comment = True
+                break
+            rest = rest[close + 3 :]
+        heading = _MARKDOWN_HEADING_LINE_RE.match("".join(visible))
+        if heading is None:
+            continue
+        tag = _severity_tag_from_heading_text(heading.group(1))
+        if tag is not None:
+            tags.add(tag)
+    return tags
+
+
+class _HeadingTextCollector(HTMLParser):
+    """Collect the inline text of ``h1``-``h6`` (entity-decoded). Standard
+    library only; deliberately NOT a general HTML parser/validator (#2994):
+    headings inside ``pre`` / ``script`` / ``style`` are ignored and comments
+    are not data."""
+
+    _HEADING_TAGS = frozenset({"h1", "h2", "h3", "h4", "h5", "h6"})
+    _OPAQUE_TAGS = frozenset({"pre", "script", "style"})
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.headings: "list[str]" = []
+        self._current: "list[str] | None" = None
+        self._opaque_depth = 0
+
+    def _finish_heading(self) -> None:
+        if self._current is not None:
+            self.headings.append(" ".join("".join(self._current).split()))
+            self._current = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._OPAQUE_TAGS:
+            self._opaque_depth += 1
+        elif tag in self._HEADING_TAGS and self._opaque_depth == 0:
+            self._finish_heading()
+            self._current = []
+
+    def handle_endtag(self, tag):
+        if tag in self._OPAQUE_TAGS:
+            self._opaque_depth = max(0, self._opaque_depth - 1)
+        elif tag in self._HEADING_TAGS:
+            self._finish_heading()
+
+    def handle_data(self, data):
+        if self._current is not None and self._opaque_depth == 0:
+            self._current.append(data)
+
+    def finish(self) -> "list[str]":
+        self.close()
+        self._finish_heading()
+        return self.headings
+
+
+def _html_heading_texts(fragment: str) -> "list[str]":
+    collector = _HeadingTextCollector()
+    collector.feed(fragment)
+    return collector.finish()
+
+
 def extract_severity_tags(text: "str | None") -> list:
-    """Detect owner adversarial-review severity-tagged headings such as
-    ``## P0-1`` / ``### P1-3`` (``^#+\\s*P[0-9]+-[0-9]+`` form, case
-    insensitive) via ``_SEVERITY_TAGGED_HEADING_RE``, returning the matched
-    tags (e.g. ``P0-1``) uppercased and sorted.
+    """Detect owner adversarial-review severity-tagged headings and return the
+    tags (uppercased, de-duplicated, sorted): ``P0-1`` (``## P0-1`` /
+    ``### P1-3``) or bracketed ``P1`` (``### [P1]`` / ``### 1. [P1] ...``).
+    Grammar: see ``_SEVERITY_HEADING_TEXT_RE`` (heading text must START with an
+    optional ``\\d+[.)]`` number prefix and then ``[P<n>]`` or ``P<n>-<n>``;
+    case insensitive).
+
+    #2994 scan regions:
+
+    - Complete CF_HTML envelope (outer ``html``/``body`` immediately followed
+      by ``<!--StartFragment-->`` and a later FIRST ``<!--EndFragment-->``,
+      i.e. the envelope shape ``_canonicalize_cf_html_envelope()`` recognizes):
+      HTML headings (``h1``-``h6``) are extracted ONLY from the interior
+      Start..first-End region via ``HTMLParser`` (a Markdown tail is not
+      required -- HTML-only fragments are valid), and the Markdown scanner runs
+      ONLY on the tail after the first EndFragment (wrapper close tags
+      stripped), never on the envelope interior.
+    - Incomplete envelope (open shape matched but no EndFragment): the HTML
+      region cannot be bounded, so HTML heading extraction is skipped; the
+      ordinary Markdown scanner still runs on the whole body (fence / comment
+      exclusions apply). Callers that need such a comment treated as a trigger
+      use ``user_requested``.
+    - No envelope: the whole body goes to the Markdown scanner. Raw HTML
+      headings outside an envelope are not severity findings.
+
+    Fenced code blocks and HTML comments are excluded from the Markdown scan
+    (``_scan_markdown_severity_tags``).
 
     #2296 fix_delta iteration 6 (P1-4): kept as an independent function
-    from ``extract_directive_markers()`` -- sharing only the regex
-    constant -- so that severity-tag detection never feeds
-    ``classify_directive_confidence()`` / contract_patch_operations via
-    that function's marker-present code path. Consumers that need the
-    ``severity_tagged_anchor_findings`` signal for
+    from ``extract_directive_markers()`` so that severity-tag detection never
+    feeds ``classify_directive_confidence()`` / contract_patch_operations via
+    that function's marker-present code path. #2994 does not change
+    ``extract_directive_markers()`` / ``_canonicalize_cf_html_envelope()`` /
+    ``_cf_html_canonical_text()``; the envelope constants are only READ here.
+    Consumers that need the ``severity_tagged_anchor_findings`` signal for
     ``semantic_review_trigger.py`` (Step 2.5, #2296) call this function
     directly (see ``build_semantic_review_trigger_input()``); this module
     itself remains unaware of that downstream caller's contract
     (responsibility separation preserved).
     """
-    tags = {match.group(1).upper() for match in _SEVERITY_TAGGED_HEADING_RE.finditer(text or "")}
+    body = text or ""
+    tags: "set[str]" = set()
+    markdown_text = body
+    open_match = _CF_HTML_ENVELOPE_OPEN_RE.match(body)
+    if open_match is not None:
+        end_match = _CF_HTML_END_FRAGMENT_RE.search(body, open_match.end())
+        if end_match is not None:
+            for heading_text in _html_heading_texts(body[open_match.end() : end_match.start()]):
+                tag = _severity_tag_from_heading_text(heading_text)
+                if tag is not None:
+                    tags.add(tag)
+            tail = body[end_match.end() :]
+            wrapper_close = _CF_HTML_WRAPPER_CLOSE_RE.match(tail)
+            markdown_text = tail[wrapper_close.end() :] if wrapper_close else tail
+    tags |= _scan_markdown_severity_tags(markdown_text)
     return sorted(tags)
 
 
