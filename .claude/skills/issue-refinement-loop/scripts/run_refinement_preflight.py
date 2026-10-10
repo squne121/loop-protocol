@@ -5715,8 +5715,13 @@ def _verified_repo_local_no_web_handoff(
         or (matches[0].get("html_url") is not None and matches[0]["html_url"] != anchor_url)
     ):
         return False
-    valid, errors = _validate_anchor_comment_url(anchor_url, repo, issue_number, fixture_comments=comments)
-    if not valid or errors:
+    # The anchor was structurally validated before the planner ran. Check its
+    # issue binding here without resolving the same comment a third time.
+    issue_url = matches[0].get("issue_url")
+    if issue_url not in (
+        f"https://api.github.com/repos/{repo}/issues/{issue_number}",
+        f"https://github.com/{repo}/issues/{issue_number}",
+    ):
         return False
     for raw, sanitized in zip(comments, planner_comments):
         if not isinstance(raw, dict) or not isinstance(sanitized, dict):
