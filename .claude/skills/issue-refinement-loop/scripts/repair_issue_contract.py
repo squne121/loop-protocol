@@ -530,7 +530,10 @@ def _is_runtime_only(cmd: str) -> bool:
 def _repair_runtime_commands(body: str) -> tuple[str, list[dict]]:
     """Annotate allowlist-outside runtime-only commands with deferred markers.
 
-    Adds ``# preflight-scope: pr_review_only reason=<reason>`` before the command.
+    Adds the canonical ``# preflight-scope: pr_review_only`` marker (no
+    trailing suffix; the shared parser only accepts the exact scope value)
+    before the command. The human-readable reason is kept only in the
+    independent ``repairs[].reason`` field, never in the marker line.
     Does NOT modify:
     - pnpm typecheck/lint/test/build (regression gates)
     - commands in denylist (curl, rm, bash -c, etc.)
@@ -582,7 +585,7 @@ def _annotate_runtime_commands(section: str) -> tuple[str, list[dict]]:
                 # Preserve leading indent of the command line
                 indent = len(line) - len(line.lstrip())
                 indent_str = line[:indent]
-                marker = f"{indent_str}# preflight-scope: pr_review_only reason=runtime_only_command"
+                marker = f"{indent_str}# preflight-scope: pr_review_only"
                 new_lines.append(marker)
                 repairs.append({
                     "kind": "runtime_only_command",
