@@ -1238,7 +1238,17 @@ def ensure_contract_snapshot(
         # go/blocked precedence is decided, not only when selecting a go
         # candidate. Otherwise an untrusted comment posted after a trusted
         # go can still pre-empt it via the "latest blocked wins" branch below.
-        latest = parser_mod.find_latest_result(results, trusted_only=True)
+        #
+        # #3012: a trusted ``go`` that is not fingerprint-ready is never
+        # adoptable and must not become "latest" ahead of an earlier trusted
+        # blocked (same ``adoptable`` semantics as
+        # verify_snapshot_authority_postcondition).
+        adoptable = [
+            item
+            for item in results
+            if item.get("status") != "go" or item.get("is_fingerprint_ready") is True
+        ]
+        latest = parser_mod.find_latest_result(adoptable, trusted_only=True)
         try:
             go_result = parser_mod.find_latest_go(
                 results, trusted_only=True, fingerprint_ready_only=True
