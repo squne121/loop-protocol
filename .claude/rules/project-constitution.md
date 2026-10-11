@@ -92,6 +92,12 @@ hook は **fail-closed ローカルガードレール** であり、セキュリ
 - current milestone boundary の正本は `docs/dev/current-focus.md` と `docs/product/playable-roadmap.md` を参照し、境界を越える拡張は follow-up Issue に分離する。
 - hooks、permission 詳細、skill 実装はそれぞれ専用 Issue で扱う。
 
+## Auto memory の保存判断
+
+- Auto memory への保存・更新・棚卸しを行うときは `docs/dev/claude-code-memory-policy.md` を参照する。
+- Issue / PR / CI / HEAD などの live 状態は GitHub と run-state が正本であり、Auto memory は代替 authority にしない。
+- これは運用上の指針であり、hook や gate のような強制ではない。
+
 ## Secret 管理
 
 - Secret Inventory と no-secret 運用境界の正本は `docs/dev/secret-policy.md` を参照する。
