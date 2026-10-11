@@ -20,6 +20,8 @@ Issue / PR の可変な進捗スナップショットを memory に重複して�
 - 保存先は `~/.claude/projects/<project>/memory/` で、`MEMORY.md`（索引。1 メモ 1 行）と topic file（1 メモ 1 ファイル）で構成される。
 - 同一 git リポジトリの全 worktree とサブディレクトリは 1 つの Auto memory ディレクトリを共有する。Auto memory は machine-local であり、他のマシンや cloud 環境とは共有されない。
 - セッション開始時に読み込まれるのは `MEMORY.md` の先頭 200 行または 25KB のうち、先に到達した方までである。この読み込み上限は `MEMORY.md` にのみ適用される。topic file は起動時に読み込まれず、Claude が必要になったときに標準のファイルツールで読む。
+- `CLAUDE.md` / `CLAUDE.local.md` は、作業ディレクトリとその上位ディレクトリ分が起動時に読み込まれる。`paths` frontmatter のない `.claude/rules/` の rule は起動時に読み込まれ、`paths` 付きの rule は一致するファイルを扱うときに読み込まれる。サブディレクトリの `CLAUDE.md` は、そのサブディレクトリのファイルを読み書きしたときに読み込まれる。
+- `AGENTS.md` は、既定の Project instructions 設定（`claude-md-or-agents-md`）では、作業ディレクトリまたは上位に `CLAUDE.md` / `.claude/CLAUDE.md` / `CLAUDE.local.md` が存在しない場合にだけ読み込まれる。これらが存在すると `CLAUDE.md` 系だけが読み込まれる。`CLAUDE.md` が `@AGENTS.md` を import していれば、import 経由で読み込まれる。`AGENTS.md` と `CLAUDE.md` の両方を読む `claude-md-and-agents-md` は、利用者が明示的に選ぶ別設定である。
 - Claude は「コードから導出できるもの」「CLAUDE.md が既に述べているもの」を保存しない。毎セッション保存するわけではなく、将来の会話で有用かどうかで判断する。
 - メインの会話の Auto memory は通常の subagent には読み込まれない（fork を除く）。subagent 自身の memory は frontmatter の `memory:` で有効化する別ディレクトリである。
 
@@ -29,9 +31,18 @@ Issue / PR の可変な進捗スナップショットを memory に重複して�
 
 情報の性質ごとに、置き場所の正本を次のとおり決める。Auto memory は他の正本の代替 authority にならない。
 
+### 保存先と読み込み経路の区別
+
+正本への保存と、各セッションでの読み込みは別である。知見を instructions / SSOT / Skill / test へ昇格したという理由だけで、後続セッションへ確実に届くとはみなさない。
+
+- 現行 repo のルート `CLAUDE.md` には `@AGENTS.md` の import がない。この import の整備は既存 Issue #1737 の責務であり、本ポリシーでは扱わない。
+- そのため `AGENTS.md` への記載だけで、将来の全 Claude Code セッションに自動で読み込まれるとは保証しない。既定設定のまま `CLAUDE.md` と `AGENTS.md` が併存する場合、`AGENTS.md` は読み込まれない。
+- `CLAUDE.md`、個人用 `~/.claude/CLAUDE.md`、`.claude/rules/` の読み込み条件は上の「公式仕様の前提」に従う。条件が不確かなときは断定せず、`/context` 等で読み込み条件を確認する。
+- 利用者が `claude-md-and-agents-md` を選んでいる環境では `AGENTS.md` も読み込まれる。ただし本ポリシーはその設定を前提条件にしない。
+
 | 情報の性質 | 置き場所 | 備考 |
 |---|---|---|
-| 共通の行動指示（出力形式・固定の開発方針） | repo 共通 `AGENTS.md`、Claude 専用 `CLAUDE.md`、個人横断 `~/.claude/CLAUDE.md`、適切な `.claude/rules/` | instructions / rules の層。毎セッション読み込まれる |
+| 共通の行動指示（出力形式・固定の開発方針） | repo 共通 `AGENTS.md`、Claude 専用 `CLAUDE.md`、個人横断 `~/.claude/CLAUDE.md`、適切な `.claude/rules/` | instructions / rules の層。ここは保存先の正本であり、セッションへの読み込みは別に確認する（下記「保存先と読み込み経路の区別」） |
 | 複数ステップの手順 | 該当する `.claude/skills/**/SKILL.md` | skills の層 |
 | role / tool の境界 | `.claude/agents/*.md` | agents の層 |
 | Issue / PR / CI / HEAD / approval / AC 判定 / terminal history | live GitHub と、repository が管理する artifact / run-state | memory はその代替 authority にならない。毎回 fresh read する |
@@ -56,8 +67,9 @@ Issue / PR の可変な進捗スナップショットを memory に重複して�
 | 新規保存しない | GitHub / CI / artifact から復元できる可変の進捗スナップショット。必要になった時点で fresh read する |
 | 既存へ統合 | 同一の有用な知見が既存 memory に既にある。新しい索引行や topic file を増やさず、既存を更新・統合する |
 | 新規保存 | GitHub 等から再取得できず、将来有用な固有の知見だけ |
-| 退役 / 参照化 | 正本（instructions / SSOT / Skill / test）へ反映済み、または失効した知見。整理・退役し、必要なら正本への参照だけを残すことを検討する |
+| 退役 / 参照化 | 正本（instructions / SSOT / Skill / test）へ反映済み、または失効した知見。ただし反映先の読み込み・参照経路が確立していることを確認できた場合に限り、整理・退役し、必要なら正本への参照だけを残すことを検討する。経路が未確立なら、有用な知見への参照を保持する |
 
+- 正本への保存と各セッションでの読み込みは別である。退役 / 参照化の前に、保存先に応じた読み込み・参照経路（「保存先と読み込み経路の区別」を参照）を確認する。経路が未確立なら元の memory を退役せず、有用な知見への参照を保持する。「保存されたが読まれないまま元 memory を退役した」状態を作らない。
 - `project` memory の短期情報を一律には禁止しない。上の 4 観点を通過したものは保存できる。
 - 「新規保存しない」は新規に書かないという意味であり、既存 memory の削除を自動で要求するものではない。既存項目の扱いは後述の棚卸し手順で、人間が判断する。
 
@@ -70,7 +82,8 @@ Issue / PR の可変な進捗スナップショットを memory に重複して�
 | #3015 / #3026 の stale Draft | memory が「PR #3026 は Draft・人間 merge 待ち」と記録。観測時点で #3026 は merged だった | 新規保存しない。Draft や merged の状態は fresh read する。既存項目があれば退役 / 参照化を検討する |
 | #3006 / #3025 の AC6 / AC7 重複進捗 | 同じ #3006 / PR #3025 を扱う topic file が複数の索引行から参照され、異なる時点の停止理由が並存していた。PR 本文に残る過去の検証 HEAD は current HEAD の証拠ではなく、fresh read で得た値でも current-head evidence とは扱わない | 新しい topic file・索引行を作らない。既存項目へ統合するか、GitHub に正本があるものは退役 / 参照化する |
 | #2872 の blocker | pre-merge では検証できない AC を、人間判断待ちの blocker として記録していた | GitHub（Issue / PR コメント）から復元できる blocker は新規保存しない |
-| `set +e` の guard workaround | secret guard が `set +e` を含むコマンドをブロックするため、終了コードは `cmd; PE=$?` で取る、という回避策を memory に残していた | 再発する defect の修正候補として SSOT / Skill / test へ昇格する。昇格後は memory の退役 / 参照化を検討する（memory だけで恒久修正済みとしない） |
+| `set +e` の guard workaround | secret guard が `set +e` を含むコマンドをブロックするため、終了コードは `cmd; PE=$?` で取る、という回避策を memory に残していた | 再発する defect の修正候補として SSOT / Skill / test へ昇格する。昇格後は、昇格先の読み込み・参照経路を確認できた場合に限り memory の退役 / 参照化を検討する。経路が未確立なら参照を保持する（memory だけで恒久修正済みとしない） |
+| `CLAUDE.md` と `AGENTS.md` の併存 | repo に `CLAUDE.md` と `AGENTS.md` があり、`CLAUDE.md` に `@AGENTS.md` の import がなく、instruction loading は既定設定。再利用できるユーザー訂正を `AGENTS.md` へ昇格しようとしている | `AGENTS.md` への保存だけを「後続セッションで必ず利用可能」と判定しない。元の memory を退役せず参照を保持する。または、確実に読み込まれる経路（`CLAUDE.md` や `paths` なしの `.claude/rules/` 等）へ反映する |
 
 ### positive control（新規保存してよい例）
 
@@ -86,7 +99,7 @@ Issue / PR の可変な進捗スナップショットを memory に重複して�
 
 1. 当面の回避策として memory に残すのは許容する。ただし出典・時点・再検証条件を併記する。
 2. 再発している defect は修正 Issue を起票し、SSOT / Skill / test のいずれかへ反映する。
-3. 反映後は、その memory を退役 / 参照化の対象として棚卸しで扱う。
+3. 反映後は、反映先の読み込み・参照経路を確認できた場合に限り、その memory を退役 / 参照化の対象として棚卸しで扱う。経路が未確立なら参照を保持する。
 4. memory に回避策があることを理由に、defect を解決済みと扱わない。
 
 ## operator 向けの確認方法
