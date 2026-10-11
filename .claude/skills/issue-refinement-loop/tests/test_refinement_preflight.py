@@ -1742,6 +1742,16 @@ def test_repo_local_no_web_preflight_handoff_preserves_unverified_anchor_warning
             "GitHub GraphQL errors will be verified against official docs before approval",
         ),
         (
+            "Do not verify local fixtures and GitHub GraphQL errors are checked "
+            "against official docs before approval.",
+            "GitHub GraphQL errors are checked against official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors will be checked "
+            "against official docs without editing tests.",
+            "GitHub GraphQL errors will be checked against official docs",
+        ),
+        (
             "Do not verify local fixtures and GitHub GraphQL errors must match "
             "official docs no later than release.",
             "GitHub GraphQL errors must match official docs no later than release",
@@ -1809,6 +1819,8 @@ def test_noun_start_external_anchor_cannot_clear_no_web_warning(tmp_path, phrase
     "against official docs before approval.",
     "Do not verify local fixtures and GitHub GraphQL errors won't be checked "
     "against official docs before approval.",
+    "Previously quoted: Do not verify local fixtures, but verify GitHub GraphQL "
+    "errors against official docs before approval.",
     "Do not verify local fixtures and check repository tests instead.",
 ])
 def test_negated_future_anchor_keeps_repo_local_no_web_handoff(tmp_path, phrase):

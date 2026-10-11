@@ -629,7 +629,7 @@ _NOUN_CLAUSE_PREDICATE_RE = re.compile(
     r"\b(?:must|should|shall|needs?|require[ds]?|depends?|"
     r"(?:has|have)\s+to|"
     r"will\s+be\s+(?:checked|verified|validated|compared)|"
-    r"(?:is|are)\s+(?:to\s+be\s+(?:checked|verified|validated|compared)|"
+    r"(?:is|are)\s+(?:(?:to\s+be\s+)?(?:checked|verified|validated|compared)|"
     r"specified|defined|documented|described|covered|"
     r"outlined|listed|explained|required|expected|stated|published)|"
     r"match(?:es)?|agree(?:s)?|follow(?:s)?|conform(?:s)?|align(?:s)?)\b", re.I,
@@ -670,51 +670,72 @@ def _visible_comment_lines(body: str) -> list[str]:
     return [line for line in _claim_prose_lines(body) if not line.lstrip().startswith(">")]
 
 
+def _split_repo_local_without(sentence: str) -> list[str]:
+    """Keep an external request apart from a trailing local-only restriction."""
+    for boundary in re.finditer(r"\s+without\s+", sentence, flags=re.I):
+        restriction = sentence[boundary.end():].strip()
+        if (
+            _REPO_TOPIC_RE.search(restriction)
+            and not _EXTERNAL_TOPIC_RE.search(restriction)
+            and not _EXTERNAL_AUTHORITY_RE.search(restriction)
+        ):
+            return [sentence[:boundary.start()].strip(), f"without {restriction}"]
+    return [sentence]
+
+
 def _claim_sentences(line: str) -> list[str]:
-    """Split independent requests and contrasting affirmative/negative clauses.
+    """Split independent requests without losing quoted sentence context.
 
     A negated local clause must not suppress a later external dependency in
     the same sentence ("do not check fixtures, but verify official docs").
     """
     sentences = [part.strip() for part in re.split(
-        r"(?<=[。！？])|(?<=[.!?])\s+(?=[A-Z])|[;；]|"
-        r"(?:,\s*|\s+)(?:but|however|yet)\s+|(?:、|，)\s*(?:しかし|一方で?)\s*",
-        line, flags=re.I,
+        r"(?<=[。！？])|(?<=[.!?])\s+(?=[A-Z])", line, flags=re.I,
     ) if part.strip()]
     split_sentences = []
     for sentence in sentences:
-        clauses = re.split(
-            r"\s+and\s+(?=(?:(?:do|does)\s+not|don't|never|no|without|"
-            r"verify|check|validate|compare|confirm)\b)|[、，]",
+        # A past quote spans contrasting clauses up to the sentence boundary;
+        # a following independent sentence can still request current research.
+        if _QUOTED_CONTEXT_RE.search(sentence):
+            split_sentences.append(sentence)
+            continue
+        units = re.split(
+            r"[;；]|(?:,\s*|\s+)(?:but|however|yet)\s+|"
+            r"(?:、|，)\s*(?:しかし|一方で?)\s*",
             sentence, flags=re.I,
         )
-        quoted = bool(_QUOTED_CONTEXT_RE.search(sentence))
-        if not quoted:
-            expanded = []
-            for clause in clauses:
-                for boundary in re.finditer(r"\s+and\s+", clause, flags=re.I):
-                    local = clause[:boundary.start()].strip()
-                    external = clause[boundary.end():].strip()
-                    if (
-                        _NEGATED_REQUEST_RE.search(local)
-                        and _REPO_TOPIC_RE.search(local)
-                        and _NOUN_CLAUSE_PREDICATE_RE.search(external)
-                        and _is_external_dependency(external)
-                    ):
-                        expanded.extend((local, external))
-                        break
+        for unit in units:
+            for part in _split_repo_local_without(unit):
+                if not part.strip():
+                    continue
+                clauses = re.split(
+                    r"\s+and\s+(?=(?:(?:do|does)\s+not|don't|never|no|without|"
+                    r"verify|check|validate|compare|confirm)\b)|[、，]",
+                    part, flags=re.I,
+                )
+                expanded = []
+                for clause in clauses:
+                    for boundary in re.finditer(r"\s+and\s+", clause, flags=re.I):
+                        local = clause[:boundary.start()].strip()
+                        external = clause[boundary.end():].strip()
+                        if (
+                            _NEGATED_REQUEST_RE.search(local)
+                            and _REPO_TOPIC_RE.search(local)
+                            and _NOUN_CLAUSE_PREDICATE_RE.search(external)
+                            and _is_external_dependency(external)
+                        ):
+                            expanded.extend((local, external))
+                            break
+                    else:
+                        expanded.append(clause)
+                if (
+                    len(expanded) > 1
+                    and any(_NEGATED_REQUEST_RE.search(c) and _REPO_TOPIC_RE.search(c) for c in expanded)
+                    and any(_is_external_dependency(c) for c in expanded)
+                ):
+                    split_sentences.extend(clause.strip() for clause in expanded if clause.strip())
                 else:
-                    expanded.append(clause)
-            clauses = expanded
-        if (
-            len(clauses) > 1
-            and not quoted
-            and any(_NEGATED_REQUEST_RE.search(c) and _REPO_TOPIC_RE.search(c) for c in clauses)
-            and any(_is_external_dependency(c) for c in clauses)
-        ):
-            split_sentences.extend(clause.strip() for clause in clauses if clause.strip())
-        else:
-            split_sentences.append(sentence)
+                    split_sentences.append(part.strip())
     return split_sentences
 
 
