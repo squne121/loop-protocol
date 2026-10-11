@@ -1043,3 +1043,241 @@ def test_load_module_restores_prior_entry_on_failure(monkeypatch):
             sys.modules[module_name] = previous
         else:
             sys.modules.pop(module_name, None)
+
+
+# ---------------------------------------------------------------------------
+# Issue #3012: a trusted fingerprint-NON-ready go that is newer than a trusted
+# blocked must not hide that blocked result from
+# _normalize_contract_snapshot_live().  Real shared parser and real
+# production consumer; only the GitHub read boundary is data.
+# Timeline notation: G = fingerprint-ready trusted go, B = trusted blocked,
+# P = schema-valid trusted go that is NOT fingerprint-ready.
+# ---------------------------------------------------------------------------
+
+_NR_ISSUE_URL = "https://github.com/squne121/loop-protocol/issues/958"
+_NR_ISSUE_BODY = "## Machine-Readable Contract\n\nstatus: full-body\n\n## Allowed Paths\n- tracked.txt\n"
+_NR_UNTRUSTED = {
+    "author": "mallory",
+    "author_id": 4242,
+    "author_type": "User",
+    "author_association": "NONE",
+}
+
+
+def _nr_comment(cid: int, created_at: str, body: str, **identity) -> dict:
+    return json.loads(_comment_ndjson(body, comment_id=cid, created_at=created_at, **identity))
+
+
+def _nr_ready_go(cid: int, created_at: str, **identity) -> dict:
+    body_sha256 = mod._sha256(_NR_ISSUE_BODY)
+    paths_hash = mod._live_allowed_paths_hash(_NR_ISSUE_BODY)
+    body = f"""
+```yaml
+CONTRACT_REVIEW_RESULT_V1:
+  status: go
+  generated_at: "2026-06-19T00:01:00Z"
+  generated_by: issue-contract-review
+  issue_url: {_NR_ISSUE_URL}
+  body_sha256: "{body_sha256}"{_fingerprint_yaml_block(cid, body_sha256, paths_hash)}```
+"""
+    return _nr_comment(cid, created_at, body, **identity)
+
+
+def _nr_nonready_go(cid: int, created_at: str, **identity) -> dict:
+    body = f"""
+```yaml
+CONTRACT_REVIEW_RESULT_V1:
+  status: go
+  generated_at: "2026-06-19T00:01:00Z"
+  generated_by: issue-contract-review
+  issue_url: {_NR_ISSUE_URL}
+  body_sha256: "{mod._sha256(_NR_ISSUE_BODY)}"
+```
+"""
+    return _nr_comment(cid, created_at, body, **identity)
+
+
+def _nr_blocked(cid: int, created_at: str, **identity) -> dict:
+    body = f"""
+```yaml
+CONTRACT_REVIEW_RESULT_V1:
+  status: blocked
+  generated_at: "2026-06-19T00:01:00Z"
+  generated_by: issue-contract-review
+  issue_url: {_NR_ISSUE_URL}
+```
+"""
+    return _nr_comment(cid, created_at, body, **identity)
+
+
+def _nr_assert_fixture_shape(comments, *, go_id=None, blocked_id=None, nonready_id=None) -> None:
+    """After the real parser: G/B/P are trusted, schema-valid, and P is not fingerprint-ready."""
+    parsed, _counts = mod._parse_contract_results(comments, _NR_ISSUE_URL, 958)
+    by_id = {r["comment_id"]: r for r in parsed}
+    for cid in (go_id, blocked_id, nonready_id):
+        if cid is not None:
+            assert by_id[cid]["is_trusted_author"] is True
+    if go_id is not None:
+        assert by_id[go_id]["status"] == "go"
+        assert by_id[go_id]["is_fingerprint_ready"] is True
+    if blocked_id is not None:
+        assert by_id[blocked_id]["status"] == "blocked"
+    if nonready_id is not None:
+        assert by_id[nonready_id]["status"] == "go"
+        assert by_id[nonready_id]["is_fingerprint_ready"] is False
+
+
+def _nr_normalize(comments: list[dict]) -> dict:
+    snapshot, _complete = mod._normalize_contract_snapshot_live(
+        _NR_ISSUE_URL,
+        _NR_ISSUE_BODY,
+        mod._sha256(_NR_ISSUE_BODY),
+        "2026-06-19T00:00:00Z",
+        comments,
+        {},
+    )
+    return snapshot
+
+
+def _nr_url(cid: int) -> str:
+    return f"{_NR_ISSUE_URL.replace('/issues/958', '')}/issues/958#issuecomment-{cid}"
+
+
+_NR_T = "2026-06-19T00:0{}:00Z"
+
+
+def test_nonready_go_after_blocked_routes_to_latest_blocked_not_existing_go():
+    comments = [
+        _nr_ready_go(101, _NR_T.format(1)),
+        _nr_blocked(102, _NR_T.format(2)),
+        _nr_nonready_go(103, _NR_T.format(3)),
+    ]
+    _nr_assert_fixture_shape(comments, go_id=101, blocked_id=102, nonready_id=103)
+
+    snapshot = _nr_normalize(comments)
+
+    assert snapshot["normalized_status"] == "latest_blocked"
+    assert snapshot["source"] == "latest_blocked"
+    assert snapshot["upstream_status"] == "blocked"
+    assert snapshot["contract_snapshot_url"] == _nr_url(102)
+
+
+def test_nonready_go_after_blocked_end_to_end_capsule_routes_to_blocker_triage():
+    comments = [
+        _nr_ready_go(101, _NR_T.format(1)),
+        _nr_blocked(102, _NR_T.format(2)),
+        _nr_nonready_go(103, _NR_T.format(3)),
+    ]
+    run_cmd = _run_command_side_effect_factory(
+        [
+            (0, _issue_view_json(body=_NR_ISSUE_BODY), ""),
+            (0, "abc\n", ""),
+            (0, "main\n", ""),
+            (0, "", ""),
+            (0, "\n".join(json.dumps(c) for c in comments), ""),
+        ]
+    )
+
+    with patch.object(mod, "_run_command", side_effect=run_cmd):
+        capsule, _artifact, exit_code = mod.build_intake_capsule(958, "squne121/loop-protocol", None)
+
+    assert exit_code == 0
+    assert capsule["contract_snapshot"]["normalized_status"] == "latest_blocked"
+    assert capsule["contract_snapshot"]["contract_snapshot_url"] == _nr_url(102)
+    assert capsule["next_action"]["route"] == "run_contract_blocker_triage"
+
+
+def test_nonready_go_after_blocked_positive_controls_ready_go_still_adopted():
+    only_g = [_nr_ready_go(101, _NR_T.format(1))]
+    g_then_p = [_nr_ready_go(101, _NR_T.format(1)), _nr_nonready_go(103, _NR_T.format(3))]
+    _nr_assert_fixture_shape(g_then_p, go_id=101, nonready_id=103)
+    for comments in (only_g, g_then_p):
+        snapshot = _nr_normalize(comments)
+        assert snapshot["normalized_status"] == "go"
+        assert snapshot["source"] == "existing_go"
+        assert snapshot["contract_snapshot_url"] == _nr_url(101)
+
+
+def test_nonready_go_after_blocked_later_ready_go_beats_earlier_blocked():
+    comments = [
+        _nr_ready_go(101, _NR_T.format(1)),
+        _nr_blocked(102, _NR_T.format(2)),
+        _nr_ready_go(104, _NR_T.format(4)),
+    ]
+    snapshot = _nr_normalize(comments)
+    assert snapshot["normalized_status"] == "go"
+    assert snapshot["contract_snapshot_url"] == _nr_url(104)
+
+
+def test_nonready_go_after_blocked_blocked_without_ready_go_matches_blocked_alone():
+    blocked_and_p = [_nr_blocked(102, _NR_T.format(2)), _nr_nonready_go(103, _NR_T.format(3))]
+    _nr_assert_fixture_shape(blocked_and_p, blocked_id=102, nonready_id=103)
+    for comments in (blocked_and_p, [_nr_blocked(102, _NR_T.format(2))]):
+        snapshot = _nr_normalize(comments)
+        assert snapshot["normalized_status"] == "latest_blocked"
+        assert snapshot["source"] == "latest_blocked"
+        assert snapshot["contract_snapshot_url"] == _nr_url(102)
+
+
+def test_nonready_go_after_blocked_blocked_directly_after_ready_go_is_blocked():
+    snapshot = _nr_normalize([_nr_ready_go(101, _NR_T.format(1)), _nr_blocked(102, _NR_T.format(2))])
+    assert snapshot["normalized_status"] == "latest_blocked"
+    assert snapshot["contract_snapshot_url"] == _nr_url(102)
+
+
+def test_nonready_go_after_blocked_nonready_go_alone_stays_missing_go():
+    snapshot = _nr_normalize([_nr_nonready_go(103, _NR_T.format(3))])
+    assert snapshot["normalized_status"] == "missing_go"
+    assert snapshot["contract_snapshot_url"] is None
+
+
+def test_nonready_go_after_blocked_untrusted_blocked_and_plain_comments_do_not_reject():
+    comments = [
+        _nr_ready_go(101, _NR_T.format(1)),
+        _nr_blocked(102, _NR_T.format(2), **_NR_UNTRUSTED),
+        _nr_comment(105, _NR_T.format(3), "ordinary discussion", **_NR_UNTRUSTED),
+        _nr_comment(106, _NR_T.format(3), "trusted but plain comment"),
+    ]
+    snapshot = _nr_normalize(comments)
+    assert snapshot["normalized_status"] == "go"
+    assert snapshot["contract_snapshot_url"] == _nr_url(101)
+
+
+def test_nonready_go_after_blocked_input_order_does_not_change_result():
+    comments = [
+        _nr_ready_go(101, _NR_T.format(1)),
+        _nr_blocked(102, _NR_T.format(2)),
+        _nr_nonready_go(103, _NR_T.format(3)),
+    ]
+    for ordering in (list(reversed(comments)), [comments[2], comments[0], comments[1]]):
+        snapshot = _nr_normalize(ordering)
+        assert snapshot["normalized_status"] == "latest_blocked"
+        assert snapshot["contract_snapshot_url"] == _nr_url(102)
+
+
+def test_nonready_go_after_blocked_same_created_at_uses_numeric_comment_id():
+    same = _NR_T.format(5)
+    blocked_wins = [_nr_ready_go(101, _NR_T.format(1)), _nr_ready_go(110, same), _nr_blocked(120, same)]
+    snapshot = _nr_normalize(blocked_wins)
+    assert snapshot["normalized_status"] == "latest_blocked"
+    assert snapshot["contract_snapshot_url"] == _nr_url(120)
+    go_wins = [_nr_ready_go(101, _NR_T.format(1)), _nr_blocked(9, same), _nr_ready_go(10, same)]
+    snapshot = _nr_normalize(go_wins)
+    assert snapshot["normalized_status"] == "go"
+    assert snapshot["contract_snapshot_url"] == _nr_url(10)
+
+
+def test_nonready_go_after_blocked_fingerprint_binding_mismatch_keeps_existing_rejection():
+    wrong_paths = _nr_ready_go(101, _NR_T.format(1))
+    wrong_paths["body"] = wrong_paths["body"].replace(
+        mod._live_allowed_paths_hash(_NR_ISSUE_BODY), "e" * 64
+    )
+    snapshot = _nr_normalize([wrong_paths])
+    assert snapshot["normalized_status"] == "missing_go"
+    assert snapshot["source"] == "fingerprint_live_allowed_paths_mismatch"
+    stale_snapshot, _ = mod._normalize_contract_snapshot_live(
+        _NR_ISSUE_URL, _NR_ISSUE_BODY, mod._sha256("another body"),
+        "2026-06-19T00:00:00Z", [_nr_ready_go(101, _NR_T.format(1))], {},
+    )
+    assert stale_snapshot["normalized_status"] == "stale"
+    assert stale_snapshot["source"] == "existing_go"
