@@ -135,7 +135,7 @@ Test e2e.
 
 ```bash
 # AC1
-# preflight-scope: pr_review_only reason=runtime_only_command
+# preflight-scope: pr_review_only
 $ pnpm test:e2e
 ```
 """
@@ -309,7 +309,7 @@ def test_already_annotated_not_double_annotated():
 
 ```bash
 # AC1
-# preflight-scope: pr_review_only reason=runtime_only_command
+# preflight-scope: pr_review_only
 $ pnpm test:e2e
 ```
 """
@@ -738,3 +738,191 @@ def test_extract_allowed_paths_no_path_marker_returns_empty():
 
     body_legacy = "## Allowed Paths\n\n- 読み取り専用。リポジトリ変更なし（既定）\n"
     assert ric._extract_allowed_paths_ric(body_legacy) == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #3024: runtime_only_command marker must be the canonical
+# ``# preflight-scope: pr_review_only`` (no ``reason=`` suffix).
+# These tests use the REAL repair CLI, the REAL shared parser and the REAL
+# baseline_vc_preflight.py (no mocks).
+# ---------------------------------------------------------------------------
+
+# scripts dir is <repo>/.claude/skills/issue-refinement-loop/scripts, so the
+# repo root is parents[3]. Derived structurally (not by walking up to the first
+# ancestor that contains a ``.claude`` dir) to avoid nested-.claude
+# misdetection (#3023).
+_REPO_ROOT_3024 = _SCRIPTS_DIR.parents[3]
+_CONTRACT_REVIEW_SCRIPTS_3024 = (
+    _REPO_ROOT_3024 / ".claude" / "skills" / "issue-contract-review" / "scripts"
+)
+_BASELINE_PREFLIGHT_3024 = _CONTRACT_REVIEW_SCRIPTS_3024 / "baseline_vc_preflight.py"
+_VC_SYNTAX_3024 = _CONTRACT_REVIEW_SCRIPTS_3024 / "vc_contract_syntax.py"
+
+_CANONICAL_MARKER_3024 = "# preflight-scope: pr_review_only"
+_LEGACY_MARKER_3024 = "# preflight-scope: pr_review_only reason=runtime_only_command"
+
+_UNANNOTATED_BODY_3024 = """## Verification Commands
+
+```bash
+# AC1
+$ pnpm test:e2e
+```
+"""
+
+
+def _load_module_3024(unique_name: str, path: Path):
+    """Load a module by path under a unique name (avoid sys.modules collisions)."""
+    import importlib.util
+
+    assert path.is_file(), f"module not found: {path}"
+    spec = importlib.util.spec_from_file_location(unique_name, str(path))
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[unique_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _real_repair_cli_3024(body: str, tmp_path: Path, name: str) -> tuple[dict, str]:
+    """Run the real repair CLI (--apply --out-file) and return (result, candidate body)."""
+    body_file = tmp_path / f"{name}.in.md"
+    out_file = tmp_path / f"{name}.out.md"
+    body_file.write_text(body, encoding="utf-8")
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(_SCRIPT),
+            "--body-file",
+            str(body_file),
+            "--apply",
+            "--out-file",
+            str(out_file),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, (
+        f"repair CLI failed rc={proc.returncode} stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+    data = json.loads(proc.stdout)
+    assert data["dry_run"] is False, data
+    assert out_file.is_file(), "repair CLI did not write the candidate body"
+    return data, out_file.read_text(encoding="utf-8")
+
+
+def _marker_lines_3024(body: str) -> list[str]:
+    return [ln.strip() for ln in body.splitlines() if ln.strip().startswith("# preflight-scope:")]
+
+
+def _real_baseline_preflight_3024(body: str, tmp_path: Path, name: str) -> dict:
+    body_file = tmp_path / f"{name}.preflight.md"
+    body_file.write_text(body, encoding="utf-8")
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(_BASELINE_PREFLIGHT_3024),
+            "--body-file",
+            str(body_file),
+            "--cwd",
+            str(_REPO_ROOT_3024),
+            "--no-history-estimator",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.stdout, f"no stdout rc={proc.returncode} stderr={proc.stderr!r}"
+    assert proc.returncode == 0, (
+        f"baseline_vc_preflight failed rc={proc.returncode} stderr={proc.stderr!r}"
+    )
+    return json.loads(proc.stdout)
+
+
+def test_runtime_only_marker_real_preflight_classifies_pr_review_only(tmp_path):
+    """AC1: real repair output -> real baseline_vc_preflight.py => canonical pr_review_only skip."""
+    result, candidate = _real_repair_cli_3024(_UNANNOTATED_BODY_3024, tmp_path, "ac1")
+    assert result["changed"] is True, result
+    runtime_repairs = [r for r in result["repairs"] if r["kind"] == "runtime_only_command"]
+    assert len(runtime_repairs) == 1, result["repairs"]
+    # the marker was actually emitted by the real repair (not hand-written)
+    assert _marker_lines_3024(candidate) == [_CANONICAL_MARKER_3024], candidate
+
+    data = _real_baseline_preflight_3024(candidate, tmp_path, "ac1")
+    results = [it for it in data["results"] if "pnpm test:e2e" in (it.get("raw_command") or "")]
+    assert len(results) == 1, data["results"]
+    item = results[0]
+    # AC mapping / command line preserved
+    assert item["ac"] == "AC1", item
+    assert item["raw_command"] == "pnpm test:e2e", item
+    assert item["classification"] == "skipped", item
+    assert item["category"] == "preflight_scope_pr_review_only", item
+    assert item["scope_class"] == "pr_review_only", item
+    assert item["decision"] == "go", item
+    assert item["exit_code"] is None, item
+    assert item["verification_owner"] == "pr-review-judge", item
+    assert item["runtime_verification_required"] is False, item
+    assert data["summary"]["human_judgment"] == 0, data["summary"]
+
+
+def test_runtime_only_marker_real_parser_returns_canonical_known(tmp_path):
+    """AC2: marker line extracted from the real repair output parses to exactly ('pr_review_only', True)."""
+    _result, candidate = _real_repair_cli_3024(_UNANNOTATED_BODY_3024, tmp_path, "ac2")
+    markers = _marker_lines_3024(candidate)
+    assert len(markers) == 1, candidate
+    syntax = _load_module_3024("vc_contract_syntax_3024_real_parser", _VC_SYNTAX_3024)
+    assert syntax.parse_preflight_scope_marker_line(markers[0]) == ("pr_review_only", True)
+
+
+def test_runtime_only_marker_roundtrip_idempotent_on_real_output(tmp_path):
+    """AC3: real repair output re-fed to real repair is a fixed point."""
+    first, body_after_first = _real_repair_cli_3024(_UNANNOTATED_BODY_3024, tmp_path, "rt1")
+    assert first["changed"] is True, first
+    assert body_after_first != _UNANNOTATED_BODY_3024
+
+    second, body_after_second = _real_repair_cli_3024(body_after_first, tmp_path, "rt2")
+    assert body_after_second == body_after_first
+    assert (
+        first["repaired_body_sha256"]
+        == second["original_body_sha256"]
+        == second["repaired_body_sha256"]
+    ), (first, second)
+    assert second["changed"] is False, second
+    assert [r for r in second["repairs"] if r["kind"] == "runtime_only_command"] == []
+
+
+def test_runtime_only_marker_repair_reason_still_recorded(tmp_path):
+    """AC4: repairs[].reason is preserved as an independent field, not in the marker line."""
+    result, candidate = _real_repair_cli_3024(_UNANNOTATED_BODY_3024, tmp_path, "reason")
+    runtime_repairs = [r for r in result["repairs"] if r["kind"] == "runtime_only_command"]
+    assert len(runtime_repairs) == 1, result["repairs"]
+    assert "command_not_in_allowlist_runtime_only" in runtime_repairs[0]["reason"]
+    assert "pnpm test:e2e" in runtime_repairs[0]["reason"]
+    assert "reason=" not in candidate
+    assert "reason=" not in runtime_repairs[0]["repaired"]
+
+
+def test_runtime_only_marker_existing_canonical_preserved(tmp_path):
+    """AC3: an existing canonical marker is left unchanged by repair."""
+    body = _UNANNOTATED_BODY_3024.replace(
+        "$ pnpm test:e2e", f"{_CANONICAL_MARKER_3024}\n$ pnpm test:e2e"
+    )
+    assert _marker_lines_3024(body) == [_CANONICAL_MARKER_3024]
+    result, candidate = _real_repair_cli_3024(body, tmp_path, "canon")
+    assert result["changed"] is False, result
+    assert candidate == body
+    assert [r for r in result["repairs"] if r["kind"] == "runtime_only_command"] == []
+
+
+def test_runtime_only_marker_legacy_suffix_preserved(tmp_path):
+    """AC3: a stored legacy ``reason=`` suffix marker is NOT auto-migrated (boundary fixture,
+    not an endorsement of the legacy marker)."""
+    body = _UNANNOTATED_BODY_3024.replace(
+        "$ pnpm test:e2e", f"{_LEGACY_MARKER_3024}\n$ pnpm test:e2e"
+    )
+    assert _marker_lines_3024(body) == [_LEGACY_MARKER_3024]
+    result, candidate = _real_repair_cli_3024(body, tmp_path, "legacy")
+    assert result["changed"] is False, result
+    assert candidate == body
+    assert _marker_lines_3024(candidate) == [_LEGACY_MARKER_3024]
+    assert [r for r in result["repairs"] if r["kind"] == "runtime_only_command"] == []
