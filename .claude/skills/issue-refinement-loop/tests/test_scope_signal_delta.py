@@ -731,3 +731,121 @@ def test_html_only_severity_input_does_not_change_directive_authority():
         ("Acceptance Criteria", "append")
     ]
     assert operations[0]["text"] == "- AC9: 新しい受入条件を追加する。"
+
+
+# --- Issue #3016: trusted OWNER review ``P<n>:`` / ``P<n>：`` headings ----
+# Independent fixtures (one pytest node per case). Every envelope case is a
+# complete CF_HTML envelope (outer html/body + StartFragment ... first
+# EndFragment); plain-Markdown cases have no envelope at all.
+
+_COLON_ENV_OPEN = "<html>\n<body>\n<!--StartFragment-->"
+_COLON_ENV_CLOSE = "<!--EndFragment-->\n</body>\n</html>"
+
+
+def _colon_envelope(fragment: str, tail: str = "") -> str:
+    body = _COLON_ENV_OPEN + fragment + _COLON_ENV_CLOSE
+    return body + "\n\n" + tail if tail else body
+
+
+_COLON_POSITIVE_CASES = [
+    pytest.param("### 1. P2：全角コロンの指摘\n\n本文。\n", ["P2"], id="P1"),
+    pytest.param("### P2: ASCII colon finding\n\nBody.\n", ["P2"], id="P2"),
+    pytest.param("### 1. P2: ASCII colon with number\n\nBody.\n", ["P2"], id="P3a"),
+    pytest.param("### P2：全角コロン番号なし\n\n本文。\n", ["P2"], id="P3b"),
+    pytest.param(
+        _colon_envelope("<h3>1. P2：全角の指摘</h3><p>詳細</p>", "ordinary prose only.\n"),
+        ["P2"],
+        id="P4",
+    ),
+    pytest.param(
+        _colon_envelope("<h3>P2: ASCII finding</h3><p>detail</p>", "ordinary prose only.\n"),
+        ["P2"],
+        id="P5",
+    ),
+    pytest.param(
+        _colon_envelope("<h3>1. P2：全角の指摘</h3>", "### 1. P2：全角の指摘\n"),
+        ["P2"],
+        id="P6",
+    ),
+    pytest.param(
+        _colon_envelope(
+            "<h3>1. P2：全角の指摘</h3>",
+            "Markdown tail は ordinary prose のみ。P2: という語を含む文章。\n",
+        ),
+        ["P2"],
+        id="P7",
+    ),
+    pytest.param(
+        _colon_envelope("<h3>概要</h3><p>severity なし</p>", "### P2: tail finding\n"),
+        ["P2"],
+        id="P8",
+    ),
+    pytest.param(
+        _colon_envelope("<h3>1. P2：全角の指摘</h3>", "### P3: tail finding\n"),
+        ["P2", "P3"],
+        id="P9",
+    ),
+]
+
+
+@pytest.mark.parametrize(("body", "expected"), _COLON_POSITIVE_CASES)
+def test_owner_colon_cf_html_and_markdown(body, expected):
+    """GIVEN an independent OWNER-review input whose heading starts with an
+    optional number prefix and ``P<n>:`` / ``P<n>：``
+    WHEN extract_severity_tags runs
+    THEN the expected tags are returned (HTML / Markdown collectors checked
+    on separate inputs; the same severity in both is de-duplicated)."""
+    assert delta.extract_severity_tags(body) == expected
+
+
+_COLON_NEGATIVE_BODIES = [
+    pytest.param("P2: ordinary prose paragraph.\n\nP2：全角の通常文。\n", id="N1a_markdown_prose"),
+    pytest.param("P2: ASCII の通常文だけの段落。\n", id="N1b_ascii_prose"),
+    pytest.param("P2：全角の通常文だけの段落。\n", id="N1c_fullwidth_prose"),
+    pytest.param(
+        _colon_envelope("<p>P2: ordinary prose</p>", "P2：ordinary prose tail.\n"),
+        id="N1d_envelope_prose_both",
+    ),
+    pytest.param(_colon_envelope("<p>P2：段落であり見出しではない</p>"), id="N2"),
+    pytest.param("説明文に `P2：コード` を含む段落。\n", id="N3a_code_span_in_paragraph"),
+    pytest.param("### `P2: code span heading`\n", id="N3b_heading_starts_with_backtick"),
+    pytest.param("`### P2：見出し風のコードスパン`\n", id="N3c_code_span_heading_like"),
+    pytest.param("```\n### P2：fence 内\n```\n", id="N4a_backtick_fence"),
+    pytest.param("~~~\n### P2: fence 内\n~~~\n", id="N4b_tilde_fence"),
+    pytest.param("<!--\n### P2：comment 内\n-->\n", id="N5"),
+    pytest.param("### Notes about P2: heading\n", id="N6a_ascii_mid_heading"),
+    pytest.param("### 1. See P2：中途の言及\n", id="N6b_fullwidth_mid_heading"),
+    pytest.param(_colon_envelope("<h3>Notes about P2: heading</h3>"), id="N7a_html_ascii_mid"),
+    pytest.param(_colon_envelope("<h3>1. See P2：中途の言及</h3>"), id="N7b_html_fullwidth_mid"),
+    pytest.param(_colon_envelope("<pre><h3>1. P2：pre 内</h3></pre>"), id="N8a_pre"),
+    pytest.param(
+        _colon_envelope('<script>var s = "<h3>P2: script 内</h3>";</script>'),
+        id="N8b_script",
+    ),
+    pytest.param(
+        _colon_envelope("<style>/* <h3>1. P2：style 内</h3> */</style>"), id="N8c_style"
+    ),
+]
+
+_COLON_EXISTING_GRAMMAR_CASES = [
+    pytest.param("### [P1] bracketed\n", ["P1"], id="existing_bracketed"),
+    pytest.param("### 1. [P1] numbered bracketed\n", ["P1"], id="existing_numbered_bracketed"),
+    pytest.param("### P1-1\n", ["P1-1"], id="existing_hyphen"),
+    pytest.param("### 1. P1-1 numbered hyphen\n", ["P1-1"], id="existing_numbered_hyphen"),
+]
+
+
+_COLON_NEGATIVE_AND_EXISTING_CASES = [
+    pytest.param(case.values[0], [], id=case.id) for case in _COLON_NEGATIVE_BODIES
+] + list(_COLON_EXISTING_GRAMMAR_CASES)
+
+
+@pytest.mark.parametrize(("body", "expected"), _COLON_NEGATIVE_AND_EXISTING_CASES)
+def test_owner_colon_negative_matrix(body, expected):
+    """GIVEN inputs that are NOT heading-start colon severity findings
+    (ordinary prose, ``<p>``, code span, fence, comment, mid-heading mention,
+    ``pre`` / ``script`` / ``style``) plus the pre-existing ``[P<n>]`` /
+    ``P<n>-<n>`` grammar
+    WHEN extract_severity_tags runs
+    THEN negatives return [] and the existing grammar keeps its tags."""
+    assert delta.extract_severity_tags(body) == expected
