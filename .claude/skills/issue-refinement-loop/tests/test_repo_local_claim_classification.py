@@ -325,6 +325,16 @@ VC: GitHub API rate-limit response must be checked against the official docs bef
             "GitHub GraphQL errors are to be checked against official docs before approval",
         ),
         (
+            "Do not verify local fixtures and GitHub GraphQL errors will be checked "
+            "against official docs before approval.",
+            "GitHub GraphQL errors will be checked against official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors will be verified "
+            "against official docs before approval.",
+            "GitHub GraphQL errors will be verified against official docs before approval",
+        ),
+        (
             "Do not verify local fixtures and GitHub GraphQL errors must match "
             "official docs no later than release.",
             "GitHub GraphQL errors must match official docs no later than release",
@@ -416,6 +426,29 @@ def test_independent_noun_start_external_claims_remain_dispositive(phrase, expec
         assert _consumer().route_web_research_result(routing_input)["next_action"] == "proceed"
 
 
+@pytest.mark.parametrize("external", [
+    "GitHub GraphQL errors will be checked against official docs before approval.",
+    "GitHub GraphQL errors will be verified against official docs before approval.",
+    "GitHub GraphQL errors are to be checked against official docs before approval.",
+    "GitHub GraphQL errors must match official docs no later than release.",
+])
+def test_external_dependency_survives_independent_negative_local_prefix(external):
+    for phrase in (external, f"Do not verify local fixtures and {external}"):
+        for body, comments, source_hint in [
+            (_body(ac=f"- AC1: {phrase}"), None, None),
+            (_body(ac="- AC1: Run current-main repository tests."),
+             [{"id": 93, "body": phrase}], "comment_93"),
+        ]:
+            policy = _web(_plan(body, comments))
+            claims = policy["critical_external_claims"]
+            assert policy["required"] and len(claims) == 1, claims
+            assert external.rstrip(".") in claims[0]["claim"]
+            assert "Do not verify local fixtures" not in claims[0]["claim"]
+            assert claims[0]["source_hint"] == source_hint
+            assert claims[0]["role"] == "dispositive"
+            assert set(claims[0]) == {"claim", "affects", "source_hint", "role"}
+
+
 def test_affirmative_deadline_does_not_negate_external_dependency():
     phrase = "GitHub GraphQL errors must match official docs no later than release."
     for body, comments in [
@@ -439,6 +472,8 @@ def test_affirmative_deadline_does_not_negate_external_dependency():
         "Do not verify local fixtures and GitHub GraphQL errors have to not match official docs.",
         "Do not verify local fixtures and GitHub GraphQL errors must not match official docs.",
         "Do not verify local fixtures and GitHub GraphQL errors are not to be checked against official docs.",
+        "Do not verify local fixtures and GitHub GraphQL errors will not be checked against official docs.",
+        "Do not verify local fixtures and GitHub GraphQL errors won't be checked against official docs.",
         "No later than release, do not verify GitHub GraphQL errors against official docs.",
         "GitHub GraphQL errors must not match official docs no later than release.",
         "Previously quoted: Do not verify local fixtures and GitHub GraphQL errors "
@@ -447,6 +482,8 @@ def test_affirmative_deadline_does_not_negate_external_dependency():
         "have to match official docs before approval.",
         "Literal example: Do not verify local fixtures and GitHub GraphQL errors "
         "must match official docs before approval.",
+        "Previously quoted: Do not verify local fixtures and GitHub GraphQL errors "
+        "will be checked against official docs before approval.",
         "リポジトリ fixtures の検証は不要、GitHub GraphQL は例示のみ。",
     ],
 )
@@ -460,11 +497,29 @@ def test_noun_start_mixed_clause_negative_controls_do_not_require_web(phrase):
         assert policy["required"] is False
         assert policy["critical_external_claims"] == []
 
-    fenced = _body(ac="- AC1: Run current-main repository tests.", vc=(
-        "```text\nDo not verify local fixtures and GitHub GraphQL errors "
-        "must match official docs before approval.\n```"
-    ))
-    assert not _web(_plan(fenced))["required"]
+    for external in (
+        "GitHub GraphQL errors must match official docs before approval.",
+        "GitHub GraphQL errors will be checked against official docs before approval.",
+    ):
+        fenced = _body(ac="- AC1: Run current-main repository tests.", vc=(
+            f"```text\nDo not verify local fixtures and {external}\n```"
+        ))
+        assert not _web(_plan(fenced))["required"]
+
+
+@pytest.mark.parametrize("phrase", [
+    "GitHub GraphQL errors will not be checked against official docs before approval.",
+    "GitHub GraphQL errors won't be checked against official docs before approval.",
+])
+def test_negated_future_external_claims_do_not_require_web(phrase):
+    for body, comments in [
+        (_body(ac=f"- AC1: {phrase}"), None),
+        (_body(ac="- AC1: Run current-main repository tests."),
+         [{"id": 94, "body": phrase}]),
+    ]:
+        policy = _web(_plan(body, comments))
+        assert policy["required"] is False
+        assert policy["critical_external_claims"] == []
 
 
 def test_planner_output_routes_without_manual_role_rewrite_or_web_skip():

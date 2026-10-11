@@ -1732,6 +1732,16 @@ def test_repo_local_no_web_preflight_handoff_preserves_unverified_anchor_warning
             "GitHub GraphQL errors are to be checked against official docs before approval",
         ),
         (
+            "Do not verify local fixtures and GitHub GraphQL errors will be checked "
+            "against official docs before approval.",
+            "GitHub GraphQL errors will be checked against official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors will be verified "
+            "against official docs before approval.",
+            "GitHub GraphQL errors will be verified against official docs before approval",
+        ),
+        (
             "Do not verify local fixtures and GitHub GraphQL errors must match "
             "official docs no later than release.",
             "GitHub GraphQL errors must match official docs no later than release",
@@ -1792,6 +1802,30 @@ def test_noun_start_external_anchor_cannot_clear_no_web_warning(tmp_path, phrase
     assert claim["role"] == "dispositive"
     assert (result["status"], exit_code) == ("warn", wrapper.EXIT_WARN)
     assert result["next_action"] == "proceed_with_notes"
+
+
+@pytest.mark.parametrize("phrase", [
+    "Do not verify local fixtures and GitHub GraphQL errors will not be checked "
+    "against official docs before approval.",
+    "Do not verify local fixtures and GitHub GraphQL errors won't be checked "
+    "against official docs before approval.",
+    "Do not verify local fixtures and check repository tests instead.",
+])
+def test_negated_future_anchor_keeps_repo_local_no_web_handoff(tmp_path, phrase):
+    fixture, anchor_url = _ac8_repo_local_anchor_fixture(f"## Revised AC\n- AC2: {phrase}\n")
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+
+    with mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path):
+        result, exit_code = wrapper.run_preflight(
+            issue_number=2857,
+            repo="testowner/testrepo",
+            anchor_comment_urls=[anchor_url],
+            fixture_path=fixture_path,
+        )
+
+    assert (result["status"], exit_code) == ("pass", wrapper.EXIT_PASS)
+    assert result["next_action"] == "proceed"
 
 
 @pytest.mark.parametrize("api_url", [True, False])
