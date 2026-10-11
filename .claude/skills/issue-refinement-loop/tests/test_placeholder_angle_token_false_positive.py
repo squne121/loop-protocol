@@ -343,3 +343,40 @@ def test_production_path_true_blocker_preserved(kind):
     route = ric.route_structural_repair_disposition(bundle)
     assert route["status"] == "blocked"
     assert route["next_action"] == "human_judgment_required"
+
+
+# ---------------------------------------------------------------------------
+# P3-1: `_is_placeholder_mrc_scalar()` の 3 つの placeholder 判定分岐を独立に固定する
+#   A: 単一山括弧トークン全体一致 / B: 未選択 enum / C: template default との完全一致
+# いずれも template default が value と異なる（または A/B が他分岐に依存しない）入力で、
+# 各分岐が他の分岐に依存せず単独で placeholder と判定されることを確認する。
+# ---------------------------------------------------------------------------
+
+
+def test_placeholder_branch_a_single_angle_token_independent_of_default():
+    value = "<独自の未記入項目>"
+    default = "正規の既定値"
+    assert value != default
+    assert ric._is_placeholder_mrc_scalar("goal_ref", value, default) is True
+
+
+def test_placeholder_branch_b_unselected_enum_independent_of_angle_and_default():
+    value = "docs|code"
+    default = "正規の既定値"
+    assert value != default
+    assert ric._PLACEHOLDER_ANGLE_TOKEN_RE.search(value) is None
+    assert ric._is_placeholder_mrc_scalar("goal_ref", value, default) is True
+
+
+def test_placeholder_branch_c_template_default_exact_match_composite():
+    default = "親: <未記入> / 子: <未記入>"
+    # 単一トークン全体一致では検出できない構造であること（分岐 A 非依存）。
+    assert ric._PLACEHOLDER_ANGLE_TOKEN_RE.fullmatch(default.strip()) is None
+    assert ric._contains_unselected_enum_scaffold(default) is False
+    assert ric._is_placeholder_mrc_scalar("goal_ref", f"  {default}  ", default) is True
+
+
+def test_placeholder_branches_negative_control_partial_angle_is_legit():
+    default = "親: <未記入> / 子: <未記入>"
+    value = "検証用 digest を sha256:<hex> 形式で比較する"
+    assert ric._is_placeholder_mrc_scalar("goal_ref", value, default) is False
