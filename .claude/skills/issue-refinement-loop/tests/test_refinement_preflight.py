@@ -1707,6 +1707,10 @@ def test_repo_local_no_web_preflight_handoff_preserves_unverified_anchor_warning
     "phrase,expected",
     [
         (
+            "Official OAuth 2.0 documentation requires an exact registered redirect URI match before approval.",
+            "registered redirect URI match",
+        ),
+        (
             "Verify against the official GraphQL specification that request error "
             "responses must not contain data.",
             "request error responses must not contain data",

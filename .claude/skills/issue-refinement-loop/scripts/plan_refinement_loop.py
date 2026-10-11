@@ -587,7 +587,7 @@ CRITICAL_EXTERNAL_KEYWORDS = frozenset({
     "official", "api", "cli", "auth", "migration", "graphql",
 })
 _EXTERNAL_TOPIC_RE = re.compile(
-    r"(?<![a-z0-9_])(?:graphql|api|cli|auth|authentication|migration)"
+    r"(?<![a-z0-9_])(?:graphql|api|cli|auth|authentication|oauth|migration)"
     r"(?![a-z0-9_])", re.I,
 )
 _EXTERNAL_AUTHORITY_RE = re.compile(
@@ -619,6 +619,16 @@ _EVIDENCE_ACTION_RE = re.compile(
 )
 _EXTERNAL_SOURCE_REF_RE = re.compile(
     r"\b(?:docs?|documentation|spec(?:ification)?|web|external)\b|公式|外部", re.I,
+)
+_EXTERNAL_ASSERTION_RE = re.compile(
+    r"\b(?:must|shall|should|require[ds]?|depends?|specified|defined|"
+    r"documented|mandated|prohibits?)\b|必要|禁止|定義|規定", re.I,
+)
+_REPO_SPEC_FIXTURE_RE = re.compile(
+    r"\b(?:repo(?:sitory)?|local|tests?)\b.{0,80}"
+    r"\b(?:spec(?:ification)?|rate[- ]limit|data/errors)\b.{0,50}\bfixtures?\b|"
+    r"\b(?:spec(?:ification)?|rate[- ]limit|data/errors)\s+fixtures?\b"
+    r".{0,50}\b(?:repo(?:sitory)?|local|tests?)\b", re.I,
 )
 _REPO_CHECK_RE = re.compile(
     r"\b(?:verify|inspect|check|find|run|execute|test|establish|confirm|"
@@ -655,7 +665,8 @@ _QUOTED_CONTEXT_RE = re.compile(
     r"(?<![/.])\b(?:previously(?:\s+quoted)?|historical(?:\s+context)?|"
     r"past(?:\s+quote)?|quoted|quote|literal(?:\s+example)?|noise|example)\s*[:：]|"
     r"\b(?:previously\s+quoted|literal\s+example)\s*[\"'“‘«「『`]|"
-    r"(?:過去(?:の)?引用|引用|貼付|例示)\s*[:：]|過去の引用|例示のみ", re.I,
+    r"(?:過去(?:の)?引用|引用|貼付|例示)\s*[:：]|過去の引用|例示のみ|"
+    r"\breference\s+only\s*[:：]", re.I,
 )
 _QUOTED_ASIDE_RE = re.compile(r"\([^()]*\)")
 _FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
@@ -768,7 +779,7 @@ def _claim_sentences(line: str) -> list[str]:
         # A closed past quotation can precede an independent current request.
         # Do not treat the quoted fragment itself as a directive.
         quoted_current = re.search(
-            r"(?:[\"'”’»」』])\s*,?\s+(?:but|however|yet)\s+(?=current\b)",
+            r"(?:[\"'`”’»」』])\s*,?\s+(?:but|however|yet)\s+(?=current\b)",
             sentence, re.I,
         )
         if _QUOTED_CONTEXT_RE.search(sentence) and quoted_current:
@@ -831,10 +842,18 @@ def _is_external_dependency(text: str, *, comment: bool = False) -> bool:
     topic = bool(_EXTERNAL_TOPIC_RE.search(text))
     authority = bool(_EXTERNAL_AUTHORITY_RE.search(text))
     intent = bool(_EXTERNAL_INTENT_RE.search(text))
+    local_fixture = _REPO_SPEC_FIXTURE_RE.search(text)
+    if local_fixture and not _EXTERNAL_AUTHORITY_RE.search(text[local_fixture.end():]):
+        return False
     if topic and authority and intent:
         return True
     if topic and intent and re.search(r"\b(?:spec(?:ification)?|rate[- ]limit|data/errors)\b|仕様", text, re.I):
         # GraphQL-only specifications need not say "API" or "official".
+        return True
+    if (authority and _EXTERNAL_ASSERTION_RE.search(text)
+        and re.search(r"\b(?:docs?|documentation|spec(?:ification)?|protocol|standard|policy)\b|仕様", text, re.I)):
+        # A published specification can be dispositive without naming a known
+        # service or explicitly asking the reader to verify it.
         return True
     if comment and _EXPLICIT_WEB_REQUEST_RE.search(text):
         return True

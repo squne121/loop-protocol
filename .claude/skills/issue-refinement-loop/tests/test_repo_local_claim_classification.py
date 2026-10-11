@@ -244,6 +244,72 @@ def test_quoted_fragment_followed_by_independent_current_external_requirement():
     assert claims[0]["source_hint"] == "comment_92"
 
 
+def test_official_specification_assertion_without_known_topic_remains_dispositive():
+    claims_text = [
+        "Official OAuth 2.0 documentation requires an exact registered redirect URI match before approval.",
+        "The published protocol specification requires an exact registered redirect URI match before approval.",
+        "OAuth 2.0 specification requires an exact registered redirect URI match before approval.",
+    ]
+    for phrase in claims_text:
+        for body, comments, hint in [
+            (_body(ac=f"- AC1: {phrase}"), None, None),
+            (_body(), [{"id": 98, "body": phrase}], "comment_98"),
+        ]:
+            plan = _plan(body, comments)
+            claims = _web(plan)["critical_external_claims"]
+            assert _web(plan)["required"] and len(claims) == 1, (phrase, claims)
+            assert phrase in claims[0]["claim"]
+            assert claims[0]["role"] == "dispositive" and claims[0]["source_hint"] == hint
+            assert _consumer().route_web_research_result({
+                "schema": "WEB_RESEARCH_ROUTING_INPUT_V1",
+                "repository_decision": {"status": "inconclusive", "disposition": None},
+                "critical_external_claims": claims,
+                "web_research": {"status": "inconclusive", "failure_class": None,
+                                 "verification_route": "grounded_research", "claims": [], "unresolved_risks": []},
+            })["next_action"] == "human_judgment_required"
+    assert not _web(_plan(_body(ac="- AC1: Official documentation is mentioned only as background.")))["required"]
+
+
+def test_repository_specification_fixture_is_local_evidence_not_web():
+    phrase = "Check the repository GraphQL specification fixture in tests and confirm its returned shape."
+    plan = _plan(_body(ac=f"- AC1: {phrase}"))
+    assert _web(plan)["required"] is False
+    assert _web(plan)["critical_external_claims"] == []
+    assert _investigation(plan)["required"] is True
+    assert any(phrase in claim for claim in _investigation(plan)["repo_claims"])
+    local = _web(_plan(_body(ac=(
+        "- AC1: Check the official repository GraphQL specification fixture in tests."
+    ))))
+    assert local["required"] is False
+    external = _web(_plan(_body(ac=(
+        "- AC1: Verify the official GraphQL specification against repository fixture output."
+    ))))
+    assert external["required"] and len(external["critical_external_claims"]) == 1
+    mixed = _web(_plan(_body(ac=(
+        "- AC1: Check the repository GraphQL specification fixture against official docs."
+    ))))
+    assert mixed["required"] and len(mixed["critical_external_claims"]) == 1
+
+
+def test_reference_only_inline_quote_does_not_hide_separate_current_request():
+    historical = "Reference only: `Verify GitHub GraphQL errors against official docs.` No action requested."
+    policy = _web(_plan(_body(), [{"id": 71, "body": historical}]))
+    assert policy["required"] is False and policy["critical_external_claims"] == []
+    current = "Verify current GitHub GraphQL errors against official docs before approval."
+    policy = _web(_plan(_body(), [{"id": 71, "body": f"{historical}\n\n{current}"}]))
+    assert policy["required"] is True
+    assert len(policy["critical_external_claims"]) == 1
+    assert policy["critical_external_claims"][0]["claim"] == current
+    assert policy["critical_external_claims"][0]["source_hint"] == "comment_71"
+    inline = _web(_plan(_body(), [{"id": 72, "body": (
+        "Reference only: `Verify GitHub GraphQL errors against official docs`, "
+        "but current GitHub GraphQL errors must match official docs before approval."
+    )}]))
+    assert inline["required"] is True
+    assert len(inline["critical_external_claims"]) == 1
+    assert "current GitHub GraphQL errors" in inline["critical_external_claims"][0]["claim"]
+
+
 def test_out_of_scope_negative_rate_limit_is_not_external_specification():
     """GIVEN #1659's negative scope line WHEN planned THEN web remains optional."""
     body = _body(out_of_scope="- GitHub API rate-limit policy 全体の変更")
