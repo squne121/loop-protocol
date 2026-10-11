@@ -624,6 +624,10 @@ _EXTERNAL_ASSERTION_RE = re.compile(
     r"\b(?:must|shall|should|require[ds]?|depends?|specified|defined|"
     r"documented|mandated|prohibits?)\b|必要|禁止|定義|規定", re.I,
 )
+_EXTERNAL_SOURCE_BEFORE_FIXTURE_RE = re.compile(
+    r"\b(?:docs?|documentation|spec(?:ification)?|protocol|standard|policy|web)\b|"
+    r"仕様|ドキュメント", re.I,
+)
 _REPO_SPEC_FIXTURE_RE = re.compile(
     r"\b(?:repo(?:sitory)?|local|tests?)\b.{0,80}"
     r"\b(?:spec(?:ification)?|rate[- ]limit|data/errors)\b.{0,50}\bfixtures?\b|"
@@ -666,7 +670,8 @@ _QUOTED_CONTEXT_RE = re.compile(
     r"past(?:\s+quote)?|quoted|quote|literal(?:\s+example)?|noise|example)\s*[:：]|"
     r"\b(?:previously\s+quoted|literal\s+example)\s*[\"'“‘«「『`]|"
     r"(?:過去(?:の)?引用|引用|貼付|例示)\s*[:：]|過去の引用|例示のみ|"
-    r"\breference\s+only\s*[:：]", re.I,
+    r"\breference\s+only\s*[:：]|"
+    r"\b(?:earlier|previous)\s+(?:reviewer\s+)?(?:wrote|said|noted)\s*[:：]", re.I,
 )
 _QUOTED_ASIDE_RE = re.compile(r"\([^()]*\)")
 _FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
@@ -843,8 +848,15 @@ def _is_external_dependency(text: str, *, comment: bool = False) -> bool:
     authority = bool(_EXTERNAL_AUTHORITY_RE.search(text))
     intent = bool(_EXTERNAL_INTENT_RE.search(text))
     local_fixture = _REPO_SPEC_FIXTURE_RE.search(text)
-    if local_fixture and not _EXTERNAL_AUTHORITY_RE.search(text[local_fixture.end():]):
-        return False
+    if local_fixture:
+        before = text[:local_fixture.start()]
+        after = text[local_fixture.end():]
+        independent_source = (
+            _EXTERNAL_AUTHORITY_RE.search(before)
+            and _EXTERNAL_SOURCE_BEFORE_FIXTURE_RE.search(before)
+        )
+        if not independent_source and not _EXTERNAL_AUTHORITY_RE.search(after):
+            return False
     if topic and authority and intent:
         return True
     if topic and intent and re.search(r"\b(?:spec(?:ification)?|rate[- ]limit|data/errors)\b|仕様", text, re.I):

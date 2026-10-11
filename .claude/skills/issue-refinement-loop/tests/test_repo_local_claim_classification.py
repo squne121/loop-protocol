@@ -289,6 +289,21 @@ def test_repository_specification_fixture_is_local_evidence_not_web():
         "- AC1: Check the repository GraphQL specification fixture against official docs."
     ))))
     assert mixed["required"] and len(mixed["critical_external_claims"]) == 1
+    before = _web(_plan(_body(ac=(
+        "- AC1: Verify GitHub GraphQL errors against official docs using the repository "
+        "GraphQL specification fixture in tests before approval."
+    ))))
+    assert before["required"] and len(before["critical_external_claims"]) == 1
+    assert "official docs using the repository" in before["critical_external_claims"][0]["claim"]
+    oauth = _web(_plan(_body(ac=(
+        "- AC1: Official OAuth documentation requires a registered redirect URI match "
+        "using the repository GraphQL specification fixture in tests."
+    ))))
+    assert oauth["required"] and len(oauth["critical_external_claims"]) == 1
+    local_before = _web(_plan(_body(ac=(
+        "- AC1: Check the official GraphQL specification fixture in repository tests."
+    ))))
+    assert local_before["required"] is False
 
 
 def test_reference_only_inline_quote_does_not_hide_separate_current_request():
@@ -308,6 +323,27 @@ def test_reference_only_inline_quote_does_not_hide_separate_current_request():
     assert inline["required"] is True
     assert len(inline["critical_external_claims"]) == 1
     assert "current GitHub GraphQL errors" in inline["critical_external_claims"][0]["claim"]
+
+
+def test_earlier_reviewer_inline_quote_is_not_a_current_request():
+    historical = (
+        "Earlier reviewer wrote: `Verify GitHub GraphQL errors against official docs.` "
+        "This is a historical quote, not a current request."
+    )
+    policy = _web(_plan(_body(), [{"id": 99, "body": historical}]))
+    assert policy["required"] is False and policy["critical_external_claims"] == []
+    current = "Verify current GitHub GraphQL errors against official docs before approval."
+    policy = _web(_plan(_body(), [{"id": 99, "body": f"{historical}\n\n{current}"}]))
+    assert policy["required"] and len(policy["critical_external_claims"]) == 1
+    assert policy["critical_external_claims"][0]["claim"] == current
+    assert policy["critical_external_claims"][0]["source_hint"] == "comment_99"
+    inline = _web(_plan(_body(), [{"id": 99, "body": (
+        "Earlier reviewer wrote: `Verify GitHub GraphQL errors against official docs`, "
+        "but current GitHub GraphQL errors must match official docs before approval."
+    )}]))
+    assert inline["required"] and len(inline["critical_external_claims"]) == 1
+    assert "current GitHub GraphQL errors" in inline["critical_external_claims"][0]["claim"]
+    assert "Earlier reviewer wrote" not in inline["critical_external_claims"][0]["claim"]
 
 
 def test_out_of_scope_negative_rate_limit_is_not_external_specification():

@@ -1720,6 +1720,16 @@ def test_repo_local_no_web_preflight_handoff_preserves_unverified_anchor_warning
             "data の返却は禁止",
         ),
         (
+            "Verify GitHub GraphQL errors against official docs using the repository "
+            "GraphQL specification fixture in tests before approval.",
+            "official docs using the repository",
+        ),
+        (
+            "Official OAuth documentation requires a registered redirect URI match "
+            "using the repository GraphQL specification fixture in tests.",
+            "registered redirect URI match",
+        ),
+        (
             "Do not verify local fixtures and GitHub GraphQL errors must match "
             "official docs before approval.",
             "GitHub GraphQL errors must match official docs before approval",
@@ -1869,6 +1879,9 @@ def test_noun_start_external_anchor_cannot_clear_no_web_warning(tmp_path, phrase
     "against official docs before approval.",
     "Previously quoted: Do not verify local fixtures, but verify GitHub GraphQL "
     "errors against official docs before approval.",
+    "Earlier reviewer wrote: `Verify GitHub GraphQL errors against official docs.` "
+    "This is a historical quote, not a current request.",
+    "Check the official GraphQL specification fixture in repository tests.",
     "Do not verify local fixtures and check repository tests instead.",
     "Previously quoted: Do not verify local example fixtures and GitHub GraphQL errors "
     "must match official docs before approval.",
