@@ -21,9 +21,12 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+import os
 import re
+import shlex
 import subprocess
 import sys
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -172,6 +175,8 @@ class Scenario:
     commands: list[dict[str, Any]]
     hashes: list[str]
     kinds: list[str] = field(default_factory=list)
+    # The git repo the baseline was produced in (Issue #3020: executed fixtures run here, at ``head``).
+    repo: Path | None = None
 
     def indices(self, kind: str) -> list[int]:
         return [index for index, value in enumerate(self.kinds) if value == kind]
@@ -181,17 +186,32 @@ def _git(repo: Path, *args: str) -> str:
     return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True).stdout.strip()
 
 
-def _build_scenario(tmp_path_factory: pytest.TempPathFactory, name: str, body: str) -> Scenario:
-    base = tmp_path_factory.mktemp(f"scenario_{name}")
-    repo = base / "repo"
-    repo.mkdir()
+def _init_repo(repo: Path, extra_files: dict[str, str] | None = None) -> str:
+    """Create a git repo with ``tracked.txt`` plus ``extra_files`` committed; return the HEAD SHA."""
+    repo.mkdir(parents=True)
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     _git(repo, "config", "user.email", "test@example.invalid")
     _git(repo, "config", "user.name", "Test")
-    (repo / "tracked.txt").write_text("fixture\n", encoding="utf-8")
+    files = {"tracked.txt": "fixture\n", **(extra_files or {})}
+    for relative, content in files.items():
+        target = repo / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "initial")
-    head = _git(repo, "rev-parse", "HEAD")
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def _build_scenario(
+    tmp_path_factory: pytest.TempPathFactory,
+    name: str,
+    body: str,
+    *,
+    repo_files: dict[str, str] | None = None,
+) -> Scenario:
+    base = tmp_path_factory.mktemp(f"scenario_{name}")
+    repo = base / "repo"
+    head = _init_repo(repo, repo_files)
     # The body lives OUTSIDE the repo so it does not dirty the tree under test.
     body_file = base / "issue-body.md"
     body_file.write_text(body, encoding="utf-8")
@@ -258,6 +278,7 @@ def _build_scenario(tmp_path_factory: pytest.TempPathFactory, name: str, body: s
         commands=commands,
         hashes=hashes,
         kinds=kinds,
+        repo=repo,
     )
 
 
@@ -1435,3 +1456,667 @@ def test_step2_delegation_template_passes_ac_command_command_hash_triplets_verba
     ):
         assert _squash(phrase) in doc, phrase
     assert _squash("`(ac label, literal command)` の組") not in doc
+
+
+# =============================================================================
+# Issue #3020: executed-fixture integration regression.
+#
+# Everything above builds its PASS report by hand (``_row()`` defaults to
+# ``exit_code=0`` / ``status="pass"``), which proves the consumer's input-shape
+# validation but not that an EXECUTED VC result reaches it. The helpers below run
+# a small local pytest fixture in a real subprocess and build the report rows
+# from the OBSERVED run only. The producer (``baseline_vc_preflight.py``) and the
+# adjudicator (``adjudicate_vc_result.py step4-adjudicate``) stay real; nothing is
+# mocked.
+#
+# Binding model (one literal command end to end):
+#   declared VC (body ``raw_command``) == executed command (shlex.split -> argv)
+#   == report row ``command`` / ``command_hash`` (looked up in the scenario's
+#   ``commands`` by that exact literal) and the observed run happened in the
+#   scenario's own git repo at ``scenario.head`` with a clean tracked tree.
+# Execution proof: exit 0 alone is NOT an executed PASS (``--collect-only`` exits
+# 0 without running anything). The fixture test writes a call-phase witness
+# after its assertion succeeded; only exit 0 + that witness is "pass".
+# https://docs.pytest.org/en/9.0.x/reference/reference.html
+# =============================================================================
+
+FIXTURE_TEST_PATH = "fixture_tests/test_fixture_3020.py"
+FIXTURE_TEST_NAME = "test_executed_fixture_deferred_case"
+FIXTURE_K_EXPR = "executed_fixture and deferred"
+FIXTURE_K_EXPR_OTHER = "executed_fixture"
+FIXTURE_K_EXPR_UNCOLLECTED = "no_such_test_name_anywhere"
+WITNESS_FILE_ENV = "LP3020_WITNESS_FILE"
+WITNESS_NONCE_ENV = "LP3020_WITNESS_NONCE"
+REPAIR_SCRIPT_PATH = SKILL_DIR.parent / "issue-refinement-loop" / "scripts" / "repair_issue_contract.py"
+
+# Caches the pytest child may create; keep the scenario repo clean without touching pytest's argv.
+FIXTURE_GITIGNORE = ".pytest_cache/\n__pycache__/\n"
+
+
+def _fixture_source(assertion: str = "True") -> str:
+    """The fixture test. The witness is written AFTER the assertion, so it exists only if the test body
+    really ran in the call phase and the assertion held (a failing assertion raises before the write)."""
+    return (
+        "import json\n"
+        "import os\n"
+        "\n"
+        "\n"
+        f"def {FIXTURE_TEST_NAME}():\n"
+        f"    assert {assertion}\n"
+        f"    witness = os.environ.get({WITNESS_FILE_ENV!r})\n"
+        "    if witness:\n"
+        "        nodeid, _, phase = os.environ['PYTEST_CURRENT_TEST'].rpartition(' (')\n"
+        "        with open(witness, 'w', encoding='utf-8') as handle:\n"
+        "            json.dump(\n"
+        "                {\n"
+        "                    'nodeid': nodeid,\n"
+        "                    'phase': phase.rstrip(')'),\n"
+        "                    'assertion': 'passed',\n"
+        f"                    'nonce': os.environ.get({WITNESS_NONCE_ENV!r}),\n"
+        "                },\n"
+        "                handle,\n"
+        "            )\n"
+    )
+
+
+def _repo_files(source: str | None = None) -> dict[str, str]:
+    return {FIXTURE_TEST_PATH: source or _fixture_source(), ".gitignore": FIXTURE_GITIGNORE}
+
+
+# The declared VC is an executable literal (not `uv run --locked`, which would need a lockfile the local
+# fixture repo does not have, and whose equivalence to a direct interpreter run is not assumed).
+_BODY_3020_TEMPLATE = """## Allowed Paths
+- tracked.txt
+- {fixture_path}
+
+## Verification Commands
+
+```bash
+# AC1
+{annotation}
+$ python -m pytest {fixture_path} -q -k "{k_expr}"
+```
+"""
+
+
+def _body_3020(annotation: str, k_expr: str = FIXTURE_K_EXPR) -> str:
+    return _BODY_3020_TEMPLATE.format(annotation=annotation, fixture_path=FIXTURE_TEST_PATH, k_expr=k_expr)
+
+
+BODY_DEFERRED_RAW = _body_3020("# baseline-expect: deferred")
+BODY_PR_REVIEW_ONLY = _body_3020("# preflight-scope: pr_review_only")
+
+
+class BindingMismatch(Exception):
+    """The executed observation does not bind to the scenario's declared VC / head."""
+
+
+@dataclass
+class FixtureObservation:
+    """What the local pytest subprocess actually did (no assumed outcome)."""
+
+    exit_code: int
+    output: str
+    executed: bool  # True only for an observation that really ran the test body (pass / red)
+    kind: str  # "pass" | "red" | "not_executed" | "uncollected" | "launch_obstacle"
+    executed_command: str  # the literal declared command that was split into argv
+    argv: list[str]
+    cwd: str
+    head: str
+    launcher_substituted: str | None
+    selector: str | None
+    target_path: str | None
+    witness: dict[str, Any] | None
+
+
+def _valid_witness(witness: Any, nonce: str | None) -> bool:
+    return (
+        isinstance(witness, dict)
+        and nonce is not None
+        and witness.get("nodeid") == f"{FIXTURE_TEST_PATH}::{FIXTURE_TEST_NAME}"
+        and witness.get("phase") == "call"
+        and witness.get("assertion") == "passed"
+        and witness.get("nonce") == nonce
+    )
+
+
+def _classify_pytest_observation(
+    exit_code: int, output: str, witness: Any = None, nonce: str | None = None
+) -> tuple[bool, str]:
+    """Classify an OBSERVED pytest run -> (executed, kind).
+
+    exit 0 is a PASS only when the test-local call-phase witness is present and matches (``--collect-only``
+    exits 0 without running anything). Only an exit-1 run reporting an assertion failure is RED; exit 5
+    (nothing collected) and pre-launch obstacles (uv / usage / launch errors) are never RED (AC6)."""
+    if exit_code == 0:
+        if _valid_witness(witness, nonce):
+            return True, "pass"
+        return False, "not_executed"
+    if exit_code == 5:
+        return False, "uncollected"
+    if exit_code == 1 and re.search(r"^(FAILED|E\s+assert)", output, flags=re.MULTILINE):
+        return True, "red"
+    return False, "launch_obstacle"
+
+
+def _assert_repo_pristine(repo: Path, expected_head: str) -> None:
+    head = _git(repo, "rev-parse", "HEAD")
+    assert head == expected_head, f"repo HEAD {head} != scenario head {expected_head}"
+    dirty = _git(repo, "status", "--porcelain")
+    assert dirty == "", f"repo is not clean: {dirty!r}"
+
+
+def _child_env(witness_file: Path, nonce: str, extra_env: dict[str, str] | None) -> dict[str, str]:
+    """Child env: parent pytest options (PYTEST_ADDOPTS / PYTEST_PLUGINS / PYTEST_CURRENT_TEST ...) are
+    removed by default so the parent run cannot change the child's behaviour. ``extra_env`` re-adds them
+    explicitly (negative tests)."""
+    env = {key: value for key, value in os.environ.items() if not key.startswith("PYTEST_")}
+    env.update({"PYTHONDONTWRITEBYTECODE": "1", WITNESS_FILE_ENV: str(witness_file), WITNESS_NONCE_ENV: nonce})
+    env.update(extra_env or {})
+    return env
+
+
+def _selector_and_target(argv: list[str]) -> tuple[str | None, str | None]:
+    selector = argv[argv.index("-k") + 1] if "-k" in argv and argv.index("-k") + 1 < len(argv) else None
+    targets = [token for token in argv if token.endswith(".py") or "::" in token]
+    return selector, (targets[0] if targets else None)
+
+
+def _run_local_pytest_fixture(
+    repo: Path,
+    expected_head: str,
+    raw_command: str,
+    *,
+    witness_dir: Path,
+    extra_env: dict[str, str] | None = None,
+) -> FixtureObservation:
+    """Execute the DECLARED literal command (``shlex.split``) in the scenario repo at ``expected_head``.
+
+    Only the launcher word ``python`` / ``python3`` is replaced by ``sys.executable`` (recorded in the
+    observation); cwd / selector / target path are recorded too."""
+    _assert_repo_pristine(repo, expected_head)
+    argv = shlex.split(raw_command)
+    substituted = None
+    if argv and argv[0] in ("python", "python3"):
+        substituted = f"{argv[0]} -> {sys.executable}"
+        argv[0] = sys.executable
+    witness_dir.mkdir(parents=True, exist_ok=True)
+    nonce = uuid.uuid4().hex
+    witness_file = witness_dir / f"witness_{nonce}.json"  # outside the repo
+    completed = subprocess.run(
+        argv,
+        cwd=repo,
+        env=_child_env(witness_file, nonce, extra_env),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = completed.stdout + completed.stderr
+    witness = json.loads(witness_file.read_text(encoding="utf-8")) if witness_file.exists() else None
+    executed, kind = _classify_pytest_observation(completed.returncode, output, witness, nonce)
+    selector, target = _selector_and_target(argv)
+    return FixtureObservation(
+        exit_code=completed.returncode,
+        output=output,
+        executed=executed,
+        kind=kind,
+        executed_command=raw_command,
+        argv=argv,
+        cwd=str(repo),
+        head=_git(repo, "rev-parse", "HEAD"),
+        launcher_substituted=substituted,
+        selector=selector,
+        target_path=target,
+        witness=witness,
+    )
+
+
+def _run_scenario_vc(
+    scenario: Scenario,
+    tmp_path: Path,
+    *,
+    raw_command: str | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> FixtureObservation:
+    assert scenario.repo is not None
+    return _run_local_pytest_fixture(
+        scenario.repo,
+        scenario.head,
+        raw_command if raw_command is not None else scenario.commands[0]["raw_command"],
+        witness_dir=tmp_path / "witness",
+        extra_env=extra_env,
+    )
+
+
+def _report_from_observation(scenario: Scenario, observation: FixtureObservation) -> dict[str, Any]:
+    """Build the independent test-runner report from the observation ONLY.
+
+    The row command / command_hash / ac come from the ``scenario.commands`` entry whose ``raw_command`` is
+    exactly the executed literal; the head is the observed head. Nothing is filled in from the scenario
+    unconditionally, and a command or head that does not bind raises ``BindingMismatch``.
+    ``result`` is derived from the observation (PASS only for an executed pass), never forced.
+    """
+    matches = [i for i, c in enumerate(scenario.commands) if c["raw_command"] == observation.executed_command]
+    if len(matches) != 1:
+        raise BindingMismatch(
+            f"command binding mismatch: executed {observation.executed_command!r} is not a declared "
+            f"raw_command of scenario {scenario.name!r}"
+        )
+    if observation.head != scenario.head:
+        raise BindingMismatch(f"head binding mismatch: observed {observation.head} != scenario {scenario.head}")
+    index = matches[0]
+    command = scenario.commands[index]
+    passed = observation.kind == "pass"
+    tail = observation.output.strip().splitlines()[-1] if observation.output.strip() else ""
+    row = {
+        "command_hash": command["command_hash"],
+        "exit_code": observation.exit_code,
+        "status": "pass" if passed else "fail",
+        "notes": f"{observation.kind}; cwd={observation.cwd}; head={observation.head}; {tail}",
+    }
+    report = _report(
+        scenario,
+        head=observation.head,
+        drop=tuple(i for i in range(len(scenario.commands)) if i != index),
+        row_overrides={index: row},
+        result="PASS" if passed else "FAIL",
+    )
+    # ``_row`` takes the command positionally, so the literal that was executed is set explicitly here.
+    report["runtime_ac_results"][0]["command"] = observation.executed_command
+    return report
+
+
+def _apply_real_repair(tmp_path: Path, body: str) -> tuple[dict[str, Any], str]:
+    body_file = tmp_path / "raw_body.md"
+    out_file = tmp_path / "repaired_body.md"
+    body_file.write_text(body, encoding="utf-8")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(REPAIR_SCRIPT_PATH),
+            "--body-file",
+            str(body_file),
+            "--apply",
+            "--out-file",
+            str(out_file),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout), out_file.read_text(encoding="utf-8")
+
+
+def _executed_ws(tmp_path: Path, scenario: Scenario) -> Workspace:
+    return Workspace(tmp_path, scenario)
+
+
+def _adjudicate_executed(ws: Workspace, report: dict[str, Any], **kwargs: Any) -> tuple[int, dict[str, Any]]:
+    return ws.adjudicate(
+        report,
+        diff_summary=_diff_summary(ws.scenario, changed_paths=[FIXTURE_TEST_PATH]),
+        allowed=[*ALLOWED_PATHS, FIXTURE_TEST_PATH],
+        **kwargs,
+    )
+
+
+@pytest.fixture(scope="module")
+def deferred_raw(tmp_path_factory: pytest.TempPathFactory) -> Scenario:
+    scenario = _build_scenario(tmp_path_factory, "deferred_raw", BODY_DEFERRED_RAW, repo_files=_repo_files())
+    item = scenario.producer["results"][0]
+    # The REAL producer's classification of the raw annotation -- not the canonical pr_review_only envelope.
+    assert item["category"] == "baseline_expect_deferred", item
+    assert item["classification"] == "skipped", item
+    return scenario
+
+
+def _canonical_scenario(
+    factory: pytest.TempPathFactory,
+    name: str,
+    *,
+    k_expr: str = FIXTURE_K_EXPR,
+    source: str | None = None,
+    extra_files: dict[str, str] | None = None,
+) -> Scenario:
+    scenario = _build_scenario(
+        factory,
+        name,
+        _body_3020("# preflight-scope: pr_review_only", k_expr),
+        repo_files={**_repo_files(source), **(extra_files or {})},
+    )
+    item = scenario.producer["results"][0]
+    assert item["category"] == "preflight_scope_pr_review_only", item
+    assert item["scope_class"] == "pr_review_only", item
+    assert scenario.commands[0]["raw_command"].startswith("python -m pytest "), scenario.commands
+    return scenario
+
+
+@pytest.fixture(scope="module")
+def canonical_pr_review_only(tmp_path_factory: pytest.TempPathFactory) -> Scenario:
+    return _canonical_scenario(tmp_path_factory, "pr_review_only_3020")
+
+
+@pytest.fixture(scope="module")
+def canonical_other_selector(tmp_path_factory: pytest.TempPathFactory) -> Scenario:
+    """Same fixture and annotation, but a DIFFERENT `-k` selector -> a different command hash."""
+    # An extra committed file keeps its HEAD distinct from the first scenario's (same-second commits would
+    # otherwise hash identically).
+    return _canonical_scenario(
+        tmp_path_factory,
+        "pr_review_only_other_selector",
+        k_expr=FIXTURE_K_EXPR_OTHER,
+        extra_files={"other_selector_marker.txt": "other selector scenario\n"},
+    )
+
+
+@pytest.fixture(scope="module")
+def canonical_red(tmp_path_factory: pytest.TempPathFactory) -> Scenario:
+    return _canonical_scenario(tmp_path_factory, "pr_review_only_red", source=_fixture_source("1 == 2"))
+
+
+@pytest.fixture(scope="module")
+def canonical_uncollected(tmp_path_factory: pytest.TempPathFactory) -> Scenario:
+    """The DECLARED selector matches nothing, so the honest run is pytest exit 5."""
+    return _canonical_scenario(tmp_path_factory, "pr_review_only_uncollected", k_expr=FIXTURE_K_EXPR_UNCOLLECTED)
+
+
+def test_executed_fixture_observation_classification_is_real_and_exit5_or_launch_failure_is_not_red(tmp_path):
+    """AC6: classify REAL subprocess observations; exit 5 and a pre-launch obstacle are never RED."""
+    declared = f'python -m pytest {FIXTURE_TEST_PATH} -q -k "{FIXTURE_K_EXPR}"'
+
+    def run(name: str, files: dict[str, str], command: str = declared) -> FixtureObservation:
+        repo = tmp_path / name / "repo"
+        head = _init_repo(repo, files)
+        return _run_local_pytest_fixture(repo, head, command, witness_dir=tmp_path / name / "w")
+
+    ok = run("ok", _repo_files())
+    assert (ok.exit_code, ok.kind, ok.executed) == (0, "pass", True), ok.output
+    assert ok.witness is not None and ok.witness["phase"] == "call", ok.witness
+
+    red = run("red", _repo_files(_fixture_source("1 == 2")))
+    assert (red.exit_code, red.kind, red.executed) == (1, "red", True), red.output
+    assert red.witness is None  # the assertion failed before the witness write
+
+    # `-k` is partial matching; a selector matching nothing is exit 5 (not collected), never RED.
+    uncollected = run(
+        "unc", _repo_files(), f'python -m pytest {FIXTURE_TEST_PATH} -q -k "{FIXTURE_K_EXPR_UNCOLLECTED}"'
+    )
+    assert (uncollected.exit_code, uncollected.kind, uncollected.executed) == (5, "uncollected", False)
+
+    # A real `uv run --locked` launch obstacle (no lockfile) is a pre-launch failure, not RED.
+    obstacle = run(
+        "uvproj",
+        {**_repo_files(), "pyproject.toml": '[project]\nname = "x"\nversion = "0"\n'},
+        f'uv run --locked pytest {FIXTURE_TEST_PATH} -q -k "{FIXTURE_K_EXPR}"',
+    )
+    assert obstacle.exit_code != 0, obstacle.output
+    assert obstacle.kind == "launch_obstacle" and obstacle.executed is False, obstacle.output
+    assert "lockfile" in obstacle.output
+    assert obstacle.launcher_substituted is None  # only the `python` launcher word is replaced
+
+    # Synthetic classifier boundaries: only exit 1 with an assertion failure is RED.
+    assert _classify_pytest_observation(1, "usage: pytest ...")[1] == "launch_obstacle"
+    assert _classify_pytest_observation(4, "ERROR: usage")[1] == "launch_obstacle"
+    assert _classify_pytest_observation(127, "uv: command not found")[1] == "launch_obstacle"
+    # exit 0 without a (valid) call-phase witness is never an executed pass.
+    good = {
+        "nodeid": f"{FIXTURE_TEST_PATH}::{FIXTURE_TEST_NAME}",
+        "phase": "call",
+        "assertion": "passed",
+        "nonce": "n1",
+    }
+    assert _classify_pytest_observation(0, "", good, "n1") == (True, "pass")
+    assert _classify_pytest_observation(0, "", None, "n1") == (False, "not_executed")
+    for forged in (
+        {**good, "nonce": "other"},
+        {**good, "phase": "setup"},
+        {**good, "assertion": "failed"},
+        {**good, "nodeid": "x.py::y"},
+    ):
+        assert _classify_pytest_observation(0, "", forged, "n1") == (False, "not_executed"), forged
+
+
+def test_executed_fixture_run_is_bound_to_declared_command_repo_and_head(tmp_path, canonical_pr_review_only):
+    """P2-4: the executed argv is derived from the declared literal, run in the scenario repo at its head
+    (fixture committed there, clean), and the observation records what actually ran."""
+    scenario = canonical_pr_review_only
+    declared = scenario.commands[0]["raw_command"]
+    assert scenario.repo is not None
+    assert _git(scenario.repo, "rev-parse", "HEAD") == scenario.head
+    assert FIXTURE_TEST_PATH in _git(scenario.repo, "ls-tree", "-r", "--name-only", scenario.head).splitlines()
+    # The producer ran in this same repo.
+    assert scenario.producer["results"][0]["raw_command"] == declared
+
+    observation = _run_scenario_vc(scenario, tmp_path)
+
+    assert observation.kind == "pass" and observation.executed, observation.output
+    assert observation.executed_command == declared
+    assert observation.cwd == str(scenario.repo) and observation.head == scenario.head
+    assert observation.argv == [sys.executable, *shlex.split(declared)[1:]]
+    assert observation.launcher_substituted == f"python -> {sys.executable}"
+    assert observation.selector == FIXTURE_K_EXPR and observation.target_path == FIXTURE_TEST_PATH
+    assert _git(scenario.repo, "status", "--porcelain") == ""  # the run left the repo clean
+
+    report = _report_from_observation(scenario, observation)
+    row = report["runtime_ac_results"][0]
+    assert (row["command"], row["command_hash"]) == (declared, scenario.commands[0]["command_hash"])
+    assert report["head_sha"] == scenario.head and report["result"] == "PASS"
+
+
+def test_executed_fixture_refuses_to_run_in_a_dirty_or_moved_repo(tmp_path):
+    repo = tmp_path / "repo"
+    head = _init_repo(repo, _repo_files())
+    declared = f'python -m pytest {FIXTURE_TEST_PATH} -q -k "{FIXTURE_K_EXPR}"'
+    (repo / "tracked.txt").write_text("drifted\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="not clean"):
+        _run_local_pytest_fixture(repo, head, declared, witness_dir=tmp_path / "w")
+    _git(repo, "checkout", "--", "tracked.txt")
+    with pytest.raises(AssertionError, match="HEAD"):
+        _run_local_pytest_fixture(repo, "0" * 40, declared, witness_dir=tmp_path / "w")
+
+
+def test_executed_fixture_child_env_strips_parent_pytest_options_by_default(
+    tmp_path, monkeypatch, canonical_pr_review_only
+):
+    """P2-3: a parent PYTEST_ADDOPTS must not leak into the child (default), so the run executes for real."""
+    monkeypatch.setenv("PYTEST_ADDOPTS", "--collect-only")
+    monkeypatch.setenv("PYTEST_PLUGINS", "no_such_plugin_module_3020")
+    observation = _run_scenario_vc(canonical_pr_review_only, tmp_path)
+    assert observation.kind == "pass" and observation.executed, observation.output
+    assert observation.witness is not None
+
+
+def test_executed_fixture_collect_only_exit0_without_witness_is_not_pass_and_not_dispatched(
+    tmp_path, canonical_pr_review_only
+):
+    """P2-3 negative: `PYTEST_ADDOPTS=--collect-only` is actually handed to the child. pytest exits 0 without
+    running the test; no witness exists, so the observation is not a pass, the report is not PASS, and the
+    real step4-adjudicate does not dispatch the reviewer."""
+    observation = _run_scenario_vc(canonical_pr_review_only, tmp_path, extra_env={"PYTEST_ADDOPTS": "--collect-only"})
+    assert observation.exit_code == 0, observation.output  # the false-PASS precondition
+    assert "1 test collected" in observation.output, observation.output
+    assert observation.witness is None
+    assert (observation.kind, observation.executed) == ("not_executed", False)
+
+    report = _report_from_observation(canonical_pr_review_only, observation)
+    assert report["result"] == "FAIL"
+    assert report["runtime_ac_results"][0]["status"] == "fail"
+
+    ws = _executed_ws(tmp_path / "ws", canonical_pr_review_only)
+    ws.dir.mkdir()
+    rc, payload = _adjudicate_executed(ws, report)
+
+    _assert_fail_closed_no_dispatch(ws, rc, payload, ["pr_review_only_current_execution_not_pass:AC1"])
+    assert "pr_review_only_runtime_evidence_pass" not in json.dumps(payload)
+
+
+def test_executed_fixture_other_selector_observation_is_rejected_as_binding_mismatch(
+    tmp_path, canonical_pr_review_only, canonical_other_selector
+):
+    """P2-4 negative: a run of a DIFFERENT `-k` selector (or of another repo head) cannot be used as the
+    evidence of the declared VC. It is rejected as a binding mismatch, and as its own scenario it carries
+    its own command hash."""
+    scenario_a, scenario_b = canonical_pr_review_only, canonical_other_selector
+    command_a, command_b = scenario_a.commands[0], scenario_b.commands[0]
+    assert command_a["raw_command"] != command_b["raw_command"]
+    assert command_a["command_hash"] != command_b["command_hash"]
+
+    # B's selector executed in A's repo is a genuine pass, but not of A's declared command.
+    wrong = _run_scenario_vc(scenario_a, tmp_path / "wrong", raw_command=command_b["raw_command"])
+    assert wrong.kind == "pass" and wrong.head == scenario_a.head, wrong.output
+    assert wrong.selector == FIXTURE_K_EXPR_OTHER
+    with pytest.raises(BindingMismatch, match="command binding mismatch"):
+        _report_from_observation(scenario_a, wrong)
+
+    # A's command executed in B's repo: the command is declared in A, but the head is B's.
+    moved = _run_scenario_vc(scenario_b, tmp_path / "moved", raw_command=command_a["raw_command"])
+    assert moved.kind == "pass" and moved.head == scenario_b.head and scenario_a.head != scenario_b.head
+    with pytest.raises(BindingMismatch, match="head binding mismatch"):
+        _report_from_observation(scenario_a, moved)
+
+    # The same observation is valid evidence only for the scenario whose declared VC it executed.
+    right = _run_scenario_vc(scenario_b, tmp_path / "right")
+    report_b = _report_from_observation(scenario_b, right)
+    row = report_b["runtime_ac_results"][0]
+    assert (row["command"], row["command_hash"]) == (command_b["raw_command"], command_b["command_hash"])
+    assert row["command_hash"] != command_a["command_hash"]
+
+    # And the real adjudicator accepts B's report only against B's own binding.
+    ws = _executed_ws(tmp_path / "ws_b", scenario_b)
+    ws.dir.mkdir()
+    rc, payload = _adjudicate_executed(ws, report_b)
+    assert rc == 0 and payload["invoke_pr_reviewer"] is True, payload
+
+
+def test_executed_fixture_deferred_raw_annotation_rejected_as_unsupported_classification(tmp_path, deferred_raw):
+    """AC5(a): raw `baseline-expect: deferred` + a valid, actually-executed PASS -> the real step4-adjudicate
+    rejects the baseline classification and does not dispatch the reviewer."""
+    observation = _run_scenario_vc(deferred_raw, tmp_path / "fx")
+    assert observation.kind == "pass" and observation.executed, observation.output
+    report = _report_from_observation(deferred_raw, observation)
+    assert report["result"] == "PASS"
+    ws = _executed_ws(tmp_path / "ws", deferred_raw)
+    ws.dir.mkdir()
+
+    rc, payload = _adjudicate_executed(ws, report)
+
+    assert rc == 1, payload
+    assert payload["invoke_pr_reviewer"] is False and payload["seq"] is None
+    assert payload["reason_code"] == "adjudication_missing_or_malformed"
+    errors = payload["adjudication"]["errors"]
+    assert errors == ["unsupported_baseline_classification:AC1"], payload
+    assert payload["adjudication"]["blocking"] is True
+    assert "dispatch" not in ws.state()
+
+
+def test_executed_fixture_deferred_binding_mismatch_is_a_distinct_cause(
+    tmp_path, deferred_raw, canonical_pr_review_only
+):
+    """AC5: the error side is judged on `adjudication.errors`, so a head / body / command binding mismatch is
+    identifiable as its own cause and is not confused with the deferred classification rejection."""
+    observation = _run_scenario_vc(canonical_pr_review_only, tmp_path / "fx")
+    assert observation.kind == "pass", observation.output
+
+    # Canonical scenario + drifting bindings: the errors are binding errors, never the deferred error.
+    ws = _executed_ws(tmp_path / "ws_canon", canonical_pr_review_only)
+    ws.dir.mkdir()
+    report = _report_from_observation(canonical_pr_review_only, observation)
+    drift_head = dict(report, reviewed_head_sha="e" * 40)
+    rc, payload = _adjudicate_executed(ws, drift_head)
+    assert rc == 1 and payload["invoke_pr_reviewer"] is False
+    assert payload["adjudication"]["errors"] == ["pr_review_only_head_binding_mismatch"], payload
+
+    ws2 = _executed_ws(tmp_path / "ws_body", canonical_pr_review_only)
+    ws2.dir.mkdir()
+    drift_body = _report_from_observation(canonical_pr_review_only, observation)
+    drift_body["contract_body_sha256"] = "sha256:" + "f" * 64
+    rc, payload = _adjudicate_executed(ws2, drift_body)
+    assert rc == 1 and payload["invoke_pr_reviewer"] is False
+    assert payload["adjudication"]["errors"] == ["pr_review_only_source_body_sha256_mismatch"], payload
+
+    # Deferred scenario + the same drift: the classification error is reported FIRST and alone, so the two
+    # causes are distinguishable by exact `errors` content (never a generic top-level reason only).
+    deferred_observation = _run_scenario_vc(deferred_raw, tmp_path / "fx_deferred")
+    assert deferred_observation.kind == "pass", deferred_observation.output
+    ws3 = _executed_ws(tmp_path / "ws_deferred_drift", deferred_raw)
+    ws3.dir.mkdir()
+    drifted = _report_from_observation(deferred_raw, deferred_observation)
+    drifted["reviewed_head_sha"] = "e" * 40
+    rc, payload = _adjudicate_executed(ws3, drifted)
+    assert rc == 1 and payload["invoke_pr_reviewer"] is False
+    assert payload["adjudication"]["errors"] == ["unsupported_baseline_classification:AC1"], payload
+    assert payload["reason_code"] == "adjudication_missing_or_malformed"
+
+
+def test_executed_fixture_deferred_normalized_to_pr_review_only_reaches_reviewer_dispatch(tmp_path, tmp_path_factory):
+    """AC5(b): the real repair normalizes `baseline-expect: deferred` to `preflight-scope: pr_review_only`
+    (annotation only), the real producer then yields the canonical envelope, and an actually-executed PASS
+    of the same declared literal at the same head makes the real step4-adjudicate dispatch the reviewer; the
+    real terminal gate approves."""
+    producer_result, repaired_body = _apply_real_repair(tmp_path, BODY_DEFERRED_RAW)
+    assert producer_result["repair_action"]["disposition"] == "auto_apply_safe"
+    assert repaired_body == BODY_PR_REVIEW_ONLY
+
+    scenario = _build_scenario(tmp_path_factory, "deferred_normalized", repaired_body, repo_files=_repo_files())
+    assert scenario.producer["results"][0]["category"] == "preflight_scope_pr_review_only"
+
+    observation = _run_scenario_vc(scenario, tmp_path / "fx")
+    assert observation.kind == "pass" and observation.executed, observation.output
+    report = _report_from_observation(scenario, observation)
+    ws = _executed_ws(tmp_path / "ws", scenario)
+    ws.dir.mkdir()
+
+    rc, payload = _adjudicate_executed(ws, report)
+
+    assert rc == 0, payload
+    assert payload["invoke_pr_reviewer"] is True and payload["seq"] == 1
+    assert payload["adjudication"]["errors"] == [] and payload["adjudication"]["blocking"] is False
+    stored = ws.state()["vc_adjudication"][ws.binding_key()]
+    assert [entry["reason_code"] for entry in stored["per_ac"]] == ["pr_review_only_runtime_evidence_pass"]
+    _approve_and_assert(ws, payload)
+
+
+def test_executed_fixture_deferred_canonical_scope_but_uncollected_exit5_is_never_pass(tmp_path, canonical_uncollected):
+    """AC5(c)/AC6: canonical annotation but the DECLARED selector collects nothing (pytest exit 5) -> the
+    observed exit code is transcribed, nothing is converted to PASS, and the reviewer is not dispatched."""
+    observation = _run_scenario_vc(canonical_uncollected, tmp_path / "fx")
+    assert observation.exit_code == 5 and observation.kind == "uncollected" and not observation.executed
+    report = _report_from_observation(canonical_uncollected, observation)
+    assert report["result"] == "FAIL"
+    assert report["runtime_ac_results"][0]["exit_code"] == 5
+    ws = _executed_ws(tmp_path / "ws", canonical_uncollected)
+    ws.dir.mkdir()
+
+    rc, payload = _adjudicate_executed(ws, report)
+
+    _assert_fail_closed_no_dispatch(ws, rc, payload, ["pr_review_only_current_execution_not_pass:AC1"])
+    assert "pr_review_only_runtime_evidence_pass" not in json.dumps(payload)
+    assert payload["adjudication"]["overall_status"] == "indeterminate"
+
+
+def test_executed_fixture_deferred_canonical_scope_but_not_executed_is_never_pass(tmp_path, canonical_pr_review_only):
+    """AC5(c): canonical annotation but no executed row at all (the VC never ran) -> not converted to PASS."""
+    ws = _executed_ws(tmp_path / "ws", canonical_pr_review_only)
+    ws.dir.mkdir()
+    report = _report(canonical_pr_review_only, drop=(0,), result="PASS")
+
+    rc, payload = _adjudicate_executed(ws, report)
+
+    _assert_fail_closed_no_dispatch(ws, rc, payload, ["pr_review_only_coverage_mismatch"])
+    assert "pr_review_only_runtime_evidence_pass" not in json.dumps(payload)
+
+
+def test_executed_fixture_deferred_canonical_scope_with_real_red_exit1_is_fail_closed(tmp_path, canonical_red):
+    """AC6: a real assertion failure (exit 1, RED) is transcribed as a failure and also blocks dispatch --
+    and it is distinguishable from the exit-5 case by the observed exit code."""
+    observation = _run_scenario_vc(canonical_red, tmp_path / "fx")
+    assert observation.exit_code == 1 and observation.kind == "red" and observation.executed
+    report = _report_from_observation(canonical_red, observation)
+    ws = _executed_ws(tmp_path / "ws", canonical_red)
+    ws.dir.mkdir()
+
+    rc, payload = _adjudicate_executed(ws, report)
+
+    _assert_fail_closed_no_dispatch(ws, rc, payload, ["pr_review_only_current_execution_not_pass:AC1"])
+    assert report["runtime_ac_results"][0]["exit_code"] == 1

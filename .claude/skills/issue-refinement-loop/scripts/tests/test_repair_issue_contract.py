@@ -740,6 +740,458 @@ def test_extract_allowed_paths_no_path_marker_returns_empty():
     assert ric._extract_allowed_paths_ric(body_legacy) == []
 
 
+# ===========================================================================
+# Issue #3020: `baseline-expect: deferred` misused as a pr_review_only stand-in
+# for a pytest VC -> annotation-line-only repair, classified auto_apply_safe.
+# ===========================================================================
+
+_T3020_TEST_PATH = ".claude/skills/example/tests/test_example_3020.py"
+
+
+def _t3020_body(vc_block: str, allowed: list[str] | None = None) -> str:
+    allowed_paths = allowed if allowed is not None else [_T3020_TEST_PATH]
+    allowed_block = "\n".join(f"- {p}" for p in allowed_paths)
+    return (
+        "## Outcome\nOutcome.\n\n"
+        "## Verification Commands\n\n"
+        f"```bash\n{vc_block}\n```\n\n"
+        f"## Allowed Paths\n\n{allowed_block}\n\n"
+        "## Stop Conditions\n- none\n"
+    )
+
+
+_T3020_DEFERRED_CMD = f'uv run --locked pytest {_T3020_TEST_PATH} -q -k "deferred and new_case"'
+_T3020_DEFERRED_VC = f"# AC1\n# baseline-expect: deferred\n$ {_T3020_DEFERRED_CMD}"
+
+
+def _t3020_deferred_repairs(res: dict) -> list[dict]:
+    return [r for r in res["repairs"] if r.get("kind") == "deferred_to_pr_review_only"]
+
+
+def _t3020_commands(body: str) -> list[str]:
+    return [ln for ln in body.splitlines() if ln.startswith("$ ")]
+
+
+def _t3020_apply_repair(body: str, tmp_path: Path) -> tuple[dict, str]:
+    ric = _import_ric()
+    out_file = tmp_path / "repaired.md"
+    res = ric.run_repair(body, apply=True, out_file=str(out_file), root_dir=str(tmp_path))
+    return res, out_file.read_text(encoding="utf-8")
+
+
+def test_deferred_pr_review_only_auto_apply_safe_high_confidence():
+    """GIVEN a pytest VC on an Allowed Paths test file annotated baseline-expect: deferred
+    (no valid preflight-scope) / WHEN repair runs / THEN exactly one annotation-line-only
+    repair is emitted with confidence high and repair_action.disposition == auto_apply_safe."""
+    body = _t3020_body(_T3020_DEFERRED_VC)
+    res = run_repair(body)
+
+    recs = _t3020_deferred_repairs(res)
+    assert len(recs) == 1, res
+    rec = recs[0]
+    assert rec["confidence"] == "high"
+    assert rec["original"].strip() == "# baseline-expect: deferred"
+    assert rec["repaired"].strip() == "# preflight-scope: pr_review_only"
+    assert res["repair_action"]["disposition"] == "auto_apply_safe"
+    assert res["repair_action"]["repair_kinds"] == ["deferred_to_pr_review_only"]
+    assert res["dry_run"] is True
+
+
+def test_deferred_pr_review_only_auto_apply_changes_annotation_line_only(tmp_path):
+    """The command line and AC marker are byte-identical; only the annotation line changes."""
+    body = _t3020_body(_T3020_DEFERRED_VC)
+    _res, repaired = _t3020_apply_repair(body, tmp_path)
+
+    old_lines, new_lines = body.splitlines(), repaired.splitlines()
+    assert len(old_lines) == len(new_lines)
+    diff = [(a, b) for a, b in zip(old_lines, new_lines) if a != b]
+    assert diff == [("# baseline-expect: deferred", "# preflight-scope: pr_review_only")]
+    assert _t3020_commands(repaired) == _t3020_commands(body) == [f"$ {_T3020_DEFERRED_CMD}"]
+
+
+def test_deferred_pr_review_only_auto_apply_idempotent(tmp_path):
+    """Applying the repair twice yields the same body hash; the second pass finds nothing."""
+    ric = _import_ric()
+    body = _t3020_body(_T3020_DEFERRED_VC)
+    res1, repaired1 = _t3020_apply_repair(body, tmp_path)
+    assert res1["changed"] is True
+
+    res2 = ric.run_repair(repaired1)
+    assert res2["changed"] is False
+    assert res2["repaired_body_sha256"] == res2["original_body_sha256"] == res1["repaired_body_sha256"]
+    assert _t3020_deferred_repairs(res2) == []
+    assert res2["repair_action"]["disposition"] == "informational"
+
+
+def test_deferred_pr_review_only_auto_apply_body_hash_changes_command_hash_does_not(tmp_path):
+    """AC3: an annotation-only change moves the body hash but not the command hash."""
+    import hashlib
+
+    body = _t3020_body(_T3020_DEFERRED_VC)
+    res, repaired = _t3020_apply_repair(body, tmp_path)
+
+    assert res["original_body_sha256"] != res["repaired_body_sha256"]
+
+    def _cmd_hashes(text: str) -> list[str]:
+        return [hashlib.sha256(c[2:].encode("utf-8")).hexdigest() for c in _t3020_commands(text)]
+
+    assert _cmd_hashes(body) == _cmd_hashes(repaired)
+    assert len(_cmd_hashes(body)) == 1
+
+
+def test_deferred_pr_review_only_auto_apply_accepted_by_preflight_result_validator(tmp_path):
+    """The existing consumer-side validator (schema + classify_repair_action() recompute) accepts
+    the producer output without any consumer change."""
+    import sys as _sys
+
+    scripts_dir = Path(__file__).resolve().parents[1]
+    if str(scripts_dir) not in _sys.path:
+        _sys.path.insert(0, str(scripts_dir))
+    import run_refinement_preflight as rrp
+
+    res = run_repair(_t3020_body(_T3020_DEFERRED_VC))
+    assert rrp._validate_repair_result_schema_and_semantics(res) is None
+
+
+def test_deferred_pr_review_only_auto_apply_producer_classification_flips(tmp_path):
+    """Real producer parity: baseline_vc_preflight.py classifies the raw VC as
+    baseline_expect_deferred (the Step 4-unsupported classification), and the repaired VC as the
+    canonical preflight_scope_pr_review_only."""
+    body = _t3020_body(_T3020_DEFERRED_VC)
+    _res, repaired = _t3020_apply_repair(body, tmp_path)
+
+    before = _result_for_899(_run_bvp_899(body), "-k")
+    after = _result_for_899(_run_bvp_899(repaired), "-k")
+    assert before is not None and after is not None
+    assert before["category"] == "baseline_expect_deferred", before
+    assert after["category"] == "preflight_scope_pr_review_only", after
+    assert before["raw_command"] == after["raw_command"]
+
+
+def test_deferred_pr_review_only_auto_apply_via_repair_action_apply_consumer(tmp_path):
+    """AC3: the repaired body reaches the existing `run_repair_action_apply()` consumer (which
+    dispatches via the edit_issue_txn controlled-transaction closure) with commands preserved."""
+    import hashlib
+    import sys as _sys
+
+    scripts_dir = Path(__file__).resolve().parents[1]
+    if str(scripts_dir) not in _sys.path:
+        _sys.path.insert(0, str(scripts_dir))
+    import run_refinement_preflight as rrp
+
+    original = _t3020_body(_T3020_DEFERRED_VC)
+    artifact_dir = tmp_path / ".claude" / "artifacts" / "issue-refinement-loop" / "3020"
+    artifact_dir.mkdir(parents=True)
+    candidate_path = artifact_dir / "candidate_body.md"
+    ric = _import_ric()
+    producer = ric.run_repair(original, apply=True, out_file=str(candidate_path), root_dir=str(tmp_path))
+    candidate = candidate_path.read_text(encoding="utf-8")
+    action = dict(producer["repair_action"])
+    assert action["disposition"] == "auto_apply_safe"
+    action.update({
+        "source_lane": "unanchored",
+        "preflight_run_identity": "sha256:testrun",
+        "original_updated_at": "2024-01-01T00:00:00Z",
+        "source_refs_digest": None,
+    })
+    result_path = artifact_dir / "preflight_result.json"
+    result_path.write_text(json.dumps({
+        "schema": "issue_refinement_preflight_result/v1",
+        "repair_action": action,
+        "result_core_sha256": "sha256:testrun",
+    }))
+
+    dispatched: list[str] = []
+
+    def _apply_txn(current_issue: dict, candidate_body: str) -> dict:
+        dispatched.append(candidate_body)
+        digest = hashlib.sha256(candidate_body.encode("utf-8")).hexdigest()
+        return {
+            "status": "ok",
+            "mutation_started": True,
+            "body_update": {
+                "attempted": True,
+                "status": "ok",
+                "remote_current_body_sha256": f"sha256:{digest}",
+            },
+            "content_update": {"patch_attempted": True, "mutation_outcome": "applied"},
+            "errors": [],
+        }
+
+    bodies = iter([original, candidate])
+
+    def _fetch() -> dict:
+        return {"body": next(bodies), "updatedAt": "2024-01-01T00:00:00Z"}
+
+    result = rrp.run_repair_action_apply(
+        repo="squne121/loop-protocol",
+        issue_number=3020,
+        preflight_result_path=str(result_path.relative_to(tmp_path)),
+        repo_root=tmp_path,
+        fetch_current=_fetch,
+        apply_transaction=_apply_txn,
+    )
+
+    assert result["mutation_outcome"] == "applied", result
+    assert dispatched == [candidate]
+    assert _t3020_commands(dispatched[0]) == _t3020_commands(original)
+    assert "# preflight-scope: pr_review_only" in dispatched[0]
+    assert "baseline-expect: deferred" not in dispatched[0]
+
+
+
+_T3020_OUT_OF_CONDITION_CASES = {
+    "non_pytest_rg": (
+        "# AC1\n# baseline-expect: deferred\n$ rg -n \"x\" " + _T3020_TEST_PATH,
+        None,
+    ),
+    "allowed_paths_outside": (_T3020_DEFERRED_VC, ["docs/dev/dor.md"]),
+    "not_a_test_file": (
+        "# AC1\n# baseline-expect: deferred\n$ uv run --locked pytest docs/dev/helper.py -q",
+        ["docs/dev/helper.py"],
+    ),
+    "directory_target": (
+        "# AC1\n# baseline-expect: deferred\n$ uv run --locked pytest .claude/skills/example/tests -q",
+        [".claude/skills/example/tests/"],
+    ),
+    "already_valid_scope": (
+        f"# AC1\n# baseline-expect: deferred\n# preflight-scope: runtime_only\n$ {_T3020_DEFERRED_CMD}",
+        None,
+    ),
+    "invalid_scope_marker": (
+        f"# AC1\n# baseline-expect: deferred\n# preflight-scope: bogus\n$ {_T3020_DEFERRED_CMD}",
+        None,
+    ),
+    "annotation_not_adjacent": (
+        f"# baseline-expect: deferred\n# AC1\n$ {_T3020_DEFERRED_CMD}",
+        None,
+    ),
+    "compound_command": (
+        f"# AC1\n# baseline-expect: deferred\n$ {_T3020_DEFERRED_CMD} && true",
+        None,
+    ),
+    "baseline_expect_fail": (f"# AC1\n# baseline-expect: fail\n$ {_T3020_DEFERRED_CMD}", None),
+    "baseline_expect_pass": (f"# AC1\n# baseline-expect: pass\n$ {_T3020_DEFERRED_CMD}", None),
+    "pnpm_gate": ("# AC1\n# baseline-expect: deferred\n$ pnpm test", None),
+}
+
+
+def test_deferred_out_of_condition_vc_is_not_rewritten_nor_human_review():
+    """Out-of-condition `deferred` VCs are left byte-identical, and this defect is never turned
+    into a human_review_required classification."""
+
+    for name, (vc, allowed) in _T3020_OUT_OF_CONDITION_CASES.items():
+        body = _t3020_body(vc, allowed)
+        res = run_repair(body)
+        assert _t3020_deferred_repairs(res) == [], name
+        assert res["changed"] is False, name
+        assert res["repair_action"]["disposition"] != "human_review_required", name
+        assert res["repair_action"]["disposition"] == "informational", name
+
+
+def test_deferred_in_condition_mixed_with_out_of_condition_only_rewrites_in_condition(tmp_path):
+    """A body with one in-condition and one out-of-condition deferred VC rewrites only the former."""
+    other = "# AC2\n# baseline-expect: deferred\n$ pnpm test:unit"
+    body = _t3020_body(_T3020_DEFERRED_VC + "\n" + other)
+    res, repaired = _t3020_apply_repair(body, tmp_path)
+
+    assert len(_t3020_deferred_repairs(res)) == 1
+    assert "# AC2\n# baseline-expect: deferred\n$ pnpm test:unit" in repaired
+    assert _t3020_commands(repaired) == _t3020_commands(body)
+
+
+def test_deferred_unknown_repair_kind_still_human_review_and_pnpm_gate_not_deferred():
+    """Existing constraints stay intact: an unknown repair kind is human_review_required, and a
+    pnpm regression gate is never annotated deferred / pr_review_only by this repair."""
+    ric = _import_ric()
+    action = ric.classify_repair_action(
+        "a", "b",
+        [{"kind": "deferred_to_something_else", "line_start": 1, "line_end": 1, "confidence": "high"}],
+    )
+    assert action["disposition"] == "human_review_required"
+    assert "unknown_repair_kind" in action["reason_codes"]
+
+    safe = ric.classify_repair_action(
+        "a", "b",
+        [{"kind": "deferred_to_pr_review_only", "line_start": 1, "line_end": 1, "confidence": "high"}],
+    )
+    assert safe["disposition"] == "auto_apply_safe"
+    no_conf = ric.classify_repair_action(
+        "a", "b", [{"kind": "deferred_to_pr_review_only", "line_start": 1, "line_end": 1}]
+    )
+    assert no_conf["disposition"] == "human_review_required"
+
+    for gate in ("pnpm typecheck", "pnpm lint", "pnpm test", "pnpm build"):
+        res = run_repair(_t3020_body(f"# AC1\n# baseline-expect: deferred\n$ {gate}", None))
+        assert _t3020_deferred_repairs(res) == [], gate
+        assert "# preflight-scope" not in "\n".join(r["repaired"] for r in res["repairs"]), gate
+
+
+# ===========================================================================
+# Issue #3020 OWNER REQUEST_CHANGES P2-1 / P2-2 regressions.
+# ===========================================================================
+
+_T3020_PYTEST_LAUNCHER_POSITIVE = [
+    "pytest",
+    "uv run pytest",
+    "uv run --locked pytest",
+    "uv run --frozen pytest",
+    "uv run --no-project pytest",
+    "uv run --with pytest --with pyyaml python -m pytest",
+    "uv run --no-project --with pytest python3 -m pytest",
+    "uv run python -m pytest",
+    "uv run --locked python3 -m pytest",
+    "python -m pytest",
+    "python3 -m pytest",
+]
+
+
+def test_deferred_pytest_launcher_positive_forms_are_rewritten():
+    """P2-1: every real pytest launcher form used by existing VCs is recognised as a pytest VC."""
+    for launcher in _T3020_PYTEST_LAUNCHER_POSITIVE:
+        body = _t3020_body(f"# AC1\n# baseline-expect: deferred\n$ {launcher} {_T3020_TEST_PATH} -q")
+        res = run_repair(body)
+        assert len(_t3020_deferred_repairs(res)) == 1, (launcher, res)
+        assert res["repair_action"]["disposition"] == "auto_apply_safe", launcher
+
+
+def test_deferred_pytest_token_not_at_launcher_position_is_not_a_pytest_vc():
+    """P2-1: a `pytest` string appearing as an ARGUMENT (e.g. rg pattern) is not a pytest VC; such
+    a deferred VC is left byte-identical and is not turned into human_review_required."""
+    negatives = [
+        f'$ rg -n "pytest" {_T3020_TEST_PATH}',
+        f"$ rg -n pytest {_T3020_TEST_PATH}",
+        f"$ echo pytest {_T3020_TEST_PATH}",
+        f"$ FOO=1 pytest {_T3020_TEST_PATH}",
+        f"$ uv run --locked rg pytest {_T3020_TEST_PATH}",
+        f"$ uv run --bogus-flag pytest {_T3020_TEST_PATH}",
+        f"$ uv pytest {_T3020_TEST_PATH}",
+        f"$ python3 pytest {_T3020_TEST_PATH}",
+        f"$ python3 -m unittest pytest {_T3020_TEST_PATH}",
+        f"$ grep pytest {_T3020_TEST_PATH}",
+    ]
+    for cmd in negatives:
+        for body in (
+            _t3020_body(f"# AC1\n# baseline-expect: deferred\n{cmd}"),
+            _t3020_body(f"# AC1\n{cmd} # baseline-expect: deferred"),
+        ):
+            res = run_repair(body)
+            assert _t3020_deferred_repairs(res) == [], cmd
+            assert "# preflight-scope" not in "\n".join(r["repaired"] for r in res["repairs"]), cmd
+            assert res["repair_action"]["disposition"] != "human_review_required", cmd
+
+
+def test_pytest_test_file_targets_unit():
+    ric = _import_ric()
+    f = ric._pytest_test_file_targets
+    assert f(f"uv run --locked pytest {_T3020_TEST_PATH}::t -q -k x") == [_T3020_TEST_PATH]
+    assert f(f'rg -n "pytest" {_T3020_TEST_PATH}') is None
+    assert f(f"uv run pytest {_T3020_TEST_PATH} && true") is None
+    assert f("uv run pytest") is None
+    assert f("") is None
+
+
+_T3020_INLINE_DEFERRED_CMD = f"pytest {_T3020_TEST_PATH}"
+
+
+def test_inline_deferred_pytest_chain_is_one_consistent_auto_apply_safe_repair(tmp_path):
+    """P2-2: `$ pytest X # baseline-expect: deferred` (inline) is normalised in two dependent
+    steps (move -> pr_review_only). The real repair_body() -> classify_repair_action() path must
+    treat it as ONE consistent original->final repair: auto_apply_safe, not overlapping_repair."""
+    ric = _import_ric()
+    body = _t3020_body(f"# AC1\n$ {_T3020_INLINE_DEFERRED_CMD} # baseline-expect: deferred")
+
+    repaired, repairs = ric.repair_body(body)
+    action = ric.classify_repair_action("a", "b", repairs)
+    assert action["disposition"] == "auto_apply_safe", (repairs, action)
+    assert "overlapping_repair" not in action["reason_codes"]
+    assert len(repairs) == 1, repairs
+    rec = repairs[0]
+    assert rec["kind"] == "deferred_to_pr_review_only"
+    assert rec["confidence"] == "high"
+    assert rec["line_start"] == rec["line_end"]
+    assert rec["original"] == f"$ {_T3020_INLINE_DEFERRED_CMD} # baseline-expect: deferred"
+    assert rec["repaired"] == f"# preflight-scope: pr_review_only\n$ {_T3020_INLINE_DEFERRED_CMD}"
+    # original -> repaired replacement is consistent with the actual body transformation
+    assert body.count(rec["original"]) == 1
+    assert body.replace(rec["original"], rec["repaired"]) == repaired
+    # command line preserved (without the inline annotation), canonical marker present
+    assert f"$ {_T3020_INLINE_DEFERRED_CMD}\n" in repaired
+    assert "# preflight-scope: pr_review_only\n$ " + _T3020_INLINE_DEFERRED_CMD in repaired
+    assert "baseline-expect" not in repaired
+    # the recorded line really holds the first line of `repaired` in the final body
+    section_lines = repaired.split("\n")
+    vc_idx = section_lines.index("## Verification Commands")
+    assert section_lines[vc_idx + rec["line_start"] - 1] == "# preflight-scope: pr_review_only"
+
+
+def test_inline_deferred_pytest_chain_end_to_end_idempotent(tmp_path):
+    ric = _import_ric()
+    body = _t3020_body(f"# AC1\n$ {_T3020_INLINE_DEFERRED_CMD} # baseline-expect: deferred")
+    res1, repaired1 = _t3020_apply_repair(body, tmp_path)
+    assert res1["repair_action"]["disposition"] == "auto_apply_safe"
+    assert res1["changed"] is True
+
+    res2 = ric.run_repair(repaired1)
+    assert res2["changed"] is False
+    assert res2["repaired_body_sha256"] == res1["repaired_body_sha256"]
+    assert res2["repairs"] == []
+    assert res2["repair_action"]["disposition"] == "informational"
+
+
+def test_inline_deferred_pytest_chain_multiple_vcs_and_unrelated_inline(tmp_path):
+    """P2-2: several chained VCs plus an unrelated inline repair: each chain collapses to one
+    record, the unrelated inline repair stays its own record, nothing overlaps."""
+    ric = _import_ric()
+    other = "pnpm test:e2e # baseline-expect: fail"
+    vc = (
+        f"# AC1\n$ pytest {_T3020_TEST_PATH} -q # baseline-expect: deferred\n"
+        f"# AC2\n$ {other}\n"
+        f"# AC3\n$ pytest {_T3020_TEST_PATH} -x # baseline-expect: deferred"
+    )
+    body = _t3020_body(vc)
+    repaired, repairs = ric.repair_body(body)
+    action = ric.classify_repair_action("a", "b", repairs)
+    kinds = sorted(r["kind"] for r in repairs)
+    assert kinds == [
+        "deferred_to_pr_review_only",
+        "deferred_to_pr_review_only",
+        "move_inline_baseline_expect_to_preceding_line",
+    ], repairs
+    assert action["disposition"] == "auto_apply_safe", action
+    assert repaired.count("# preflight-scope: pr_review_only") == 2
+    assert "$ pytest " + _T3020_TEST_PATH + " -q\n" in repaired
+    assert "$ pytest " + _T3020_TEST_PATH + " -x\n" in repaired
+    again, again_repairs = ric.repair_body(repaired)
+    assert again == repaired
+    assert [r for r in again_repairs if r["kind"] == "deferred_to_pr_review_only"] == []
+
+
+def test_inline_deferred_chain_out_of_condition_keeps_plain_inline_move():
+    """P2-2: when the chain is not eligible for pr_review_only (non-pytest), only the ordinary
+    inline-move repair remains (annotation stays `deferred`); it is still auto_apply_safe."""
+    ric = _import_ric()
+    body = _t3020_body(f'# AC1\n$ rg -n "x" {_T3020_TEST_PATH} # baseline-expect: deferred')
+    repaired, repairs = ric.repair_body(body)
+    assert [r["kind"] for r in repairs] == ["move_inline_baseline_expect_to_preceding_line"]
+    assert "# baseline-expect: deferred\n$ rg" in repaired
+
+
+def test_overlapping_independent_repairs_are_still_rejected():
+    """P2-2 guard: overlap detection is NOT disabled; independent overlapping records are still
+    human_review_required / overlapping_repair."""
+    ric = _import_ric()
+    action = ric.classify_repair_action(
+        "a", "b",
+        [
+            {"kind": "deferred_to_pr_review_only", "line_start": 5, "line_end": 5, "confidence": "high"},
+            {"kind": "move_inline_baseline_expect_to_preceding_line", "line_start": 5, "line_end": 5,
+             "confidence": "high"},
+        ],
+    )
+    assert action["disposition"] == "human_review_required"
+    assert action["reason_codes"] == ["overlapping_repair"]
+
 # ---------------------------------------------------------------------------
 # Issue #3024: runtime_only_command marker must be the canonical
 # ``# preflight-scope: pr_review_only`` (no ``reason=`` suffix).

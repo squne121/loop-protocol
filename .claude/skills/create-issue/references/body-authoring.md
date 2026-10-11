@@ -245,6 +245,20 @@ pytest で baseline-fail（`expected_baseline_fail`）を表す VC は、原則�
 - 既存ファイルの missing node-id 判定は `ast.parse()` による静的解析（top-level `def test_*` のみ）に限定する。class/method や parametrization は対象外。
 - 生成される missing-file node-id は Allowed Paths に含まれる場合のみ提案される。安全な候補が無い場合は書き換えない。
 
+### 実装後に検証する新規 pytest VC は `pr_review_only` を使う（deferred を pr_review_only の代用にしない）
+
+baseline に存在しない新規テストを実装後の独立検証（Step 4 / `pr-review-judge`）で確認する pytest VC には、コマンド直前行に正規の `# preflight-scope: pr_review_only` を付ける。`# baseline-expect: deferred` は baseline で実行を省略する点が似ているだけで、producer の出力契約と Step 4 の `step4-adjudicate` での受理可能性は同じではない（`unsupported_baseline_classification` で拒否される）。**deferred を pr_review_only の代用にしない**。
+
+```
+# AC2
+# preflight-scope: pr_review_only
+$ uv run --locked pytest <Allowed Paths 内テストファイル> -q -k "<新規テストの識別子>"
+```
+
+- 正規 `preflight-scope: pr_review_only` / `runtime_only` が付いた VC は、`vc_baseline_shape_compiler.py` と hygiene の書換え対象にならず、コマンドは保持される。
+- 正当な `baseline-expect: pass|fail` の用法（既存テストの回帰確認・既存ファイルへの意図的な新規追加の `fail`）は変更しない。
+- 誤って `deferred` を選んだ pytest VC は `repair_issue_contract.py` が限定条件下で注釈行のみ `pr_review_only` へ修復する。不正値の `baseline-expect` は別 Issue（#2760）の対象である。
+
 ## VC_SINGLE_COMMAND_GUARDRAIL
 
 Issue body の VC（Verification Commands）は **shell control operator に依存しない単一コマンド** で記述する。

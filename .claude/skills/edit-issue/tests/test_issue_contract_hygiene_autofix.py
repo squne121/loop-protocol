@@ -813,3 +813,140 @@ def test_parse_allowed_paths_no_path_marker_returns_empty():
         "## Allowed Paths\n\n- 読み取り専用。リポジトリ変更なし（既定）\n\n## Stop Conditions\n"
     ).split("\n")
     assert autofix.parse_allowed_paths(lines_legacy) == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #3020: canonical preflight-scope markers are preserved through the real
+# hygiene path (issue_contract_hygiene_autofix.py -> repair_vc_baseline_shape()
+# -> vc_baseline_shape_compiler.compile_body()).
+# ---------------------------------------------------------------------------
+
+
+def _cleanup_probe(probe_file: Path) -> None:
+    probe_file.unlink(missing_ok=True)
+    try:
+        probe_file.parent.rmdir()
+    except OSError:
+        pass  # never remove the shared "scripts/" parent directory
+
+
+def _vc_section(text: str) -> str:
+    return text.split("## Verification Commands", 1)[1].split("## Allowed Paths", 1)[0]
+
+
+def _command_lines(text: str) -> list[str]:
+    return [ln for ln in _vc_section(text).splitlines() if ln.lstrip().startswith("$ ")]
+
+
+def _ac_command_pairs(text: str) -> list[tuple[str, str]]:
+    """(AC label, command) pairs in order, taking the last `# AC<N>` seen before each command."""
+    pairs: list[tuple[str, str]] = []
+    current = ""
+    for ln in _vc_section(text).splitlines():
+        stripped = ln.strip()
+        if stripped.startswith("# AC"):
+            current = stripped
+        elif stripped.startswith("$ "):
+            pairs.append((current, stripped))
+    return pairs
+
+
+def test_scope_marker_pr_review_only_vc_preserved_with_other_repairs():
+    """GIVEN a pr_review_only-marked pytest VC (new -k on an existing repo test file) next to a
+    C4 repair target / WHEN the real autofix script runs / THEN C4 is applied but the marked VC's
+    command, AC mapping, target path and marker line are unchanged and vc_shape is not applied;
+    a second run is a no_change."""
+    repo_root = SCRIPT.parents[4]
+    probe_file, existing_repo_file, candidate = _make_blocker4_probe(
+        repo_root, "issue3020_scope_preserved_probe"
+    )
+    try:
+        marked = f"pytest {existing_repo_file} -k test_new_issue3020_scope_preserved"
+        body = _wrap_body(
+            vc_block=textwrap.dedent(f"""\
+                ```bash
+                # AC1
+                test -f {existing_repo_file}
+                # AC2
+                # preflight-scope: pr_review_only
+                $ {marked}
+                ```"""),
+            allowed_paths=f"- {existing_repo_file}\n- {candidate}\n",
+            rva_block=_RVA_BLOCK,
+        )
+        code, out, err = run_autofix(body)
+        assert code == 0, f"Expected exit 0 (C4 repaired), got {code}. stderr={err}"
+        assert "c4=True" in err
+        assert "vc_shape=False" in err
+        assert f"$ {marked}" in out
+        assert "# preflight-scope: pr_review_only" in out
+        assert candidate not in _vc_section(out)
+        assert ("# AC2", f"$ {marked}") in _ac_command_pairs(out)
+        assert f"$ test -f {existing_repo_file}" in _command_lines(out)
+
+        code2, _out2, err2 = run_autofix(out)
+        assert code2 == 1 and "no_change" in err2
+    finally:
+        _cleanup_probe(probe_file)
+
+
+def test_scope_marker_runtime_only_simple_k_vc_preserved():
+    """GIVEN a runtime_only-marked pytest VC with a bare new `-k test_x` (a shape the compiler
+    would otherwise rewrite) / WHEN autofix runs on a body with no other repair / THEN the body
+    is unchanged (exit 1 no_change), not rewritten to a missing-file node-id."""
+    repo_root = SCRIPT.parents[4]
+    probe_file, existing_repo_file, candidate = _make_blocker4_probe(
+        repo_root, "issue3020_scope_runtime_probe"
+    )
+    try:
+        body = _wrap_body(
+            vc_block=textwrap.dedent(f"""\
+                ```bash
+                # AC1
+                # preflight-scope: runtime_only
+                $ pytest {existing_repo_file} -k test_new_issue3020_runtime
+                ```"""),
+            allowed_paths=f"- {existing_repo_file}\n- {candidate}\n",
+            rva_block=_RVA_BLOCK,
+        )
+        code, out, err = run_autofix(body)
+        assert code == 1, f"Expected exit 1 (no_change), got {code}. stderr={err}"
+        assert "no_change" in err
+        assert "vc_shape_mixed" not in err
+    finally:
+        _cleanup_probe(probe_file)
+
+
+def test_scope_marker_preserved_in_mixed_body_without_unsafe_mixed():
+    """GIVEN a pr_review_only-marked VC with a complex `-k` plus an unmarked rewritable VC /
+    WHEN autofix runs / THEN no UNSAFE_MIXED fail-closed is raised (the marked VC is not a
+    not_autofixable warning), only the unmarked VC is rewritten, and the marked command is
+    unchanged. Unmarked legacy VCs are still rewritten as before."""
+    repo_root = SCRIPT.parents[4]
+    probe_file, existing_repo_file, candidate = _make_blocker4_probe(
+        repo_root, "issue3020_scope_mixed_probe"
+    )
+    try:
+        marked = f'pytest {existing_repo_file} -k "test_alpha or test_beta"'
+        body = _wrap_body(
+            vc_block=textwrap.dedent(f"""\
+                ```bash
+                # AC1
+                # preflight-scope: pr_review_only
+                $ {marked}
+                # AC2
+                $ pytest {existing_repo_file} -k test_new_issue3020_mixed
+                ```"""),
+            allowed_paths=f"- {existing_repo_file}\n- {candidate}\n",
+            rva_block=_RVA_BLOCK,
+        )
+        code, out, err = run_autofix(body)
+        assert code == 0, f"Expected exit 0 (no UNSAFE_MIXED), got {code}. stderr={err}"
+        assert "vc_shape_mixed_changed_and_warnings" not in err
+        assert "vc_shape=True" in err
+        pairs = _ac_command_pairs(out)
+        assert ("# AC1", f"$ {marked}") in pairs
+        assert ("# AC2", f"$ pytest {candidate}::test_new_issue3020_mixed") in pairs
+        assert "# preflight-scope: pr_review_only" in out
+    finally:
+        _cleanup_probe(probe_file)
