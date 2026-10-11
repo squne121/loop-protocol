@@ -276,7 +276,7 @@ Markdown / prose の lint VC は、exit 0 であることと、要求した変�
 - canary は、その対象が検査に到達したことを示すが、E 内のほかの clean なファイルが検査されたことまでは示さない。
 - `showFound` の一覧から per-directory の `ignores` を差し引く導出は補助の推論にすぎない。root の `ignores`・`gitignore`・`--config` の merge 結果の取りこぼしを検出できないため、単独で P の証拠にしない。
 
-#### cwd と revision
+#### cwd と revision の合わせ方
 
 - cwd は、検証したい探索範囲と対象 revision に合わせる。通常の変更ファイル検査は、レビュー対象の変更内容が存在する worktree / checkout で実行する。
 - #217 / PR #215 は、main checkout 配下の worktree traversal と ESLint ignore を検証した個別の限定事例であり、すべての lint VC を main checkout で実行する規則ではない。#217 の実装や merge を前提にしない。
