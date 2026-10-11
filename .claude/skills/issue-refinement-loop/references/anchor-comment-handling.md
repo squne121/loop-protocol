@@ -327,9 +327,9 @@ control-plane が本 CLI の構造化結果を読んでから実施する運用�
 `run_refinement_preflight.py` の `_classify_heavy_mutation_gate()` は、`known_context.mutation_category` が heavy mutation カテゴリ（`close` / `not_planned` / `replacement_issue_creation` / `dependency_removal` / `parent_child_change`）に該当する場合、`scope_delta_decision` が owner 発言由来の明示的決定（`status: approved_by_trusted_anchor` かつ `anchor_author_association: OWNER`）でない限り `status: blocked` / `fail_closed: true` を返す。非 heavy な通常改善・追加調査・review 継続カテゴリは、owner 明示的決定がなくても `status: warn` で継続する。
 
 
-### Severity-tagged 見出しの構造化抽出（#2296 AC9、fix_delta iteration 6 で P1-4 修正、#2994 で HTML-only / bracketed 対応）
+### Severity-tagged 見出しの構造化抽出（#2296 AC9、fix_delta iteration 6 で P1-4 修正、#2994 で HTML-only / bracketed 対応、#3016 で colon 見出し対応）
 
-Owner の敵対的レビューコメントで頻出する `## P0-1` / `### P1-3` / `### [P1]` のような
+Owner の敵対的レビューコメントで頻出する `## P0-1` / `### P1-3` / `### [P1]` / `### 1. P2：` のような
 severity-tagged 見出しは、`scope_signal_delta.py` の **独立した専用関数**
 `extract_severity_tags()` が抽出し、マッチしたタグ（例: `P0-1` / `P1`）を大文字化・
 ソートして返す。この関数が severity 抽出の唯一の owner であり、
@@ -338,10 +338,13 @@ severity-tagged 見出しは、`scope_signal_delta.py` の **独立した専用�
 #### 抽出文法（bracketed severity を含む）
 
 見出し text（Markdown は `#` 以降、HTML は見出し内 inline text を連結したもの）が、
-任意の番号 prefix（`1.` / `2)` 形式）の後に bracketed severity `[P<n>]`（タグ `P<n>`）または
-既存形式 `P<n>-<n>`（タグ `P<n>-<n>`）で **始まる** 場合に限りタグを返す（大文字小文字を区別しない）。
-見出し中に埋め込まれた `[P1]`（例: `### Notes about [P1] policy`）や通常の文中の `[P1]` は
-severity finding ではない。`P2` のように `-<n>` も括弧も無い表記は対象外。
+任意の番号 prefix（`1.` / `2)` 形式）の後に bracketed severity `[P<n>]`（タグ `P<n>`）、
+既存形式 `P<n>-<n>`（タグ `P<n>-<n>`）、または `P<n>` の直後に ASCII `:` / 全角 `：` が続く
+colon 形式（例: `### 1. P2：...` / `### P2: ...`、タグ `P<n>`、#3016）で **始まる** 場合に限り
+タグを返す（大文字小文字を区別しない）。colon は `P<n>` の直後に置く必要がある。
+見出し中に埋め込まれた `[P1]` / `P2:`（例: `### Notes about [P1] policy` / `### 1. See P2：...`）や
+通常の文中・段落・Markdown backtick code span 内の表記は severity finding ではない。
+`P2` のように `-<n>`・括弧・colon のいずれも無い表記は対象外。
 
 #### 走査領域（HTML-only severity heading の抽出は envelope 限定）
 
