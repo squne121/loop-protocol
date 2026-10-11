@@ -1488,9 +1488,14 @@ def _cmd_produce(args: argparse.Namespace) -> int:
         )
         return 2
 
-    tmp_root = _REPO_ROOT / "tmp"
-    tmp_root.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=str(tmp_root), prefix="root_review_pipeline_") as scratch_dir:
+    # Issue #3039: per-invocation scratch (pinned body / history snapshot) lives
+    # in the system temporary directory (outside the repo), NOT under
+    # `_REPO_ROOT / "tmp"`. The canonical executor's before/after filesystem
+    # snapshot (`skill_runtime_exec._snapshot_repo_paths`) walks the repo, so a
+    # peer `produce` scratch under repo `tmp/` made a legitimate concurrent
+    # `repair_action.apply` child fail with `unauthorized_write_path`. Same
+    # placement precedent as the attempt scratch (`tempfile.mkdtemp` below).
+    with tempfile.TemporaryDirectory(prefix="root_review_pipeline_") as scratch_dir:
         body_file = write_pinned_body_tempfile(body, dir=scratch_dir)
 
         # Issue #2254 fix_delta P0 blocker 1: serialize the SAME
