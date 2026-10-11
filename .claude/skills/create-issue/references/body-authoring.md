@@ -259,6 +259,68 @@ $ uv run --locked pytest <Allowed Paths 内テストファイル> -q -k "<新規
 - 正当な `baseline-expect: pass|fail` の用法（既存テストの回帰確認・既存ファイルへの意図的な新規追加の `fail`）は変更しない。
 - 誤って `deferred` を選んだ pytest VC は `repair_issue_contract.py` が限定条件下で注釈行のみ `pr_review_only` へ修復する。不正値の `baseline-expect` は別 Issue（#2760）の対象である。
 
+### lint VC の対象 coverage（列挙と実検査の区別）
+
+Markdown / prose の lint VC は、exit 0 であることと、要求した変更対象が実際に検査されたことを区別して設計する。lint の exit 0 は対象ファイルの coverage を保証しない。config の ignore / glob / gitignore により、対象が 1 件も検査されないまま exit 0 になる false-green を避けるための、新規 gate を伴わない authoring 上の指針である。
+
+#### 集合の定義（E ⊆ P）
+
+- E: VC が検査すると主張する期待対象集合（Issue の Allowed Paths 内で変更する Markdown など）
+- P: lint が実際に処理した集合
+- PASS に必要な条件は `E ⊆ P` である。ゼロ件、一部欠落、処理確認不能は PASS にしない。対象を限定した検証例では、可能な限り P = E にする。
+- E と P のパスは、同じ cwd / checkout を基準にした絶対パス、または repo-relative のどちらかに正規化してから比較する。
+- exit code は lint の verdict であり、E ⊆ P の証拠とは別の項目として評価する。exit 0 でも P が空なら未検査であり、exit 1 でも別ファイルの診断だけが原因なら対象の検査を意味しない。
+
+#### 列挙は実検査の証拠ではない
+
+`showFound` の `Found:` 一覧や `Linting: N file(s)` は列挙の証拠にすぎず、実検査の証拠ではない。次は、以下に記す installed version で隔離環境（repo 外の `mktemp` ディレクトリ）に再現した例である。実測できた範囲のみを記載し、未確認の挙動は断定しない。
+
+- markdownlint-cli2 0.17.2（markdownlint 0.37.4）の root `ignores` に含まれるファイルを `:path` 形式のリテラルで指定すると、`Found:` にも `Linting: N file(s)` にも数えられる。しかし MD040 の違反を含んでいても `Summary: 0 error(s)` かつ exit 0 になる。これが negative control（違反を含む ignore 対象が報告されない例）である。同じ内容を ignore 外へ置くと違反が報告されて exit 1 になる。
+- サブディレクトリに置いた `.markdownlint-cli2.yaml` の `ignores` は列挙の後に適用される。そのため、`Found:` に載り `Linting:` に数えられても、そのサブディレクトリのファイルは 0 error・exit 0 になる。
+- `gitignore: true` では、git-ignored のファイルを通常のパス / glob 形式で指定すると、`Finding:` 行に除外の表示が出ないまま `Found:` からも黙って外れる（同じファイルを `:path` 形式で指定したときは検査され、違反が報告された）。
+- CLI で指定した対象に config の `globs` が合成されるため、別ファイルの違反で exit 1 になることがある。このとき診断は指定した対象とは無関係であり、対象が検査された証拠にならない（P ≠ E）。
+- `--config <file>` は base として読まれ、cwd の `.markdownlint-cli2.*` が後から merge される。`globs`・`ignores`・`gitignore` のような同名の最上位プロパティは cwd 側の値で置き換えられ、base 側の値は残らない。`config` 内の規則は規則ごとに merge される。そのため、cwd の設定が `ignores` を持つ場合は、`--config` で `ignores` を渡すだけでは除外を外せない。
+- `--config <file>` のファイル名は、末尾の suffix によって読み込み方が決まる（根拠は markdownlint-cli2 0.17.2 の `readOptionsOrConfig()`）。末尾が `.markdownlint-cli2.jsonc` / `.yaml` / `.cjs` / `.mjs` なら CLI2 options として、`.markdownlint.jsonc` / `.json` / `.yaml` / `.yml` / `.cjs` / `.mjs` なら markdownlint の規則設定として読まれる（後者は内部で `{ config }` に包まれる）。末尾が対応する suffix であれば prefix 付きの名前も受理される（例: `rules.markdownlint.json`、`base.markdownlint-cli2.yaml`）。両形式は中身の形式が異なるため、ファイル名だけを変えて交換してはならない。対応する suffix を持たない名前は設定ファイルの読込エラーになる。これは、対応する suffix の設定ファイルを読み込めたうえで lint が返す結果（違反があれば exit 1）とは別の事象であり、混同しない。設定ファイルを読み込めたことは、lint 全体が exit 0 になることを意味しない。以下は実測した範囲のみで、ほかの exit code へは一般化しない（隔離ディレクトリ、markdownlint-cli2 0.17.2 / markdownlint 0.37.4、cwd は一時ディレクトリ）。
+  - `rules.markdownlint.json`（`{"default": true}`）と違反のない Markdown では exit 0（規則設定として受理）。`opts.markdownlint-cli2.jsonc`（`{"config": {"default": true}}`）でも exit 0（options として受理）。
+  - 対応する suffix を持たない `bad.config.json` では、実測では exit 2 だった。
+  - MD040 違反を含む Markdown に `{"MD040": false}` を `off.markdownlint.json` で渡すと MD040 が無効化されて exit 0 だった。同じ内容を `off.markdownlint-cli2.jsonc` に改名すると options として読まれ、`MD040` キーは規則設定にならないため MD040 が報告されて exit 1 だった。
+- textlint 14.8.4 では、`--ignore-path` を指定すると既定の `.textlintignore` は適用されず置き換えられる（併用にならない）。リテラルの明示パスは `.textlintignore` で除外されず処理されるが、glob 経由の指定は除外され、全件が除外されると出力は `[]`・exit 0 になる。存在しないパスも `[]`・exit 0 になりうる。
+- textlint の `--output-file` を指定すると、違反があっても exit 0 になる。exit code だけで判定しない。
+
+#### P の根拠
+
+- textlint: `--format json` の出力にある `filePath` の集合を P とする。`jq -r '.[].filePath'` などで抽出し、E ⊆ P と exit code を別々に評価する。
+- markdownlint-cli2: 処理した集合を直接出力する機能に頼らず、canary を主たる根拠にする。canary は、意図的な違反（例: 言語指定のないコードフェンス MD040）を含む一時ファイルを、検証対象と同じディレクトリ・同じ設定スコープ・同じ指定経路（glob か literal path か）に置き、その違反が報告されることで、その指定経路が実検査に到達したことを示す補助証拠である。実行後に canary は削除する。
+- 別の ignore 範囲や別ファイルに置いた canary の検出は、実対象が lint された証拠にならない。ファイル単位の除外まで排除したい場合は、対象ファイルそのものに一時的な意図的違反を入れる。その前に作業前の内容を保存して `sha256sum` を記録し、検証後に元の内容へ byte-identical に復元して `sha256sum` と `diff` で確認する。違反を commit に残さない。そして、その対象のパスに対する診断が出力されることを確認する。E に複数の対象があれば、対象ごとに行う。
+- canary は、その対象が検査に到達したことを示すが、E 内のほかの clean なファイルが検査されたことまでは示さない。
+- `showFound` の一覧から per-directory の `ignores` を差し引く導出は補助の推論にすぎない。root の `ignores`・`gitignore`・`--config` の merge 結果の取りこぼしを検出できないため、単独で P の証拠にしない。
+
+#### cwd と revision の合わせ方
+
+- cwd は、検証したい探索範囲と対象 revision に合わせる。通常の変更ファイル検査は、レビュー対象の変更内容が存在する worktree / checkout で実行する。
+- #217 / PR #215 は、main checkout 配下の worktree traversal と ESLint ignore を検証した個別の限定事例であり、すべての lint VC を main checkout で実行する規則ではない。#217 の実装や merge を前提にしない。
+
+#### baseline の切り分けと境界
+
+- 既存違反と変更由来の違反を区別する。例えば textlint を `.claude/` 配下の Markdown へリテラル指定すると、変更前から存在する `prh` 違反で exit 1 になることがある。同様に、`.claude/**` の ignore を外した隔離環境で markdownlint-cli2 を実際に走らせると、変更前から存在する MD038 / MD040 の違反が報告されうる。これらの非ゼロ終了を「PASS」と書き換えない。変更前の revision と変更後の revision で診断を比較し、変更由来の違反が増えていないことだけを示す。
+- 差分外ファイルの大規模な改変や、全体の ignore 設定の廃止は要求しない。
+- この指針を守るために、新規の gate・hook・wrapper・schema・CI job は不要である。VC の作者が証拠を設計し、reviewer が照合する。
+
+#### 掲載する限定 lint 例の要件
+
+この節または Issue の VC に限定 lint 例を載せる場合は、実行確認済みのものに限る。未確認の例は載せない。実行確認の証拠として、次の項目を記録する。
+
+- installed version（例: `pnpm exec markdownlint-cli2 --help` の先頭行、`pnpm exec textlint --version`）
+- 対象 revision（Git commit SHA / PR HEAD）
+- 実行した cwd と、検査した対象の実内容
+- 期待対象集合 E
+- 実検査集合 P の根拠（textlint の `filePath` 集合、markdownlint-cli2 の canary 結果）
+- 実際の exit code
+- diagnostics（negative control / canary の結果を含む）
+- 既存違反と変更由来の違反の区別
+
+`pnpm run lint:docs` の一般結果は、`.claude/**` が ignore されているため、本ファイルのような対象の検査証拠として扱わない。限定 lint の実測証拠は、一般結果とは別の欄に記載する。
+
 ## VC_SINGLE_COMMAND_GUARDRAIL
 
 Issue body の VC（Verification Commands）は **shell control operator に依存しない単一コマンド** で記述する。
