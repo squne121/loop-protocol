@@ -1155,13 +1155,11 @@ _UNSELECTED_ENUM_VALUE_RE = re.compile(
 )
 
 
-def _contains_placeholder_scaffold(text: str) -> bool:
-    """Recursively (line-by-line) reject `<...>` authoring hints and bare
-    unselected `a|b|c` enum scaffolds anywhere in `text` (Issue #995 P0-4)."""
+def _contains_unselected_enum_scaffold(text: str) -> bool:
+    """True when any line of `text` carries a bare unselected `a|b|c` enum
+    scaffold (Issue #995 P0-4)."""
     if not isinstance(text, str):
         return False
-    if _PLACEHOLDER_ANGLE_TOKEN_RE.search(text):
-        return True
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or line.startswith("```") or line.startswith("~~~"):
@@ -1173,12 +1171,25 @@ def _contains_placeholder_scaffold(text: str) -> bool:
     return False
 
 
-def _extract_template_declared_scalar(block_text: object, key: str) -> Optional[str]:
-    """Extract a single top-level scalar key's value from a template field's
-    fenced-YAML `value` default (e.g. the real `contract_schema_version: v1`
-    already committed inside the implementation template's Machine-Readable
-    Contract scaffold), instead of hard-coding that value independently
-    (Issue #995 P0-4)."""
+def _contains_placeholder_scaffold(text: str) -> bool:
+    """Recursively (line-by-line) reject `<...>` authoring hints and bare
+    unselected `a|b|c` enum scaffolds anywhere in `text` (Issue #995 P0-4)."""
+    if not isinstance(text, str):
+        return False
+    if _PLACEHOLDER_ANGLE_TOKEN_RE.search(text):
+        return True
+    return _contains_unselected_enum_scaffold(text)
+
+
+# Issue #3015: the only Machine-Readable Contract key whose value is free
+# prose. Every other MRC key has a closed value format and keeps the strict
+# `_contains_placeholder_scaffold` detection (fail-closed default).
+_MRC_FREE_TEXT_KEYS = frozenset({"goal_ref"})
+
+
+def _extract_template_mrc_default(block_text: object, key: str) -> Optional[str]:
+    """Return the raw (placeholder-agnostic) string default of `key` in a
+    template field's fenced-YAML `value`, or None when unresolvable."""
     if not isinstance(block_text, str):
         return None
     m = re.search(r"```ya?ml\n(.*?)```", block_text, re.DOTALL)
@@ -1192,7 +1203,42 @@ def _extract_template_declared_scalar(block_text: object, key: str) -> Optional[
     if not isinstance(data, dict):
         return None
     value = data.get(key)
-    if not isinstance(value, str) or not value.strip() or _contains_placeholder_scaffold(value):
+    if not isinstance(value, str):
+        return None
+    return value
+
+
+def _is_placeholder_mrc_scalar(key: str, value: str, template_default: Optional[str]) -> bool:
+    """Issue #3015: placeholder judgement for an already-parsed MRC scalar.
+
+    Closed-format keys (everything but `goal_ref`) and an unresolvable
+    template default keep the current strict `_contains_placeholder_scaffold`
+    behaviour (fail-closed). For the free-text key `goal_ref`, a value is a
+    placeholder only when (1) the whole value is a single angle token, (2) it
+    equals (strip, exact) the same key's placeholder default in the template,
+    or (3) it is an unselected `a|b|c` enum. A value that merely contains a
+    partial angle description (e.g. `sha256:<hex>` in prose) is legitimate.
+    """
+    if key not in _MRC_FREE_TEXT_KEYS or not isinstance(template_default, str):
+        return _contains_placeholder_scaffold(value)
+    stripped = value.strip()
+    token = _PLACEHOLDER_ANGLE_TOKEN_RE.fullmatch(stripped)
+    if token is not None:
+        return True
+    default = template_default.strip()
+    if stripped == default and _contains_placeholder_scaffold(default):
+        return True
+    return _contains_unselected_enum_scaffold(stripped)
+
+
+def _extract_template_declared_scalar(block_text: object, key: str) -> Optional[str]:
+    """Extract a single top-level scalar key's value from a template field's
+    fenced-YAML `value` default (e.g. the real `contract_schema_version: v1`
+    already committed inside the implementation template's Machine-Readable
+    Contract scaffold), instead of hard-coding that value independently
+    (Issue #995 P0-4)."""
+    value = _extract_template_mrc_default(block_text, key)
+    if value is None or not value.strip() or _contains_placeholder_scaffold(value):
         return None
     return value.strip()
 
@@ -2098,7 +2144,14 @@ def detect_missing_template_sections(
             )
             is_placeholder = isinstance(value, str) and (
                 bool(_REQUIRED_PLACEHOLDER_RE.match(value.strip()))
-                or _contains_placeholder_scaffold(value)
+                or _is_placeholder_mrc_scalar(
+                    key,
+                    value,
+                    _extract_template_mrc_default(
+                        mrc_template_field.get("value") if mrc_template_field else None,
+                        key,
+                    ),
+                )
             )
             if not (is_missing or is_null_or_empty or is_placeholder):
                 continue
