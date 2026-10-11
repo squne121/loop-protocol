@@ -311,6 +311,21 @@ VC: GitHub API rate-limit response must be checked against the official docs bef
             "GitHub GraphQL errors must match official docs before approval",
         ),
         (
+            "Do not verify local fixtures (example: repository API fixtures) and "
+            "GitHub GraphQL errors must match official docs before approval.",
+            "GitHub GraphQL errors must match official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures (historical context: repository API fixtures) "
+            "and GitHub GraphQL errors must match official docs before approval.",
+            "GitHub GraphQL errors must match official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures (過去の引用) and GitHub GraphQL errors "
+            "must match official docs before approval.",
+            "GitHub GraphQL errors must match official docs before approval",
+        ),
+        (
             "Do not verify historical local fixtures and GitHub GraphQL errors must match "
             "official docs before approval.",
             "GitHub GraphQL errors must match official docs before approval",
@@ -592,6 +607,8 @@ def test_affirmative_deadline_does_not_negate_external_dependency():
         "official docs without checking repository API fixtures.",
         "Previously quoted: Do not verify local example fixtures and GitHub GraphQL errors "
         "must match official docs before approval.",
+        "Previously quoted “GitHub GraphQL errors must match official docs before approval.”",
+        "(Example: GitHub GraphQL errors must match official docs before approval.)",
         "Previously quoted: Do not verify local fixtures, but verify GitHub GraphQL "
         "errors against official docs before approval.",
         "Previously quoted: Do not verify local fixtures; verify GitHub GraphQL "
@@ -627,6 +644,25 @@ def test_noun_start_mixed_clause_negative_controls_do_not_require_web(phrase):
             f"```text\nDo not verify local fixtures and {external}\n```"
         ))
         assert not _web(_plan(fenced))["required"]
+
+
+def test_parenthetical_quoted_example_does_not_erase_independent_current_claim():
+    phrase = (
+        "Do not verify local fixtures (example: GitHub GraphQL errors must match official docs) "
+        "and GitHub GraphQL data/errors must match official docs before approval."
+    )
+    for body, comments, source_hint in [
+        (_body(ac=f"- AC1: {phrase}"), None, None),
+        (_body(ac="- AC1: Run current-main repository tests."),
+         [{"id": 93, "body": phrase}], "comment_93"),
+    ]:
+        policy = _web(_plan(body, comments))
+        claims = policy["critical_external_claims"]
+        assert policy["required"] and len(claims) == 1, claims
+        assert "GitHub GraphQL data/errors must match official docs" in claims[0]["claim"]
+        assert "example:" not in claims[0]["claim"]
+        assert claims[0]["source_hint"] == source_hint
+        assert claims[0]["role"] == "dispositive"
 
 
 def test_quoted_contrast_does_not_suppress_next_current_sentence():

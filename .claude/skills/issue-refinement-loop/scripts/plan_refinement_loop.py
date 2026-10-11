@@ -634,8 +634,10 @@ _NEGATED_REQUEST_RE = re.compile(
 _QUOTED_CONTEXT_RE = re.compile(
     r"(?<![/.])\b(?:previously(?:\s+quoted)?|historical(?:\s+context)?|"
     r"past(?:\s+quote)?|quoted|quote|literal(?:\s+example)?|noise|example)\s*[:：]|"
+    r"\b(?:previously\s+quoted|literal\s+example)\s*[\"'“‘«「『`]|"
     r"(?:過去(?:の)?引用|引用|貼付|例示)\s*[:：]|過去の引用|例示のみ", re.I,
 )
+_QUOTED_ASIDE_RE = re.compile(r"\([^()]*\)")
 _FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 # A noun-start RHS needs its own predicate; "fixtures and API errors against docs"
 # is still one negated request, not a second affirmative dependency.
@@ -711,6 +713,12 @@ def _claim_sentences(line: str) -> list[str]:
     A negated local clause must not suppress a later external dependency in
     the same sentence ("do not check fixtures, but verify official docs").
     """
+    # A quoted aside describes only its parenthesized content, not a separate
+    # affirmative claim later in the sentence.
+    line = _QUOTED_ASIDE_RE.sub(
+        lambda match: " " if _QUOTED_CONTEXT_RE.search(match.group()) else match.group(),
+        line,
+    )
     sentences = [part.strip() for part in re.split(
         r"(?<=[。！？])|(?<=[.!?])\s+(?=[A-Z])", line, flags=re.I,
     ) if part.strip()]
