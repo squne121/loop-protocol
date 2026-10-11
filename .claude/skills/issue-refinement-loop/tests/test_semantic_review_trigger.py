@@ -14,6 +14,7 @@ sys.path.insert(
     0, str(Path(__file__).resolve().parent.parent / "scripts")
 )
 
+import pytest  # noqa: E402
 import semantic_review_trigger as trig  # noqa: E402
 
 
@@ -481,6 +482,112 @@ def test_fence_opener_limited_rules_four_space_indent_and_container_prefix():
     assert delta.extract_severity_tags(container) == ["P1-1"]
     # control: a genuine 3-space-indented opener DOES start a fence.
     assert delta.extract_severity_tags("   ```\n### P1-1\n   ```\n") == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #3016: trusted OWNER review ``P<n>:`` / ``P<n>：`` headings
+# ---------------------------------------------------------------------------
+# Each case is an independent raw anchor body passed to the actual
+# build_semantic_review_trigger_input() -> evaluate_semantic_review_applicable()
+# (no hand-set trigger flags). Envelope cases are complete CF_HTML envelopes.
+
+
+def _colon_envelope(fragment, tail=""):
+    body = _ENV_OPEN + fragment + _ENV_CLOSE
+    return body + "\n\n" + tail if tail else body
+
+
+_COLON_TRIGGER_CASES = [
+    # (body, expected severity_tagged_anchor_findings)
+    pytest.param("### 1. P2：全角コロンの指摘\n\n本文。\n", ["P2"], id="P1"),
+    pytest.param("### P2: ASCII colon finding\n\nBody.\n", ["P2"], id="P2"),
+    pytest.param("### 1. P2: ASCII colon with number\n", ["P2"], id="P3a"),
+    pytest.param("### P2：全角コロン番号なし\n", ["P2"], id="P3b"),
+    pytest.param(
+        _colon_envelope("<h3>1. P2：全角の指摘</h3><p>詳細</p>", "ordinary prose only.\n"),
+        ["P2"],
+        id="P4",
+    ),
+    pytest.param(
+        _colon_envelope("<h3>P2: ASCII finding</h3>", "ordinary prose only.\n"),
+        ["P2"],
+        id="P5",
+    ),
+    pytest.param(
+        _colon_envelope("<h3>1. P2：全角の指摘</h3>", "### 1. P2：全角の指摘\n"),
+        ["P2"],
+        id="P6",
+    ),
+    pytest.param(
+        _colon_envelope(
+            "<h3>1. P2：全角の指摘</h3>",
+            "Markdown tail は ordinary prose のみ。P2: という語を含む文章。\n",
+        ),
+        ["P2"],
+        id="P7",
+    ),
+    pytest.param(
+        _colon_envelope("<h3>概要</h3><p>severity なし</p>", "### P2: tail finding\n"),
+        ["P2"],
+        id="P8",
+    ),
+    pytest.param(
+        _colon_envelope("<h3>1. P2：全角の指摘</h3>", "### P3: tail finding\n"),
+        ["P2", "P3"],
+        id="P9",
+    ),
+    # negatives: no severity signal at all
+    pytest.param("P2: ordinary prose paragraph.\n\nP2：全角の通常文。\n", [], id="N1a"),
+    pytest.param("P2: ASCII の通常文だけの段落。\n", [], id="N1b"),
+    pytest.param("P2：全角の通常文だけの段落。\n", [], id="N1c"),
+    pytest.param(
+        _colon_envelope("<p>P2: ordinary prose</p>", "P2：ordinary prose tail.\n"),
+        [],
+        id="N1d",
+    ),
+    pytest.param(_colon_envelope("<p>P2：段落であり見出しではない</p>"), [], id="N2"),
+    pytest.param("説明文に `P2：コード` を含む段落。\n", [], id="N3a"),
+    pytest.param("### `P2: code span heading`\n", [], id="N3b"),
+    pytest.param("`### P2：見出し風のコードスパン`\n", [], id="N3c"),
+    pytest.param("```\n### P2：fence 内\n```\n", [], id="N4a"),
+    pytest.param("~~~\n### P2: fence 内\n~~~\n", [], id="N4b"),
+    pytest.param("<!--\n### P2：comment 内\n-->\n", [], id="N5"),
+    pytest.param("### Notes about P2: heading\n", [], id="N6a"),
+    pytest.param("### 1. See P2：中途の言及\n", [], id="N6b"),
+    pytest.param(_colon_envelope("<h3>Notes about P2: heading</h3>"), [], id="N7a"),
+    pytest.param(_colon_envelope("<h3>1. See P2：中途の言及</h3>"), [], id="N7b"),
+    pytest.param(_colon_envelope("<pre><h3>1. P2：pre 内</h3></pre>"), [], id="N8a"),
+    pytest.param(
+        _colon_envelope('<script>var s = "<h3>P2: script 内</h3>";</script>'),
+        [],
+        id="N8b",
+    ),
+    pytest.param(
+        _colon_envelope("<style>/* <h3>1. P2：style 内</h3> */</style>"), [], id="N8c"
+    ),
+]
+
+
+@pytest.mark.parametrize(("body", "expected"), _COLON_TRIGGER_CASES)
+def test_owner_colon_semantic_trigger(body, expected):
+    """GIVEN one independent raw OWNER anchor body (colon-form severity
+    heading, or a near-miss that must not count)
+    WHEN it goes through the actual build_semantic_review_trigger_input() and
+    evaluate_semantic_review_applicable() with every other signal at default
+    THEN positives set severity_tagged_anchor_findings and trigger only that
+    signal; negatives leave semantic_review_applicable False."""
+    raw, result = _trigger_for_anchor(body)
+    assert raw["user_requested"] is False
+    assert raw["severity_tagged_anchor_findings"] == expected
+    if expected:
+        assert result["semantic_review_applicable"] is True
+        assert result["triggered_by"] == _ONLY_SEVERITY_SIGNAL
+        breakdown = dict(result["signal_breakdown"])
+        assert breakdown.pop("severity_tagged_anchor_findings") is True
+        assert breakdown == _SEVERITY_OFF
+    else:
+        assert result["semantic_review_applicable"] is False
+        assert result["triggered_by"] == []
 
 
 if __name__ == "__main__":
