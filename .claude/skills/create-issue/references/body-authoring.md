@@ -268,6 +268,7 @@ Markdown / prose の lint VC は、exit 0 であることと、要求した変�
 - E: VC が検査すると主張する期待対象集合（Issue の Allowed Paths 内で変更する Markdown など）
 - P: lint が実際に処理した集合
 - PASS に必要な条件は `E ⊆ P` である。ゼロ件、一部欠落、処理確認不能は PASS にしない。対象を限定した検証例では、可能な限り P = E にする。
+- E と P のパスは、同じ cwd / checkout を基準にした絶対パス、または repo-relative のどちらかに正規化してから比較する。
 - exit code は lint の verdict であり、E ⊆ P の証拠とは別の項目として評価する。exit 0 でも P が空なら未検査であり、exit 1 でも別ファイルの診断だけが原因なら対象の検査を意味しない。
 
 #### 列挙は実検査の証拠ではない
@@ -278,7 +279,11 @@ Markdown / prose の lint VC は、exit 0 であることと、要求した変�
 - サブディレクトリに置いた `.markdownlint-cli2.yaml` の `ignores` は列挙の後に適用される。そのため、`Found:` に載り `Linting:` に数えられても、そのサブディレクトリのファイルは 0 error・exit 0 になる。
 - `gitignore: true` では、git-ignored のファイルを通常のパス / glob 形式で指定すると、`Finding:` 行に除外の表示が出ないまま `Found:` からも黙って外れる（同じファイルを `:path` 形式で指定したときは検査され、違反が報告された）。
 - CLI で指定した対象に config の `globs` が合成されるため、別ファイルの違反で exit 1 になることがある。このとき診断は指定した対象とは無関係であり、対象が検査された証拠にならない（P ≠ E）。
-- `--config <file>` は base として読まれ、cwd の `.markdownlint-cli2.*` が後から merge される。ファイル名は `.markdownlint-cli2.*` 形式（例: `base.markdownlint-cli2.yaml`）が必須で、他の名前は exit 2 のエラーになる。`globs`・`ignores`・`gitignore` のような同名の最上位プロパティは cwd 側の値で置き換えられ、base 側の値は残らない。`config` 内の規則は規則ごとに merge される。そのため、cwd の設定が `ignores` を持つ場合は、`--config` で `ignores` を渡すだけでは除外を外せない。
+- `--config <file>` は base として読まれ、cwd の `.markdownlint-cli2.*` が後から merge される。`globs`・`ignores`・`gitignore` のような同名の最上位プロパティは cwd 側の値で置き換えられ、base 側の値は残らない。`config` 内の規則は規則ごとに merge される。そのため、cwd の設定が `ignores` を持つ場合は、`--config` で `ignores` を渡すだけでは除外を外せない。
+- `--config <file>` のファイル名は、末尾の suffix によって読み込み方が決まる（根拠は markdownlint-cli2 0.17.2 の `readOptionsOrConfig()`）。末尾が `.markdownlint-cli2.jsonc` / `.yaml` / `.cjs` / `.mjs` なら CLI2 options として、`.markdownlint.jsonc` / `.json` / `.yaml` / `.yml` / `.cjs` / `.mjs` なら markdownlint の規則設定として読まれる（後者は内部で `{ config }` に包まれる）。末尾が対応する suffix であれば prefix 付きの名前も受理される（例: `rules.markdownlint.json`、`base.markdownlint-cli2.yaml`）。両形式は中身の形式が異なるため、ファイル名だけを変えて交換してはならない。対応する suffix を持たない名前は設定ファイルの読込エラーになる。これは、対応する suffix の設定ファイルを読み込めたうえで lint が返す結果（違反があれば exit 1）とは別の事象であり、混同しない。設定ファイルを読み込めたことは、lint 全体が exit 0 になることを意味しない。以下は実測した範囲のみで、ほかの exit code へは一般化しない（隔離ディレクトリ、markdownlint-cli2 0.17.2 / markdownlint 0.37.4、cwd は一時ディレクトリ）。
+  - `rules.markdownlint.json`（`{"default": true}`）と違反のない Markdown では exit 0（規則設定として受理）。`opts.markdownlint-cli2.jsonc`（`{"config": {"default": true}}`）でも exit 0（options として受理）。
+  - 対応する suffix を持たない `bad.config.json` では、実測では exit 2 だった。
+  - MD040 違反を含む Markdown に `{"MD040": false}` を `off.markdownlint.json` で渡すと MD040 が無効化されて exit 0 だった。同じ内容を `off.markdownlint-cli2.jsonc` に改名すると options として読まれ、`MD040` キーは規則設定にならないため MD040 が報告されて exit 1 だった。
 - textlint 14.8.4 では、`--ignore-path` を指定すると既定の `.textlintignore` は適用されず置き換えられる（併用にならない）。リテラルの明示パスは `.textlintignore` で除外されず処理されるが、glob 経由の指定は除外され、全件が除外されると出力は `[]`・exit 0 になる。存在しないパスも `[]`・exit 0 になりうる。
 - textlint の `--output-file` を指定すると、違反があっても exit 0 になる。exit code だけで判定しない。
 
