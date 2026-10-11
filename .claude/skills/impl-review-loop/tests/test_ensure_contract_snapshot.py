@@ -4625,3 +4625,270 @@ class TestPostPublishUpdatedAtRace:
         assert remote.patched_comment_ids == [_RACE_COMMENT_ID]
         assert list(remote.comments) == [_RACE_COMMENT_ID]
         assert result["contract_snapshot_url"].endswith(f"#issuecomment-{_RACE_COMMENT_ID}")
+
+
+# ---------------------------------------------------------------------------
+# Issue #3012: a trusted fingerprint-NON-ready go that is newer than a trusted
+# blocked must not hide that blocked result from the INITIAL existing_go
+# selection of the REAL ensure_contract_snapshot().  The REAL shared parser is
+# used (``_import_parser_module`` is not a MagicMock) and only the ``gh``
+# subprocess boundary is faked via ``_PostPublishRaceRemote``.  The
+# post-publication verifier stays under the autouse stub, so these tests do
+# not depend on ``stale_or_conflicting_snapshot``.
+# Timeline notation: G = fingerprint-ready trusted go, B = trusted blocked,
+# P = schema-valid trusted go that is NOT fingerprint-ready.
+# ---------------------------------------------------------------------------
+
+_NR_T = "2026-06-13T07:00:0{}Z"
+
+
+def _nr_add_ready_go(remote, cid, created_at, *, base_sha="a" * 40, user=None, association="OWNER"):
+    fingerprint = _ecs_mod.compute_expected_contract_fingerprint(
+        issue_number=_ISSUE_NUMBER,
+        contract_source_id=str(cid),
+        contract_body_sha256=_SAMPLE_BODY_SHA256,
+        allowed_paths=["tracked.txt"],
+        base_ref="main",
+        base_sha_at_snapshot=base_sha,
+    )
+    body = _ecs_mod._build_contract_review_comment(
+        issue_number=_ISSUE_NUMBER,
+        repo=_REPO,
+        review_result=_make_review_result("go"),
+        idempotency_marker="<!-- marker -->",
+        body_sha256=_SAMPLE_BODY_SHA256,
+        expected_contract_fingerprint=fingerprint,
+    )
+    return remote.add_comment(
+        body=body,
+        user=user or _RACE_TRUSTED_USER,
+        association=association,
+        created_at=created_at,
+        comment_id=cid,
+    )
+
+
+def _nr_add_blocked(remote, cid, created_at, *, user=None, association="OWNER"):
+    return remote.add_comment(
+        body=_race_blocked_body(),
+        user=user or _RACE_TRUSTED_USER,
+        association=association,
+        created_at=created_at,
+        comment_id=cid,
+    )
+
+
+def _nr_add_nonready_go(remote, cid, created_at):
+    return remote.add_comment(
+        body=_race_not_ready_go_body(),
+        user=_RACE_TRUSTED_USER,
+        association="OWNER",
+        created_at=created_at,
+        comment_id=cid,
+    )
+
+
+def _nr_assert_fixture_shape(remote, *, go_id=None, blocked_id=None, nonready_id=None):
+    """After the REAL parser: G/B/P are trusted, schema-valid; P is not fingerprint-ready."""
+    comments = [
+        {
+            "id": c["id"],
+            "html_url": c["html_url"],
+            "created_at": c["created_at"],
+            "updated_at": c["updated_at"],
+            "body": c["body"],
+            "author": c["user"]["login"],
+            "author_id": c["user"]["id"],
+            "author_type": c["user"]["type"],
+            "author_association": c["author_association"],
+        }
+        for c in remote.comments.values()
+    ]
+    parsed = _real_parser_mod_for_fp_tests.parse_contract_review_results(
+        comments, expected_issue_url=_ISSUE_URL
+    )
+    by_id = {r["comment_id"]: r for r in parsed}
+    for cid in (go_id, blocked_id, nonready_id):
+        if cid is not None:
+            assert by_id[cid]["is_trusted_author"] is True
+    if go_id is not None:
+        assert by_id[go_id]["status"] == "go"
+        assert by_id[go_id]["is_fingerprint_ready"] is True
+        assert is_go_current(by_id[go_id], _SAMPLE_BODY_SHA256)
+    if blocked_id is not None:
+        assert by_id[blocked_id]["status"] == "blocked"
+    if nonready_id is not None:
+        assert by_id[nonready_id]["status"] == "go"
+        assert by_id[nonready_id]["is_fingerprint_ready"] is False
+
+
+def _nr_run_ensure(monkeypatch, remote, *, mode="check-only"):
+    """REAL ensure_contract_snapshot(), REAL parser, ``gh`` boundary faked; verifier stays stubbed."""
+    monkeypatch.setattr(_ecs_mod.subprocess, "run", remote.run)
+    with patch.object(
+        _ecs_mod, "_import_parser_module", return_value=_real_parser_mod_for_fp_tests
+    ):
+        return ensure_contract_snapshot(
+            issue_number=_ISSUE_NUMBER, repo=_REPO, mode=mode, do_post=False
+        )
+
+
+def _nr_url(cid):
+    return f"{_ISSUE_URL}#issuecomment-{cid}"
+
+
+def _nr_assert_latest_blocked(result, blocked_id):
+    assert result["status"] == "blocked_needs_refinement", result
+    assert result["source"] == "latest_blocked", result
+    assert result["contract_snapshot_url"] == _nr_url(blocked_id), result
+
+
+def test_nonready_go_after_blocked_initial_selection_returns_latest_blocked(monkeypatch):
+    remote = _PostPublishRaceRemote()
+    _nr_add_ready_go(remote, 8101, _NR_T.format(1))
+    _nr_add_blocked(remote, 8102, _NR_T.format(2))
+    _nr_add_nonready_go(remote, 8103, _NR_T.format(3))
+    _nr_assert_fixture_shape(remote, go_id=8101, blocked_id=8102, nonready_id=8103)
+
+    result = _nr_run_ensure(monkeypatch, remote)
+
+    _nr_assert_latest_blocked(result, 8102)
+    assert remote.post_count == 0 and remote.patch_count == 0
+
+
+def test_nonready_go_after_blocked_positive_controls_ready_go_still_adopted(monkeypatch):
+    for with_p in (False, True):
+        remote = _PostPublishRaceRemote()
+        _nr_add_ready_go(remote, 8101, _NR_T.format(1))
+        if with_p:
+            _nr_add_nonready_go(remote, 8103, _NR_T.format(3))
+        _nr_assert_fixture_shape(
+            remote, go_id=8101, nonready_id=8103 if with_p else None
+        )
+
+        result = _nr_run_ensure(monkeypatch, remote)
+
+        assert result["status"] == "ok", result
+        assert result["source"] == "existing_go", result
+        assert result["contract_snapshot_url"] == _nr_url(8101)
+
+
+def test_nonready_go_after_blocked_blocked_directly_after_ready_go_is_blocked(monkeypatch):
+    remote = _PostPublishRaceRemote()
+    _nr_add_ready_go(remote, 8101, _NR_T.format(1))
+    _nr_add_blocked(remote, 8102, _NR_T.format(2))
+    _nr_assert_fixture_shape(remote, go_id=8101, blocked_id=8102)
+
+    _nr_assert_latest_blocked(_nr_run_ensure(monkeypatch, remote), 8102)
+
+
+def test_nonready_go_after_blocked_later_ready_go_beats_earlier_blocked(monkeypatch):
+    remote = _PostPublishRaceRemote()
+    _nr_add_ready_go(remote, 8101, _NR_T.format(1))
+    _nr_add_blocked(remote, 8102, _NR_T.format(2))
+    _nr_add_ready_go(remote, 8104, _NR_T.format(4))
+    _nr_assert_fixture_shape(remote, go_id=8104, blocked_id=8102)
+
+    result = _nr_run_ensure(monkeypatch, remote)
+
+    assert result["status"] == "ok", result
+    assert result["source"] == "existing_go", result
+    assert result["contract_snapshot_url"] == _nr_url(8104)
+
+
+def test_nonready_go_after_blocked_blocked_without_ready_go_matches_blocked_alone(monkeypatch):
+    for with_p in (False, True):
+        remote = _PostPublishRaceRemote()
+        _nr_add_blocked(remote, 8102, _NR_T.format(2))
+        if with_p:
+            _nr_add_nonready_go(remote, 8103, _NR_T.format(3))
+        _nr_assert_fixture_shape(
+            remote, blocked_id=8102, nonready_id=8103 if with_p else None
+        )
+
+        _nr_assert_latest_blocked(_nr_run_ensure(monkeypatch, remote), 8102)
+
+
+def test_nonready_go_after_blocked_untrusted_blocked_and_plain_comments_do_not_reject(monkeypatch):
+    remote = _PostPublishRaceRemote()
+    _nr_add_ready_go(remote, 8101, _NR_T.format(1))
+    _nr_add_blocked(
+        remote, 8102, _NR_T.format(2), user=_RACE_UNTRUSTED_USER, association="NONE"
+    )
+    remote.add_comment(
+        body="ordinary discussion",
+        user=_RACE_TRUSTED_USER,
+        association="OWNER",
+        created_at=_NR_T.format(3),
+        comment_id=8105,
+    )
+
+    result = _nr_run_ensure(monkeypatch, remote)
+
+    assert result["status"] == "ok", result
+    assert result["contract_snapshot_url"] == _nr_url(8101)
+
+
+def test_nonready_go_after_blocked_pending_only_comment_is_not_a_go(monkeypatch):
+    remote = _PostPublishRaceRemote()
+    remote.add_comment(
+        body=_ecs_mod._build_contract_review_comment(
+            issue_number=_ISSUE_NUMBER,
+            repo=_REPO,
+            review_result=_make_review_result("go"),
+            idempotency_marker="<!-- marker -->",
+            body_sha256=_SAMPLE_BODY_SHA256,
+            expected_contract_fingerprint=None,
+        ),
+        user=_RACE_TRUSTED_USER,
+        association="OWNER",
+        created_at=_NR_T.format(2),
+        comment_id=8106,
+    )
+
+    result = _nr_run_ensure(monkeypatch, remote)
+
+    assert result["status"] == "human_judgment", result
+    assert result["contract_snapshot_url"] is None
+
+
+def test_nonready_go_after_blocked_binding_mismatch_keeps_ready_go_rejected(monkeypatch):
+    drifted_base = _PostPublishRaceRemote()
+    _nr_add_ready_go(drifted_base, 8101, _NR_T.format(1), base_sha="f" * 40)
+    drifted = _nr_run_ensure(monkeypatch, drifted_base)
+    assert drifted["status"] == "human_judgment", drifted
+    assert drifted["contract_snapshot_url"] is None
+
+    edited_body = _PostPublishRaceRemote()
+    edited_body.body = _SAMPLE_BODY + "edited after snapshot\n"
+    _nr_add_ready_go(edited_body, 8101, _NR_T.format(1))
+    edited = _nr_run_ensure(monkeypatch, edited_body)
+    assert edited["status"] == "human_judgment", edited
+    assert edited["contract_snapshot_url"] is None
+
+
+def test_nonready_go_after_blocked_input_order_does_not_change_result(monkeypatch):
+    remote = _PostPublishRaceRemote()
+    _nr_add_nonready_go(remote, 8103, _NR_T.format(3))
+    _nr_add_blocked(remote, 8102, _NR_T.format(2))
+    _nr_add_ready_go(remote, 8101, _NR_T.format(1))
+    assert list(remote.comments) == [8103, 8102, 8101]
+
+    _nr_assert_latest_blocked(_nr_run_ensure(monkeypatch, remote), 8102)
+
+
+def test_nonready_go_after_blocked_same_created_at_uses_numeric_comment_id(monkeypatch):
+    same = _NR_T.format(5)
+    blocked_wins = _PostPublishRaceRemote()
+    _nr_add_ready_go(blocked_wins, 8101, _NR_T.format(1))
+    _nr_add_ready_go(blocked_wins, 8110, same)
+    _nr_add_blocked(blocked_wins, 8120, same)
+    _nr_assert_latest_blocked(_nr_run_ensure(monkeypatch, blocked_wins), 8120)
+
+    go_wins = _PostPublishRaceRemote()
+    _nr_add_ready_go(go_wins, 8101, _NR_T.format(1))
+    _nr_add_blocked(go_wins, 809, same)
+    _nr_add_ready_go(go_wins, 8110, same)
+    result = _nr_run_ensure(monkeypatch, go_wins)
+    assert result["status"] == "ok", result
+    assert result["contract_snapshot_url"] == _nr_url(8110)

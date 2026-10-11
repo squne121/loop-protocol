@@ -460,7 +460,16 @@ def check_existing_go_comment(
     # #1475 (fix_delta P1 item 1): trust filtering must be applied BEFORE
     # go/blocked precedence is decided. An untrusted comment posted after a
     # trusted go must never pre-empt that go, regardless of its status.
-    latest = find_latest_result(results, trusted_only=True)
+    #
+    # #3012: a trusted ``go`` that is not fingerprint-ready is never adoptable
+    # and must not become "latest" ahead of an earlier trusted blocked (same
+    # ``adoptable`` semantics as verify_snapshot_authority_postcondition).
+    adoptable = [
+        item
+        for item in results
+        if item.get("status") != "go" or item.get("is_fingerprint_ready") is True
+    ]
+    latest = find_latest_result(adoptable, trusted_only=True)
 
     # If the latest (trusted) result is blocked, do not return an existing go
     if latest and latest["status"] == "blocked":

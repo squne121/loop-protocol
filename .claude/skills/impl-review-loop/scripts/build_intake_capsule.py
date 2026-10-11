@@ -686,7 +686,16 @@ def _normalize_contract_snapshot_live(
     # #1475 fix_delta P1 item 1: trust filtering before precedence -- an
     # untrusted comment must never pre-empt a trusted go via the
     # "latest blocked wins" branch below.
-    latest = _find_latest_result(parsed_results, trusted_only=True)
+    #
+    # #3012: a trusted ``go`` that is not fingerprint-ready is never adoptable
+    # and must not become "latest" ahead of an earlier trusted blocked (same
+    # ``adoptable`` semantics as verify_snapshot_authority_postcondition).
+    adoptable = [
+        item
+        for item in parsed_results
+        if item.get("status") != "go" or item.get("is_fingerprint_ready") is True
+    ]
+    latest = _find_latest_result(adoptable, trusted_only=True)
     latest_go = _find_latest_go(parsed_results)
     # #1537: a trusted go lacking a well-formed source-bound
     # expected_contract_fingerprint must never be routed as the
