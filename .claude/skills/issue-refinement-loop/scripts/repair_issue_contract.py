@@ -11,6 +11,11 @@ Repairs performed:
 2. runtime_only_command — Annotate allowlist-outside runtime-only commands
                           (e.g. ``pnpm test:e2e``) with
                           ``# baseline-expect: deferred`` / ``# preflight-scope: pr_review_only``.
+3. deferred_to_pr_review_only — Replace ONLY the annotation line of a pytest VC that
+                          misuses ``# baseline-expect: deferred`` as a stand-in for
+                          ``# preflight-scope: pr_review_only`` (Issue #3020). Narrow,
+                          real-producer-classification-based conditions; the command
+                          line is never changed.
 
 Design:
 - dry-run by default (no file written unless --apply is given)
@@ -66,6 +71,22 @@ if str(_AGENT_OPS_DIR) not in sys.path:
     sys.path.insert(0, str(_AGENT_OPS_DIR))
 from allowed_paths_policy import is_no_path_marker  # noqa: E402
 
+# Issue #3020: reuse the shared VC annotation grammar that the real producer
+# (baseline_vc_preflight.py) itself consumes, so the deferred -> pr_review_only
+# repair decides on exactly the same preceding-line / contiguous-block semantics.
+# Fail-closed: when the grammar module is unavailable the repair pass is a no-op.
+_VC_SYNTAX_DIR = _REPO_ROOT / ".claude" / "skills" / "issue-contract-review" / "scripts"
+if str(_VC_SYNTAX_DIR) not in sys.path:
+    sys.path.insert(0, str(_VC_SYNTAX_DIR))
+try:
+    from vc_contract_syntax import (  # noqa: E402
+        extract_baseline_expect_annotation as _extract_baseline_expect_annotation,
+        parse_preflight_scope_marker_line as _parse_preflight_scope_marker_line,
+    )
+except ImportError:  # pragma: no cover - defensive fallback (fail-closed, not fail-open)
+    _extract_baseline_expect_annotation = None
+    _parse_preflight_scope_marker_line = None
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -102,6 +123,9 @@ _INFORMATIONAL_REPAIR_KINDS = frozenset({"non_target_fence"})
 _SAFE_MUTATING_KINDS_REQUIRE_HIGH_CONFIDENCE = frozenset({
     "move_inline_baseline_expect_to_preceding_line",
     "insert_baseline_expect_fail",
+    # Issue #3020: annotation-line-only replacement of a misused
+    # `baseline-expect: deferred` on an in-scope pytest VC.
+    "deferred_to_pr_review_only",
 })
 
 # Known mutating kinds that are never auto-safe regardless of confidence
@@ -801,9 +825,285 @@ def _repair_insert_baseline_expect(body: str, cwd: str = ".") -> tuple[str, list
     return body, repairs
 
 
+# ---------------------------------------------------------------------------
+# Issue #3020: `baseline-expect: deferred` misused as a `pr_review_only`
+# stand-in for a pytest VC.
+#
+# The real producer (`baseline_vc_preflight.py`) classifies such a VC as
+# `baseline_expect_deferred` (runner: exec / classification: skipped), which the
+# Step 4 authoritative adjudicator (`adjudicate_vc_result.py step4-adjudicate`)
+# rejects as `unsupported_baseline_classification`. The canonical form is
+# `# preflight-scope: pr_review_only`. This pass rewrites ONLY the annotation
+# line, only for a deliberately narrow, deterministic condition set; every
+# other `deferred` is left untouched (and is NOT turned into a
+# human_review_required record).
+# ---------------------------------------------------------------------------
+
+_DEFERRED_ANNOTATION_LINE_RE = re.compile(r"^#\s*baseline-expect:\s*deferred\s*$")
+_SHELL_OPERATOR_RE = re.compile(r"&&|\|\||\||;|>|<|`|\$\(")
+_PYTEST_VALUE_FLAGS = frozenset({
+    "-k", "-m", "-p", "-c", "-o", "--maxfail", "--deselect", "--ignore",
+    "--rootdir", "--junitxml", "--durations",
+})
+
+
+# `uv run` option forms that the repo's existing pytest VCs actually use. Any other
+# flag makes the launcher ambiguous and the VC is left untouched.
+_UV_RUN_FLAGS_NO_VALUE = frozenset({
+    "--locked", "--frozen", "--no-project", "--offline", "--isolated", "--no-sync",
+})
+_UV_RUN_FLAGS_WITH_VALUE = frozenset({"--with"})
+_PYTHON_LAUNCHERS = frozenset({"python", "python3"})
+
+
+def _pytest_launcher_args(tokens: list[str]) -> Optional[list[str]]:
+    """Return the argv after a recognised pytest launcher PREFIX, else None.
+
+    Recognised forms (the ones existing VCs use), anchored at tokens[0]:
+      pytest ...
+      python|python3 -m pytest ...
+      uv run [--locked|--frozen|--no-project|--offline|--isolated|--no-sync|--with <pkg>|--with=<pkg>]...
+          (pytest | python|python3 -m pytest) ...
+    A ``pytest`` token anywhere else (e.g. an ``rg`` pattern) is NOT a launcher.
+    """
+    i = 0
+    if tokens[:2] == ["uv", "run"]:
+        i = 2
+        while i < len(tokens) and tokens[i].startswith("-"):
+            tok = tokens[i]
+            if tok in _UV_RUN_FLAGS_NO_VALUE or (tok.startswith("--with=") and len(tok) > len("--with=")):
+                i += 1
+            elif tok in _UV_RUN_FLAGS_WITH_VALUE and i + 1 < len(tokens):
+                i += 2
+            else:
+                return None
+    if i >= len(tokens):
+        return None
+    if tokens[i] == "pytest":
+        return tokens[i + 1:]
+    if tokens[i] in _PYTHON_LAUNCHERS and tokens[i + 1:i + 3] == ["-m", "pytest"]:
+        return tokens[i + 3:]
+    return None
+
+
+def _pytest_test_file_targets(cmd: str) -> Optional[list[str]]:
+    """Return the repo-relative test file paths a single pytest VC targets, or
+    None when the command is not a simple single pytest invocation (recognised
+    launcher prefix only) over explicit ``*.py`` test files (directories,
+    globs, compound commands, ambiguous launchers, unparsable shell all yield
+    None)."""
+    if _SHELL_OPERATOR_RE.search(cmd):
+        return None
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return None
+    rest = _pytest_launcher_args(tokens)
+    if rest is None:
+        return None
+    targets: list[str] = []
+    skip_next = False
+    for tok in rest:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok.startswith("-"):
+            if "=" not in tok and tok in _PYTEST_VALUE_FLAGS:
+                skip_next = True
+            continue
+        path = tok.split("::", 1)[0]
+        if not path.endswith(".py") or any(ch in path for ch in "*?[]"):
+            return None
+        targets.append(path)
+    return targets or None
+
+
+def _is_test_file_path(path: str) -> bool:
+    name = path.rsplit("/", 1)[-1]
+    return name.startswith("test_") or name.endswith("_test.py")
+
+
+def _path_in_allowed(path: str, allowed: list) -> bool:
+    norm = path[2:] if path.startswith("./") else path
+    if norm.startswith("/") or ".." in norm.split("/"):
+        return False
+    for raw in allowed:
+        a = raw[2:] if raw.startswith("./") else raw
+        if norm == a or (a.endswith("/") and norm.startswith(a)):
+            return True
+    return False
+
+
+def _repair_deferred_to_pr_review_only(body: str) -> tuple[str, list[dict]]:
+    new_body, repairs, _cmd_lines = _repair_deferred_to_pr_review_only_ex(body)
+    return new_body, repairs
+
+
+def _repair_deferred_to_pr_review_only_ex(body: str) -> tuple[str, list[dict], list[str]]:
+    """Replace the annotation line of a misused ``# baseline-expect: deferred``
+    pytest VC with ``# preflight-scope: pr_review_only`` (Issue #3020).
+
+    Applies only when ALL hold (otherwise the VC is left byte-identical):
+      - the command is a single pytest invocation whose positional targets are
+        explicit ``*.py`` test files, each inside the Issue's Allowed Paths;
+      - the real producer would classify it ``baseline_expect_deferred``: no
+        preflight-scope marker on the immediately preceding line, no unquoted
+        inline baseline-expect in the command, and the shared annotation
+        grammar resolves ``baseline-expect`` to ``deferred``;
+      - the ``deferred`` annotation is the single baseline-expect line and sits
+        immediately before the command (so the replacement marker is adjacent,
+        the placement the producer requires for ``preflight-scope``);
+      - the command is not a denylisted / pnpm regression-gate command.
+
+    The command line is never modified, so the command hash is unchanged;
+    only the annotation line (and therefore the body hash) changes. Idempotent:
+    after the rewrite the VC has a valid scope marker and no longer matches.
+    """
+    repairs: list[dict] = []
+    cmd_lines: list[str] = []  # command line (verbatim) paired 1:1 with repairs
+    if _extract_baseline_expect_annotation is None or _parse_preflight_scope_marker_line is None:
+        return body, repairs, cmd_lines
+    vc_match = re.search(r'^## Verification Commands\s*$', body, re.MULTILINE)
+    if not vc_match:
+        return body, repairs, cmd_lines
+    vc_start = vc_match.start()
+    next_section = re.search(r'^##\s', body[vc_start + 1:], re.MULTILINE)
+    vc_end = vc_start + next_section.start() + 1 if next_section else len(body)
+    section = body[vc_start:vc_end]
+    allowed = _extract_allowed_paths_ric(body)
+    if not allowed:
+        return body, repairs, cmd_lines
+
+    lines = section.split('\n')
+    fence_re = re.compile(r'^\s*```(\w*)\s*$')
+    in_bash = False
+    block_start = 0  # index in `lines` of the first line inside the current bash fence
+    for idx, line in enumerate(lines):
+        fm = fence_re.match(line)
+        if fm:
+            if not in_bash:
+                in_bash = (fm.group(1) == 'bash')
+                block_start = idx + 1
+            else:
+                in_bash = False
+            continue
+        if not in_bash:
+            continue
+        m = re.match(r'^(\s*)\$\s+(.+)$', line)
+        if not m:
+            continue
+        cmd = m.group(2).strip()
+        block_idx = idx - block_start
+        if block_idx < 1 or not cmd or cmd.startswith('#'):
+            continue
+        if _is_pnpm_gate(cmd) or _is_denylist_command(cmd):
+            continue
+        # Mirror the real producer's baseline_expect_deferred classification.
+        block_lines = [ln.strip() for ln in lines[block_start:idx + 1]]
+        scope_marker, _ = _parse_preflight_scope_marker_line(block_lines[block_idx - 1])
+        if scope_marker is not None:
+            continue
+        if _scan_unquoted_inline_baseline_expect(line)[0] is not None:
+            continue
+        value, ann_line_no, ann_raw = _extract_baseline_expect_annotation(block_lines, block_idx)
+        if value != "deferred" or ann_raw is None:
+            continue
+        # Annotation must be the only baseline-expect line and immediately precede the command.
+        if ann_line_no != block_idx or not _DEFERRED_ANNOTATION_LINE_RE.match(ann_raw.strip()):
+            continue
+        targets = _pytest_test_file_targets(cmd)
+        if not targets:
+            continue
+        if not all(_is_test_file_path(t) and _path_in_allowed(t, allowed) for t in targets):
+            continue
+
+        ann_idx = idx - 1
+        original_ann = lines[ann_idx]
+        ann_indent = original_ann[:len(original_ann) - len(original_ann.lstrip())]
+        new_ann = f"{ann_indent}# preflight-scope: pr_review_only"
+        lines[ann_idx] = new_ann
+        repairs.append({
+            "kind": "deferred_to_pr_review_only",
+            "line_start": ann_idx + 1,
+            "line_end": ann_idx + 1,
+            "reason": (
+                "baseline-expect: deferred is classified baseline_expect_deferred by the producer and "
+                "rejected by Step 4 (unsupported_baseline_classification); a post-implementation "
+                "pytest VC must use the canonical preflight-scope: pr_review_only"
+            ),
+            "original": original_ann,
+            "repaired": new_ann,
+            "safety": "mutation-free-dry-run",
+            "confidence": "high",
+        })
+        cmd_lines.append(lines[idx])
+    if not repairs:
+        return body, repairs, cmd_lines
+    return body[:vc_start] + '\n'.join(lines) + body[vc_end:], repairs, cmd_lines
+
+
+def _collapse_inline_deferred_chain(
+    all_repairs: list[dict],
+    inline_repairs: list[dict],
+    deferred_repairs: list[dict],
+    deferred_cmd_lines: list[str],
+) -> list[dict]:
+    """Collapse the dependent Pass 2 -> Pass 2.6 chain into ONE repair record.
+
+    For ``$ pytest X  # baseline-expect: deferred`` Pass 2 moves the inline
+    annotation to its own preceding line and Pass 2.6 then rewrites that very
+    line. Reported as two records they overlap (``overlapping_repair``) although
+    they are one original->final repair. Each deferred record whose annotation
+    line + command line equal the ``repaired`` text of an inline-move record
+    (matched by content, in order; line numbers of later passes are not
+    comparable once earlier passes inserted lines) is merged with it into a
+    single ``deferred_to_pr_review_only`` record whose ``original`` is the
+    inline source line and whose ``repaired`` is the final two lines.
+    ``classify_repair_action`` overlap detection is untouched: independent
+    overlapping records are still rejected.
+
+    Mutates ``all_repairs`` (drops the consumed inline records) and returns
+    the deferred-pass records to append (merged where chained).
+    """
+    consumed: set[int] = set()
+    merged: list[dict] = []
+    for rec, cmd_line in zip(deferred_repairs, deferred_cmd_lines):
+        wanted = f"{rec['original']}\n{cmd_line}"
+        match = next(
+            (
+                i for i, inl in enumerate(inline_repairs)
+                if i not in consumed and inl.get("repaired") == wanted
+            ),
+            None,
+        )
+        if match is None:
+            merged.append(rec)
+            continue
+        consumed.add(match)
+        inl = inline_repairs[match]
+        merged.append({
+            "kind": rec["kind"],
+            "line_start": inl["line_start"],
+            "line_end": inl["line_end"],
+            "reason": (
+                f"{rec['reason']} (chained after {inl['kind']}: the inline annotation was first "
+                "moved to its own preceding line, then rewritten; reported as one repair)"
+            ),
+            "original": inl["original"],
+            "repaired": f"{rec['repaired']}\n{cmd_line}",
+            "safety": rec["safety"],
+            "confidence": rec["confidence"],
+        })
+    if consumed:
+        drop = {id(inline_repairs[i]) for i in consumed}
+        all_repairs[:] = [r for r in all_repairs if id(r) not in drop]
+    return merged
+
+
 def repair_body(body: str) -> tuple[str, list[dict]]:
     """Run all repair passes in order.  Returns (repaired_body, all_repairs[])."""
     all_repairs: list[dict] = []
+    repairs_inline: list[dict] = []
 
     # Pass 1: escaped code fence repair (Machine-Readable Contract section only)
     body, repairs1 = _repair_escaped_code_fences(body)
@@ -830,6 +1130,15 @@ def repair_body(body: str) -> tuple[str, list[dict]]:
     # Pass 2.5: insert missing baseline-expect annotations (Issue #899)
     body, repairs_insert = _repair_insert_baseline_expect(body)
     all_repairs.extend(repairs_insert)
+
+    # Pass 2.6: misused `baseline-expect: deferred` pytest VC -> canonical
+    # `preflight-scope: pr_review_only` (Issue #3020; annotation line only)
+    body, repairs_deferred, deferred_cmd_lines = _repair_deferred_to_pr_review_only_ex(body)
+    # (a chain Pass 2 -> Pass 2.6 on one VC is reported as ONE record, not two overlapping ones)
+    repairs_deferred = _collapse_inline_deferred_chain(
+        all_repairs, repairs_inline, repairs_deferred, deferred_cmd_lines
+    )
+    all_repairs.extend(repairs_deferred)
 
     # Pass 3: runtime-only command annotation (Verification Commands section only)
     body, repairs3 = _repair_runtime_commands(body)

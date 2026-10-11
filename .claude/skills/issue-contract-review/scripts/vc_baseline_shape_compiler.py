@@ -68,7 +68,10 @@ _VC_SYNTAX_DIR = Path(__file__).resolve().parent
 if str(_VC_SYNTAX_DIR) not in sys.path:
     sys.path.insert(0, str(_VC_SYNTAX_DIR))
 
-from vc_contract_syntax import extract_baseline_expect_annotation  # noqa: E402
+from vc_contract_syntax import (  # noqa: E402
+    extract_baseline_expect_annotation,
+    parse_preflight_scope_marker_line,
+)
 
 # Issue #2783: shared no-path marker predicate (`scripts/agent-ops/`). Pure
 # policy library only -- not a grammar library import.
@@ -102,6 +105,13 @@ _BARE_IDENTIFIER_RE = re.compile(r"^test_[A-Za-z0-9_]*$")
 _SIMPLE_NODE_ID_RE = re.compile(r"^test_[A-Za-z0-9_]*$")
 
 _MAX_CANDIDATE_ATTEMPTS = 20
+
+# Issue #3020: canonical preflight-scope values whose VC is intentionally not
+# executed as a baseline-fail check. Such VCs (new tests verified only after
+# implementation / runtime verification) must never be rewritten into a
+# baseline-fail shape, otherwise the author's canonical marker intent and the
+# VC command itself would be silently changed by the hygiene autofix.
+_SCOPE_PRESERVED_VALUES = frozenset({"pr_review_only", "runtime_only"})
 
 
 # ─── Body / section parsing ───────────────────────────────────────────────────
@@ -140,15 +150,35 @@ def parse_allowed_paths(lines: list[str]) -> list[str]:
     return paths
 
 
+def extract_scope_marker_for_command(lines: list[str], command_line_idx: int) -> Optional[str]:
+    """Return the canonical preflight-scope value attached to a VC command line.
+
+    Reuses the shared production grammar
+    (``vc_contract_syntax.parse_preflight_scope_marker_line``) with the same
+    "marker on the line immediately before the ``$`` command" semantics as
+    ``baseline_vc_preflight.extract_preflight_scope_marker``. Returns the
+    value only when it is a known canonical scope (``pr_review_only`` /
+    ``runtime_only``); unknown / malformed values return None so they never
+    gain preservation semantics.
+    """
+    if command_line_idx <= 0:
+        return None
+    marker, is_known = parse_preflight_scope_marker_line(lines[command_line_idx - 1].strip())
+    if marker is None or not is_known:
+        return None
+    return marker if marker in _SCOPE_PRESERVED_VALUES else None
+
+
 def _extract_vc_pytest_command_lines(
     lines: list[str], vc_start: int, vc_end: int
-) -> list[tuple[int, str, Optional[str]]]:
-    """Return pytest command lines and their scoped baseline expectation.
+) -> list[tuple[int, str, Optional[str], Optional[str]]]:
+    """Return pytest command lines with their scoped baseline expectation and
+    canonical preflight-scope marker.
 
     Only $-prefixed pytest commands inside canonical fenced ```bash blocks
     are included.
     """
-    entries: list[tuple[int, str, Optional[str]]] = []
+    entries: list[tuple[int, str, Optional[str], Optional[str]]] = []
     i = vc_start + 1
     in_block = False
     while i < vc_end:
@@ -167,7 +197,8 @@ def _extract_vc_pytest_command_lines(
                 cmd = stripped[2:].strip()
                 if "pytest" in shlex_safe_tokens(cmd):
                     baseline_expect, _, _ = extract_baseline_expect_annotation(lines, i)
-                    entries.append((i, cmd, baseline_expect))
+                    scope = extract_scope_marker_for_command(lines, i)
+                    entries.append((i, cmd, baseline_expect, scope))
         i += 1
     return entries
 
@@ -540,7 +571,12 @@ def compile_body(body: str, repo_root: Path) -> dict:
     any_change = False
     any_not_autofixable = False
 
-    for line_no, raw_cmd, baseline_expect in command_entries:
+    for line_no, raw_cmd, baseline_expect, scope in command_entries:
+        if scope in _SCOPE_PRESERVED_VALUES:
+            # Issue #3020: canonical pr_review_only / runtime_only VCs are not
+            # baseline-fail shape candidates. Leave the command untouched and
+            # do not report a not_autofixable warning for it either.
+            continue
         result = classify_pytest_command(
             raw_cmd, repo_root, allowed_paths, used_candidates, baseline_expect
         )
