@@ -6,17 +6,51 @@ impl-review-loop の missing_contract_go 分岐で呼ばれる orchestration scr
 Issue に有効な CONTRACT_REVIEW_RESULT_V1 status: go コメントが存在するか確認し、
 存在しない場合は issue-contract-review を自動実行して go コメントを取得・投稿する。
 
-Exit codes:
-  0   ok — contract snapshot が確認または materialize できた
-  10  blocked_needs_refinement — contract blocked / readiness blocked
-  20  human_judgment — 分類不能 / ambiguous / env error
-  30  invalid_input — argument エラー
-  40  runtime_error — subprocess / network エラー
-  50  stale_or_conflicting_snapshot — atomicity 検証で body_sha256 or updatedAt mismatch
-  60  controlled_publisher_binding_failed — #1475: 投稿直後の comment ID readback binding 不一致・欠落
+Exit codes (normal producer result) — ensure_contract_snapshot() が返した result の
+status から main() が決める終了コード (#3005。実挙動は main() 末尾の分岐が正本):
+  0 ok — contract snapshot が確認または materialize できた
+  10 blocked_needs_refinement — contract blocked / readiness blocked
+  20 human_judgment, dry_run_would_post — 2 つの status が同じ exit 20 を共有する。
+      終了コードでは区別できないため、stdout JSON の status で区別する
+      (EXIT20_DISAMBIGUATE_BY_STATUS)。human_judgment は分類不能 / ambiguous /
+      env error、dry_run_would_post は正常な dry-run 候補生成 (GitHub 投稿なし)
+  40 runtime_error — subprocess / network エラー。表にない未知 status もここへ落ちる
+  50 stale_or_conflicting_snapshot — atomicity 検証で body_sha256 or updatedAt mismatch
+  60 controlled_publisher_binding_failed — #1475: 投稿直後の comment ID readback binding 不一致・欠落
 
-stdout: CONTRACT_SNAPSHOT_ENSURE_RESULT_V1 compact JSON のみ
-stderr: diagnostic messages のみ
+Exit codes (CLI front stage) — result 生成より前に終了する経路 (#3005):
+  30 runtime_error — 整数変換後の Issue 番号が 0 の場合のみ
+      (--issue-number 0 / --issue 0 のどちらでも同じ)。status=runtime_error の JSON
+      (errors: ["--issue-number is required"]) を stdout に出す。
+      ensure_contract_snapshot() にも artifact 保存にも到達しない。
+      status が invalid_input になることはない (EXIT30_ONLY_ISSUE_NUMBER_ZERO)
+  2 argparse_usage_error — 必須引数 (--issue-number) の欠落、または整数型不正
+      (例: --issue-number abc)。argparse が stderr に診断を出して終了し、
+      stdout は通常空
+  0 argparse_help — --help。argparse が stdout にヘルプテキストを出して終了する
+
+終了コードから status を一意に復元することはできない。exit 0 は ok と --help の双方、
+exit 40 は runtime_error と未知 status の双方を含み、runtime_error は exit 30 と 40 の
+両方に現れる。
+
+stdout: CONTRACT_SNAPSHOT_ENSURE_RESULT_V1 compact JSON のみ。
+  ただし例外として argparse の早期終了は JSON を出さない
+  (exit 2 は stdout が通常空で診断は stderr、--help は stdout にヘルプテキスト)。
+stderr: diagnostic messages のみ (argparse の使用法エラーの診断もここ)
+
+Artifact contract (--artifact-dir、#3005):
+  artifact_saved: --artifact-dir 指定で保存に成功した場合に限り、保存先を示す
+      artifact_path が stdout の JSON にだけ追加される。保存された artifact
+      (contract-snapshot-<N>.json) は stdout の JSON から artifact_path を除いた
+      ものと内容が一致する (バイト列一致ではない。ARTIFACT_OMITS_ARTIFACT_PATH)
+  artifact_save_failed: 保存に失敗した場合は errors に artifact_write_error: ... が
+      追加されるだけで、artifact_path は追加されず、status も終了コードも変わらない。
+      status が ok なら保存に失敗しても exit 0 のまま
+  artifact_dir_unspecified: --artifact-dir 未指定では保存処理自体がなく、
+      ファイルは作られず artifact_path も追加されない
+  exit 0 は今回の artifact 保存成功の証明ではない。保存成功は stdout JSON の
+  artifact_path と errors で判定する。上記の目印 (EXIT20_DISAMBIGUATE_BY_STATUS 等) は
+  検索用であり、テストでも正しさの証明に使わない。
 
 Modes:
   check-only  — 既存 go コメントを確認するのみ。mutation なし (default)
