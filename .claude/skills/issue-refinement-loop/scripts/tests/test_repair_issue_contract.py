@@ -1025,3 +1025,169 @@ def test_deferred_unknown_repair_kind_still_human_review_and_pnpm_gate_not_defer
         res = run_repair(_t3020_body(f"# AC1\n# baseline-expect: deferred\n$ {gate}", None))
         assert _t3020_deferred_repairs(res) == [], gate
         assert "# preflight-scope" not in "\n".join(r["repaired"] for r in res["repairs"]), gate
+
+
+# ===========================================================================
+# Issue #3020 OWNER REQUEST_CHANGES P2-1 / P2-2 regressions.
+# ===========================================================================
+
+_T3020_PYTEST_LAUNCHER_POSITIVE = [
+    "pytest",
+    "uv run pytest",
+    "uv run --locked pytest",
+    "uv run --frozen pytest",
+    "uv run --no-project pytest",
+    "uv run --with pytest --with pyyaml python -m pytest",
+    "uv run --no-project --with pytest python3 -m pytest",
+    "uv run python -m pytest",
+    "uv run --locked python3 -m pytest",
+    "python -m pytest",
+    "python3 -m pytest",
+]
+
+
+def test_deferred_pytest_launcher_positive_forms_are_rewritten():
+    """P2-1: every real pytest launcher form used by existing VCs is recognised as a pytest VC."""
+    for launcher in _T3020_PYTEST_LAUNCHER_POSITIVE:
+        body = _t3020_body(f"# AC1\n# baseline-expect: deferred\n$ {launcher} {_T3020_TEST_PATH} -q")
+        res = run_repair(body)
+        assert len(_t3020_deferred_repairs(res)) == 1, (launcher, res)
+        assert res["repair_action"]["disposition"] == "auto_apply_safe", launcher
+
+
+def test_deferred_pytest_token_not_at_launcher_position_is_not_a_pytest_vc():
+    """P2-1: a `pytest` string appearing as an ARGUMENT (e.g. rg pattern) is not a pytest VC; such
+    a deferred VC is left byte-identical and is not turned into human_review_required."""
+    negatives = [
+        f'$ rg -n "pytest" {_T3020_TEST_PATH}',
+        f"$ rg -n pytest {_T3020_TEST_PATH}",
+        f"$ echo pytest {_T3020_TEST_PATH}",
+        f"$ FOO=1 pytest {_T3020_TEST_PATH}",
+        f"$ uv run --locked rg pytest {_T3020_TEST_PATH}",
+        f"$ uv run --bogus-flag pytest {_T3020_TEST_PATH}",
+        f"$ uv pytest {_T3020_TEST_PATH}",
+        f"$ python3 pytest {_T3020_TEST_PATH}",
+        f"$ python3 -m unittest pytest {_T3020_TEST_PATH}",
+        f"$ grep pytest {_T3020_TEST_PATH}",
+    ]
+    for cmd in negatives:
+        for body in (
+            _t3020_body(f"# AC1\n# baseline-expect: deferred\n{cmd}"),
+            _t3020_body(f"# AC1\n{cmd} # baseline-expect: deferred"),
+        ):
+            res = run_repair(body)
+            assert _t3020_deferred_repairs(res) == [], cmd
+            assert "# preflight-scope" not in "\n".join(r["repaired"] for r in res["repairs"]), cmd
+            assert res["repair_action"]["disposition"] != "human_review_required", cmd
+
+
+def test_pytest_test_file_targets_unit():
+    ric = _import_ric()
+    f = ric._pytest_test_file_targets
+    assert f(f"uv run --locked pytest {_T3020_TEST_PATH}::t -q -k x") == [_T3020_TEST_PATH]
+    assert f(f'rg -n "pytest" {_T3020_TEST_PATH}') is None
+    assert f(f"uv run pytest {_T3020_TEST_PATH} && true") is None
+    assert f("uv run pytest") is None
+    assert f("") is None
+
+
+_T3020_INLINE_DEFERRED_CMD = f"pytest {_T3020_TEST_PATH}"
+
+
+def test_inline_deferred_pytest_chain_is_one_consistent_auto_apply_safe_repair(tmp_path):
+    """P2-2: `$ pytest X # baseline-expect: deferred` (inline) is normalised in two dependent
+    steps (move -> pr_review_only). The real repair_body() -> classify_repair_action() path must
+    treat it as ONE consistent original->final repair: auto_apply_safe, not overlapping_repair."""
+    ric = _import_ric()
+    body = _t3020_body(f"# AC1\n$ {_T3020_INLINE_DEFERRED_CMD} # baseline-expect: deferred")
+
+    repaired, repairs = ric.repair_body(body)
+    action = ric.classify_repair_action("a", "b", repairs)
+    assert action["disposition"] == "auto_apply_safe", (repairs, action)
+    assert "overlapping_repair" not in action["reason_codes"]
+    assert len(repairs) == 1, repairs
+    rec = repairs[0]
+    assert rec["kind"] == "deferred_to_pr_review_only"
+    assert rec["confidence"] == "high"
+    assert rec["line_start"] == rec["line_end"]
+    assert rec["original"] == f"$ {_T3020_INLINE_DEFERRED_CMD} # baseline-expect: deferred"
+    assert rec["repaired"] == f"# preflight-scope: pr_review_only\n$ {_T3020_INLINE_DEFERRED_CMD}"
+    # original -> repaired replacement is consistent with the actual body transformation
+    assert body.count(rec["original"]) == 1
+    assert body.replace(rec["original"], rec["repaired"]) == repaired
+    # command line preserved (without the inline annotation), canonical marker present
+    assert f"$ {_T3020_INLINE_DEFERRED_CMD}\n" in repaired
+    assert "# preflight-scope: pr_review_only\n$ " + _T3020_INLINE_DEFERRED_CMD in repaired
+    assert "baseline-expect" not in repaired
+    # the recorded line really holds the first line of `repaired` in the final body
+    section_lines = repaired.split("\n")
+    vc_idx = section_lines.index("## Verification Commands")
+    assert section_lines[vc_idx + rec["line_start"] - 1] == "# preflight-scope: pr_review_only"
+
+
+def test_inline_deferred_pytest_chain_end_to_end_idempotent(tmp_path):
+    ric = _import_ric()
+    body = _t3020_body(f"# AC1\n$ {_T3020_INLINE_DEFERRED_CMD} # baseline-expect: deferred")
+    res1, repaired1 = _t3020_apply_repair(body, tmp_path)
+    assert res1["repair_action"]["disposition"] == "auto_apply_safe"
+    assert res1["changed"] is True
+
+    res2 = ric.run_repair(repaired1)
+    assert res2["changed"] is False
+    assert res2["repaired_body_sha256"] == res1["repaired_body_sha256"]
+    assert res2["repairs"] == []
+    assert res2["repair_action"]["disposition"] == "informational"
+
+
+def test_inline_deferred_pytest_chain_multiple_vcs_and_unrelated_inline(tmp_path):
+    """P2-2: several chained VCs plus an unrelated inline repair: each chain collapses to one
+    record, the unrelated inline repair stays its own record, nothing overlaps."""
+    ric = _import_ric()
+    other = "pnpm test:e2e # baseline-expect: fail"
+    vc = (
+        f"# AC1\n$ pytest {_T3020_TEST_PATH} -q # baseline-expect: deferred\n"
+        f"# AC2\n$ {other}\n"
+        f"# AC3\n$ pytest {_T3020_TEST_PATH} -x # baseline-expect: deferred"
+    )
+    body = _t3020_body(vc)
+    repaired, repairs = ric.repair_body(body)
+    action = ric.classify_repair_action("a", "b", repairs)
+    kinds = sorted(r["kind"] for r in repairs)
+    assert kinds == [
+        "deferred_to_pr_review_only",
+        "deferred_to_pr_review_only",
+        "move_inline_baseline_expect_to_preceding_line",
+    ], repairs
+    assert action["disposition"] == "auto_apply_safe", action
+    assert repaired.count("# preflight-scope: pr_review_only") == 2
+    assert "$ pytest " + _T3020_TEST_PATH + " -q\n" in repaired
+    assert "$ pytest " + _T3020_TEST_PATH + " -x\n" in repaired
+    again, again_repairs = ric.repair_body(repaired)
+    assert again == repaired
+    assert [r for r in again_repairs if r["kind"] == "deferred_to_pr_review_only"] == []
+
+
+def test_inline_deferred_chain_out_of_condition_keeps_plain_inline_move():
+    """P2-2: when the chain is not eligible for pr_review_only (non-pytest), only the ordinary
+    inline-move repair remains (annotation stays `deferred`); it is still auto_apply_safe."""
+    ric = _import_ric()
+    body = _t3020_body(f'# AC1\n$ rg -n "x" {_T3020_TEST_PATH} # baseline-expect: deferred')
+    repaired, repairs = ric.repair_body(body)
+    assert [r["kind"] for r in repairs] == ["move_inline_baseline_expect_to_preceding_line"]
+    assert "# baseline-expect: deferred\n$ rg" in repaired
+
+
+def test_overlapping_independent_repairs_are_still_rejected():
+    """P2-2 guard: overlap detection is NOT disabled; independent overlapping records are still
+    human_review_required / overlapping_repair."""
+    ric = _import_ric()
+    action = ric.classify_repair_action(
+        "a", "b",
+        [
+            {"kind": "deferred_to_pr_review_only", "line_start": 5, "line_end": 5, "confidence": "high"},
+            {"kind": "move_inline_baseline_expect_to_preceding_line", "line_start": 5, "line_end": 5,
+             "confidence": "high"},
+        ],
+    )
+    assert action["disposition"] == "human_review_required"
+    assert action["reason_codes"] == ["overlapping_repair"]

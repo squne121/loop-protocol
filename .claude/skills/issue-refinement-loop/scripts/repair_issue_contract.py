@@ -844,20 +844,60 @@ _PYTEST_VALUE_FLAGS = frozenset({
 })
 
 
+# `uv run` option forms that the repo's existing pytest VCs actually use. Any other
+# flag makes the launcher ambiguous and the VC is left untouched.
+_UV_RUN_FLAGS_NO_VALUE = frozenset({
+    "--locked", "--frozen", "--no-project", "--offline", "--isolated", "--no-sync",
+})
+_UV_RUN_FLAGS_WITH_VALUE = frozenset({"--with"})
+_PYTHON_LAUNCHERS = frozenset({"python", "python3"})
+
+
+def _pytest_launcher_args(tokens: list[str]) -> Optional[list[str]]:
+    """Return the argv after a recognised pytest launcher PREFIX, else None.
+
+    Recognised forms (the ones existing VCs use), anchored at tokens[0]:
+      pytest ...
+      python|python3 -m pytest ...
+      uv run [--locked|--frozen|--no-project|--offline|--isolated|--no-sync|--with <pkg>|--with=<pkg>]...
+          (pytest | python|python3 -m pytest) ...
+    A ``pytest`` token anywhere else (e.g. an ``rg`` pattern) is NOT a launcher.
+    """
+    i = 0
+    if tokens[:2] == ["uv", "run"]:
+        i = 2
+        while i < len(tokens) and tokens[i].startswith("-"):
+            tok = tokens[i]
+            if tok in _UV_RUN_FLAGS_NO_VALUE or (tok.startswith("--with=") and len(tok) > len("--with=")):
+                i += 1
+            elif tok in _UV_RUN_FLAGS_WITH_VALUE and i + 1 < len(tokens):
+                i += 2
+            else:
+                return None
+    if i >= len(tokens):
+        return None
+    if tokens[i] == "pytest":
+        return tokens[i + 1:]
+    if tokens[i] in _PYTHON_LAUNCHERS and tokens[i + 1:i + 3] == ["-m", "pytest"]:
+        return tokens[i + 3:]
+    return None
+
+
 def _pytest_test_file_targets(cmd: str) -> Optional[list[str]]:
     """Return the repo-relative test file paths a single pytest VC targets, or
-    None when the command is not a simple single pytest invocation over
-    explicit ``*.py`` test files (directories, globs, compound commands,
-    unparsable shell all yield None)."""
+    None when the command is not a simple single pytest invocation (recognised
+    launcher prefix only) over explicit ``*.py`` test files (directories,
+    globs, compound commands, ambiguous launchers, unparsable shell all yield
+    None)."""
     if _SHELL_OPERATOR_RE.search(cmd):
         return None
     try:
         tokens = shlex.split(cmd)
     except ValueError:
         return None
-    if "pytest" not in tokens:
+    rest = _pytest_launcher_args(tokens)
+    if rest is None:
         return None
-    rest = tokens[tokens.index("pytest") + 1:]
     targets: list[str] = []
     skip_next = False
     for tok in rest:
@@ -892,6 +932,11 @@ def _path_in_allowed(path: str, allowed: list) -> bool:
 
 
 def _repair_deferred_to_pr_review_only(body: str) -> tuple[str, list[dict]]:
+    new_body, repairs, _cmd_lines = _repair_deferred_to_pr_review_only_ex(body)
+    return new_body, repairs
+
+
+def _repair_deferred_to_pr_review_only_ex(body: str) -> tuple[str, list[dict], list[str]]:
     """Replace the annotation line of a misused ``# baseline-expect: deferred``
     pytest VC with ``# preflight-scope: pr_review_only`` (Issue #3020).
 
@@ -912,18 +957,19 @@ def _repair_deferred_to_pr_review_only(body: str) -> tuple[str, list[dict]]:
     after the rewrite the VC has a valid scope marker and no longer matches.
     """
     repairs: list[dict] = []
+    cmd_lines: list[str] = []  # command line (verbatim) paired 1:1 with repairs
     if _extract_baseline_expect_annotation is None or _parse_preflight_scope_marker_line is None:
-        return body, repairs
+        return body, repairs, cmd_lines
     vc_match = re.search(r'^## Verification Commands\s*$', body, re.MULTILINE)
     if not vc_match:
-        return body, repairs
+        return body, repairs, cmd_lines
     vc_start = vc_match.start()
     next_section = re.search(r'^##\s', body[vc_start + 1:], re.MULTILINE)
     vc_end = vc_start + next_section.start() + 1 if next_section else len(body)
     section = body[vc_start:vc_end]
     allowed = _extract_allowed_paths_ric(body)
     if not allowed:
-        return body, repairs
+        return body, repairs, cmd_lines
 
     lines = section.split('\n')
     fence_re = re.compile(r'^\s*```(\w*)\s*$')
@@ -987,14 +1033,74 @@ def _repair_deferred_to_pr_review_only(body: str) -> tuple[str, list[dict]]:
             "safety": "mutation-free-dry-run",
             "confidence": "high",
         })
+        cmd_lines.append(lines[idx])
     if not repairs:
-        return body, repairs
-    return body[:vc_start] + '\n'.join(lines) + body[vc_end:], repairs
+        return body, repairs, cmd_lines
+    return body[:vc_start] + '\n'.join(lines) + body[vc_end:], repairs, cmd_lines
+
+
+def _collapse_inline_deferred_chain(
+    all_repairs: list[dict],
+    inline_repairs: list[dict],
+    deferred_repairs: list[dict],
+    deferred_cmd_lines: list[str],
+) -> list[dict]:
+    """Collapse the dependent Pass 2 -> Pass 2.6 chain into ONE repair record.
+
+    For ``$ pytest X  # baseline-expect: deferred`` Pass 2 moves the inline
+    annotation to its own preceding line and Pass 2.6 then rewrites that very
+    line. Reported as two records they overlap (``overlapping_repair``) although
+    they are one original->final repair. Each deferred record whose annotation
+    line + command line equal the ``repaired`` text of an inline-move record
+    (matched by content, in order; line numbers of later passes are not
+    comparable once earlier passes inserted lines) is merged with it into a
+    single ``deferred_to_pr_review_only`` record whose ``original`` is the
+    inline source line and whose ``repaired`` is the final two lines.
+    ``classify_repair_action`` overlap detection is untouched: independent
+    overlapping records are still rejected.
+
+    Mutates ``all_repairs`` (drops the consumed inline records) and returns
+    the deferred-pass records to append (merged where chained).
+    """
+    consumed: set[int] = set()
+    merged: list[dict] = []
+    for rec, cmd_line in zip(deferred_repairs, deferred_cmd_lines):
+        wanted = f"{rec['original']}\n{cmd_line}"
+        match = next(
+            (
+                i for i, inl in enumerate(inline_repairs)
+                if i not in consumed and inl.get("repaired") == wanted
+            ),
+            None,
+        )
+        if match is None:
+            merged.append(rec)
+            continue
+        consumed.add(match)
+        inl = inline_repairs[match]
+        merged.append({
+            "kind": rec["kind"],
+            "line_start": inl["line_start"],
+            "line_end": inl["line_end"],
+            "reason": (
+                f"{rec['reason']} (chained after {inl['kind']}: the inline annotation was first "
+                "moved to its own preceding line, then rewritten; reported as one repair)"
+            ),
+            "original": inl["original"],
+            "repaired": f"{rec['repaired']}\n{cmd_line}",
+            "safety": rec["safety"],
+            "confidence": rec["confidence"],
+        })
+    if consumed:
+        drop = {id(inline_repairs[i]) for i in consumed}
+        all_repairs[:] = [r for r in all_repairs if id(r) not in drop]
+    return merged
 
 
 def repair_body(body: str) -> tuple[str, list[dict]]:
     """Run all repair passes in order.  Returns (repaired_body, all_repairs[])."""
     all_repairs: list[dict] = []
+    repairs_inline: list[dict] = []
 
     # Pass 1: escaped code fence repair (Machine-Readable Contract section only)
     body, repairs1 = _repair_escaped_code_fences(body)
@@ -1024,7 +1130,11 @@ def repair_body(body: str) -> tuple[str, list[dict]]:
 
     # Pass 2.6: misused `baseline-expect: deferred` pytest VC -> canonical
     # `preflight-scope: pr_review_only` (Issue #3020; annotation line only)
-    body, repairs_deferred = _repair_deferred_to_pr_review_only(body)
+    body, repairs_deferred, deferred_cmd_lines = _repair_deferred_to_pr_review_only_ex(body)
+    # (a chain Pass 2 -> Pass 2.6 on one VC is reported as ONE record, not two overlapping ones)
+    repairs_deferred = _collapse_inline_deferred_chain(
+        all_repairs, repairs_inline, repairs_deferred, deferred_cmd_lines
+    )
     all_repairs.extend(repairs_deferred)
 
     # Pass 3: runtime-only command annotation (Verification Commands section only)
