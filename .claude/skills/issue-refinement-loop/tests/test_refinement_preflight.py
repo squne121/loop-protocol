@@ -1707,6 +1707,15 @@ def test_repo_local_no_web_preflight_handoff_preserves_unverified_anchor_warning
     "phrase,expected",
     [
         (
+            "Verify against the official GraphQL specification that request error "
+            "responses must not contain data.",
+            "request error responses must not contain data",
+        ),
+        (
+            "GraphQL の公式仕様で request error 時の data の返却は禁止されるため、この制約を検証する。",
+            "data の返却は禁止",
+        ),
+        (
             "Do not verify local fixtures and GitHub GraphQL errors must match "
             "official docs before approval.",
             "GitHub GraphQL errors must match official docs before approval",

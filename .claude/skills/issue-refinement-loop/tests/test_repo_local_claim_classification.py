@@ -170,6 +170,80 @@ def test_distinct_comment_claims_with_shared_prefix_retain_source_hints_and_dedu
     jsonschema.Draft202012Validator(json.loads(SCHEMA.read_text())).validate(plan)
 
 
+def test_external_first_local_later_claims_retain_distinct_subjects_and_dedupe():
+    graphql = ("GitHub GraphQL request errors must follow the official specification "
+               "before maintainers verify repository tests.")
+    rest = ("GitHub REST API rate-limit responses must follow the official specification "
+            "before maintainers verify repository tests.")
+    comments = [{"id": 71, "body": f"{graphql}\n{rest}\n{graphql}"}]
+    claims = _web(_plan(_body(), comments))["critical_external_claims"]
+    assert len(claims) == 2, claims
+    assert {claim["claim"] for claim in claims} == {graphql, rest}
+    assert all(claim["source_hint"] == "comment_71" and claim["role"] == "dispositive"
+               and claim["affects"] == "VC" for claim in claims)
+    assert not _web(_plan(_body(), [{"id": 71, "body": "Verify repository tests."}]))["required"]
+
+
+@pytest.mark.parametrize("phrase,required", [
+    ("Verify against the official GraphQL specification that request error "
+     "responses must not contain data.", True),
+    ("GraphQL の公式仕様で request error 時の data の返却は禁止されるため、この制約を検証する。", True),
+    ("Do not verify GraphQL request error behavior against official documentation.", False),
+    ("GraphQL の公式仕様は今回確認しない。", False),
+])
+def test_negation_scope_distinguishes_specification_from_verification(phrase, required):
+    for body, comments, hint in [
+        (_body(ac=f"- AC1: {phrase}"), None, None),
+        (_body(), [{"id": 97, "body": phrase}], "comment_97"),
+    ]:
+        policy = _web(_plan(body, comments))
+        assert policy["required"] is required, (phrase, policy)
+        claims = policy["critical_external_claims"]
+        assert len(claims) == int(required), (phrase, claims)
+        if required:
+            assert ("must not contain data" in claims[0]["claim"]
+                    or "返却は禁止" in claims[0]["claim"])
+            assert claims[0]["role"] == "dispositive"
+            assert claims[0]["source_hint"] == hint
+            result = _consumer().route_web_research_result({
+                "schema": "WEB_RESEARCH_ROUTING_INPUT_V1",
+                "repository_decision": {"status": "inconclusive", "disposition": None},
+                "critical_external_claims": claims,
+                "web_research": {"status": "inconclusive", "failure_class": None,
+                                 "verification_route": "grounded_research", "claims": [], "unresolved_risks": []},
+            })
+            assert result["next_action"] == "human_judgment_required"
+        else:
+            assert policy["reason_code"] == "no_critical_external_claim"
+
+
+@pytest.mark.parametrize("quoted", [
+    "> Earlier reviewer wrote:\nVerify GitHub GraphQL errors against official docs.",
+    "<pre><code>Verify GitHub GraphQL errors against official docs.</code></pre>",
+    "<pre>\nVerify GitHub GraphQL errors against official docs.\n</pre>",
+])
+def test_comment_quote_and_code_literals_do_not_become_current_claims(quoted):
+    bare = _web(_plan(_body(), [{"id": 91, "body": quoted}]))
+    assert bare["critical_external_claims"] == []
+    assert bare["reason_code"] == "no_critical_external_claim"
+    current = "Verify current GitHub GraphQL errors against official docs."
+    contrasted = _web(_plan(_body(), [{"id": 91, "body": f"{quoted}\n\n{current}"}]))
+    assert contrasted["required"] is True
+    assert len(contrasted["critical_external_claims"]) == 1
+    assert contrasted["critical_external_claims"][0]["claim"] == current
+    assert contrasted["critical_external_claims"][0]["source_hint"] == "comment_91"
+    assert contrasted["critical_external_claims"][0]["role"] == "dispositive"
+
+
+def test_quoted_fragment_followed_by_independent_current_external_requirement():
+    comment = ("Previously quoted “GitHub GraphQL errors must match official docs”, "
+               "but current GitHub GraphQL errors must match official docs before approval.")
+    claims = _web(_plan(_body(), [{"id": 92, "body": comment}]))["critical_external_claims"]
+    assert len(claims) == 1
+    assert "current GitHub GraphQL errors" in claims[0]["claim"]
+    assert claims[0]["source_hint"] == "comment_92"
+
+
 def test_out_of_scope_negative_rate_limit_is_not_external_specification():
     """GIVEN #1659's negative scope line WHEN planned THEN web remains optional."""
     body = _body(out_of_scope="- GitHub API rate-limit policy 全体の変更")

@@ -629,6 +629,26 @@ _NEGATED_REQUEST_RE = re.compile(
     r"out\s+of\s+scope)\b|不要|参照しない|確認しない|検証しない|対象外|"
     r"非ゴール|変更しない|禁止|単なる|言及のみ", re.I,
 )
+_NEGATED_EVIDENCE_ACTION_RE = re.compile(
+    r"\b(?:do(?:es)?\s+not|don't|never|no)\s+(?:\w+\s+){0,3}"
+    r"(?:verify|check|validate|compare|consult|reference|refer)\b|"
+    r"\b(?:will|is|are|must|should|have\s+to)\s+(?:not|never)\s+"
+    r"(?:(?:be|to|have)\s+){0,2}(?:checked|verified|validated|compared|match)\b|"
+    r"\bwon't\s+(?:be\s+)?(?:checked|verified|validated|compared)\b|"
+    r"\bwithout\s+(?:\w+\s+){0,3}(?:official|published|external|web|仕様|ドキュメント)|"
+    r"\bwithout\s+(?:consulting|using|checking)\s+.{0,60}"
+    r"(?:official|published|external|web|specification|documentation|docs?)\b|"
+    r"(?:検証|確認|照合|参照)(?:を|は|が)?(?:しない|せず|不要|は禁止)|"
+    r"(?:検証|確認|照合|参照).{0,8}禁止",
+    re.I,
+)
+_NEGATIVE_SCOPE_RE = re.compile(
+    r"\b(?:unrelated|out\s+of\s+scope)\b|対象外|非ゴール|単なる|言及のみ", re.I,
+)
+_NEGATED_EXTERNAL_MATCH_RE = re.compile(
+    r"\b(?:must|should|will|is|are|has|have)\s+(?:to\s+)?not\s+"
+    r"(?:match|agree|follow|conform|align)\b", re.I,
+)
 # A quote cue must introduce quoted content; words describing local fixtures
 # ("example fixtures", "historical tests") do not quote a later claim.
 _QUOTED_CONTEXT_RE = re.compile(
@@ -639,6 +659,10 @@ _QUOTED_CONTEXT_RE = re.compile(
 )
 _QUOTED_ASIDE_RE = re.compile(r"\([^()]*\)")
 _FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
+_COMMENT_BLOCK_START_RE = re.compile(
+    r"^\s{0,3}(?:#{1,6}\s|[-+*]\s|\d+[.)]\s|`{3,}|~{3,}|"
+    r"<(?:p|div|h[1-6]|ul|ol|li)\b)", re.I,
+)
 # A noun-start RHS needs its own predicate; "fixtures and API errors against docs"
 # is still one negated request, not a second affirmative dependency.
 _NOUN_CLAUSE_PREDICATE_RE = re.compile(
@@ -678,12 +702,29 @@ def _claim_prose_lines(text: str, *, vc: bool = False) -> list[str]:
 
 
 def _visible_comment_lines(body: str) -> list[str]:
-    """Read visible prose only; quoted/pasted HTML is never a trusted directive."""
-    body = re.sub(r"<blockquote\b[^>]*>.*?</blockquote>", " ", body, flags=re.I | re.S)
-    body = re.sub(r"<!--.*?-->", " ", body, flags=re.S)
-    body = re.sub(r"</(?:p|div|li|br|h[1-6])\s*>", "\n", body, flags=re.I)
-    body = html.unescape(re.sub(r"<[^>]*>", " ", body))
-    return [line for line in _claim_prose_lines(body) if not line.lstrip().startswith(">")]
+    """Keep current prose while excluding quote continuations and code literals."""
+    body = re.sub(r"<blockquote\b[^>]*>.*?</blockquote>", "\n", body, flags=re.I | re.S)
+    body = re.sub(r"<pre\b[^>]*>.*?(?:</pre\s*>|\Z)", "\n", body, flags=re.I | re.S)
+    body = re.sub(r"<code\b[^>]*>.*?(?:</code\s*>|\Z)", " ", body, flags=re.I | re.S)
+    body = re.sub(r"<!--.*?-->", "\n", body, flags=re.S)
+    visible = []
+    quoted_paragraph = False
+    for line in body.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith(">"):
+            quoted_paragraph = bool(stripped[1:].strip())
+            continue
+        if not stripped:
+            quoted_paragraph = False
+        elif quoted_paragraph and not _COMMENT_BLOCK_START_RE.match(line):
+            continue
+        else:
+            quoted_paragraph = False
+        visible.append(line)
+    prose = "\n".join(visible)
+    prose = re.sub(r"</(?:p|div|li|br|h[1-6])\s*>", "\n", prose, flags=re.I)
+    prose = html.unescape(re.sub(r"<[^>]*>", " ", prose))
+    return _claim_prose_lines(prose)
 
 
 def _split_repo_local_without(sentence: str) -> list[str]:
@@ -724,6 +765,14 @@ def _claim_sentences(line: str) -> list[str]:
     ) if part.strip()]
     split_sentences = []
     for sentence in sentences:
+        # A closed past quotation can precede an independent current request.
+        # Do not treat the quoted fragment itself as a directive.
+        quoted_current = re.search(
+            r"(?:[\"'”’»」』])\s*,?\s+(?:but|however|yet)\s+(?=current\b)",
+            sentence, re.I,
+        )
+        if _QUOTED_CONTEXT_RE.search(sentence) and quoted_current:
+            sentence = sentence[quoted_current.end():].strip()
         # A past quote spans contrasting clauses up to the sentence boundary;
         # a following independent sentence can still request current research.
         if _QUOTED_CONTEXT_RE.search(sentence):
@@ -776,7 +825,8 @@ def _is_external_dependency(text: str, *, comment: bool = False) -> bool:
     topic tokens, negative scope, past quotes and repo-local checks do not
     acquire external authority from accidental substrings.
     """
-    if _NEGATED_REQUEST_RE.search(text) or _QUOTED_CONTEXT_RE.search(text):
+    if (_NEGATIVE_SCOPE_RE.search(text) or _NEGATED_EVIDENCE_ACTION_RE.search(text)
+        or _NEGATED_EXTERNAL_MATCH_RE.search(text) or _QUOTED_CONTEXT_RE.search(text)):
         return False
     topic = bool(_EXTERNAL_TOPIC_RE.search(text))
     authority = bool(_EXTERNAL_AUTHORITY_RE.search(text))
@@ -1379,12 +1429,15 @@ def _extract_critical_external_claims(
                     if not _is_external_dependency(sentence, comment=True):
                         continue
                     claim_text = sentence.strip()
-                    # A lengthy contextual preamble is not the verification
-                    # request. Extract the actionable sentence, not [:100].
                     if len(claim_text) > 100:
-                        match = re.search(r"\b(?:verify|check|validate)\b|web\s*(?:で)?確認", claim_text, re.I)
-                        if match:
-                            claim_text = claim_text[match.start():].strip()
+                        for match in re.finditer(
+                            r"\b(?:verify|check|validate)\b|web\s*(?:で)?確認",
+                            claim_text, re.I,
+                        ):
+                            actionable = claim_text[match.start():].strip()
+                            if _is_external_dependency(actionable, comment=True):
+                                claim_text = actionable
+                                break
                     claims.append({
                         "claim": claim_text,
                         "affects": "VC",
