@@ -15,6 +15,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[4]
 SKILL = ROOT / ".claude/skills/edit-issue/SKILL.md"
+EDITOR_AGENT = ROOT / ".claude/agents/issue-editor.md"
 REFINEMENT_SKILL = ROOT / ".claude/skills/issue-refinement-loop/SKILL.md"
 TEMPLATE = ROOT / ".github/ISSUE_TEMPLATE/implementation.yml"
 READINESS = ROOT / ".claude/skills/issue-contract-review/scripts/contract_readiness_check.py"
@@ -210,12 +211,9 @@ def _section(text: str, start: str, end: str) -> str:
     return text.split(start, 1)[1].split(end, 1)[0]
 
 
-def test_editor_candidate_guard_repair_transaction_order_contract() -> None:
-    """GIVEN an edited candidate WHEN invoking editor THEN its last checked bytes reach txn."""
-    procedure = _section(SKILL.read_text(encoding="utf-8"), "## 手順", "## visual_impact")
-    # Assert the actual procedural steps (not a generic mention elsewhere in the skill).
+def _assert_editor_procedure(procedure: str) -> None:
+    """Check the three edit-sensitive instructions in their actual step, not just keywords."""
     candidate = procedure.index("### 1. candidate body")
-    assert "new_body == current_body" in procedure[candidate:]
     change_only = procedure.index("new_body == current_body", candidate)
     command = (
         "uv run --locked python3 .claude/skills/edit-issue/scripts/guard-issue-body.py "
@@ -234,8 +232,48 @@ def test_editor_candidate_guard_repair_transaction_order_contract() -> None:
     assert re.search(r"exit 0.*exit 2", procedure[guard:repair], re.DOTALL)
     assert "readiness" in procedure[candidate:guard]
 
+    # Exact operative clauses are essential: the noun/command alone would allow the
+    # opposite instruction to pass. Scope these to the candidate-only step.
+    step = procedure[procedure.index("### 2. 本文を変更する候補だけ"):transaction]
+    assert "no-change / title-only / comment-only は本ステップの kind-aware guard と LP017 補充を**実行しない**" in step
+    assert "最後の検証後に候補を変更した場合は、再び full guard を実行する" in step
+    assert "ファイルを、その内容を変更せず `ISSUE_EDIT_TXN_INPUT_V1.new_body_file` に指定" in step
+
+
+def test_editor_candidate_guard_repair_transaction_order_contract() -> None:
+    """GIVEN an edited candidate WHEN invoking editor THEN its last checked bytes reach txn."""
+    procedure = _section(SKILL.read_text(encoding="utf-8"), "## 手順", "## visual_impact")
+    _assert_editor_procedure(procedure)
+
     step4 = _section(REFINEMENT_SKILL.read_text(encoding="utf-8"), "### Step 4: 書き換え", "### Step 4.5:")
     assert "--mode preflight-static" in step4
     assert "<current_body_file>" in step4
     assert "候補" in step4 and "issue-editor" in step4
     assert "edit-ready" in step4
+
+    agent = EDITOR_AGENT.read_text(encoding="utf-8")
+    forwarding = _section(agent, "## readiness_forwarding_payload 契約", "## context_bundle_path")
+    assert "既存本文" in forwarding and "candidate body が edit-ready" in forwarding
+    flow = _section(agent, "## 既存 Issue 更新フロー", "## 結果ルーティング")
+    assert ".claude/skills/edit-issue/SKILL.md" in flow
+    assert "1. current issue body" not in flow  # no competing numbered editor recipe
+
+
+@pytest.mark.parametrize(
+    ("original", "mutated"),
+    [
+        ("補充を**実行しない**", "補充を**実行する**"),
+        ("その内容を変更せず", "その内容を再生成して変更した後"),
+        (
+            "最後の検証後に候補を変更した場合は、再び full guard を実行する",
+            "最後の検証後に候補を変更した場合は、再検証せずに渡す",
+        ),
+    ],
+    ids=["unchanged-must-skip", "checked-file-must-be-unchanged", "post-change-must-revalidate"],
+)
+def test_editor_instruction_negative_mutations_are_rejected(original: str, mutated: str) -> None:
+    """GIVEN a single reversed instruction WHEN checked THEN the contract fails."""
+    procedure = _section(SKILL.read_text(encoding="utf-8"), "## 手順", "## visual_impact")
+    assert procedure.count(original) == 1
+    with pytest.raises(AssertionError):
+        _assert_editor_procedure(procedure.replace(original, mutated, 1))
