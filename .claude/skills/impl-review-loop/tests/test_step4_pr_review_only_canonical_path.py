@@ -1435,3 +1435,324 @@ def test_step2_delegation_template_passes_ac_command_command_hash_triplets_verba
     ):
         assert _squash(phrase) in doc, phrase
     assert _squash("`(ac label, literal command)` の組") not in doc
+
+
+# =============================================================================
+# Issue #3020: executed-fixture integration regression.
+#
+# Everything above builds its PASS report by hand (``_row()`` defaults to
+# ``exit_code=0`` / ``status="pass"``), which proves the consumer's input-shape
+# validation but not that an EXECUTED VC result reaches it. The helpers below run
+# a small local pytest fixture in a real subprocess and build the report rows
+# from the OBSERVED exit code / collection output only. The producer
+# (``baseline_vc_preflight.py``) and the adjudicator (``adjudicate_vc_result.py
+# step4-adjudicate``) stay real; nothing is mocked.
+# =============================================================================
+
+FIXTURE_TEST_PATH = "fixture_tests/test_fixture_3020.py"
+FIXTURE_K_EXPR = "executed_fixture and deferred"
+FIXTURE_TEST_SOURCE = "def test_executed_fixture_deferred_case():\n    assert True\n"
+REPAIR_SCRIPT_PATH = SKILL_DIR.parent / "issue-refinement-loop" / "scripts" / "repair_issue_contract.py"
+
+_BODY_3020_TEMPLATE = """## Allowed Paths
+- tracked.txt
+- {fixture_path}
+
+## Verification Commands
+
+```bash
+# AC1
+{annotation}
+$ uv run --locked pytest {fixture_path} -q -k "{k_expr}"
+```
+"""
+BODY_DEFERRED_RAW = _BODY_3020_TEMPLATE.format(
+    annotation="# baseline-expect: deferred", fixture_path=FIXTURE_TEST_PATH, k_expr=FIXTURE_K_EXPR
+)
+BODY_PR_REVIEW_ONLY = _BODY_3020_TEMPLATE.format(
+    annotation="# preflight-scope: pr_review_only", fixture_path=FIXTURE_TEST_PATH, k_expr=FIXTURE_K_EXPR
+)
+
+
+@dataclass
+class FixtureObservation:
+    """What the local pytest subprocess actually did (no assumed outcome)."""
+
+    exit_code: int
+    output: str
+    collected: bool
+    kind: str  # "pass" | "red" | "uncollected" | "launch_obstacle"
+
+
+def _classify_pytest_observation(exit_code: int, output: str) -> tuple[bool, str]:
+    """Classify an OBSERVED pytest run. Only an exit-1 run that actually collected tests and reports an
+    assertion failure is RED; exit 5 (nothing collected) and pre-launch obstacles (uv / usage / launch
+    errors) are never RED (AC6)."""
+    if exit_code == 0:
+        return True, "pass"
+    if exit_code == 5:
+        return False, "uncollected"
+    if exit_code == 1 and re.search(r"^(FAILED|E\s+assert)", output, flags=re.MULTILINE):
+        return True, "red"
+    return False, "launch_obstacle"
+
+
+def _run_local_pytest_fixture(
+    workdir: Path,
+    *,
+    source: str = FIXTURE_TEST_SOURCE,
+    k_expr: str | None = FIXTURE_K_EXPR,
+    argv_prefix: list[str] | None = None,
+) -> FixtureObservation:
+    test_file = workdir / FIXTURE_TEST_PATH
+    test_file.parent.mkdir(parents=True, exist_ok=True)
+    test_file.write_text(source, encoding="utf-8")
+    argv = list(argv_prefix) if argv_prefix is not None else [sys.executable, "-m", "pytest"]
+    argv += ["-q", "-p", "no:cacheprovider", "--rootdir", str(workdir), FIXTURE_TEST_PATH]
+    if k_expr is not None:
+        argv += ["-k", k_expr]
+    completed = subprocess.run(argv, cwd=workdir, capture_output=True, text=True, check=False)
+    output = completed.stdout + completed.stderr
+    collected, kind = _classify_pytest_observation(completed.returncode, output)
+    return FixtureObservation(completed.returncode, output, collected, kind)
+
+
+def _report_from_observation(scenario: Scenario, observation: FixtureObservation) -> dict[str, Any]:
+    """Build the independent test-runner report from the observation ONLY.
+
+    exit 0 -> pass; any other observed exit code is transcribed as a failure with that exact exit code.
+    ``result`` is derived, never forced to PASS.
+    """
+    passed = observation.exit_code == 0
+    row = {
+        "exit_code": observation.exit_code,
+        "status": "pass" if passed else "fail",
+        "notes": observation.output.strip().splitlines()[-1] if observation.output.strip() else "",
+    }
+    return _report(scenario, row_overrides={0: row}, result="PASS" if passed else "FAIL")
+
+
+def _apply_real_repair(tmp_path: Path, body: str) -> tuple[dict[str, Any], str]:
+    body_file = tmp_path / "raw_body.md"
+    out_file = tmp_path / "repaired_body.md"
+    body_file.write_text(body, encoding="utf-8")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(REPAIR_SCRIPT_PATH),
+            "--body-file",
+            str(body_file),
+            "--apply",
+            "--out-file",
+            str(out_file),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout), out_file.read_text(encoding="utf-8")
+
+
+def _executed_ws(tmp_path: Path, scenario: Scenario) -> Workspace:
+    return Workspace(tmp_path, scenario)
+
+
+def _adjudicate_executed(ws: Workspace, report: dict[str, Any], **kwargs: Any) -> tuple[int, dict[str, Any]]:
+    return ws.adjudicate(
+        report,
+        diff_summary=_diff_summary(ws.scenario, changed_paths=[FIXTURE_TEST_PATH]),
+        allowed=[*ALLOWED_PATHS, FIXTURE_TEST_PATH],
+        **kwargs,
+    )
+
+
+@pytest.fixture(scope="module")
+def deferred_raw(tmp_path_factory: pytest.TempPathFactory) -> Scenario:
+    scenario = _build_scenario(tmp_path_factory, "deferred_raw", BODY_DEFERRED_RAW)
+    item = scenario.producer["results"][0]
+    # The REAL producer's classification of the raw annotation -- not the canonical pr_review_only envelope.
+    assert item["category"] == "baseline_expect_deferred", item
+    assert item["classification"] == "skipped", item
+    return scenario
+
+
+@pytest.fixture(scope="module")
+def canonical_pr_review_only(tmp_path_factory: pytest.TempPathFactory) -> Scenario:
+    scenario = _build_scenario(tmp_path_factory, "pr_review_only_3020", BODY_PR_REVIEW_ONLY)
+    item = scenario.producer["results"][0]
+    assert item["category"] == "preflight_scope_pr_review_only", item
+    assert item["scope_class"] == "pr_review_only", item
+    return scenario
+
+
+def test_executed_fixture_observation_classification_is_real_and_exit5_or_launch_failure_is_not_red(tmp_path):
+    """AC6: classify REAL subprocess observations; exit 5 and a pre-launch obstacle are never RED."""
+    ok = _run_local_pytest_fixture(tmp_path / "ok")
+    assert (ok.exit_code, ok.kind, ok.collected) == (0, "pass", True), ok.output
+
+    red = _run_local_pytest_fixture(
+        tmp_path / "red", source="def test_executed_fixture_deferred_case():\n    assert 1 == 2\n"
+    )
+    assert (red.exit_code, red.kind) == (1, "red"), red.output
+
+    # `-k` is partial matching; a selector matching nothing is exit 5 (not collected), never RED.
+    uncollected = _run_local_pytest_fixture(tmp_path / "unc", k_expr="no_such_test_name_anywhere")
+    assert (uncollected.exit_code, uncollected.kind, uncollected.collected) == (
+        5,
+        "uncollected",
+        False,
+    ), uncollected.output
+
+    # A real `uv run --locked` launch obstacle (no lockfile) is a pre-launch failure, not RED.
+    project = tmp_path / "uvproj"
+    project.mkdir()
+    (project / "pyproject.toml").write_text('[project]\nname = "x"\nversion = "0"\n', encoding="utf-8")
+    obstacle = _run_local_pytest_fixture(project, argv_prefix=["uv", "run", "--locked", "pytest"])
+    assert obstacle.exit_code != 0, obstacle.output
+    assert obstacle.kind == "launch_obstacle" and obstacle.collected is False, obstacle.output
+    assert "lockfile" in obstacle.output
+
+    # Synthetic classifier boundaries: only exit 1 with an assertion failure is RED.
+    assert _classify_pytest_observation(1, "usage: pytest ...")[1] == "launch_obstacle"
+    assert _classify_pytest_observation(4, "ERROR: usage")[1] == "launch_obstacle"
+    assert _classify_pytest_observation(127, "uv: command not found")[1] == "launch_obstacle"
+
+
+def test_executed_fixture_deferred_raw_annotation_rejected_as_unsupported_classification(tmp_path, deferred_raw):
+    """AC5(a): raw `baseline-expect: deferred` + a valid, actually-executed PASS -> the real step4-adjudicate
+    rejects the baseline classification and does not dispatch the reviewer."""
+    observation = _run_local_pytest_fixture(tmp_path / "fx")
+    assert observation.kind == "pass" and observation.collected, observation.output
+    report = _report_from_observation(deferred_raw, observation)
+    assert report["result"] == "PASS"
+    ws = _executed_ws(tmp_path / "ws", deferred_raw)
+    ws.dir.mkdir()
+
+    rc, payload = _adjudicate_executed(ws, report)
+
+    assert rc == 1, payload
+    assert payload["invoke_pr_reviewer"] is False and payload["seq"] is None
+    assert payload["reason_code"] == "adjudication_missing_or_malformed"
+    errors = payload["adjudication"]["errors"]
+    assert errors == ["unsupported_baseline_classification:AC1"], payload
+    assert payload["adjudication"]["blocking"] is True
+    assert "dispatch" not in ws.state()
+
+
+def test_executed_fixture_deferred_binding_mismatch_is_a_distinct_cause(
+    tmp_path, deferred_raw, canonical_pr_review_only
+):
+    """AC5: the error side is judged on `adjudication.errors`, so a head / body / command binding mismatch is
+    identifiable as its own cause and is not confused with the deferred classification rejection."""
+    observation = _run_local_pytest_fixture(tmp_path / "fx")
+    assert observation.kind == "pass", observation.output
+
+    # Canonical scenario + drifting bindings: the errors are binding errors, never the deferred error.
+    ws = _executed_ws(tmp_path / "ws_canon", canonical_pr_review_only)
+    ws.dir.mkdir()
+    report = _report_from_observation(canonical_pr_review_only, observation)
+    drift_head = dict(report, reviewed_head_sha="e" * 40)
+    rc, payload = _adjudicate_executed(ws, drift_head)
+    assert rc == 1 and payload["invoke_pr_reviewer"] is False
+    assert payload["adjudication"]["errors"] == ["pr_review_only_head_binding_mismatch"], payload
+
+    ws2 = _executed_ws(tmp_path / "ws_body", canonical_pr_review_only)
+    ws2.dir.mkdir()
+    drift_body = _report_from_observation(canonical_pr_review_only, observation)
+    drift_body["contract_body_sha256"] = "sha256:" + "f" * 64
+    rc, payload = _adjudicate_executed(ws2, drift_body)
+    assert rc == 1 and payload["invoke_pr_reviewer"] is False
+    assert payload["adjudication"]["errors"] == ["pr_review_only_source_body_sha256_mismatch"], payload
+
+    # Deferred scenario + the same drift: the classification error is reported FIRST and alone, so the two
+    # causes are distinguishable by exact `errors` content (never a generic top-level reason only).
+    ws3 = _executed_ws(tmp_path / "ws_deferred_drift", deferred_raw)
+    ws3.dir.mkdir()
+    drifted = _report_from_observation(deferred_raw, observation)
+    drifted["reviewed_head_sha"] = "e" * 40
+    rc, payload = _adjudicate_executed(ws3, drifted)
+    assert rc == 1 and payload["invoke_pr_reviewer"] is False
+    assert payload["adjudication"]["errors"] == ["unsupported_baseline_classification:AC1"], payload
+    assert payload["reason_code"] == "adjudication_missing_or_malformed"
+
+
+def test_executed_fixture_deferred_normalized_to_pr_review_only_reaches_reviewer_dispatch(
+    tmp_path, tmp_path_factory
+):
+    """AC5(b): the real repair normalizes `baseline-expect: deferred` to `preflight-scope: pr_review_only`
+    (annotation only), the real producer then yields the canonical envelope, and an actually-executed PASS
+    makes the real step4-adjudicate dispatch the reviewer; the real terminal gate approves."""
+    producer_result, repaired_body = _apply_real_repair(tmp_path, BODY_DEFERRED_RAW)
+    assert producer_result["repair_action"]["disposition"] == "auto_apply_safe"
+    assert repaired_body == BODY_PR_REVIEW_ONLY
+
+    scenario = _build_scenario(tmp_path_factory, "deferred_normalized", repaired_body)
+    assert scenario.producer["results"][0]["category"] == "preflight_scope_pr_review_only"
+
+    observation = _run_local_pytest_fixture(tmp_path / "fx")
+    assert observation.kind == "pass" and observation.collected, observation.output
+    report = _report_from_observation(scenario, observation)
+    ws = _executed_ws(tmp_path / "ws", scenario)
+    ws.dir.mkdir()
+
+    rc, payload = _adjudicate_executed(ws, report)
+
+    assert rc == 0, payload
+    assert payload["invoke_pr_reviewer"] is True and payload["seq"] == 1
+    assert payload["adjudication"]["errors"] == [] and payload["adjudication"]["blocking"] is False
+    stored = ws.state()["vc_adjudication"][ws.binding_key()]
+    assert [entry["reason_code"] for entry in stored["per_ac"]] == ["pr_review_only_runtime_evidence_pass"]
+    _approve_and_assert(ws, payload)
+
+
+def test_executed_fixture_deferred_canonical_scope_but_uncollected_exit5_is_never_pass(
+    tmp_path, canonical_pr_review_only
+):
+    """AC5(c)/AC6: canonical annotation but the fixture is not collected (pytest exit 5) -> the observed
+    exit code is transcribed, nothing is converted to PASS, and the reviewer is not dispatched."""
+    observation = _run_local_pytest_fixture(tmp_path / "fx", k_expr="no_such_test_name_anywhere")
+    assert observation.exit_code == 5 and observation.kind == "uncollected" and not observation.collected
+    report = _report_from_observation(canonical_pr_review_only, observation)
+    assert report["result"] == "FAIL"
+    assert report["runtime_ac_results"][0]["exit_code"] == 5
+    ws = _executed_ws(tmp_path / "ws", canonical_pr_review_only)
+    ws.dir.mkdir()
+
+    rc, payload = _adjudicate_executed(ws, report)
+
+    _assert_fail_closed_no_dispatch(ws, rc, payload, ["pr_review_only_current_execution_not_pass:AC1"])
+    assert "pr_review_only_runtime_evidence_pass" not in json.dumps(payload)
+    assert payload["adjudication"]["overall_status"] == "indeterminate"
+
+
+def test_executed_fixture_deferred_canonical_scope_but_not_executed_is_never_pass(tmp_path, canonical_pr_review_only):
+    """AC5(c): canonical annotation but no executed row at all (the VC never ran) -> not converted to PASS."""
+    ws = _executed_ws(tmp_path / "ws", canonical_pr_review_only)
+    ws.dir.mkdir()
+    report = _report(canonical_pr_review_only, drop=(0,), result="PASS")
+
+    rc, payload = _adjudicate_executed(ws, report)
+
+    _assert_fail_closed_no_dispatch(ws, rc, payload, ["pr_review_only_coverage_mismatch"])
+    assert "pr_review_only_runtime_evidence_pass" not in json.dumps(payload)
+
+
+def test_executed_fixture_deferred_canonical_scope_with_real_red_exit1_is_fail_closed(
+    tmp_path, canonical_pr_review_only
+):
+    """AC6: a real assertion failure (exit 1, RED) is transcribed as a failure and also blocks dispatch --
+    and it is distinguishable from the exit-5 case by the observed exit code."""
+    observation = _run_local_pytest_fixture(
+        tmp_path / "fx", source="def test_executed_fixture_deferred_case():\n    assert 1 == 2\n"
+    )
+    assert observation.exit_code == 1 and observation.kind == "red"
+    report = _report_from_observation(canonical_pr_review_only, observation)
+    ws = _executed_ws(tmp_path / "ws", canonical_pr_review_only)
+    ws.dir.mkdir()
+
+    rc, payload = _adjudicate_executed(ws, report)
+
+    _assert_fail_closed_no_dispatch(ws, rc, payload, ["pr_review_only_current_execution_not_pass:AC1"])
+    assert report["runtime_ac_results"][0]["exit_code"] == 1
+

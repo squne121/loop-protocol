@@ -128,7 +128,9 @@ $ test -f .claude/skills/issue-refinement-loop/scripts/repair_issue_contract.py
 |---|---|---|
 | `pass` | baseline（実装前）で exit 0 が期待される | promotion/refactor Issue（既存コードの検証） |
 | `fail` | baseline で exit 非0 が期待される | 従来の新規実装 Issue（デフォルト想定） |
-| `deferred` | baseline 実行を延期 | `pr_review_only` と同等 |
+| `deferred` | baseline 実行を延期 | baseline で実行を省略する点は `pr_review_only` と共通だが、producer の出力契約と Step 4 での受理可能性は同じではない（下記注記） |
+
+**`deferred` と `pr_review_only` を同一視しない**: 両者は baseline で VC の実行を省略する点は共通するが、受理可能性は同じではない。`# baseline-expect: deferred` は producer 側で `baseline_expect_deferred` 分類（`runner: exec` / `classification: skipped`）になり、`impl-review-loop` Step 4 の `adjudicate_vc_result.py step4-adjudicate` が要求する完全な `pr_review_only` envelope（`runner: skipped` / `category: preflight_scope_pr_review_only` / `verification_owner: pr-review-judge` / 非空 `deferred_reason`）を満たさず、`unsupported_baseline_classification` として拒否される。refinement / contract review が `go` でも Step 4 では通らない。実装後の独立検証へつなぐ対象 VC（baseline に存在しない新規テストを実装後に検証する pytest VC 等）には、正規 `# preflight-scope: pr_review_only` を用いる。`deferred` を `pr_review_only` の代用にしない。
 
 **重要な制約**: `baseline-expect` は「実行結果分類 annotation」であり「安全ポリシー bypass annotation」ではない。
 

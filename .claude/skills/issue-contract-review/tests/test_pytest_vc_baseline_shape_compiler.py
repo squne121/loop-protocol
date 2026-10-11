@@ -672,3 +672,108 @@ def test_parse_allowed_paths_no_path_marker_returns_empty():
 
     lines_legacy = "## Allowed Paths\n\n- 読み取り専用。リポジトリ変更なし（既定）\n".split("\n")
     assert compiler.parse_allowed_paths(lines_legacy) == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #3020: canonical preflight-scope markers are preserved (never rewritten)
+# ---------------------------------------------------------------------------
+
+
+def _write_existing_test(tmp_path: Path) -> tuple[str, str]:
+    pkg_dir = tmp_path / "some_dir"
+    pkg_dir.mkdir()
+    (pkg_dir / "test_existing.py").write_text("def test_alpha():\n    assert True\n", encoding="utf-8")
+    return "some_dir/test_existing.py", "some_dir/test_existing_new_test.py"
+
+
+@pytest.mark.parametrize("scope", ["pr_review_only", "runtime_only"])
+def test_scope_marker_canonical_pytest_vc_is_preserved(tmp_path: Path, scope: str):
+    """GIVEN a pytest VC for a new -k test on an existing file carrying a canonical
+    `# preflight-scope: <scope>` marker / WHEN compile_body runs / THEN it is not a
+    rewrite target (no rewrites, no not_autofixable warning)."""
+    compiler = _load_compiler()
+    existing, candidate = _write_existing_test(tmp_path)
+    body = _make_body(
+        vc_bash_block=(
+            f"# AC1\n# preflight-scope: {scope}\n$ pytest {existing} -k test_new_name"
+        ),
+        allowed_paths=[existing, candidate],
+    )
+
+    result = compiler.compile_body(body, tmp_path)
+
+    assert result["status"] == "already_canonical"
+    assert result["rewrites"] == []
+    assert result["warnings"] == []
+
+
+def test_scope_marker_complex_k_expression_is_preserved(tmp_path: Path):
+    """GIVEN the exact Issue #3020 shape (`-k "a and b"` with pr_review_only) /
+    WHEN compile_body runs / THEN no not_autofixable warning is raised and the VC is preserved."""
+    compiler = _load_compiler()
+    existing, candidate = _write_existing_test(tmp_path)
+    body = _make_body(
+        vc_bash_block=(
+            "# AC2\n# preflight-scope: pr_review_only\n"
+            f'$ uv run --locked pytest {existing} -q -k "scope_marker and preserved"'
+        ),
+        allowed_paths=[existing, candidate],
+    )
+
+    result = compiler.compile_body(body, tmp_path)
+
+    assert result["status"] == "already_canonical"
+    assert result["rewrites"] == []
+    assert result["warnings"] == []
+
+
+def test_scope_marker_preserved_in_mixed_body_only_unmarked_vc_rewritten(tmp_path: Path):
+    """GIVEN a marked VC and an unmarked rewritable VC in one body / WHEN compile_body
+    runs / THEN only the unmarked VC is rewritten (conventional behavior is kept) and
+    the marked VC contributes neither a rewrite nor a warning."""
+    compiler = _load_compiler()
+    existing, candidate = _write_existing_test(tmp_path)
+    body = _make_body(
+        vc_bash_block=(
+            "# AC1\n# preflight-scope: pr_review_only\n"
+            f'$ pytest {existing} -k "test_a or test_b"\n'
+            "# AC2\n"
+            f"$ pytest {existing} -k test_new_name"
+        ),
+        allowed_paths=[existing, candidate],
+    )
+
+    result = compiler.compile_body(body, tmp_path)
+
+    assert result["status"] == "changed"
+    assert result["warnings"] == []
+    assert len(result["rewrites"]) == 1
+    assert result["rewrites"][0]["original_command"] == f"pytest {existing} -k test_new_name"
+
+
+def test_scope_marker_unknown_or_detached_value_is_not_preserved(tmp_path: Path):
+    """GIVEN an unknown scope value, or a canonical marker separated from the command by
+    another line / WHEN compile_body runs / THEN the shared immediate-previous-line
+    semantics apply and the VC is still a normal rewrite target."""
+    compiler = _load_compiler()
+    existing, candidate = _write_existing_test(tmp_path)
+    for block in (
+        f"# preflight-scope: bogus_scope\n$ pytest {existing} -k test_new_name",
+        f"# preflight-scope: pr_review_only\n# AC1\n$ pytest {existing} -k test_new_name",
+    ):
+        body = _make_body(vc_bash_block=block, allowed_paths=[existing, candidate])
+        result = compiler.compile_body(body, tmp_path)
+        assert result["status"] == "changed", block
+        assert len(result["rewrites"]) == 1, block
+
+
+def test_scope_marker_preserved_reuses_shared_parser_not_local_regex():
+    """GIVEN the compiler module / THEN the scope marker is extracted through the shared
+    vc_contract_syntax parser (no compiler-local scope regex is introduced)."""
+    compiler = _load_compiler()
+    import vc_contract_syntax  # imported via the compiler's sys.path insertion
+
+    assert compiler.parse_preflight_scope_marker_line is vc_contract_syntax.parse_preflight_scope_marker_line
+    lines = ["# preflight-scope: runtime_only\n", "$ pytest a.py\n"]
+    assert compiler.extract_scope_marker_for_command(lines, 1) == "runtime_only"
+    assert compiler.extract_scope_marker_for_command(lines, 0) is None
