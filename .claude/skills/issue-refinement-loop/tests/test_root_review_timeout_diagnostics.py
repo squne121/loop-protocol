@@ -374,7 +374,10 @@ def test_production_path_diagnostic_survives_cleanup_in_transport_and_full_artif
     for readiness_file in harness.readiness_files_seen:
         assert not Path(readiness_file).exists()
         assert not Path(readiness_file).parent.exists()
-    assert list((tmp_path / "tmp").iterdir()) == []
+    # Issue #3039: the scratch now lives in the system temp dir, so the repo
+    # `tmp/` may never be created; if it exists, nothing may be left inside.
+    repo_tmp_dir = tmp_path / "tmp"
+    assert (not repo_tmp_dir.exists()) or list(repo_tmp_dir.iterdir()) == []
 
     # Persisted bytes: canonical transport artifact and full review artifact.
     full_artifact, semantic_result, transport_bytes = _persisted_artifacts(out)
