@@ -8,6 +8,9 @@ Issue #3005: ensure_contract_snapshot.py の exit code 表と artifact 出力の
 - docstring 検証関数は ``__doc__`` 文字列だけを受け取る純粋関数であり、
   git 履歴にも実モジュールにも依存しない。
 - マーカー (EXIT20_DISAMBIGUATE_BY_STATUS など) の存在は正しさの判定に使わない。
+- 否定・限定条件を含む重要な説明は、対象ケースの説明ブロックを抽出し、空白・折返しを正規化した
+  文 (clause) の完全一致で検証する。部分文字列の存在だけでは説明の反転 (「区別できない」->「区別できる」)
+  を検出できないため (OWNER REQUEST_CHANGES P2)。
 - 既存 test_ensure_contract_snapshot.py の autouse fixture には依存しない。
   各ケースは fresh な result dict を使う (main() は result を変更するため使い回さない)。
 
@@ -25,6 +28,7 @@ import importlib.util
 import json
 import re
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -59,9 +63,7 @@ NORMAL_EXIT_TABLE: dict[int, frozenset[str]] = {
 }
 
 # 通常 result で exit code から導く status -> exit code (main() の検証に使う)
-STATUS_TO_EXIT: dict[str, int] = {
-    status: code for code, statuses in NORMAL_EXIT_TABLE.items() for status in statuses
-}
+STATUS_TO_EXIT: dict[str, int] = {status: code for code, statuses in NORMAL_EXIT_TABLE.items() for status in statuses}
 UNKNOWN_STATUS = "some_status_not_in_the_table"
 UNKNOWN_STATUS_EXIT = 40
 
@@ -101,6 +103,73 @@ ARTIFACT_CONTRACT: dict[str, tuple[str, ...]] = {
 }
 ARTIFACT_WHOLE_SECTION_PHRASES: tuple[str, ...] = ("証明ではない",)
 
+# ---------------------------------------------------------------------------
+# 文 (clause) 単位の期待値表 (Issue #3005 OWNER REQUEST_CHANGES P2)
+#
+# 上の *_PHRASES は部分文字列の存在しか見ないため、「区別できない」を「区別できる」に、
+# 「追加されず」を「追加され」に反転しても通ってしまう。そこで否定・限定条件を含む重要な
+# 説明は、対象ケースの説明ブロックを構造的に抽出したうえで、空白・折返しを正規化した
+# 「文 (clause)」として完全一致で検証する。clause の区切りは 。 、 と括弧のみで、
+# 汎用の自然言語解析は行わない。期待文には区切り文字を含めない (アトミックな文にする)。
+# ---------------------------------------------------------------------------
+
+NORMAL_REQUIRED_CLAUSES: dict[int, tuple[str, ...]] = {
+    20: (
+        "2 つの status が同じ exit 20 を共有する",
+        "終了コードでは区別できないため",
+        "stdout JSON の status で区別する",
+    ),
+    40: ("表にない未知 status もここへ落ちる",),
+}
+
+FRONT_STAGE_REQUIRED_CLAUSES: dict[int, tuple[str, ...]] = {
+    30: (
+        "整数変換後の Issue 番号が 0 の場合のみ",
+        "ensure_contract_snapshot にも artifact 保存にも到達しない",
+        "status が invalid_input になることはない",
+    ),
+    2: ("argparse が stderr に診断を出して終了し", "stdout は通常空"),
+    0: ("argparse が stdout にヘルプテキストを出して終了する",),
+}
+
+# 'stdout:' 段落 (継続行を含む) の clause
+STDOUT_REQUIRED_CLAUSES: tuple[str, ...] = (
+    "ただし例外として argparse の早期終了は JSON を出さない",
+    "exit 2 は stdout が通常空で診断は stderr",
+    "--help は stdout にヘルプテキスト",
+)
+
+# 「終了コードから status を…」で始まる段落の clause
+FRONT_STAGE_FOOTER_PREFIX = "終了コードから status"
+FRONT_STAGE_FOOTER_CLAUSES: tuple[str, ...] = (
+    "終了コードから status を一意に復元することはできない",
+    "exit 0 は ok と --help の双方",
+    "exit 40 は runtime_error と未知 status の双方を含み",
+    "runtime_error は exit 30 と 40 の両方に現れる",
+)
+
+ARTIFACT_REQUIRED_CLAUSES: dict[str, tuple[str, ...]] = {
+    "artifact_saved": (
+        "--artifact-dir 指定で保存に成功した場合に限り",
+        "保存先を示す artifact_path が stdout の JSON にだけ追加される",
+        "は stdout の JSON から artifact_path を除いたものと内容が一致する",
+        "バイト列一致ではない",
+    ),
+    "artifact_save_failed": (
+        "artifact_path は追加されず",
+        "status も終了コードも変わらない",
+        "status が ok なら保存に失敗しても exit 0 のまま",
+    ),
+    "artifact_dir_unspecified": (
+        "--artifact-dir 未指定では保存処理自体がなく",
+        "ファイルは作られず artifact_path も追加されない",
+    ),
+}
+ARTIFACT_WHOLE_SECTION_CLAUSES: tuple[str, ...] = (
+    "exit 0 は今回の artifact 保存成功の証明ではない",
+    "保存成功は stdout JSON の artifact_path と errors で判定する",
+)
+
 _MARKERS = (
     "EXIT20_DISAMBIGUATE_BY_STATUS",
     "EXIT30_ONLY_ISSUE_NUMBER_ZERO",
@@ -113,6 +182,43 @@ _MARKERS = (
 
 _EXIT_ENTRY_RE = re.compile(r"^  (\d+) ([a-z_]+(?:, [a-z_]+)*) — (.*)$")
 _ARTIFACT_ENTRY_RE = re.compile(r"^  (artifact_[a-z_]+): (.*)$")
+
+
+_CLAUSE_SEPARATORS = re.compile(r"[。、()（）]")
+
+
+def _squash(text: str) -> str:
+    """空白 (改行・折返しの空白を含む) をすべて除去する。折返し位置の違いを無効化する。"""
+    return re.sub(r"\s+", "", text)
+
+
+def _clauses(text: str) -> set[str]:
+    """説明ブロックを 。 、 括弧で区切った clause の集合にする (空白は除去済み)。
+
+    ``name()`` の空括弧は区切りにせず取り除く。clause の完全一致で検証するため、
+    「区別できない」が「区別できる」「区別できないわけではない」になると不一致になる。
+    """
+    pieces = _CLAUSE_SEPARATORS.split(text.replace("()", ""))
+    return {squashed for piece in pieces if (squashed := _squash(piece))}
+
+
+def _missing_clauses(block: str, required: tuple[str, ...], label: str) -> list[str]:
+    present = _clauses(block)
+    return [f"{label}: 期待する文 {clause!r} が説明に無い" for clause in required if _squash(clause) not in present]
+
+
+def _paragraph(doc: str, start_prefix: str) -> str | None:
+    """start_prefix で始まる行から、次の空行までの段落を改行で連結して返す。"""
+    lines = doc.splitlines()
+    for idx, line in enumerate(lines):
+        if line.startswith(start_prefix):
+            block = [line]
+            for follow in lines[idx + 1 :]:
+                if not follow.strip():
+                    break
+                block.append(follow)
+            return "\n".join(block)
+    return None
 
 
 def _section_lines(doc: str, header_prefix: str) -> list[str] | None:
@@ -130,7 +236,12 @@ def _section_lines(doc: str, header_prefix: str) -> list[str] | None:
 
 
 def _validate_exit_section(
-    doc: str, header_prefix: str, table: dict[int, frozenset[str]], phrases: dict[int, tuple[str, ...]], label: str
+    doc: str,
+    header_prefix: str,
+    table: dict[int, frozenset[str]],
+    phrases: dict[int, tuple[str, ...]],
+    clauses: dict[int, tuple[str, ...]],
+    label: str,
 ) -> list[str]:
     mismatches: list[str] = []
     section = _section_lines(doc, header_prefix)
@@ -167,6 +278,7 @@ def _validate_exit_section(
         for phrase in phrases.get(code, ()):
             if phrase not in description:
                 mismatches.append(f"{label}: exit {code} の説明に {phrase!r} が無い")
+        mismatches.extend(_missing_clauses(description, clauses.get(code, ()), f"{label}: exit {code}"))
     for code in parsed:
         if code not in table:
             mismatches.append(f"{label}: 期待値表に無い exit {code} の行がある")
@@ -176,14 +288,24 @@ def _validate_exit_section(
 def validate_exit_table(doc: str) -> list[str]:
     """通常 producer result の status -> exit code 表 (AC1) を検証し、不一致の説明を返す。"""
     return _validate_exit_section(
-        doc, "Exit codes (normal producer result)", NORMAL_EXIT_TABLE, NORMAL_REQUIRED_PHRASES, "normal"
+        doc,
+        "Exit codes (normal producer result)",
+        NORMAL_EXIT_TABLE,
+        NORMAL_REQUIRED_PHRASES,
+        NORMAL_REQUIRED_CLAUSES,
+        "normal",
     )
 
 
 def validate_cli_front_stage(doc: str) -> list[str]:
     """CLI 前段の表と stdout 例外記載 (AC2) を検証し、不一致の説明を返す。"""
     mismatches = _validate_exit_section(
-        doc, "Exit codes (CLI front stage)", FRONT_STAGE_TABLE, FRONT_STAGE_REQUIRED_PHRASES, "front_stage"
+        doc,
+        "Exit codes (CLI front stage)",
+        FRONT_STAGE_TABLE,
+        FRONT_STAGE_REQUIRED_PHRASES,
+        FRONT_STAGE_REQUIRED_CLAUSES,
+        "front_stage",
     )
     stdout_text: str | None = None
     lines = doc.splitlines()
@@ -201,6 +323,12 @@ def validate_cli_front_stage(doc: str) -> list[str]:
         for phrase in STDOUT_EXCEPTION_PHRASES:
             if phrase not in stdout_text:
                 mismatches.append(f"stdout: 説明に {phrase!r} が無い")
+        mismatches.extend(_missing_clauses(stdout_text, STDOUT_REQUIRED_CLAUSES, "stdout"))
+    footer = _paragraph(doc, FRONT_STAGE_FOOTER_PREFIX)
+    if footer is None:
+        mismatches.append(f"front_stage: {FRONT_STAGE_FOOTER_PREFIX!r} で始まる段落が無い")
+    else:
+        mismatches.extend(_missing_clauses(footer, FRONT_STAGE_FOOTER_CLAUSES, "front_stage footer"))
     return mismatches
 
 
@@ -233,6 +361,7 @@ def validate_artifact_contract(doc: str) -> list[str]:
         for phrase in phrases:
             if phrase not in parsed[case]:
                 mismatches.append(f"artifact: {case} の説明に {phrase!r} が無い")
+        mismatches.extend(_missing_clauses(parsed[case], ARTIFACT_REQUIRED_CLAUSES[case], f"artifact: {case}"))
     for case in parsed:
         if case not in ARTIFACT_CONTRACT:
             mismatches.append(f"artifact: 期待値表に無いケース {case} がある")
@@ -241,6 +370,9 @@ def validate_artifact_contract(doc: str) -> list[str]:
     for phrase in ARTIFACT_WHOLE_SECTION_PHRASES:
         if phrase not in whole:
             mismatches.append(f"artifact: セクション全体に {phrase!r} が無い")
+    # ケース説明の継続行 (インデント 4 以上) を除いた、セクション末尾の総括文 (インデント 2 の非ケース行)
+    summary = "\n".join(line for line in section if re.match(r"^  \S", line) and not _ARTIFACT_ENTRY_RE.match(line))
+    mismatches.extend(_missing_clauses(summary, ARTIFACT_WHOLE_SECTION_CLAUSES, "artifact: セクション末尾の総括"))
     return mismatches
 
 
@@ -465,9 +597,7 @@ def test_main_result_without_status_key_is_exit_40(monkeypatch, capsys):
 def test_main_exit_codes_cover_every_row_of_the_expectation_table(monkeypatch, capsys):
     for code_expected, statuses in NORMAL_EXIT_TABLE.items():
         for status in sorted(statuses):
-            code, _out, _err, _calls = _run_main(
-                monkeypatch, capsys, ["--issue-number", "3005"], _fresh_result(status)
-            )
+            code, _out, _err, _calls = _run_main(monkeypatch, capsys, ["--issue-number", "3005"], _fresh_result(status))
             assert code == code_expected, status
 
 
@@ -628,3 +758,183 @@ def test_mutation_markers_alone_never_satisfy_validators():
     assert validate_docstring(markers_only)
     assert validate_docstring(None)
     assert validate_docstring("")
+
+
+# ---------------------------------------------------------------------------
+# AC5 (続き): 説明の反転 mutation (Issue #3005 OWNER REQUEST_CHANGES P2)
+#
+# 見出し・ケース名・exit/status 表・検索用マーカーをすべて残したまま、説明の否定・限定条件だけを
+# 反転した docstring を、対応する validate_* が不一致として検出することを固定する。
+# 上の「見出し削除」「表の status 変更」「旧 docstring」系とは別軸である。
+# 変異は実モジュールの正しい docstring への置換で作り、置換元が実在し、ちょうど 1 回
+# 置換されたこと (vacuous でないこと) を必ず確認する。
+# ---------------------------------------------------------------------------
+
+_HEADINGS = (
+    "Exit codes (normal producer result)",
+    "Exit codes (CLI front stage)",
+    "Artifact contract",
+)
+_CASE_NAMES = ("artifact_saved:", "artifact_save_failed:", "artifact_dir_unspecified:")
+_STATUS_ROWS = ("20 human_judgment, dry_run_would_post — ", "30 runtime_error — ")
+
+# (id, 置換元, 置換後, 対応する validator, 不一致メッセージに含まれるべき対象)
+_INVERSION_MUTATIONS = [
+    pytest.param(
+        "artifact_path は追加されず",
+        "artifact_path は追加され",
+        validate_artifact_contract,
+        "artifact_save_failed",
+        id="artifact_save_failed_adds_artifact_path",
+    ),
+    pytest.param(
+        "ファイルは作られず artifact_path も追加されない",
+        "ファイルが作られ artifact_path も追加される",
+        validate_artifact_contract,
+        "artifact_dir_unspecified",
+        id="artifact_dir_unspecified_creates_file",
+    ),
+    pytest.param(
+        "内容が一致する",
+        "内容が一致しない",
+        validate_artifact_contract,
+        "artifact_saved",
+        id="artifact_saved_content_does_not_match",
+    ),
+    pytest.param(
+        "argparse の早期終了は JSON を出さない",
+        "argparse の早期終了は JSON を出す",
+        validate_cli_front_stage,
+        "stdout",
+        id="argparse_early_exit_emits_json",
+    ),
+    pytest.param(
+        "終了コードでは区別できない",
+        "終了コードでは区別できる",
+        validate_exit_table,
+        "exit 20",
+        id="exit20_distinguishable_by_exit_code",
+    ),
+    pytest.param(
+        "整数変換後の Issue 番号が 0 の場合のみ",
+        "引数が不正な場合",
+        validate_cli_front_stage,
+        "exit 30",
+        id="exit30_for_any_invalid_argument",
+    ),
+]
+
+
+@pytest.mark.parametrize(("original", "inverted", "validator", "target"), _INVERSION_MUTATIONS)
+def test_mutation_inverted_explanation_is_detected_with_headings_and_markers_kept(
+    original, inverted, validator, target
+):
+    doc = _ecs.__doc__
+    # vacuous 防止: 置換元は実モジュールの docstring にちょうど 1 回だけ存在する
+    assert doc.count(original) == 1
+    mutated = doc.replace(original, inverted)
+    assert mutated != doc
+    assert inverted in mutated and original not in mutated
+
+    # 見出し・ケース名・exit/status 表・検索用マーカーは残っている (説明だけを反転した変異)
+    for kept in (*_HEADINGS, *_CASE_NAMES, *_STATUS_ROWS, *_MARKERS):
+        assert kept in mutated, kept
+
+    # 変異前は不一致 0 件、変異後は対応する検証が説明の不一致を検出する
+    assert validator(doc) == []
+    mismatches = validator(mutated)
+    assert mismatches
+    assert any(target in m for m in mismatches), mismatches
+    # 表・見出し・語句ではなく、説明の文の不一致として落ちている
+    assert any("期待する文" in m for m in mismatches), mismatches
+
+
+@pytest.mark.parametrize(("original", "inverted", "validator", "target"), _INVERSION_MUTATIONS)
+def test_mutation_inverted_explanation_is_detected_by_validate_docstring(original, inverted, validator, target):
+    doc = _ecs.__doc__
+    assert doc.count(original) == 1
+    assert validate_docstring(doc) == []
+    assert validate_docstring(doc.replace(original, inverted))
+
+
+@pytest.mark.parametrize(("original", "inverted", "validator", "target"), _INVERSION_MUTATIONS)
+def test_mutation_deleting_explanation_clause_is_detected(original, inverted, validator, target):
+    doc = _ecs.__doc__
+    assert doc.count(original) == 1
+    assert validator(doc.replace(original, ""))
+
+
+def _all_required_clauses() -> list[str]:
+    clauses: list[str] = []
+    for group in (
+        *NORMAL_REQUIRED_CLAUSES.values(),
+        *FRONT_STAGE_REQUIRED_CLAUSES.values(),
+        STDOUT_REQUIRED_CLAUSES,
+        FRONT_STAGE_FOOTER_CLAUSES,
+        *ARTIFACT_REQUIRED_CLAUSES.values(),
+        ARTIFACT_WHOLE_SECTION_CLAUSES,
+    ):
+        clauses.extend(group)
+    return clauses
+
+
+def test_mutation_required_clauses_are_atomic_and_all_present_in_real_docstring():
+    clauses = _all_required_clauses()
+    assert clauses
+    squashed_doc = _squash(_ecs.__doc__.replace("()", ""))
+    for clause in clauses:
+        # 区切り文字を含まないアトミックな文だけを期待値にする (完全一致検証の前提)
+        assert not _CLAUSE_SEPARATORS.search(clause), clause
+        # 期待文は実 docstring に実在する (表が空振りしていない。厳密な clause 一致は validate_* が検証する)
+        assert _squash(clause) in squashed_doc, clause
+
+
+def test_mutation_clause_matching_ignores_whitespace_and_fold_position():
+    reference = _clauses("終了コードでは区別できないため、stdout JSON の status で区別する (EXIT20)。")
+    folded = _clauses("終了コード\n      では区\n別できないため、stdout\n JSON の\nstatus で区別する\n(EXIT20)。")
+    assert reference == folded
+    assert _squash("終了コードでは区別できないため") in reference
+    # 否定が反転した文・否定の後ろに語が足された文は完全一致しない
+    assert _squash("終了コードでは区別できないため") not in _clauses("終了コードでは区別できるため、")
+    assert _squash("終了コードでは区別できないため") not in _clauses("終了コードでは区別できないためではない、")
+
+
+def _refold(doc: str, width: int) -> str:
+    """説明の継続行を、空白位置で width 文字幅に折り返し直す (意味不変。折返し位置だけ変える)。
+
+    対象は exit 表 / artifact 契約の継続行 (インデント 6)、stdout 段落の継続行、
+    「終了コードから status」で始まる段落の行。見出し・ケース名・表の先頭行は触らない。
+    """
+    out: list[str] = []
+    in_footer = False
+    for line in doc.splitlines():
+        if not line.strip():
+            in_footer = False
+        if line.startswith(FRONT_STAGE_FOOTER_PREFIX):
+            in_footer = True
+        is_continuation = line.startswith("      ") and line.strip() != ""
+        is_stdout_cont = line.startswith(("  ただし例外として", "  (exit 2 は"))
+        if is_continuation or is_stdout_cont or in_footer:
+            indent = line[: len(line) - len(line.lstrip())]
+            wrapped = textwrap.wrap(line.strip(), width=width, break_long_words=False, break_on_hyphens=False)
+            out.extend(indent + piece for piece in wrapped)
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+@pytest.mark.parametrize("step", [20, 30, 50])
+def test_mutation_rewrapping_real_docstring_keeps_zero_mismatches(step):
+    doc = _ecs.__doc__
+    rewrapped = _refold(doc, step)
+    assert rewrapped != doc  # 折返し位置が実際に変わっている
+    assert validate_docstring(rewrapped) == []
+
+
+@pytest.mark.parametrize("step", [20, 40])
+@pytest.mark.parametrize(("original", "inverted", "validator", "target"), _INVERSION_MUTATIONS)
+def test_mutation_inverted_explanation_is_detected_after_rewrapping(step, original, inverted, validator, target):
+    doc = _ecs.__doc__
+    assert doc.count(original) == 1
+    # 反転は raw 行で行い、そのうえで折返し位置を変えても検出される
+    assert validator(_refold(doc.replace(original, inverted), step))
