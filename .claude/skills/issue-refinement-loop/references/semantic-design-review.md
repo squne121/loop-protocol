@@ -234,11 +234,49 @@ uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/semantic_re
   --invocation-dir <pin-bundle が返した invocation_dir> \
   --result-file <SubAgent 出力を保存したファイル> \
   --completed-at <ISO8601, agent 完了時刻> \
-  --current-body-sha256 <必須。stale 判定用の再チェック body_sha256>
+  --current-body-sha256 <必須。stale 判定用の再チェック body_sha256（受理形式は下記）>
 ```
 
 `--current-body-sha256` は必須引数（#2296 fix_delta iteration 6, P1-2: freshness の再チェックを
-省略可能にしない）。
+省略可能にしない）。欠落時は argparse の usage error（exit 2）のままである。
+
+### `--current-body-sha256` の受理形式と正規化境界（#3007）
+
+受理する表現は次の 2 つだけで、`re.fullmatch()` による全体一致で検証する（部分一致・前後空白・
+末尾改行・大文字 hex・任意文字列は受理しない）:
+
+- bare 形式: `<64-lowercase-hex>`（`pin-bundle` が返す `body_sha256` と同形式）
+- 接頭辞付き形式: `sha256:<64-lowercase-hex>`（`CONTRACT_REVIEW_RESULT_V1.body_sha256` が使う形式）
+
+正規化は比較時のみ（`sha256:` 接頭辞を外した bare lowercase 64 hex に揃える）で、`pin-bundle` の
+出力、bundle の `body_sha256`、永続化される `semantic_review_result.json` の `body_sha256`
+（常に bare）は変えない。transport は GitHub から body を取得せず、新しい gate / wrapper / schema も
+持たない。
+
+- 同一 digest の二表現は同値で、どちらも `transport_status: ok` / `freshness_valid: true`（exit 0）
+- 異なる well-formed digest は genuine body drift として `transport_status: stale` /
+  `freshness_valid: false`（exit 0。従来どおり）
+- 不正形式は表記差でも body drift でもなく caller 入力の誤りで、`transport_status: error` /
+  `reason_code: invalid_current_body_sha256`（stdout JSON、exit 1）となる
+
+実例（`CONTRACT_REVIEW_RESULT_V1.body_sha256` が `sha256:<64 hex>` の場合、そのまま渡せる）:
+
+```bash
+uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/semantic_review_transport.py \
+  record-result \
+  --invocation-dir .claude/artifacts/issue-refinement-loop/3007/<invocation_id> \
+  --result-file <SubAgent 出力を保存したファイル> \
+  --completed-at 2026-10-10T12:00:00Z \
+  --current-body-sha256 sha256:bc26f7a5cc7667c3aaf26f5c30da40e959a2b9a909a0fccfb7ef78e7eb592a71
+```
+
+caller の責務（freshness）:
+
+- live Issue body を再取得する caller は、reviewer 完了**後**に取得した body から SHA-256 を算出して
+  渡す。reviewer 完了前に取得した古い SHA を current SHA として再利用してはならない
+  （再利用すると genuine drift を見逃すか、実際には drift していないのに stale と誤判定する）
+- body が実際に変わっていて `stale` になった場合は表記差ではなく本物の drift であり、
+  digest 表記を変えて再試行するのではなく Step 2.5 を再実行する
 
 `record-result` は以下を fail-closed で検証する:
 
@@ -259,6 +297,16 @@ uv run --locked python3 .claude/skills/issue-refinement-loop/scripts/semantic_re
 検証を通過した場合のみ `SEMANTIC_REVIEW_RESULT_V1` sidecar artifact を
 `.claude/artifacts/issue-refinement-loop/<issue>/<invocation_id>/semantic_review_result.json`
 へ保存し、`transport_status: ok`（または stale 時 `stale`）を返す。
+
+`invalid_current_body_sha256` の場合も、raw reviewer result 自体が検証を通過していれば、検証済みの
+assessment / findings を失わないよう artifact を保持する（`freshness_valid: false` /
+`artifact_valid: true`、`body_sha256` は bare lowercase、返却 artifact と保存内容は一致）。
+このとき `transport_status` は `error` のままで成功扱いにはならず、`reason_code` は transport
+result 側に残る。`artifact` が non-null の `error` では `artifact.findings` を本書 §4 の join へ
+そのまま渡し、blocker/high finding を落とさない。raw reviewer result 自体が不正な場合は従来の
+rejection と reason code（`artifact: null`）が優先される。`invalid_current_body_sha256` は
+caller 入力の誤りであり、同じ不正値のまま再試行せず、caller が渡す digest を修正してから
+`record-result` を呼び直す。
 
 ## 4. Join（結果の統合）
 
