@@ -114,6 +114,7 @@ def test_repo_local_execution_claims_do_not_require_external_evidence():
         "current-main で `rg` により symbol_a を探し call chain を確認する。",
         "Run current-main function_a directly and verify its return value.",
         "Repository tests and fixtures must establish the behavior of symbol_b.",
+        "Check local example fixtures for symbol_b.",
         "`rg symbol_c` でリポジトリの実装を確認する。",
         "Check the repository call-chain of symbol_d with no path literal.",
     ]
@@ -301,6 +302,21 @@ VC: GitHub API rate-limit response must be checked against the official docs bef
     [
         (
             "Do not verify local fixtures and GitHub GraphQL errors must match "
+            "official docs before approval.",
+            "GitHub GraphQL errors must match official docs before approval",
+        ),
+        (
+            "Do not verify local example fixtures and GitHub GraphQL errors must match "
+            "official docs before approval.",
+            "GitHub GraphQL errors must match official docs before approval",
+        ),
+        (
+            "Do not verify historical local fixtures and GitHub GraphQL errors must match "
+            "official docs before approval.",
+            "GitHub GraphQL errors must match official docs before approval",
+        ),
+        (
+            "Do not verify literal example fixtures and GitHub GraphQL errors must match "
             "official docs before approval.",
             "GitHub GraphQL errors must match official docs before approval",
         ),
@@ -574,6 +590,8 @@ def test_affirmative_deadline_does_not_negate_external_dependency():
         "without checking GitHub GraphQL specification.",
         "Previously quoted: Do not verify local fixtures and GitHub GraphQL errors must match "
         "official docs without checking repository API fixtures.",
+        "Previously quoted: Do not verify local example fixtures and GitHub GraphQL errors "
+        "must match official docs before approval.",
         "Previously quoted: Do not verify local fixtures, but verify GitHub GraphQL "
         "errors against official docs before approval.",
         "Previously quoted: Do not verify local fixtures; verify GitHub GraphQL "

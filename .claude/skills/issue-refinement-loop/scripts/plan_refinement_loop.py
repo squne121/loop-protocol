@@ -629,9 +629,12 @@ _NEGATED_REQUEST_RE = re.compile(
     r"out\s+of\s+scope)\b|不要|参照しない|確認しない|検証しない|対象外|"
     r"非ゴール|変更しない|禁止|単なる|言及のみ", re.I,
 )
+# A quote cue must introduce quoted content; words describing local fixtures
+# ("example fixtures", "historical tests") do not quote a later claim.
 _QUOTED_CONTEXT_RE = re.compile(
-    r"\b(?:previously|historical|past|quoted|quote|literal|noise)\b|"
-    r"(?<![/.])\bexample\b|過去|引用|貼付|例示", re.I,
+    r"(?<![/.])\b(?:previously(?:\s+quoted)?|historical(?:\s+context)?|"
+    r"past(?:\s+quote)?|quoted|quote|literal(?:\s+example)?|noise|example)\s*[:：]|"
+    r"(?:過去(?:の)?引用|引用|貼付|例示)\s*[:：]|過去の引用|例示のみ", re.I,
 )
 _FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 # A noun-start RHS needs its own predicate; "fixtures and API errors against docs"
