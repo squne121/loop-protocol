@@ -674,19 +674,25 @@ def test_invalid_digest_preserves_high_finding_through_join():
         artifact = outcome["artifact"]
         assert artifact is not None
 
+        assert artifact["findings"], "validated high finding must be present on the artifact"
         for policy in ("best_effort", "required"):
-            joined = joiner.join_review_results(
-                deterministic_verdict="approve",
-                semantic_assessment=artifact["assessment"],
-                transport_status=outcome["transport_status"],
-                findings=artifact["findings"],
-                transport_policy=policy,
-                source_artifact=str(Path(bundle["invocation_dir"]) / "semantic_review_result.json"),
-                checked_body_sha256=artifact["body_sha256"],
-            )
-            assert joined["effective_verdict"] == "needs-fix", policy
-            assert joined["effective_verdict"] != "approve"
-            assert joined["rewrite_lane"] == "semantic"
+            for retry in (False, True):
+                case = (policy, retry)
+                joined = joiner.join_review_results(
+                    deterministic_verdict="approve",
+                    semantic_assessment=artifact["assessment"],
+                    transport_status=outcome["transport_status"],
+                    findings=artifact["findings"],
+                    transport_policy=policy,
+                    retry_already_attempted=retry,
+                    source_artifact=str(Path(bundle["invocation_dir"]) / "semantic_review_result.json"),
+                    checked_body_sha256=artifact["body_sha256"],
+                )
+                assert joined["effective_verdict"] == "needs-fix", case
+                assert joined["effective_verdict"] != "approve", case
+                assert joined["rewrite_lane"] == "semantic", case
+                preserved = joined["semantic_rewrite_constraints"]["findings"]
+                assert preserved == [_HIGH_FINDING], case
 
 
 if __name__ == "__main__":
