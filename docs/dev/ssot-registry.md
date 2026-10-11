@@ -91,6 +91,17 @@
   keywords: [runtime, verification, policy, skip, exit77, immediate, deferred, not_applicable]
   description: 動作検証 AC の運用規約
 
+- id: claude-code-memory-policy
+  path: docs/dev/claude-code-memory-policy.md
+  title: Claude Code Auto memory 保存判断ポリシー
+  keywords: [auto-memory, memory, MEMORY.md, claude-code, claude-gpt, 保存判断, 棚卸し, 進捗スナップショット, subagent-memory]
+  description: Claude Code / Claude-GPT の Auto memory に保存する情報の選別基準、保存時の 4 操作、判別 fixture、手動棚卸し手順の正本。運用上の指針であり enforcement ではない
+  sections:
+    - "## 保存先の決定表"
+    - "## 保存時の 4 つの操作結果"
+    - "## 判別 fixture"
+    - "## 可逆的な手動棚卸し手順"
+
 - id: workflows-design-docs-refinement
   path: docs/dev/workflows/issue-refinement-loop-design.md
   title: issue-refinement-loop 詳細設計ノート（derived_design_note）
