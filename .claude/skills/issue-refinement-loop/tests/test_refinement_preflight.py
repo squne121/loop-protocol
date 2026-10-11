@@ -1763,6 +1763,11 @@ def test_repo_local_no_web_preflight_handoff_preserves_unverified_anchor_warning
         ),
         (
             "Do not verify local fixtures and GitHub GraphQL errors must match "
+            "official docs without checking repository API fixtures.",
+            "GitHub GraphQL errors must match official docs",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors must match "
             "official docs no later than release.",
             "GitHub GraphQL errors must match official docs no later than release",
         ),
@@ -1832,6 +1837,10 @@ def test_noun_start_external_anchor_cannot_clear_no_web_warning(tmp_path, phrase
     "Previously quoted: Do not verify local fixtures, but verify GitHub GraphQL "
     "errors against official docs before approval.",
     "Do not verify local fixtures and check repository tests instead.",
+    "Previously quoted: Do not verify local fixtures and GitHub GraphQL errors must match "
+    "official docs without checking repository API fixtures.",
+    "Do not verify local fixtures and GitHub GraphQL errors must match official docs "
+    "without consulting official API documentation.",
 ])
 def test_negated_future_anchor_keeps_repo_local_no_web_handoff(tmp_path, phrase):
     fixture, anchor_url = _ac8_repo_local_anchor_fixture(f"## Revised AC\n- AC2: {phrase}\n")

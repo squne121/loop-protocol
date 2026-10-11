@@ -490,6 +490,31 @@ def test_external_dependency_survives_independent_negative_local_prefix(external
         "against official docs without adding source files before approval.",
         "GitHub GraphQL errors will be checked against official docs",
     ),
+    (
+        "Do not verify local fixtures and GitHub GraphQL errors must match "
+        "official docs without checking repository API fixtures.",
+        "GitHub GraphQL errors must match official docs",
+    ),
+    (
+        "Do not verify local fixtures and GitHub GraphQL errors must match "
+        "official docs without checking repository fixtures.",
+        "GitHub GraphQL errors must match official docs",
+    ),
+    (
+        "Do not verify local fixtures and GitHub GraphQL errors must match "
+        "official docs without editing repository API fixtures.",
+        "GitHub GraphQL errors must match official docs",
+    ),
+    (
+        "Do not verify local fixtures and GitHub GraphQL errors will be checked "
+        "against official docs without checking local GraphQL API tests.",
+        "GitHub GraphQL errors will be checked against official docs",
+    ),
+    (
+        "Do not verify local fixtures and GitHub GraphQL errors must match "
+        "official docs without checking repository API fixtures or consulting official docs.",
+        "GitHub GraphQL errors must match official docs",
+    ),
 ])
 def test_repo_local_without_modifier_does_not_erase_external_dependency(phrase, expected):
     for body, comments, source_hint in [
@@ -543,6 +568,12 @@ def test_affirmative_deadline_does_not_negate_external_dependency():
         "Do not verify local fixtures and GitHub GraphQL errors will be checked without official docs.",
         "Do not verify local fixtures and GitHub GraphQL errors will be checked without consulting official docs.",
         "Do not verify local fixtures and GitHub GraphQL errors will be checked without using external docs.",
+        "Do not verify local fixtures and GitHub GraphQL errors must match official docs "
+        "without consulting official API documentation.",
+        "Do not verify local fixtures and GitHub GraphQL errors must match official docs "
+        "without checking GitHub GraphQL specification.",
+        "Previously quoted: Do not verify local fixtures and GitHub GraphQL errors must match "
+        "official docs without checking repository API fixtures.",
         "Previously quoted: Do not verify local fixtures, but verify GitHub GraphQL "
         "errors against official docs before approval.",
         "Previously quoted: Do not verify local fixtures; verify GitHub GraphQL "

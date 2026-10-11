@@ -685,15 +685,18 @@ def _split_repo_local_without(sentence: str) -> list[str]:
     """Keep an external request apart from a trailing local-only restriction."""
     for boundary in re.finditer(r"\s+without\s+", sentence, flags=re.I):
         restriction = sentence[boundary.end():].strip()
-        external_source = (
-            _EXTERNAL_TOPIC_RE.search(restriction)
-            or _EXTERNAL_AUTHORITY_RE.search(restriction)
-            or _EXTERNAL_SOURCE_REF_RE.search(restriction)
+        # API/GraphQL may name local fixtures; only a source or authority in
+        # the restriction can negate the external evidence request itself.
+        source_refs = (
+            _EXTERNAL_AUTHORITY_RE.search(restriction),
+            _EXTERNAL_SOURCE_REF_RE.search(restriction),
         )
+        source_offsets = [match.start() for match in source_refs if match]
+        local_object = _REPO_TOPIC_RE.search(restriction)
         if (
             _NON_EVIDENCE_MODIFIER_RE.match(restriction)
-            or (_REPO_TOPIC_RE.search(restriction) and not external_source)
-            or (not external_source and not _EVIDENCE_ACTION_RE.match(restriction))
+            or (local_object and (not source_offsets or local_object.start() < min(source_offsets)))
+            or (not source_offsets and not _EVIDENCE_ACTION_RE.match(restriction))
         ):
             return [sentence[:boundary.start()].strip(), f"without {restriction}"]
     return [sentence]
