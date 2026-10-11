@@ -470,6 +470,26 @@ def test_external_dependency_survives_independent_negative_local_prefix(external
         "against official docs without editing tests.",
         "GitHub GraphQL errors will be checked against official docs",
     ),
+    (
+        "Do not verify local fixtures and GitHub GraphQL errors will be checked "
+        "against official docs without changing code before approval.",
+        "GitHub GraphQL errors will be checked against official docs",
+    ),
+    (
+        "GitHub GraphQL errors will be checked against official docs "
+        "without modifying files before approval.",
+        "GitHub GraphQL errors will be checked against official docs",
+    ),
+    (
+        "Do not verify local fixtures and GitHub GraphQL errors will be checked "
+        "against official docs without altering implementation before approval.",
+        "GitHub GraphQL errors will be checked against official docs",
+    ),
+    (
+        "Do not verify local fixtures and GitHub GraphQL errors will be checked "
+        "against official docs without adding source files before approval.",
+        "GitHub GraphQL errors will be checked against official docs",
+    ),
 ])
 def test_repo_local_without_modifier_does_not_erase_external_dependency(phrase, expected):
     for body, comments, source_hint in [
@@ -482,7 +502,7 @@ def test_repo_local_without_modifier_does_not_erase_external_dependency(phrase, 
         assert policy["required"] and len(claims) == 1, claims
         assert expected in claims[0]["claim"]
         assert "Do not verify local fixtures" not in claims[0]["claim"]
-        assert "without editing tests" not in claims[0]["claim"]
+        assert " without " not in claims[0]["claim"]
         assert claims[0]["source_hint"] == source_hint
         assert claims[0]["role"] == "dispositive"
         assert _consumer().route_web_research_result({
@@ -521,6 +541,8 @@ def test_affirmative_deadline_does_not_negate_external_dependency():
         "Do not verify local fixtures and GitHub GraphQL errors won't be checked against official docs.",
         "Do not verify local fixtures and GitHub GraphQL errors are not checked against official docs.",
         "Do not verify local fixtures and GitHub GraphQL errors will be checked without official docs.",
+        "Do not verify local fixtures and GitHub GraphQL errors will be checked without consulting official docs.",
+        "Do not verify local fixtures and GitHub GraphQL errors will be checked without using external docs.",
         "Previously quoted: Do not verify local fixtures, but verify GitHub GraphQL "
         "errors against official docs before approval.",
         "Previously quoted: Do not verify local fixtures; verify GitHub GraphQL "

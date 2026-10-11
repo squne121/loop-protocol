@@ -609,6 +609,17 @@ _REPO_TOPIC_RE = re.compile(
     r"(?<![a-z0-9_])(?:rg|current-main|repo(?:sitory)?|fixtures?|"
     r"tests?|symbols?|call[- ]chain)(?![a-z0-9_])|リポジトリ|実装|直接実行", re.I,
 )
+_NON_EVIDENCE_MODIFIER_RE = re.compile(
+    r"^(?:editing|changing|modifying|altering|touching|writing|running|"
+    r"executing|rebuilding|replacing|adding|removing|deleting|updating)\b", re.I,
+)
+_EVIDENCE_ACTION_RE = re.compile(
+    r"^(?:verifying|checking|validating|comparing|consulting|reading|"
+    r"referencing|using|reviewing)\b", re.I,
+)
+_EXTERNAL_SOURCE_REF_RE = re.compile(
+    r"\b(?:docs?|documentation|spec(?:ification)?|web|external)\b|公式|外部", re.I,
+)
 _REPO_CHECK_RE = re.compile(
     r"\b(?:verify|inspect|check|find|run|execute|test|establish|confirm|"
     r"search|trace|must)\b|検証|確認|調査|探[すし]|照合|直接実行|必要", re.I,
@@ -674,10 +685,15 @@ def _split_repo_local_without(sentence: str) -> list[str]:
     """Keep an external request apart from a trailing local-only restriction."""
     for boundary in re.finditer(r"\s+without\s+", sentence, flags=re.I):
         restriction = sentence[boundary.end():].strip()
+        external_source = (
+            _EXTERNAL_TOPIC_RE.search(restriction)
+            or _EXTERNAL_AUTHORITY_RE.search(restriction)
+            or _EXTERNAL_SOURCE_REF_RE.search(restriction)
+        )
         if (
-            _REPO_TOPIC_RE.search(restriction)
-            and not _EXTERNAL_TOPIC_RE.search(restriction)
-            and not _EXTERNAL_AUTHORITY_RE.search(restriction)
+            _NON_EVIDENCE_MODIFIER_RE.match(restriction)
+            or (_REPO_TOPIC_RE.search(restriction) and not external_source)
+            or (not external_source and not _EVIDENCE_ACTION_RE.match(restriction))
         ):
             return [sentence[:boundary.start()].strip(), f"without {restriction}"]
     return [sentence]
