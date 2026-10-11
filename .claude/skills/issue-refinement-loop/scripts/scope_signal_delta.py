@@ -1073,8 +1073,13 @@ def _has_explicit_exact_allowed_path_expansion(evidence: dict) -> bool:
 # ``P<n>-<n>`` form (tag ``P<n>-<n>``). A severity token embedded later in a
 # heading (``### Notes about [P1] policy``) or in ordinary prose is NOT a
 # finding heading.
+# #3016: the heading-start grammar additionally accepts ``P<n>`` immediately
+# followed by an ASCII ``:`` or a fullwidth ``：`` (tag ``P<n>``), e.g.
+# ``### 1. P2：...`` / ``<h3>P2: ...</h3>``. The colon must directly follow the
+# number, and the token must still START the heading text.
 _SEVERITY_HEADING_TEXT_RE = re.compile(
-    r"^\s*(?:[0-9]+[.)]\s*)?(?:\[(P[0-9]+)\]|(P[0-9]+-[0-9]+)\b)",
+    r"^\s*(?:[0-9]+[.)]\s*)?"
+    r"(?:\[(P[0-9]+)\]|(P[0-9]+-[0-9]+)\b|(P[0-9]+)[:\uFF1A])",
     re.IGNORECASE,
 )
 _MARKDOWN_HEADING_LINE_RE = re.compile(r"^\s*#+\s*(.*)$")
@@ -1112,7 +1117,7 @@ def _severity_tag_from_heading_text(heading_text: str) -> "str | None":
     match = _SEVERITY_HEADING_TEXT_RE.match(heading_text)
     if match is None:
         return None
-    return (match.group(1) or match.group(2)).upper()
+    return (match.group(1) or match.group(2) or match.group(3)).upper()
 
 
 def _find_html_comment_opener(line: str, start: int = 0) -> int:
@@ -1271,10 +1276,12 @@ def _html_heading_texts(fragment: str) -> "list[str]":
 def extract_severity_tags(text: "str | None") -> list:
     """Detect owner adversarial-review severity-tagged headings and return the
     tags (uppercased, de-duplicated, sorted): ``P0-1`` (``## P0-1`` /
-    ``### P1-3``) or bracketed ``P1`` (``### [P1]`` / ``### 1. [P1] ...``).
+    ``### P1-3``), bracketed ``P1`` (``### [P1]`` / ``### 1. [P1] ...``) or
+    colon ``P2`` (``### 1. P2：...`` / ``### P2: ...``, #3016).
     Grammar: see ``_SEVERITY_HEADING_TEXT_RE`` (heading text must START with an
-    optional ``\\d+[.)]`` number prefix and then ``[P<n>]`` or ``P<n>-<n>``;
-    case insensitive).
+    optional ``\\d+[.)]`` number prefix and then ``[P<n>]``, ``P<n>-<n>`` or
+    ``P<n>`` directly followed by ASCII ``:`` / fullwidth ``：``; case
+    insensitive).
 
     #2994 scan regions:
 
