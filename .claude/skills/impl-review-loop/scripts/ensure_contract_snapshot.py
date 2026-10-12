@@ -1906,6 +1906,41 @@ def ensure_contract_snapshot(
     return result
 
 
+# Issue #3050: GitHub rewrites control characters in a comment body to caret
+# notation at storage time.  Observed on live GitHub (2026-10-12): a real ESC
+# becomes ``^[``, and the *literal text* ``\u001b`` -- exactly what json.dumps
+# emits for an ESC -- becomes ``\^[`` (all C0 except TAB/LF/CR, and
+# ``\u0080``).  The readback then differs from the body the producer hashed
+# and the full binding fails with ``binding_body_hash_mismatch``.  Neither
+# ``\xNN`` nor ``\^[`` literals are rewritten, so advisory text is made
+# stable under that rewrite *before* the body is built and hashed.
+_GITHUB_REWRITTEN_CONTROL_RE = re.compile(
+    "[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]"
+    r"|\\u00(?:[01][0-9a-fA-F]|[89][0-9a-fA-F])"
+)
+
+
+def _github_stable_control_text(text: str) -> str:
+    def _repl(match: "re.Match[str]") -> str:
+        token = match.group(0)
+        code = ord(token) if len(token) == 1 else int(token[-2:], 16)
+        if code in (0x09, 0x0A, 0x0D):
+            return token
+        return f"\\x{code:02x}"
+
+    return _GITHUB_REWRITTEN_CONTROL_RE.sub(_repl, text)
+
+
+def _github_stable_control_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _github_stable_control_text(value)
+    if isinstance(value, list):
+        return [_github_stable_control_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _github_stable_control_value(item) for key, item in value.items()}
+    return value
+
+
 def _build_contract_review_comment(
     issue_number: int,
     repo: str,
@@ -1974,6 +2009,11 @@ CONTRACT_SNAPSHOT_MATERIALIZATION_PENDING_V1:
         vc_preflight_classifications,
         classifications_transport,
     ) = compact_vc_preflight_classifications(vc_preflight_classifications)
+    # Applied after compaction so original_payload_sha256 still binds the
+    # unmodified producer payload (#3050).
+    vc_preflight_classifications = _github_stable_control_value(
+        vc_preflight_classifications
+    )
     classifications_json = json_yaml_scalar(vc_preflight_classifications)
     classifications_transport_json = json.dumps(
         classifications_transport, ensure_ascii=False, separators=(",", ":")

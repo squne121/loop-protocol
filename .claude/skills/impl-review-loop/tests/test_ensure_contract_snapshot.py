@@ -3406,7 +3406,32 @@ class TestPatchCommentTransportAndReconciliation:
             expected_contract_fingerprint=fingerprint,
         )
 
-    def _install_remote_boundary(self, monkeypatch, remote: dict, patch_response: str, after_patch=None):
+    @staticmethod
+    def _github_storage_rewrite(body: str) -> str:
+        """Model of the live GitHub storage rewrite observed for Issue #3050.
+
+        Probed on 2026-10-12 against real GitHub comments: real C0 controls
+        (except TAB/LF/CR) become caret notation (ESC -> ``^[``), and the
+        literal text ``\\u00XX`` for the same C0 range / ``\\u0080`` becomes
+        ``\\^X``.  ``\\x1b``, ``\\^[`` and ``\\u007f`` are left untouched.
+        """
+        import re as _re
+
+        body = _re.sub(
+            r"\\u00([01][0-9a-fA-F]|80)",
+            lambda m: ("\\^" + chr((int(m.group(1), 16) & 0x7F) ^ 0x40))
+            if int(m.group(1), 16) not in (0x09, 0x0A, 0x0D)
+            else m.group(0),
+            body,
+        )
+        return "".join(
+            "^" + chr(ord(ch) ^ 0x40)
+            if ord(ch) < 0x20 and ch not in "\t\n\r"
+            else ch
+            for ch in body
+        )
+
+    def _install_remote_boundary(self, monkeypatch, remote: dict, patch_response: str, after_patch=None, rewrite=None):
         endpoint = f"repos/{_REPO}/issues/comments/{self._COMMENT_ID}"
         calls = {"patch": [], "get": []}
 
@@ -3419,7 +3444,7 @@ class TestPatchCommentTransportAndReconciliation:
                 assert input is not None
                 payload = json.loads(input.decode("utf-8"))
                 calls["patch"].append(payload)
-                remote["body"] = payload["body"]
+                remote["body"] = rewrite(payload["body"]) if rewrite else payload["body"]
                 if after_patch is not None:
                     after_patch(remote)
                 if patch_response == "invalid_json":
@@ -3481,7 +3506,12 @@ class TestPatchCommentTransportAndReconciliation:
             parsed[0]["inner"], self._COMMENT_ID, _ISSUE_NUMBER
         )
         parsed_classification = parsed[0]["inner"]["checks"]["vc_preflight"]["classifications"][0]
-        assert parsed_classification == classifications[0]
+        # #3050: a real ESC is transported as the stable literal ``\x1b``;
+        # the literal ``\^[[2K`` stays distinct from it (#2619).
+        expected_classification = json.loads(
+            json.dumps(classifications[0]).replace("\\u001b", "\\\\x1b")
+        )
+        assert parsed_classification == expected_classification
         assert parsed[0]["inner"]["checks"]["vc_preflight"]["classifications_transport"] == {
             "schema": "vc_preflight_classifications_transport/v1",
             "classification_count": 1,
@@ -3491,6 +3521,70 @@ class TestPatchCommentTransportAndReconciliation:
             "compact": False,
             "truncated": False,
         }
+
+    @pytest.mark.parametrize(
+        "stdout_head",
+        [
+            ["\x1b[36mvite v8.0.13 \x1b[32mbuilding...\x1b[39m", "\x1b[2K", "\x07bell"],
+            [r"\u001b[36mliteral json escape", r"\u0007", r"\u001B[2K", r"\u0080"],
+            ["\x7f", "\x85", "plain \U0001F600 ✓"],
+        ],
+    )
+    def test_given_control_output_when_github_rewrites_stored_body_then_producer_body_is_stable_and_binds(
+        self, monkeypatch, stdout_head
+    ):
+        """#3050 regression: modelled GitHub rewrite must not break the binding."""
+        classifications = [
+            {
+                "ac": "AC1",
+                "decision": "pass",
+                "category": "regression_gate",
+                "stdout_head": stdout_head,
+                "stderr_head": ["\x1b[0m"],
+            }
+        ]
+        final_body = self._final_comment_body(classifications)
+        # The producer body is a fixed point of the observed storage rewrite.
+        assert self._github_storage_rewrite(final_body) == final_body
+        remote = self._trusted_remote_comment("provisional")
+        calls = self._install_remote_boundary(
+            monkeypatch, remote, "exact", rewrite=self._github_storage_rewrite
+        )
+
+        ok, error = _ecs_mod.patch_comment(
+            _ISSUE_NUMBER, _REPO, self._COMMENT_ID, final_body
+        )
+
+        assert (ok, error) == (True, None)
+        assert len(calls["patch"]) == 1
+        assert len(calls["get"]) == 1
+        assert remote["body"] == final_body
+        parsed = _parser_mod.parse_contract_review_results([remote], _ISSUE_URL)
+        assert len(parsed) == 1 and parsed[0]["status"] == "go"
+        assert _parser_mod.is_fingerprint_ready_go(
+            parsed[0]["inner"], self._COMMENT_ID, _ISSUE_NUMBER
+        )
+        transport = parsed[0]["inner"]["checks"]["vc_preflight"]["classifications_transport"]
+        assert transport["original_payload_sha256"] == _ecs_mod.sha256_of(
+            json.dumps(classifications, ensure_ascii=False, separators=(",", ":"))
+        )
+
+    def test_given_unstable_body_when_github_rewrites_then_binding_still_fails_closed(
+        self, monkeypatch
+    ):
+        """Negative control: an unnormalised body keeps failing closed (#3050 AC4)."""
+        unstable = "marker \x1b[2K and \\u001b[36m"
+        remote = self._trusted_remote_comment("provisional")
+        calls = self._install_remote_boundary(
+            monkeypatch, remote, "exact", rewrite=self._github_storage_rewrite
+        )
+
+        ok, error = _ecs_mod.patch_comment(_ISSUE_NUMBER, _REPO, self._COMMENT_ID, unstable)
+
+        assert ok is False
+        assert error is not None and "binding_body_hash_mismatch" in error
+        assert len(calls["patch"]) == 1
+        assert len(calls["get"]) == 1
 
     def test_given_large_payload_when_patched_then_compaction_metadata_and_nonverbose_fields_round_trip_to_valid_go(
         self, monkeypatch
