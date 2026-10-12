@@ -1,5 +1,5 @@
 name: Research
-description: 仕様調査・比較検討用の child issue。次のアクションに進める状態を成果物とする。
+description: 仕様調査・比較検討用の child issue。次のアクションに進める状態を成果物とし、Allowed Paths、runtime applicability、必要な evidence、成果物の納品先、停止条件を research 本文に明記する。
 title: "調査: "
 labels:
   - phase/research
@@ -78,6 +78,9 @@ body:
       label: Acceptance Criteria
       description: |
         調査完了時に **次のアクションに進める** ことを検証可能にする。例: 「結論をもとに implementation Issue が起票され、本 Issue がその issue を link している」
+
+        必要な調査を行っても結論が確定しない場合は、不足している evidence を記録して `inconclusive` として終了できる。`inconclusive` を expected behavior や defect 不存在へ再分類しない。
+        必須の runtime 観測を実行できず `SKIP` になった場合は、それを PASS として扱わない。
       placeholder: |
         - [ ] 比較結果が本 Issue 本文に記載されている
         - [ ] 採用案を実装する implementation Issue が起票され、本 Issue がそれを link している
@@ -92,6 +95,10 @@ body:
       description: |
         成果物の検証コマンドを列挙する。次 Issue 起票がゴールの場合は `gh issue list` で起票確認、
         リポジトリ出力がある場合は `test -f <path>` 等で存在確認。
+
+        runtime applicability（`not_applicable | immediate | deferred`）は research-only を根拠に決めず、調査で実際に必要な観測方法で選ぶ。
+        プロセス起動・並行実行・一時ファイルの寿命を観測することが AC の場合は、`docs/dev/runtime-verification-policy.md` に従い、AC/VC・必要な evidence・SKIP の扱いを明示する。
+        純粋な静的調査に runtime smoke を強制しない。
       placeholder: |
         - `gh issue view <new-implementation-issue-number>` — 後続 Issue が起票されている
     validations:
@@ -104,6 +111,10 @@ body:
       description: |
         **既定: 読み取り専用（リポジトリ変更なし）**。成果物は次 Issue 本文・コメント・link で表現する。
         品質調査などで成果物をリポジトリ資産として書き出す必要がある場合のみ、具体パスを記載する（例: `docs/research/<topic>.md`）。
+
+        `(none)` は tracked repository source（既存ファイルの編集に加え、新規 repository source file の追加を含む）に対する no-path marker である。次の 2 点は別の軸として、調査契約（AC）に対象と操作を明記する。
+        owned/isolated な ephemeral fixture の必要最小限の一時 I/O（プロセス起動、一時ファイルの作成・削除）は、調査契約が fixture と操作範囲を明記した場合に行える。無制限の `tmp/**` や owned でない workspace への書き込みは許可しない。
+        成果物の納品先（sanitized な Issue コメント、成果物リンク、後続 Issue の起票、許可された Issue 本文更新）への書き込みは、調査契約が対象と操作を明記した場合に行える。
       value: |
         - (none)
     validations:
@@ -118,6 +129,11 @@ body:
         - Allowed Paths 外への書き込みを試みた場合は即停止
         - 権限不足（permission denied）により操作が完了できない場合は即停止
         - 成果物の書き込みに失敗した場合（I/O エラー等）は即停止
+
+        上記の適用範囲を補足する。書き込み制限は、tracked repository source（新規 repository source file の追加を含む）と owned でない workspace に適用する。
+        即停止の対象とする禁止操作は、検証・再現のために実サービスの本文・状態・データを変更する操作である。
+        owned/isolated な ephemeral fixture の必要最小限の一時 I/O と、調査契約が対象・操作を明記した成果物の納品先への書き込み（sanitized な Issue コメント、成果物リンク、後続 Issue の起票、許可された Issue 本文更新）は別扱いで、既存 workflow の範囲で行える。
+        必須の runtime 観測を実行できず SKIP になった場合は PASS として扱わず、不足している evidence を記録して inconclusive として報告する。
     validations:
       required: true
 
