@@ -15,11 +15,9 @@ _SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 _SCRIPT = _SCRIPTS_DIR / "repair_issue_contract.py"
 
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
 
 
 def run_repair(body: str) -> dict:
@@ -29,7 +27,6 @@ def run_repair(body: str) -> dict:
     ) as tf:
         tf.write(body)
         tmp_path = tf.name
-
 
     try:
         result = subprocess.run(
@@ -49,11 +46,9 @@ def run_repair(body: str) -> dict:
             pass
 
 
-
 # ---------------------------------------------------------------------------
 # AC4: script exists
 # ---------------------------------------------------------------------------
-
 
 
 def test_script_exists():
@@ -61,18 +56,15 @@ def test_script_exists():
     assert _SCRIPT.exists(), f"Script not found: {_SCRIPT}"
 
 
-
 # ---------------------------------------------------------------------------
 # AC13: dry-run default / schema / idempotent
 # ---------------------------------------------------------------------------
-
 
 
 def test_schema_and_dry_run_default():
     """AC13: output JSON has schema, dry_run=True, idempotent fields."""
     body = """## Outcome
 Simple outcome.
-
 
 ## Acceptance Criteria
 - [ ] AC1: something
@@ -84,13 +76,11 @@ Simple outcome.
 $ test -f README.md
 ```
 
-
 ## Allowed Paths
 - README.md
 
 ## Stop Conditions
 - none
-
 
 ## Required Skills
 - none
@@ -105,15 +95,12 @@ $ test -f README.md
     assert isinstance(result["repairs"], list)
 
 
-
 def test_idempotent_unchanged_body():
     """AC13: running twice on same body gives same hash."""
     body = """## Outcome
 No defects.
 
-
 ## Verification Commands
-
 
 ```bash
 # AC1
@@ -124,7 +111,6 @@ $ test -f README.md
     result2 = run_repair(body)
     assert result1["original_body_sha256"] == result2["original_body_sha256"]
     assert result1["repaired_body_sha256"] == result2["repaired_body_sha256"]
-
 
 
 def test_idempotent_same_hash_after_repair():
@@ -146,9 +132,7 @@ $ pnpm test:e2e
     annotated_body = """## Outcome
 Test e2e.
 
-
 ## Verification Commands
-
 
 ```bash
 # AC1
@@ -162,16 +146,13 @@ $ pnpm test:e2e
     assert result2["original_body_sha256"] == result2["repaired_body_sha256"]
 
 
-
 # ---------------------------------------------------------------------------
 # AC14: escaped code fence repair limited to Machine-Readable Contract section
 # ---------------------------------------------------------------------------
 
 
-
 def test_mrc_fence_only_mrc_section():
     """AC14: escaped fence repair only affects ## Machine-Readable Contract section.
-
 
     MAJOR 1 fix: assert that escaped_code_fence repair IS triggered (positive fixture).
     """
@@ -179,17 +160,13 @@ def test_mrc_fence_only_mrc_section():
     body = r"""## Outcome
 Normal section.
 
-
 ## Verification Commands
-
 
 ```bash
 $ test -f README.md
 ```
 
-
 ## Machine-Readable Contract
-
 
 \```yaml
 schema: test/v1
@@ -202,7 +179,6 @@ schema: test/v1
         f"Expected escaped_code_fence repair but got: {result.get('repairs', [])}"
     )
     assert result["changed"] is True, "Body should be changed after escaped fence repair"
-
 
 
 def test_mrc_fence_does_not_touch_quadruple_fence():
@@ -223,17 +199,14 @@ schema: test
     assert len(escaped_repairs) == 0, "Quadruple/tilde fences should not be repaired"
 
 
-
 # ---------------------------------------------------------------------------
 # AC15: allowlist command repair rules
 # ---------------------------------------------------------------------------
 
 
-
 def test_pnpm_typecheck_not_deferred():
     """AC15: pnpm typecheck is NOT deferred/annotated."""
     body = """## Verification Commands
-
 
 ```bash
 # AC1
@@ -248,7 +221,6 @@ $ pnpm typecheck
     )
 
 
-
 def test_pnpm_lint_not_deferred():
     """AC15: pnpm lint is NOT deferred/annotated."""
     body = """## Verification Commands
@@ -261,7 +233,6 @@ $ pnpm lint
     result = run_repair(body)
     runtime_repairs = [r for r in result.get("repairs", []) if r["kind"] == "runtime_only_command"]
     assert all("pnpm lint" not in r["reason"] for r in runtime_repairs),         "pnpm lint should not be annotated"
-
 
 
 def test_pnpm_test_not_deferred():
@@ -280,7 +251,6 @@ $ pnpm test
     )
 
 
-
 def test_pnpm_build_not_deferred():
     """AC15: pnpm build is NOT deferred/annotated."""
     body = """## Verification Commands
@@ -293,7 +263,6 @@ $ pnpm build
     result = run_repair(body)
     runtime_repairs = [r for r in result.get("repairs", []) if r["kind"] == "runtime_only_command"]
     assert all("pnpm build" not in r["reason"] for r in runtime_repairs),         "pnpm build should not be annotated"
-
 
 
 def test_pnpm_test_e2e_gets_deferred():
@@ -310,7 +279,6 @@ $ pnpm test:e2e
     assert len(runtime_repairs) >= 1, "pnpm test:e2e should be annotated as runtime-only"
     reasons = [r["reason"] for r in runtime_repairs]
     assert any("pnpm test:e2e" in reason for reason in reasons)
-
 
 
 def test_denylist_not_repaired():
@@ -336,11 +304,9 @@ $ bash -c "echo hello"
         )
 
 
-
 def test_already_annotated_not_double_annotated():
     """AC15: Already-annotated commands are not double-annotated (idempotency)."""
     body = """## Verification Commands
-
 
 ```bash
 # AC1
@@ -355,11 +321,9 @@ $ pnpm test:e2e
     assert result["changed"] is False, "Body should be unchanged when already annotated"
 
 
-
 # ---------------------------------------------------------------------------
 # MAJOR 1: yaml-only fence repair + YAML reparse validation
 # ---------------------------------------------------------------------------
-
 
 
 def test_mrc_repair_requires_yaml_reparse_success():
@@ -382,11 +346,9 @@ def test_mrc_repair_requires_yaml_reparse_success():
     )
 
 
-
 def test_mrc_repair_does_not_modify_bash_fence_in_mrc():
     """MAJOR 1: escaped bash fence in MRC section is NOT repaired."""
     body = r"""## Machine-Readable Contract
-
 
 \```bash
 some_command arg1
@@ -404,11 +366,9 @@ some_command arg1
     )
 
 
-
 def test_mrc_yaml_fence_is_repaired_bash_is_not():
     """MAJOR 1: escaped yaml fence IS repaired, escaped bash fence is NOT."""
     body = r"""## Machine-Readable Contract
-
 
 \```yaml
 schema: test/v1
@@ -434,17 +394,13 @@ echo hello
 
 
 
-
-
 # ---------------------------------------------------------------------------
 # BLOCKER 1: repair_result is exposed in refinement_preflight output
 # ---------------------------------------------------------------------------
 
 
-
 def test_repair_result_is_exposed_in_refinement_preflight_output():
     """BLOCKER 1: _invoke_repair result is included in preflight output as repair_diagnostics.
-
 
     When repair detects changes (changed=True), the result dict must contain
     a 'repair_diagnostics' key with the repair result.
@@ -466,9 +422,7 @@ Test outcome.
 ## Acceptance Criteria
 - [ ] AC1: test
 
-
 ## Verification Commands
-
 
 ```bash
 # AC1
@@ -494,7 +448,6 @@ schema: test/v1
     assert "changed" in result, "repair result must have 'changed' field"
 
 
-
 def test_invoke_repair_returns_dict():
     """BLOCKER 1 additional: _invoke_repair returns a dict even on unchanged body."""
     import sys
@@ -509,9 +462,7 @@ def test_invoke_repair_returns_dict():
     clean_body = """## Outcome
 Clean issue body with no defects.
 
-
 ## Verification Commands
-
 
 ```bash
 # AC1
@@ -523,8 +474,6 @@ $ test -f README.md
     assert result.get("schema") == "repair_issue_contract/v1"
     # Clean body should not have changes
     assert result.get("changed") is False
-
-
 
 
 
@@ -548,7 +497,6 @@ def _run_ric_899(body):
         _os.unlink(p)
 
 
-
 # Producer script path relative to the repository root. Its *existence* is the
 # deterministic root sentinel (Issue #3023): a stray/nested `.claude` directory
 # (e.g. `<root>/.claude/.claude/` or `<root>/.claude/skills/.../scripts/.claude/`)
@@ -557,15 +505,12 @@ def _run_ric_899(body):
 _BVP_SCRIPT_REL = ".claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py"
 
 
-
 class BvpHelperError(AssertionError):
     """Diagnosable failure of the baseline_vc_preflight.py test helper (Issue #3023)."""
 
 
-
 def _resolve_bvp_root(start=None):
     """Return the nearest ancestor of ``start`` that contains the real producer script.
-
 
     ``start`` is the search *starting point* (default: this test file); it is injectable
     so fixtures can point it at a real file inside a synthetic tree. This is deliberately
@@ -579,7 +524,6 @@ def _resolve_bvp_root(start=None):
         f"baseline_vc_preflight.py root not found: no ancestor of {origin} contains "
         f"{_BVP_SCRIPT_REL}"
     )
-
 
 
 def _invoke_bvp_899(root, body, strict=False):
@@ -625,11 +569,9 @@ def _invoke_bvp_899(root, body, strict=False):
         _os.unlink(p)
 
 
-
 def _run_bvp_899(body, strict=False, start=None):
     """Resolve the repository root once, then run the real producer with that same root as cwd."""
     return _invoke_bvp_899(_resolve_bvp_root(start), body, strict=strict)
-
 
 
 def _result_for_899(data, needle):
@@ -637,7 +579,6 @@ def _result_for_899(data, needle):
         if needle in (it.get("raw_command") or ""):
             return it
     return None
-
 
 
 def test_inline_baseline_expect_invalid():
@@ -651,7 +592,6 @@ def test_inline_baseline_expect_invalid():
     assert res["dry_run"] is True, res
 
 
-
 def test_quoted_literal_not_annotation():
     """AC18: a quoted literal '# baseline-expect:' inside a bash fence is NOT repaired."""
     body = (
@@ -661,7 +601,6 @@ def test_quoted_literal_not_annotation():
     res = _run_ric_899(body)
     mv = [r for r in res["repairs"] if r.get("kind") == "move_inline_baseline_expect_to_preceding_line"]
     assert len(mv) == 0, res
-
 
 
 def test_new_allowed_path_baseline_fail():
@@ -677,7 +616,6 @@ def test_new_allowed_path_baseline_fail():
     assert (it.get("repair") or {}).get("kind") == "insert_baseline_expect_fail", it
 
 
-
 def test_rg_exit2_new_file():
     """AC18: rg targeting a non-existent NEW Allowed Path file (rg would exit 2) is
     classified missing_baseline_expect_for_new_allowed_path in strict mode, distinct
@@ -688,7 +626,6 @@ def test_rg_exit2_new_file():
     it = _result_for_899(data, "rg-exit2-ac18-899.md")
     assert it is not None, data
     assert it["category"] == "missing_baseline_expect_for_new_allowed_path", it
-
 
 
 # ---------------------------------------------------------------------------
@@ -714,12 +651,6 @@ _BVP_RG_NEW_PATH_BODY = (
 )
 
 
-
-def _real_repo_root_for_bvp_fixture():
-    return _resolve_bvp_root()
-
-
-
 def _make_synthetic_bvp_tree(tmp_path, nested_rel):
     """Build `<tmp>/synth` holding real producer + its real import dependencies, plus a stray
     nested `.claude` directory at ``nested_rel``. Everything stays inside ``tmp_path``.
@@ -729,8 +660,7 @@ def _make_synthetic_bvp_tree(tmp_path, nested_rel):
     """
     import shutil as _sh
 
-
-    real = _real_repo_root_for_bvp_fixture()
+    real = _resolve_bvp_root()
     synth = tmp_path / "synth"
     bvp_dir = synth / Path(_BVP_SCRIPT_REL).parent
     bvp_dir.mkdir(parents=True)
@@ -754,7 +684,6 @@ def _make_synthetic_bvp_tree(tmp_path, nested_rel):
     return synth, start
 
 
-
 def _legacy_first_dot_claude_ancestor(start):
     """Re-implementation of the pre-#3023 heuristic, used only to prove the fixture is polluting."""
     root = Path(start).resolve()
@@ -763,24 +692,20 @@ def _legacy_first_dot_claude_ancestor(start):
     return root
 
 
-
 @pytest.mark.parametrize("placement", sorted(_BVP_NESTED_CLAUDE_PLACEMENTS))
 def test_bvp_root_resolution_ignores_nested_claude_resolves_real_producer(tmp_path, placement):
     """AC1: with either nested `.claude` placement, root resolution picks the synthetic repo
     root (not an intermediate ancestor) and a real, existing producer script inside it."""
     synth, start = _make_synthetic_bvp_tree(tmp_path, _BVP_NESTED_CLAUDE_PLACEMENTS[placement])
 
-
     # Fixture self-check: the legacy `.claude`-only heuristic would stop at a wrong ancestor.
     legacy = _legacy_first_dot_claude_ancestor(start)
     assert legacy != synth and not (legacy / _BVP_SCRIPT_REL).exists(), (legacy, synth)
-
 
     root = _resolve_bvp_root(start)
     assert root == synth.resolve()
     assert (root / _BVP_SCRIPT_REL).is_file()
     assert tmp_path.resolve() in root.parents
-
 
 
 @pytest.mark.parametrize("placement", sorted(_BVP_NESTED_CLAUDE_PLACEMENTS))
@@ -803,7 +728,6 @@ def test_bvp_root_resolution_ignores_nested_claude_runs_real_producer(tmp_path, 
     assert results[0].get("category") == "missing_baseline_expect_for_new_allowed_path", results[0]
 
 
-
 def test_bvp_root_resolution_ignores_nested_claude_cwd_is_resolved_root(tmp_path, monkeypatch):
     """AC2: the VC evaluation cwd is the resolved root, not the caller cwd. A same-named file
     that exists only under the caller cwd must not change the classification, and a file that
@@ -820,13 +744,11 @@ def test_bvp_root_resolution_ignores_nested_claude_cwd_is_resolved_root(tmp_path
     caller_only = _run_bvp_899(_BVP_NEW_PATH_BODY, strict=True, start=start)
     assert caller_only["results"][0]["category"] == "missing_baseline_expect_for_new_allowed_path", caller_only
 
-
     (synth / "docs/dev").mkdir(parents=True)
     (synth / rel).write_text("root-side\n", encoding="utf-8")
     (caller / rel).unlink()
     root_side = _run_bvp_899(_BVP_NEW_PATH_BODY, strict=True, start=start)
     assert root_side["results"][0]["category"] != "missing_baseline_expect_for_new_allowed_path", root_side
-
 
 
 def test_bvp_root_resolution_ignores_nested_claude_unresolvable_start_is_diagnosed(tmp_path):
@@ -840,13 +762,11 @@ def test_bvp_root_resolution_ignores_nested_claude_unresolvable_start_is_diagnos
     assert str(lonely.resolve()) in msg and _BVP_SCRIPT_REL in msg, msg
 
 
-
 def test_bvp_root_resolution_ignores_nested_claude_missing_script_is_diagnosed(tmp_path):
     """AC4: invoking against a root whose producer script is absent fails with the script path."""
     with pytest.raises(BvpHelperError) as ei:
         _invoke_bvp_899(tmp_path, "x")
     assert str(tmp_path / _BVP_SCRIPT_REL) in str(ei.value), str(ei.value)
-
 
 
 def _make_stub_bvp_root(tmp_path, stub_source):
@@ -855,7 +775,6 @@ def _make_stub_bvp_root(tmp_path, stub_source):
     script.parent.mkdir(parents=True)
     script.write_text(stub_source, encoding="utf-8")
     return root, script
-
 
 
 @pytest.mark.parametrize(
@@ -882,13 +801,11 @@ def test_bvp_root_resolution_ignores_nested_claude_abnormal_outputs_are_diagnose
     assert expected_fragment in msg, msg
 
 
-
 def test_bvp_root_resolution_ignores_nested_claude_expected_exit1_json_is_not_raised(tmp_path):
     """AC4: a producer exit 1 with valid blocked JSON is an expected response, not an error."""
     stub = "import json, sys\nprint(json.dumps({'status': 'blocked', 'results': []}))\nsys.exit(1)\n"
     root, _script = _make_stub_bvp_root(tmp_path, stub)
     assert _invoke_bvp_899(root, "x") == {"status": "blocked", "results": []}
-
 
 
 def test_insert_baseline_expect_fail_for_new_allowed_path():
@@ -910,17 +827,14 @@ def test_insert_baseline_expect_fail_for_new_allowed_path():
     assert res["dry_run"] is True, res
 
 
-
 # ---------------------------------------------------------------------------
 # Issue #2016 iteration-3 (OWNER adversarial review P0-2): candidate body
 # materialization leaf/parent-symlink attack rejection.
 # ---------------------------------------------------------------------------
 
 
-
 def _import_ric():
     import sys as _sys
-
 
     scripts_dir = Path(__file__).resolve().parents[1]
     if str(scripts_dir) not in _sys.path:
@@ -928,7 +842,6 @@ def _import_ric():
     import repair_issue_contract as _ric
 
     return _ric
-
 
 
 def test_candidate_leaf_symlink_is_rejected_without_target_write(tmp_path):
@@ -940,7 +853,6 @@ def test_candidate_leaf_symlink_is_rejected_without_target_write(tmp_path):
 
     victim = tmp_path / "victim.txt"
     victim.write_text("do-not-touch", encoding="utf-8")
-
 
     artifact_dir = tmp_path / "artifacts"
     artifact_dir.mkdir()
@@ -961,7 +873,6 @@ def test_candidate_leaf_symlink_is_rejected_without_target_write(tmp_path):
     assert leaf.is_symlink()
 
 
-
 def test_candidate_parent_symlink_is_rejected(tmp_path):
     """P0-2: a symlinked ancestor directory between the candidate leaf and
     the allowed artifact root must be rejected -- not just a symlinked
@@ -973,14 +884,11 @@ def test_candidate_parent_symlink_is_rejected(tmp_path):
     outside_target = tmp_path / "outside_dir"
     outside_target.mkdir()
 
-
     # artifact_dir/subdir is actually a symlink pointing OUTSIDE real_root.
     symlinked_subdir = real_root / "subdir"
     symlinked_subdir.symlink_to(outside_target)
 
-
     leaf = symlinked_subdir / "repaired_issue_body.md"
-
 
     try:
         ric.secure_atomic_write_candidate(leaf, "malicious content", root=real_root)
@@ -988,10 +896,8 @@ def test_candidate_parent_symlink_is_rejected(tmp_path):
     except ric.CandidateWriteSecurityError:
         raised = True
 
-
     assert raised, "expected CandidateWriteSecurityError for a symlinked ancestor directory"
     assert not (outside_target / "repaired_issue_body.md").exists()
-
 
 
 def test_candidate_fifo_leaf_is_rejected(tmp_path):
@@ -1006,23 +912,19 @@ def test_candidate_fifo_leaf_is_rejected(tmp_path):
     leaf = artifact_dir / "repaired_issue_body.md"
     _os.mkfifo(leaf)
 
-
     try:
         ric.secure_atomic_write_candidate(leaf, "content", root=artifact_dir)
         raised = False
     except ric.CandidateWriteSecurityError:
         raised = True
 
-
     assert raised, "expected CandidateWriteSecurityError for a FIFO leaf"
-
 
 
 def test_candidate_directory_leaf_is_rejected(tmp_path):
     """P0-2 (required test 6): a directory at the candidate leaf path
     (directory substitution) must be rejected."""
     ric = _import_ric()
-
 
     artifact_dir = tmp_path / "artifacts"
     artifact_dir.mkdir()
@@ -1039,20 +941,16 @@ def test_candidate_directory_leaf_is_rejected(tmp_path):
     assert leaf.is_dir()
 
 
-
 def test_secure_atomic_write_candidate_succeeds_for_clean_path(tmp_path):
     """P0-2 sanity check: the secure writer still works normally (writes,
     fsyncs, and readback-matches) when there is no attack in play."""
     ric = _import_ric()
 
-
     artifact_dir = tmp_path / "artifacts"
     artifact_dir.mkdir()
     leaf = artifact_dir / "repaired_issue_body.md"
 
-
     ric.secure_atomic_write_candidate(leaf, "clean content", root=artifact_dir)
-
 
     assert leaf.read_text(encoding="utf-8") == "clean content"
     assert not leaf.is_symlink()
@@ -1060,7 +958,6 @@ def test_secure_atomic_write_candidate_succeeds_for_clean_path(tmp_path):
     # Idempotent overwrite of an existing regular file must also succeed.
     ric.secure_atomic_write_candidate(leaf, "clean content v2", root=artifact_dir)
     assert leaf.read_text(encoding="utf-8") == "clean content v2"
-
 
 
 def test_extract_allowed_paths_no_path_marker_returns_empty():
@@ -1071,7 +968,6 @@ def test_extract_allowed_paths_no_path_marker_returns_empty():
     non-empty "path" strings)."""
     ric = _import_ric()
 
-
     body_canonical = "## Allowed Paths\n\n- (none)\n"
     assert ric._extract_allowed_paths_ric(body_canonical) == []
 
@@ -1079,15 +975,12 @@ def test_extract_allowed_paths_no_path_marker_returns_empty():
     assert ric._extract_allowed_paths_ric(body_legacy) == []
 
 
-
 # ===========================================================================
 # Issue #3020: `baseline-expect: deferred` misused as a pr_review_only stand-in
 # for a pytest VC -> annotation-line-only repair, classified auto_apply_safe.
 # ===========================================================================
 
-
 _T3020_TEST_PATH = ".claude/skills/example/tests/test_example_3020.py"
-
 
 
 def _t3020_body(vc_block: str, allowed: list[str] | None = None) -> str:
@@ -1102,20 +995,16 @@ def _t3020_body(vc_block: str, allowed: list[str] | None = None) -> str:
     )
 
 
-
 _T3020_DEFERRED_CMD = f'uv run --locked pytest {_T3020_TEST_PATH} -q -k "deferred and new_case"'
 _T3020_DEFERRED_VC = f"# AC1\n# baseline-expect: deferred\n$ {_T3020_DEFERRED_CMD}"
-
 
 
 def _t3020_deferred_repairs(res: dict) -> list[dict]:
     return [r for r in res["repairs"] if r.get("kind") == "deferred_to_pr_review_only"]
 
 
-
 def _t3020_commands(body: str) -> list[str]:
     return [ln for ln in body.splitlines() if ln.startswith("$ ")]
-
 
 
 def _t3020_apply_repair(body: str, tmp_path: Path) -> tuple[dict, str]:
@@ -1123,7 +1012,6 @@ def _t3020_apply_repair(body: str, tmp_path: Path) -> tuple[dict, str]:
     out_file = tmp_path / "repaired.md"
     res = ric.run_repair(body, apply=True, out_file=str(out_file), root_dir=str(tmp_path))
     return res, out_file.read_text(encoding="utf-8")
-
 
 
 def test_deferred_pr_review_only_auto_apply_safe_high_confidence():
@@ -1144,7 +1032,6 @@ def test_deferred_pr_review_only_auto_apply_safe_high_confidence():
     assert res["dry_run"] is True
 
 
-
 def test_deferred_pr_review_only_auto_apply_changes_annotation_line_only(tmp_path):
     """The command line and AC marker are byte-identical; only the annotation line changes."""
     body = _t3020_body(_T3020_DEFERRED_VC)
@@ -1155,7 +1042,6 @@ def test_deferred_pr_review_only_auto_apply_changes_annotation_line_only(tmp_pat
     diff = [(a, b) for a, b in zip(old_lines, new_lines) if a != b]
     assert diff == [("# baseline-expect: deferred", "# preflight-scope: pr_review_only")]
     assert _t3020_commands(repaired) == _t3020_commands(body) == [f"$ {_T3020_DEFERRED_CMD}"]
-
 
 
 def test_deferred_pr_review_only_auto_apply_idempotent(tmp_path):
@@ -1172,11 +1058,9 @@ def test_deferred_pr_review_only_auto_apply_idempotent(tmp_path):
     assert res2["repair_action"]["disposition"] == "informational"
 
 
-
 def test_deferred_pr_review_only_auto_apply_body_hash_changes_command_hash_does_not(tmp_path):
     """AC3: an annotation-only change moves the body hash but not the command hash."""
     import hashlib
-
 
     body = _t3020_body(_T3020_DEFERRED_VC)
     res, repaired = _t3020_apply_repair(body, tmp_path)
@@ -1186,10 +1070,8 @@ def test_deferred_pr_review_only_auto_apply_body_hash_changes_command_hash_does_
     def _cmd_hashes(text: str) -> list[str]:
         return [hashlib.sha256(c[2:].encode("utf-8")).hexdigest() for c in _t3020_commands(text)]
 
-
     assert _cmd_hashes(body) == _cmd_hashes(repaired)
     assert len(_cmd_hashes(body)) == 1
-
 
 
 def test_deferred_pr_review_only_auto_apply_accepted_by_preflight_result_validator(tmp_path):
@@ -1202,10 +1084,8 @@ def test_deferred_pr_review_only_auto_apply_accepted_by_preflight_result_validat
         _sys.path.insert(0, str(scripts_dir))
     import run_refinement_preflight as rrp
 
-
     res = run_repair(_t3020_body(_T3020_DEFERRED_VC))
     assert rrp._validate_repair_result_schema_and_semantics(res) is None
-
 
 
 def test_deferred_pr_review_only_auto_apply_producer_classification_flips(tmp_path):
@@ -1223,7 +1103,6 @@ def test_deferred_pr_review_only_auto_apply_producer_classification_flips(tmp_pa
     assert before["raw_command"] == after["raw_command"]
 
 
-
 def test_deferred_pr_review_only_auto_apply_via_repair_action_apply_consumer(tmp_path):
     """AC3: the repaired body reaches the existing `run_repair_action_apply()` consumer (which
     dispatches via the edit_issue_txn controlled-transaction closure) with commands preserved."""
@@ -1234,7 +1113,6 @@ def test_deferred_pr_review_only_auto_apply_via_repair_action_apply_consumer(tmp
     if str(scripts_dir) not in _sys.path:
         _sys.path.insert(0, str(scripts_dir))
     import run_refinement_preflight as rrp
-
 
     original = _t3020_body(_T3020_DEFERRED_VC)
     artifact_dir = tmp_path / ".claude" / "artifacts" / "issue-refinement-loop" / "3020"
@@ -1258,9 +1136,7 @@ def test_deferred_pr_review_only_auto_apply_via_repair_action_apply_consumer(tmp
         "result_core_sha256": "sha256:testrun",
     }))
 
-
     dispatched: list[str] = []
-
 
     def _apply_txn(current_issue: dict, candidate_body: str) -> dict:
         dispatched.append(candidate_body)
@@ -1282,7 +1158,6 @@ def test_deferred_pr_review_only_auto_apply_via_repair_action_apply_consumer(tmp
     def _fetch() -> dict:
         return {"body": next(bodies), "updatedAt": "2024-01-01T00:00:00Z"}
 
-
     result = rrp.run_repair_action_apply(
         repo="squne121/loop-protocol",
         issue_number=3020,
@@ -1297,7 +1172,6 @@ def test_deferred_pr_review_only_auto_apply_via_repair_action_apply_consumer(tmp
     assert _t3020_commands(dispatched[0]) == _t3020_commands(original)
     assert "# preflight-scope: pr_review_only" in dispatched[0]
     assert "baseline-expect: deferred" not in dispatched[0]
-
 
 
 
@@ -1337,7 +1211,6 @@ _T3020_OUT_OF_CONDITION_CASES = {
 }
 
 
-
 def test_deferred_out_of_condition_vc_is_not_rewritten_nor_human_review():
     """Out-of-condition `deferred` VCs are left byte-identical, and this defect is never turned
     into a human_review_required classification."""
@@ -1351,18 +1224,15 @@ def test_deferred_out_of_condition_vc_is_not_rewritten_nor_human_review():
         assert res["repair_action"]["disposition"] == "informational", name
 
 
-
 def test_deferred_in_condition_mixed_with_out_of_condition_only_rewrites_in_condition(tmp_path):
     """A body with one in-condition and one out-of-condition deferred VC rewrites only the former."""
     other = "# AC2\n# baseline-expect: deferred\n$ pnpm test:unit"
     body = _t3020_body(_T3020_DEFERRED_VC + "\n" + other)
     res, repaired = _t3020_apply_repair(body, tmp_path)
 
-
     assert len(_t3020_deferred_repairs(res)) == 1
     assert "# AC2\n# baseline-expect: deferred\n$ pnpm test:unit" in repaired
     assert _t3020_commands(repaired) == _t3020_commands(body)
-
 
 
 def test_deferred_unknown_repair_kind_still_human_review_and_pnpm_gate_not_deferred():
@@ -1376,7 +1246,6 @@ def test_deferred_unknown_repair_kind_still_human_review_and_pnpm_gate_not_defer
     assert action["disposition"] == "human_review_required"
     assert "unknown_repair_kind" in action["reason_codes"]
 
-
     safe = ric.classify_repair_action(
         "a", "b",
         [{"kind": "deferred_to_pr_review_only", "line_start": 1, "line_end": 1, "confidence": "high"}],
@@ -1387,18 +1256,15 @@ def test_deferred_unknown_repair_kind_still_human_review_and_pnpm_gate_not_defer
     )
     assert no_conf["disposition"] == "human_review_required"
 
-
     for gate in ("pnpm typecheck", "pnpm lint", "pnpm test", "pnpm build"):
         res = run_repair(_t3020_body(f"# AC1\n# baseline-expect: deferred\n$ {gate}", None))
         assert _t3020_deferred_repairs(res) == [], gate
         assert "# preflight-scope" not in "\n".join(r["repaired"] for r in res["repairs"]), gate
 
 
-
 # ===========================================================================
 # Issue #3020 OWNER REQUEST_CHANGES P2-1 / P2-2 regressions.
 # ===========================================================================
-
 
 _T3020_PYTEST_LAUNCHER_POSITIVE = [
     "pytest",
@@ -1415,7 +1281,6 @@ _T3020_PYTEST_LAUNCHER_POSITIVE = [
 ]
 
 
-
 def test_deferred_pytest_launcher_positive_forms_are_rewritten():
     """P2-1: every real pytest launcher form used by existing VCs is recognised as a pytest VC."""
     for launcher in _T3020_PYTEST_LAUNCHER_POSITIVE:
@@ -1423,7 +1288,6 @@ def test_deferred_pytest_launcher_positive_forms_are_rewritten():
         res = run_repair(body)
         assert len(_t3020_deferred_repairs(res)) == 1, (launcher, res)
         assert res["repair_action"]["disposition"] == "auto_apply_safe", launcher
-
 
 
 def test_deferred_pytest_token_not_at_launcher_position_is_not_a_pytest_vc():
@@ -1452,7 +1316,6 @@ def test_deferred_pytest_token_not_at_launcher_position_is_not_a_pytest_vc():
             assert res["repair_action"]["disposition"] != "human_review_required", cmd
 
 
-
 def test_pytest_test_file_targets_unit():
     ric = _import_ric()
     f = ric._pytest_test_file_targets
@@ -1463,9 +1326,7 @@ def test_pytest_test_file_targets_unit():
     assert f("") is None
 
 
-
 _T3020_INLINE_DEFERRED_CMD = f"pytest {_T3020_TEST_PATH}"
-
 
 
 def test_inline_deferred_pytest_chain_is_one_consistent_auto_apply_safe_repair(tmp_path):
@@ -1474,7 +1335,6 @@ def test_inline_deferred_pytest_chain_is_one_consistent_auto_apply_safe_repair(t
     treat it as ONE consistent original->final repair: auto_apply_safe, not overlapping_repair."""
     ric = _import_ric()
     body = _t3020_body(f"# AC1\n$ {_T3020_INLINE_DEFERRED_CMD} # baseline-expect: deferred")
-
 
     repaired, repairs = ric.repair_body(body)
     action = ric.classify_repair_action("a", "b", repairs)
@@ -1500,7 +1360,6 @@ def test_inline_deferred_pytest_chain_is_one_consistent_auto_apply_safe_repair(t
     assert section_lines[vc_idx + rec["line_start"] - 1] == "# preflight-scope: pr_review_only"
 
 
-
 def test_inline_deferred_pytest_chain_end_to_end_idempotent(tmp_path):
     ric = _import_ric()
     body = _t3020_body(f"# AC1\n$ {_T3020_INLINE_DEFERRED_CMD} # baseline-expect: deferred")
@@ -1513,7 +1372,6 @@ def test_inline_deferred_pytest_chain_end_to_end_idempotent(tmp_path):
     assert res2["repaired_body_sha256"] == res1["repaired_body_sha256"]
     assert res2["repairs"] == []
     assert res2["repair_action"]["disposition"] == "informational"
-
 
 
 def test_inline_deferred_pytest_chain_multiple_vcs_and_unrelated_inline(tmp_path):
@@ -1544,7 +1402,6 @@ def test_inline_deferred_pytest_chain_multiple_vcs_and_unrelated_inline(tmp_path
     assert [r for r in again_repairs if r["kind"] == "deferred_to_pr_review_only"] == []
 
 
-
 def test_inline_deferred_chain_out_of_condition_keeps_plain_inline_move():
     """P2-2: when the chain is not eligible for pr_review_only (non-pytest), only the ordinary
     inline-move repair remains (annotation stays `deferred`); it is still auto_apply_safe."""
@@ -1553,7 +1410,6 @@ def test_inline_deferred_chain_out_of_condition_keeps_plain_inline_move():
     repaired, repairs = ric.repair_body(body)
     assert [r["kind"] for r in repairs] == ["move_inline_baseline_expect_to_preceding_line"]
     assert "# baseline-expect: deferred\n$ rg" in repaired
-
 
 
 def test_overlapping_independent_repairs_are_still_rejected():
@@ -1578,7 +1434,6 @@ def test_overlapping_independent_repairs_are_still_rejected():
 # baseline_vc_preflight.py (no mocks).
 # ---------------------------------------------------------------------------
 
-
 # scripts dir is <repo>/.claude/skills/issue-refinement-loop/scripts, so the
 # repo root is parents[3]. Derived structurally (not by walking up to the first
 # ancestor that contains a ``.claude`` dir) to avoid nested-.claude
@@ -1593,16 +1448,13 @@ _VC_SYNTAX_3024 = _CONTRACT_REVIEW_SCRIPTS_3024 / "vc_contract_syntax.py"
 _CANONICAL_MARKER_3024 = "# preflight-scope: pr_review_only"
 _LEGACY_MARKER_3024 = "# preflight-scope: pr_review_only reason=runtime_only_command"
 
-
 _UNANNOTATED_BODY_3024 = """## Verification Commands
-
 
 ```bash
 # AC1
 $ pnpm test:e2e
 ```
 """
-
 
 
 def _load_module_3024(unique_name: str, path: Path):
@@ -1616,7 +1468,6 @@ def _load_module_3024(unique_name: str, path: Path):
     sys.modules[unique_name] = module
     spec.loader.exec_module(module)
     return module
-
 
 
 def _real_repair_cli_3024(body: str, tmp_path: Path, name: str) -> tuple[dict, str]:
@@ -1647,10 +1498,8 @@ def _real_repair_cli_3024(body: str, tmp_path: Path, name: str) -> tuple[dict, s
     return data, out_file.read_text(encoding="utf-8")
 
 
-
 def _marker_lines_3024(body: str) -> list[str]:
     return [ln.strip() for ln in body.splitlines() if ln.strip().startswith("# preflight-scope:")]
-
 
 
 def _real_baseline_preflight_3024(body: str, tmp_path: Path, name: str) -> dict:
@@ -1675,7 +1524,6 @@ def _real_baseline_preflight_3024(body: str, tmp_path: Path, name: str) -> dict:
         f"baseline_vc_preflight failed rc={proc.returncode} stderr={proc.stderr!r}"
     )
     return json.loads(proc.stdout)
-
 
 
 def test_runtime_only_marker_real_preflight_classifies_pr_review_only(tmp_path):
@@ -1704,7 +1552,6 @@ def test_runtime_only_marker_real_preflight_classifies_pr_review_only(tmp_path):
     assert data["summary"]["human_judgment"] == 0, data["summary"]
 
 
-
 def test_runtime_only_marker_real_parser_returns_canonical_known(tmp_path):
     """AC2: marker line extracted from the real repair output parses to exactly ('pr_review_only', True)."""
     _result, candidate = _real_repair_cli_3024(_UNANNOTATED_BODY_3024, tmp_path, "ac2")
@@ -1712,7 +1559,6 @@ def test_runtime_only_marker_real_parser_returns_canonical_known(tmp_path):
     assert len(markers) == 1, candidate
     syntax = _load_module_3024("vc_contract_syntax_3024_real_parser", _VC_SYNTAX_3024)
     assert syntax.parse_preflight_scope_marker_line(markers[0]) == ("pr_review_only", True)
-
 
 
 def test_runtime_only_marker_roundtrip_idempotent_on_real_output(tmp_path):
@@ -1732,7 +1578,6 @@ def test_runtime_only_marker_roundtrip_idempotent_on_real_output(tmp_path):
     assert [r for r in second["repairs"] if r["kind"] == "runtime_only_command"] == []
 
 
-
 def test_runtime_only_marker_repair_reason_still_recorded(tmp_path):
     """AC4: repairs[].reason is preserved as an independent field, not in the marker line."""
     result, candidate = _real_repair_cli_3024(_UNANNOTATED_BODY_3024, tmp_path, "reason")
@@ -1742,7 +1587,6 @@ def test_runtime_only_marker_repair_reason_still_recorded(tmp_path):
     assert "pnpm test:e2e" in runtime_repairs[0]["reason"]
     assert "reason=" not in candidate
     assert "reason=" not in runtime_repairs[0]["repaired"]
-
 
 
 def test_runtime_only_marker_existing_canonical_preserved(tmp_path):
@@ -1755,7 +1599,6 @@ def test_runtime_only_marker_existing_canonical_preserved(tmp_path):
     assert result["changed"] is False, result
     assert candidate == body
     assert [r for r in result["repairs"] if r["kind"] == "runtime_only_command"] == []
-
 
 
 def test_runtime_only_marker_legacy_suffix_preserved(tmp_path):
