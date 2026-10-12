@@ -788,11 +788,16 @@ def _closed_quoted_current_suffix(sentence: str) -> str | None:
     if span is None or span[1] is None:
         return None
     remainder = sentence[span[1]:]
+    semicolon = re.match(r"\s*[;；]\s*(?:Current\s+requirement\s*:\s*)?", remainder, re.I)
+    if semicolon:
+        # The delimiter ends the historical quote; classify each following
+        # clause normally so a negative local clause cannot hide a later one.
+        return remainder[semicolon.end():].strip()
     transition = re.match(
         r"(?:\s+Now\s+(?=(?:verify|check|validate|compare|confirm)\b)|"
-        r"\s*[;；]\s*Current\s+requirement\s*:\s*"
-        r"(?=(?:verify|check|validate|compare|confirm)\b)|"
         r"\s*,\s*and\s+now\s+(?=(?:verify|check|validate|compare|confirm)\b)|"
+        r"\s*,?\s*(?:but|however|yet)\s+now\s+"
+        r"(?=(?:verify|check|validate|compare|confirm)\b)|"
         r"\s*,?\s*(?:but|however|yet)\s+(?=current\b))",
         remainder, re.I,
     )
@@ -815,9 +820,18 @@ def _claim_sentences(line: str) -> list[str]:
     if span is not None and span[1] is None:
         sentences = [line]
     else:
-        sentences = [part.strip() for part in re.split(
-            r"(?<=[。！？])|(?<=[.!?])\s+(?=[A-Z])", line, flags=re.I,
-        ) if part.strip()]
+        sentences = []
+        start = 0
+        for boundary in re.finditer(r"(?<=[。！？])|(?<=[.!?])\s+(?=[A-Z])", line, re.I):
+            if span is not None and span[0] <= boundary.start() < span[1]:
+                continue
+            part = line[start:boundary.start()].strip()
+            if part:
+                sentences.append(part)
+            start = boundary.end()
+        part = line[start:].strip()
+        if part:
+            sentences.append(part)
     split_sentences = []
     for sentence in sentences:
         # Only a closed quotation followed by an explicit current transition

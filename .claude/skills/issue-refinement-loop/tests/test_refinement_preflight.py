@@ -1707,6 +1707,10 @@ def test_repo_local_no_web_preflight_handoff_preserves_unverified_anchor_warning
     " Now verify current GitHub GraphQL errors against official docs before approval.",
     "; Current requirement: verify current GitHub GraphQL errors against official docs before approval.",
     ", and now verify current GitHub GraphQL errors against official docs before approval.",
+    "; Verify current GitHub GraphQL errors against official docs before approval.",
+    "; GitHub GraphQL errors must match official docs before approval.",
+    "; Do not verify local fixtures; GitHub GraphQL errors must match official docs before approval.",
+    ", but now verify current GitHub GraphQL errors against official docs before approval.",
 ])
 def test_closed_past_quote_and_current_anchor_keep_web_warning(tmp_path, continuation):
     anchor = ("## Revised AC\n- AC2: Earlier reviewer wrote: "
@@ -1741,7 +1745,7 @@ def test_closed_past_quote_and_current_anchor_keep_web_warning(tmp_path, continu
     assert policy["required"] is True
     assert len(policy["critical_external_claims"]) == 1
     claim = policy["critical_external_claims"][0]
-    assert "current GitHub GraphQL errors" in claim["claim"]
+    assert "GitHub GraphQL errors" in claim["claim"]
     assert "Earlier reviewer wrote" not in claim["claim"]
     assert claim["source_hint"] == "comment_7" and claim["role"] == "dispositive"
     assert (result["status"], exit_code) == ("warn", wrapper.EXIT_WARN)
@@ -1924,6 +1928,8 @@ def test_noun_start_external_anchor_cannot_clear_no_web_warning(tmp_path, phrase
     "against official docs before approval.",
     "Previously quoted: Do not verify local fixtures, but verify GitHub GraphQL "
     "errors against official docs before approval.",
+    "Earlier reviewer wrote: `Verify GitHub GraphQL errors against official docs. "
+    "Now verify current GitHub GraphQL errors against official docs before approval.`",
     "Earlier reviewer wrote: `Verify GitHub GraphQL errors against official docs.` "
     "This is a historical quote, not a current request.",
     "Check the official GraphQL specification fixture in repository tests.",

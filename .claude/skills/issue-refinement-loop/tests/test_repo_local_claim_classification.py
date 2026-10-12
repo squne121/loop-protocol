@@ -350,6 +350,10 @@ def test_earlier_reviewer_inline_quote_is_not_a_current_request():
     " Now verify current GitHub GraphQL errors against official docs before approval.",
     "; Current requirement: verify current GitHub GraphQL errors against official docs before approval.",
     ", and now verify current GitHub GraphQL errors against official docs before approval.",
+    "; Verify current GitHub GraphQL errors against official docs before approval.",
+    "; GitHub GraphQL errors must match official docs before approval.",
+    "; Do not verify local fixtures; GitHub GraphQL errors must match official docs before approval.",
+    ", but now verify current GitHub GraphQL errors against official docs before approval.",
 ])
 def test_closed_past_quote_preserves_following_current_request(continuation):
     quoted = "Earlier reviewer wrote: `Verify GitHub GraphQL errors against official docs.`"
@@ -358,9 +362,16 @@ def test_closed_past_quote_preserves_following_current_request(continuation):
     assert policy["required"] is True
     assert len(policy["critical_external_claims"]) == 1
     claim = policy["critical_external_claims"][0]
-    assert "current GitHub GraphQL errors" in claim["claim"]
+    assert "GitHub GraphQL errors" in claim["claim"]
     assert "Earlier reviewer wrote" not in claim["claim"]
     assert claim["source_hint"] == "comment_99" and claim["role"] == "dispositive"
+
+
+def test_closed_past_quote_internal_now_remains_historical():
+    quoted = ("Earlier reviewer wrote: `Verify GitHub GraphQL errors against official docs. "
+              "Now verify current GitHub GraphQL errors against official docs before approval.`")
+    policy = _web(_plan(_body(), [{"id": 99, "body": quoted}]))
+    assert policy["required"] is False and policy["critical_external_claims"] == []
 
 
 def test_closed_past_quote_alone_is_not_a_current_request():
@@ -374,6 +385,8 @@ def test_closed_past_quote_alone_is_not_a_current_request():
      "Now verify current GitHub GraphQL errors against official docs before approval."),
     ("Earlier reviewer wrote: `Verify GitHub GraphQL errors against official docs.` "
      "Now do not verify current GitHub GraphQL errors against official docs before approval."),
+    ("Earlier reviewer wrote: `Verify GitHub GraphQL errors against official docs.`; "
+     "Do not verify GitHub GraphQL errors against official docs before approval."),
     ("Earlier reviewer wrote: `Verify GitHub GraphQL errors against official docs.` "
      "This historical quote is not a current request."),
 ])
