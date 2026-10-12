@@ -764,6 +764,41 @@ def _split_repo_local_without(sentence: str) -> list[str]:
     return [sentence]
 
 
+def _past_quote_span(sentence: str) -> tuple[int, int | None] | None:
+    cue = _QUOTED_CONTEXT_RE.search(sentence)
+    if not cue:
+        return None
+    if cue.group()[-1] in "`\"'“‘«「『":
+        opener = cue.group()[-1]
+        quote_start = cue.end()
+    else:
+        opening = re.match(r"\s*([`\"'“‘«「『])", sentence[cue.end():])
+        if not opening:
+            return None
+        opener = opening.group(1)
+        quote_start = cue.end() + opening.end()
+    closer = {"“": "”", "‘": "’", "«": "»", "「": "」", "『": "』"}.get(opener, opener)
+    closing = re.search(r"(?<!\\)" + re.escape(closer), sentence[quote_start:])
+    return quote_start, quote_start + closing.end() if closing else None
+
+
+def _closed_quoted_current_suffix(sentence: str) -> str | None:
+    """Return an independent current clause after a closed historical quote."""
+    span = _past_quote_span(sentence)
+    if span is None or span[1] is None:
+        return None
+    remainder = sentence[span[1]:]
+    transition = re.match(
+        r"(?:\s+Now\s+(?=(?:verify|check|validate|compare|confirm)\b)|"
+        r"\s*[;；]\s*Current\s+requirement\s*:\s*"
+        r"(?=(?:verify|check|validate|compare|confirm)\b)|"
+        r"\s*,\s*and\s+now\s+(?=(?:verify|check|validate|compare|confirm)\b)|"
+        r"\s*,?\s*(?:but|however|yet)\s+(?=current\b))",
+        remainder, re.I,
+    )
+    return remainder[transition.end():].strip() if transition else None
+
+
 def _claim_sentences(line: str) -> list[str]:
     """Split independent requests without losing quoted sentence context.
 
@@ -776,21 +811,20 @@ def _claim_sentences(line: str) -> list[str]:
         lambda match: " " if _QUOTED_CONTEXT_RE.search(match.group()) else match.group(),
         line,
     )
-    sentences = [part.strip() for part in re.split(
-        r"(?<=[。！？])|(?<=[.!?])\s+(?=[A-Z])", line, flags=re.I,
-    ) if part.strip()]
+    span = _past_quote_span(line)
+    if span is not None and span[1] is None:
+        sentences = [line]
+    else:
+        sentences = [part.strip() for part in re.split(
+            r"(?<=[。！？])|(?<=[.!?])\s+(?=[A-Z])", line, flags=re.I,
+        ) if part.strip()]
     split_sentences = []
     for sentence in sentences:
-        # A closed past quotation can precede an independent current request.
-        # Do not treat the quoted fragment itself as a directive.
-        quoted_current = re.search(
-            r"(?:[\"'`”’»」』])\s*,?\s+(?:but|however|yet)\s+(?=current\b)",
-            sentence, re.I,
-        )
-        if _QUOTED_CONTEXT_RE.search(sentence) and quoted_current:
-            sentence = sentence[quoted_current.end():].strip()
-        # A past quote spans contrasting clauses up to the sentence boundary;
-        # a following independent sentence can still request current research.
+        # Only a closed quotation followed by an explicit current transition
+        # can release the suffix from the historical-quote exclusion.
+        current_suffix = _closed_quoted_current_suffix(sentence)
+        if current_suffix is not None:
+            sentence = current_suffix
         if _QUOTED_CONTEXT_RE.search(sentence):
             split_sentences.append(sentence)
             continue

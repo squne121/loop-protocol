@@ -346,6 +346,42 @@ def test_earlier_reviewer_inline_quote_is_not_a_current_request():
     assert "Earlier reviewer wrote" not in inline["critical_external_claims"][0]["claim"]
 
 
+@pytest.mark.parametrize("continuation", [
+    " Now verify current GitHub GraphQL errors against official docs before approval.",
+    "; Current requirement: verify current GitHub GraphQL errors against official docs before approval.",
+    ", and now verify current GitHub GraphQL errors against official docs before approval.",
+])
+def test_closed_past_quote_preserves_following_current_request(continuation):
+    quoted = "Earlier reviewer wrote: `Verify GitHub GraphQL errors against official docs.`"
+    comment = quoted + continuation
+    policy = _web(_plan(_body(), [{"id": 99, "body": comment}]))
+    assert policy["required"] is True
+    assert len(policy["critical_external_claims"]) == 1
+    claim = policy["critical_external_claims"][0]
+    assert "current GitHub GraphQL errors" in claim["claim"]
+    assert "Earlier reviewer wrote" not in claim["claim"]
+    assert claim["source_hint"] == "comment_99" and claim["role"] == "dispositive"
+
+
+def test_closed_past_quote_alone_is_not_a_current_request():
+    quoted = "Earlier reviewer wrote: `Verify GitHub GraphQL errors against official docs.`"
+    policy = _web(_plan(_body(), [{"id": 99, "body": quoted}]))
+    assert policy["required"] is False and policy["critical_external_claims"] == []
+
+
+@pytest.mark.parametrize("comment", [
+    ("Earlier reviewer wrote: `Verify GitHub GraphQL errors against official docs. "
+     "Now verify current GitHub GraphQL errors against official docs before approval."),
+    ("Earlier reviewer wrote: `Verify GitHub GraphQL errors against official docs.` "
+     "Now do not verify current GitHub GraphQL errors against official docs before approval."),
+    ("Earlier reviewer wrote: `Verify GitHub GraphQL errors against official docs.` "
+     "This historical quote is not a current request."),
+])
+def test_unclosed_or_negated_past_quote_does_not_create_current_request(comment):
+    policy = _web(_plan(_body(), [{"id": 99, "body": comment}]))
+    assert policy["required"] is False and policy["critical_external_claims"] == []
+
+
 def test_out_of_scope_negative_rate_limit_is_not_external_specification():
     """GIVEN #1659's negative scope line WHEN planned THEN web remains optional."""
     body = _body(out_of_scope="- GitHub API rate-limit policy 全体の変更")

@@ -1703,6 +1703,51 @@ def test_repo_local_no_web_preflight_handoff_preserves_unverified_anchor_warning
     assert result["must_read"] == ["scripts/example.py"]
 
 
+@pytest.mark.parametrize("continuation", [
+    " Now verify current GitHub GraphQL errors against official docs before approval.",
+    "; Current requirement: verify current GitHub GraphQL errors against official docs before approval.",
+    ", and now verify current GitHub GraphQL errors against official docs before approval.",
+])
+def test_closed_past_quote_and_current_anchor_keep_web_warning(tmp_path, continuation):
+    anchor = ("## Revised AC\n- AC2: Earlier reviewer wrote: "
+              "`Verify GitHub GraphQL errors against official docs.`" + continuation + "\n")
+    fixture, anchor_url = _ac8_repo_local_anchor_fixture(anchor)
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+    invoke = wrapper._invoke_planner
+    observed = []
+
+    def observe_planner(planner_input, **kwargs):
+        result = invoke(planner_input, **kwargs)
+        observed.append((planner_input, result[0]))
+        return result
+
+    with (
+        mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path),
+        mock.patch.object(wrapper, "_invoke_planner", side_effect=observe_planner),
+    ):
+        result, exit_code = wrapper.run_preflight(
+            issue_number=2857, repo="testowner/testrepo",
+            anchor_comment_urls=[anchor_url], fixture_path=fixture_path,
+        )
+
+    assert len(observed) == 2
+    sanitized, sanitized_plan = observed[0]
+    full, full_plan = observed[1]
+    assert sanitized["comments"][0]["body"] == "[redacted: anchor comment snapshot stored in artifact]"
+    assert full["comments"][0]["body"] == anchor
+    assert sanitized_plan["decisions"]["web_research_policy"]["required"] is False
+    policy = full_plan["decisions"]["web_research_policy"]
+    assert policy["required"] is True
+    assert len(policy["critical_external_claims"]) == 1
+    claim = policy["critical_external_claims"][0]
+    assert "current GitHub GraphQL errors" in claim["claim"]
+    assert "Earlier reviewer wrote" not in claim["claim"]
+    assert claim["source_hint"] == "comment_7" and claim["role"] == "dispositive"
+    assert (result["status"], exit_code) == ("warn", wrapper.EXIT_WARN)
+    assert result["next_action"] == "proceed_with_notes"
+
+
 @pytest.mark.parametrize(
     "phrase,expected",
     [
