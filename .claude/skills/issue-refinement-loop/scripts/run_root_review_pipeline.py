@@ -341,7 +341,8 @@ def resolve_external_scratch_parent() -> str:
     candidates.extend(("/tmp", "/var/tmp", "/usr/tmp"))
     for candidate in candidates:
         if _is_outside_checkout(candidate) and os.access(candidate, os.W_OK | os.X_OK):
-            return candidate
+            # Return the resolved path so the checked location is the used one.
+            return str(Path(candidate).resolve())
     raise ScratchParentUnavailableError("scratch_parent_outside_checkout_unavailable")
 
 

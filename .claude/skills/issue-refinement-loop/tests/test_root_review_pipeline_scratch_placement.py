@@ -209,6 +209,64 @@ def test_given_tmp_env_inside_checkout_when_scratch_resolved_then_parent_is_outs
         assert not Path(observed).exists()
 
 
+# Real `_cmd_produce()` in a fresh interpreter with the temp env pointing INTO the
+# fixture checkout (no tempfile.tempdir cache, no re-implemented syntax).
+_PRODUCE_ENV_SCRIPT = textwrap.dedent(
+    """
+    import argparse, contextlib, io, json, sys
+    from pathlib import Path
+
+    scripts_dir, repo_root, body, record = sys.argv[1], Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4])
+    sys.path.insert(0, scripts_dir)
+    import run_root_review_pipeline as p
+
+    p._REPO_ROOT = repo_root
+    p.fetch_and_pin_live_body = lambda n, repo, timeout_seconds=15: (body, p.sha256_of(body), None)
+    seen = []
+    real_write = p.write_pinned_body_tempfile
+
+    def spy(b, *, dir=None):
+        path = real_write(b, dir=dir)
+        seen.append(path)
+        return path
+
+    p.write_pinned_body_tempfile = spy
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = p._cmd_produce(argparse.Namespace(issue_number=3039, repo="squne121/loop-protocol"))
+    record.write_text(json.dumps({"rc": rc, "seen": seen, "out": json.loads(buf.getvalue())}))
+    """
+)
+
+
+@pytest.mark.parametrize("env_var", ["TMPDIR", "TEMP", "TMP"])
+def test_given_tmp_env_inside_checkout_when_real_cmd_produce_then_outer_scratch_is_outside(
+    tmp_path: Path, env_var: str
+):
+    checkout = tmp_path / "fixture_checkout"
+    (checkout / "tmp").mkdir(parents=True)
+    record = tmp_path / "record.json"
+    env = {k: v for k, v in os.environ.items() if k not in {"TMPDIR", "TEMP", "TMP"}}
+    env[env_var] = str(checkout / "tmp")
+    proc = subprocess.run(
+        [sys.executable, "-c", _PRODUCE_ENV_SCRIPT, str(SCRIPTS_DIR), str(checkout), _BODY, str(record)],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(record.read_text())
+    assert result["rc"] == 0 and result["out"]["status"] == "ok", result["out"]
+    assert len(result["seen"]) == 1, result["seen"]
+    pinned = Path(result["seen"][0])
+    assert pinned.parent.name.startswith("root_review_pipeline_")
+    assert not pinned.parent.resolve().is_relative_to(checkout.resolve()), pinned
+    assert not pinned.exists() and not pinned.parent.exists()
+    assert list((checkout / "tmp").iterdir()) == []
+
+
 def test_given_tmp_symlink_back_into_checkout_when_resolved_then_symlink_is_rejected(
     tmp_path: Path, monkeypatch
 ):
