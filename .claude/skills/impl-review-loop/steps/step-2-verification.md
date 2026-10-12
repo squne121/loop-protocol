@@ -149,6 +149,8 @@ root が test-runner の full `TEST_VERDICT_MACHINE/v2` を Step 4 の `step4-ad
 - `default=str`、`bool(...)`、欠落値の既定値補充など、「通る形」に直す処理を入れない。
 - `generated_at` は `test-runner.md` の既存契約どおり引用付き文字列である。無引用の timestamp など JSON 化できない値は補正せず、変換失敗（次節の handoff 失敗）として扱う。
 
+変換は生 YAML の時点で情報消失を検出して失敗させる（parse 後の object と JSON の比較だけでは、parse 時の消失は検出できないため）。次はすべて handoff 失敗である: mapping の重複 key（後続の PASS が先行の FAIL を上書きするため）、JSON で型が変わる非文字列 key、`on` / `off` / `yes` / `no` のような無引用の boolean 風 scalar や `010` のような YAML 1.1 固有の数値表記（文字列は引用する）、fence の未終端、既知 field の型不一致、JSON 往復で値・型・順序が変わる入力。fence の開始・終了は独立した行として認識し、`command` / `notes` に含まれる 3 連バッククォートは終端として扱わない。
+
 ### 実行可能な変換例
 
 次の code block が変換の正本であり、`uv run --locked python3 - "$RAW_FINAL_RESULT_FILE" "$ATTEMPT_VERDICT_FILE"` の stdin にこの code block を **変更せず** 渡して実行する。回帰テストは同じ code block を文書から抽出して実行する。
@@ -160,22 +162,104 @@ import sys
 from pathlib import Path
 import yaml
 fence = chr(96) * 3  # Markdown の fence 記号（この code block 自体の fence と衝突させないため直書きしない）
+
+
+class StrictLoader(yaml.SafeLoader):
+    """この変換専用の loader。global の SafeLoader / 他 consumer の semantics は変えない。"""
+
+
+def _mapping(loader, node, deep=False):
+    # 重複 key は後勝ちで先行事実（FAIL 等）を消すため fail-closed。key は JSON で型が変わらない str のみ。
+    loader.flatten_mapping(node)
+    result = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if type(key) is not str:
+            raise ValueError(f"non-string mapping key {key!r} is not preserved by JSON")
+        if key in result:
+            raise ValueError(f"duplicate mapping key {key!r}")
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
+
+
+def _bool(loader, node):
+    # YAML 1.1 の on/off/yes/no は意図を保持できない。true / false 以外の無引用 scalar は拒否する。
+    if node.value not in ("true", "false"):
+        raise ValueError(f"ambiguous unquoted boolean-like scalar {node.value!r}; quote it as a string")
+    return node.value == "true"
+
+
+def _number(construct):
+    def build(loader, node):
+        # 8 進・60 進・桁区切りなど YAML 1.1 固有表記は JSON 数値として読めないので拒否する。
+        try:
+            json.loads(node.value)
+        except ValueError:
+            raise ValueError(f"ambiguous unquoted numeric scalar {node.value!r}; quote it as a string") from None
+        return construct(loader, node)
+
+    return build
+
+
+StrictLoader.add_constructor("tag:yaml.org,2002:map", _mapping)
+StrictLoader.add_constructor("tag:yaml.org,2002:bool", _bool)
+StrictLoader.add_constructor("tag:yaml.org,2002:int", _number(yaml.SafeLoader.construct_yaml_int))
+StrictLoader.add_constructor("tag:yaml.org,2002:float", _number(yaml.SafeLoader.construct_yaml_float))
+
+
+def yaml_blocks(text):
+    # fence は独立した行として認識する。closing は opening と同種で opening 以上の長さの fence のみ。
+    blocks, lines, index = [], text.splitlines(), 0
+    while index < len(lines):
+        opening = re.fullmatch(r"(`{3,})[ \t]*([^`\s]*)[ \t]*", lines[index])
+        index += 1
+        if opening is None:
+            continue
+        body = []
+        while index < len(lines) and not re.fullmatch(r" {0,3}`{%d,}[ \t]*" % len(opening.group(1)), lines[index]):
+            body.append(lines[index])
+            index += 1
+        if index >= len(lines):
+            raise ValueError("unterminated markdown fence")
+        index += 1
+        if opening.group(2) in ("yaml", "yml") and any(line.startswith("TEST_VERDICT:") for line in body):
+            blocks.append("\n".join(body) + "\n")
+    return blocks
+
+
+def same(left, right):
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return list(left) == list(right) and all(same(left[key], right[key]) for key in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(same(a, b) for a, b in zip(left, right))
+    return left == right
+
+
 raw_path, out_path = Path(sys.argv[1]), Path(sys.argv[2])
 try:
-    text = raw_path.read_text(encoding="utf-8")
-    blocks = [
-        block
-        for block in re.findall(fence + r"ya?ml[ \t]*\n(.*?)" + fence, text, re.S)
-        if re.search(r"^TEST_VERDICT:", block, re.M)
-    ]
+    out_path.unlink(missing_ok=True)  # 失敗時に古い有効 report を残さない
+    blocks = yaml_blocks(raw_path.read_text(encoding="utf-8"))
     if len(blocks) != 1:
         raise ValueError(f"expected exactly one TEST_VERDICT yaml block, found {len(blocks)}")
-    report = yaml.safe_load(blocks[0])["TEST_VERDICT"]
+    report = yaml.load(blocks[0], Loader=StrictLoader)["TEST_VERDICT"]
     if not isinstance(report, dict):
         raise ValueError("TEST_VERDICT is not a mapping")
-    # default= を渡さない: JSON 非対応型（無引用 timestamp の datetime 等）は TypeError で失敗させる
-    payload = json.dumps(report, ensure_ascii=False)
+    rows = report.get("runtime_ac_results")
+    if type(report.get("result")) is not str or type(rows) is not list or not all(isinstance(row, dict) for row in rows):
+        raise ValueError("result must be a string and runtime_ac_results a list of mappings")
+    for owner, expected in [(report, {"generated_at": str, "schema": str}), *[(row, {"command": str, "command_hash": str, "status": str, "exit_code": int, "fallback_detected": bool, "notes": str}) for row in rows]]:
+        for key, kind in expected.items():
+            if key in owner and type(owner[key]) is not kind:
+                raise ValueError(f"{key} must be {kind.__name__}, got {type(owner[key]).__name__}")
+    # default= を渡さない・NaN を許さない: JSON 非対応型は TypeError / ValueError で失敗させる
+    payload = json.dumps(report, ensure_ascii=False, allow_nan=False)
+    if not same(json.loads(payload), report):
+        raise ValueError("JSON round trip changed a value, type, or order")
     out_path.write_text(payload, encoding="utf-8")
+    if not same(json.loads(out_path.read_text(encoding="utf-8")), report):
+        raise ValueError("saved handoff file differs from the parsed report")
 except Exception as exc:
     out_path.unlink(missing_ok=True)
     print(f"handoff failed: {type(exc).__name__}: {exc}", file=sys.stderr)

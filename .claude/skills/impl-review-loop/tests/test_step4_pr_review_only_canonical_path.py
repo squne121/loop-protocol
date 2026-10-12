@@ -2289,7 +2289,8 @@ def test_step2_lossless_handoff_unquoted_timestamp_is_handoff_failure(tmp_path, 
 
     assert rc != 0
     assert not out_path.exists(), "a failed handoff must leave no output file behind"
-    assert "handoff failed" in stderr and "TypeError" in stderr
+    # The known-field type check may fire before JSON encoding, so only the handoff-failure marker is pinned.
+    assert "handoff failed" in stderr
 
     # A stale file at the SAME path is removed too, so it can never be mistaken for this attempt's output.
     raw_path = tmp_path / "test_runner_final_unquoted_ts.txt"
@@ -2450,3 +2451,354 @@ def test_step2_handoff_nonpass_delegation_invalid_report_stays_fail_closed(tmp_p
     assert payload["adjudication"]["errors"] == expected_errors[case], payload
     state = ws.state()
     assert "dispatch" not in state and state.get("vc_adjudication", {}) == {}
+
+
+# --- Issue #3033 (OWNER fix_delta): raw-YAML information loss must fail closed -------------------------------------
+#
+# Duplicate mapping keys, Markdown fence mis-detection and YAML 1.1 implicit type conversion all lose information
+# at PARSE time, so a parsed-object-vs-JSON comparison cannot see them. Every negative input below is therefore
+# LITERAL raw YAML text (never ``yaml.safe_dump`` output, which can only emit what was already preserved), and
+# the conversion is always the code block extracted from ``step-2-verification.md`` (nothing is re-implemented).
+
+FENCE = "`" * 3
+LONG_FENCE = "`" * 4
+
+
+def _literal_row(
+    scenario: Scenario,
+    *,
+    command: str | None = None,
+    exit_code: str = "0",
+    status: str = "pass",
+    fallback: str = "false",
+    notes: str = "''",
+    extra: str = "",
+) -> str:
+    """One ``runtime_ac_results`` list item as LITERAL YAML (same key order as ``_row``); values are raw YAML."""
+    first = scenario.commands[0]
+    assert "'" not in first["raw_command"]
+    command_text = command if command is not None else f"'{first['raw_command']}'"
+    return (
+        f"  - ac: {first['ac']}\n"
+        f"    command: {command_text}\n"
+        f"    command_hash: '{first['command_hash']}'\n"
+        f"    exit_code: {exit_code}\n"
+        f"    status: {status}\n"
+        f"    fallback_detected: {fallback}\n"
+        "    artifact_present: not_required\n"
+        "    human_review_required: false\n"
+        "    stop_condition_triggered: false\n"
+        f"    notes: {notes}\n"
+        f"{extra}"
+    )
+
+
+def _literal_report(
+    scenario: Scenario,
+    *,
+    generated_at: str = f"'{GENERATED_AT}'",
+    result: str = "PASS",
+    rows: str | None = None,
+    extra: str = "",
+) -> str:
+    """A full ``TEST_VERDICT`` mapping as LITERAL YAML (same key order as ``_report(descriptive=False)``)."""
+    rows_text = rows if rows is not None else "  runtime_ac_results:\n" + _literal_row(scenario)
+    return (
+        "TEST_VERDICT:\n"
+        "  schema: TEST_VERDICT_MACHINE/v2\n"
+        f"  issue_number: {ISSUE_NUMBER}\n"
+        f"  pr_number: {PR_NUMBER}\n"
+        f"  head_sha: '{scenario.head}'\n"
+        f"  reviewed_head_sha: '{scenario.head}'\n"
+        f"  diff_head_sha: '{scenario.head}'\n"
+        f"  contract_body_sha256: '{scenario.body_sha256}'\n"
+        f"  generated_at: {generated_at}\n"
+        f"  result: {result}\n"
+        f"{rows_text}{extra}"
+    )
+
+
+def _fenced(yaml_text: str, *, opening: str = FENCE, closing: str | None = None, lang: str = "yaml") -> str:
+    """Japanese prose around ONE fenced block; ``closing`` defaults to ``opening`` (pass ``""`` to omit it)."""
+    closing_line = opening if closing is None else closing
+    tail = f"{closing_line}\n" if closing_line else ""
+    return f"全 Verification Command を実行しました。\n\n{opening}{lang}\n{yaml_text}{tail}\n以上が最終報告です。\n"
+
+
+def _assert_handoff_rejected(rc: int, out_path: Path, stderr: str, needle: str) -> None:
+    assert rc != 0, "the handoff must fail closed"
+    assert not out_path.exists(), "a failed handoff must leave no output file behind"
+    assert "handoff failed" in stderr and needle in stderr, stderr
+
+
+def _assert_literal_handoff_lossless(tmp_path: Path, raw_text: str, expected: dict[str, Any], tag: str) -> Path:
+    rc, out_path, stderr = _run_step2_handoff(tmp_path, raw_text, tag)
+    assert rc == 0, stderr
+    _assert_same_value_and_type(json.loads(out_path.read_text(encoding="utf-8")), expected)
+    return out_path
+
+
+def _duplicate_key_cases(scenario: Scenario) -> dict[str, str]:
+    """Raw YAML in which a LATER duplicate key would (under plain ``safe_load``) silently erase an EARLIER fact."""
+    fail_row = _literal_row(scenario, status="fail", exit_code="1")
+    pass_row = _literal_row(scenario)
+    return {
+        "top_level_result": _literal_report(scenario, result="FAIL", extra="  result: PASS\n"),
+        "top_level_runtime_ac_results": _literal_report(
+            scenario, rows="  runtime_ac_results:\n" + fail_row, extra="  runtime_ac_results:\n" + pass_row
+        ),
+        "row_status": _literal_report(
+            scenario,
+            rows="  runtime_ac_results:\n" + _literal_row(scenario, status="fail", extra="    status: pass\n"),
+        ),
+        "row_exit_code": _literal_report(
+            scenario,
+            rows="  runtime_ac_results:\n" + _literal_row(scenario, exit_code="1", extra="    exit_code: 0\n"),
+        ),
+        "nested_optional_field": _literal_report(
+            scenario,
+            rows="  runtime_ac_results:\n"
+            + _literal_row(scenario, extra="    test_count:\n      passed: 0\n      passed: 7\n"),
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    "case", ["top_level_result", "top_level_runtime_ac_results", "row_status", "row_exit_code", "nested_optional_field"]
+)
+def test_step2_lossless_handoff_duplicate_mapping_key_is_handoff_failure(tmp_path, single, case):
+    yaml_text = _duplicate_key_cases(single)[case]
+    # Sanity: plain safe_load really accepts this text and silently keeps only the LAST duplicate, so only an
+    # explicit duplicate check can make the handoff fail.
+    assert isinstance(yaml.safe_load(yaml_text)["TEST_VERDICT"], dict)
+
+    rc, out_path, stderr = _run_step2_handoff(tmp_path, _fenced(yaml_text), case)
+
+    _assert_handoff_rejected(rc, out_path, stderr, "duplicate mapping key")
+
+
+def test_step2_lossless_handoff_duplicate_key_failure_removes_stale_valid_output(tmp_path, single):
+    good_out = _handoff_ok(tmp_path, _report(single, descriptive=False), "stale")
+    assert good_out.exists() and json.loads(good_out.read_text(encoding="utf-8"))["result"] == "PASS"
+
+    # Same attempt path, but the raw result now has a duplicate key: the earlier valid output must not survive.
+    rc, out_path, stderr = _run_step2_handoff(tmp_path, _fenced(_duplicate_key_cases(single)["row_status"]), "stale")
+
+    assert out_path == good_out
+    _assert_handoff_rejected(rc, out_path, stderr, "duplicate mapping key")
+
+
+BACKTICK_COMMAND = "rg -n '```' README.md"
+BACKTICK_NOTES = "first line\n```\n```yaml\nlast line"
+BACKTICK_ROW_YAML = {
+    "command": f'"{BACKTICK_COMMAND}"',
+    "notes": "|-\n      first line\n      ```\n      ```yaml\n      last line",
+}
+
+
+def _backtick_report_yaml(scenario: Scenario) -> str:
+    return _literal_report(
+        scenario,
+        rows="  runtime_ac_results:\n"
+        + _literal_row(scenario, command=BACKTICK_ROW_YAML["command"], notes=BACKTICK_ROW_YAML["notes"]),
+    )
+
+
+def _backtick_report(scenario: Scenario) -> dict[str, Any]:
+    report = _report(scenario, descriptive=False, row_overrides={0: {"notes": BACKTICK_NOTES}})
+    # ``_row`` takes the command as a positional argument, so the verbatim command is set on the built row.
+    report["runtime_ac_results"][0]["command"] = BACKTICK_COMMAND
+    return report
+
+
+def test_step2_lossless_handoff_triple_backticks_in_command_and_notes_reach_adjudicate(tmp_path, single):
+    ws = Workspace(tmp_path, single)
+    expected = _backtick_report(single)
+    raw = _fenced(_backtick_report_yaml(single))
+    # Sanity: the old non-greedy regex fence scan would have cut the block at the first backticks of ``command``.
+    old_blocks = [
+        block
+        for block in re.findall(FENCE + r"ya?ml[ \t]*\n(.*?)" + FENCE, raw, re.S)
+        if re.search(r"^TEST_VERDICT:", block, re.M)
+    ]
+    assert len(old_blocks) == 1 and "last line" not in old_blocks[0]
+
+    out_path = _assert_literal_handoff_lossless(tmp_path, raw, expected, "backticks")
+    loaded_row = json.loads(out_path.read_text(encoding="utf-8"))["runtime_ac_results"][0]
+    assert loaded_row["command"] == BACKTICK_COMMAND and loaded_row["notes"] == BACKTICK_NOTES
+
+    rc, payload = ws.adjudicate(report_path=str(out_path))
+
+    assert rc == 0, payload
+    assert payload["invoke_pr_reviewer"] is True and payload["seq"] == 1 and payload["reason_code"] is None
+    _approve_and_assert(ws, payload)
+
+
+def test_step2_lossless_handoff_four_backtick_fence_containing_triple_backtick_lines_is_accepted(tmp_path, single):
+    raw = _fenced(_backtick_report_yaml(single), opening=LONG_FENCE)
+
+    _assert_literal_handoff_lossless(tmp_path, raw, _backtick_report(single), "long_fence")
+
+
+@pytest.mark.parametrize("shape", ["no_fence", "unterminated_fence", "closing_shorter_than_opening", "two_candidates"])
+def test_step2_lossless_handoff_fence_shape_fails_closed(tmp_path, single, shape):
+    yaml_text = _backtick_report_yaml(single)
+    raws = {
+        "no_fence": f"報告です。\n\n{yaml_text}\n以上。\n",
+        "unterminated_fence": _fenced(yaml_text, closing=""),
+        # A 4-backtick opening must NOT be closed by a 3-backtick line.
+        "closing_shorter_than_opening": _fenced(yaml_text, opening=LONG_FENCE, closing=FENCE),
+        "two_candidates": _fenced(yaml_text) + "\n" + _fenced(_literal_report(single)),
+    }
+    needles = {
+        "no_fence": "found 0",
+        "unterminated_fence": "unterminated markdown fence",
+        "closing_shorter_than_opening": "unterminated markdown fence",
+        "two_candidates": "found 2",
+    }
+
+    rc, out_path, stderr = _run_step2_handoff(tmp_path, raws[shape], shape)
+
+    _assert_handoff_rejected(rc, out_path, stderr, needles[shape])
+
+
+@pytest.mark.parametrize("value", ["off", "on", "yes", "no"])
+def test_step2_lossless_handoff_unquoted_boolean_like_scalar_is_rejected(tmp_path, single, value):
+    raw = _fenced(_literal_report(single, rows="  runtime_ac_results:\n" + _literal_row(single, notes=value)))
+    # Sanity: PyYAML resolves it to a bool, so without the strict constructor the intent (the word) is lost.
+    assert yaml.safe_load(raw.split("yaml\n", 1)[1].split(FENCE, 1)[0])["TEST_VERDICT"]["runtime_ac_results"][0][
+        "notes"
+    ] in (True, False)
+
+    rc, out_path, stderr = _run_step2_handoff(tmp_path, raw, f"bool_{value}")
+
+    _assert_handoff_rejected(rc, out_path, stderr, "ambiguous unquoted boolean-like scalar")
+
+
+@pytest.mark.parametrize(
+    ("label", "row_kwargs", "needle"),
+    [
+        ("octal_notes", {"notes": "010"}, "ambiguous unquoted numeric scalar"),
+        ("underscore_notes", {"notes": "1_000"}, "ambiguous unquoted numeric scalar"),
+        ("sexagesimal_field", {"extra": "    x: 1:30\n"}, "ambiguous unquoted numeric scalar"),
+        ("infinity_field", {"extra": "    x: .inf\n"}, "ambiguous unquoted numeric scalar"),
+        ("integer_mapping_key", {"extra": "    test_count:\n      1: a\n"}, "non-string mapping key"),
+        ("float_mapping_key", {"extra": "    test_count:\n      1.5: a\n"}, "non-string mapping key"),
+        ("null_mapping_key", {"extra": "    test_count:\n      null: a\n"}, "non-string mapping key"),
+        ("boolean_mapping_key", {"extra": "    test_count:\n      on: a\n"}, "ambiguous unquoted boolean-like scalar"),
+        # A known bool field written as ``no`` / ``yes`` would silently pass the type check as a real bool.
+        ("fallback_detected_no", {"fallback": "no"}, "ambiguous unquoted boolean-like scalar"),
+        ("fallback_detected_yes", {"fallback": "yes"}, "ambiguous unquoted boolean-like scalar"),
+        ("optional_nested_off", {"extra": "    test_count:\n      flag: off\n"}, "ambiguous unquoted boolean-like"),
+        ("exit_code_bool", {"exit_code": "true"}, "exit_code must be int, got bool"),
+        ("exit_code_string", {"exit_code": "'0'"}, "exit_code must be int, got str"),
+        ("exit_code_float", {"exit_code": "0.0"}, "exit_code must be int, got float"),
+        ("fallback_detected_string", {"fallback": "'false'"}, "fallback_detected must be bool, got str"),
+        ("fallback_detected_int", {"fallback": "0"}, "fallback_detected must be bool, got int"),
+        ("status_bool", {"status": "true"}, "status must be str, got bool"),
+    ],
+)
+def test_step2_lossless_handoff_ambiguous_scalar_or_key_is_rejected(tmp_path, single, label, row_kwargs, needle):
+    raw = _fenced(_literal_report(single, rows="  runtime_ac_results:\n" + _literal_row(single, **row_kwargs)))
+
+    rc, out_path, stderr = _run_step2_handoff(tmp_path, raw, label)
+
+    _assert_handoff_rejected(rc, out_path, stderr, needle)
+
+
+@pytest.mark.parametrize(
+    ("label", "report_kwargs", "needle"),
+    [
+        ("result_bool", {"result": "true"}, "result must be a string"),
+        ("result_null", {"result": "null"}, "result must be a string"),
+        ("top_level_boolean_like", {"extra": "  flag: off\n"}, "ambiguous unquoted boolean-like scalar"),
+    ],
+)
+def test_step2_lossless_handoff_top_level_type_violation_is_rejected(tmp_path, single, label, report_kwargs, needle):
+    raw = _fenced(_literal_report(single, **report_kwargs))
+
+    rc, out_path, stderr = _run_step2_handoff(tmp_path, raw, label)
+
+    _assert_handoff_rejected(rc, out_path, stderr, needle)
+
+
+@pytest.mark.parametrize("word", ["off", "on", "yes", "no", "010", "1:30", "1_000"])
+def test_step2_lossless_handoff_quoted_ambiguous_strings_and_optional_fields_are_preserved(tmp_path, single, word):
+    ws = Workspace(tmp_path, single)
+    test_count = {
+        "subject": "tests/test_a.py -k handoff",
+        "passed": 7,
+        "failed": 0,
+        "ratio": 0.5,
+        "skipped": None,
+        "labels": [word, True, False, None, 3],
+    }
+    expected = _report(
+        single,
+        descriptive=False,
+        row_overrides={0: {"notes": word, "test_count": test_count}},
+        optional_note=word,
+    )
+    row_extra = (
+        "    test_count:\n"
+        "      subject: tests/test_a.py -k handoff\n"
+        "      passed: 7\n"
+        "      failed: 0\n"
+        "      ratio: 0.5\n"
+        "      skipped: null\n"
+        f'      labels: ["{word}", true, false, null, 3]\n'
+    )
+    raw = _fenced(
+        _literal_report(
+            single,
+            rows="  runtime_ac_results:\n" + _literal_row(single, notes=f'"{word}"', extra=row_extra),
+            extra=f"  optional_note: '{word}'\n",
+        )
+    )
+
+    out_path = _assert_literal_handoff_lossless(tmp_path, raw, expected, f"quoted_{word.replace(':', '_')}")
+    loaded = json.loads(out_path.read_text(encoding="utf-8"))
+    row = loaded["runtime_ac_results"][0]
+    assert row["notes"] == word and type(row["notes"]) is str
+    assert row["fallback_detected"] is False and row["human_review_required"] is False
+    assert row["exit_code"] == 0 and type(row["exit_code"]) is int
+    assert row["test_count"] == test_count and loaded["optional_note"] == word
+
+    rc, payload = ws.adjudicate(report_path=str(out_path))
+
+    assert rc == 0, payload
+    assert payload["invoke_pr_reviewer"] is True and payload["seq"] == 1
+    _approve_and_assert(ws, payload)
+
+
+@pytest.mark.parametrize("case", ["duplicate_status", "ambiguous_boolean_notes"])
+def test_step2_handoff_duplicate_or_ambiguous_failure_invalidates_prior_pass(tmp_path, single, case):
+    ws = Workspace(tmp_path, single)
+
+    # (i) a good handoff stores a PASS and records dispatch seq 1.
+    first = _handoff_ok(tmp_path, _report(single), "inv_a0")
+    rc, payload = ws.adjudicate(report_path=str(first), tag="a0")
+    assert rc == 0 and payload["seq"] == 1, payload
+    assert ws.binding_key() in ws.state()["vc_adjudication"]
+
+    # (ii) a new attempt whose raw result loses information fails to convert; its never-created path goes to the
+    # ordinary step4-adjudicate and the earlier PASS under the same binding is invalidated.
+    broken = {
+        "duplicate_status": _duplicate_key_cases(single)["row_status"],
+        "ambiguous_boolean_notes": _literal_report(
+            single, rows="  runtime_ac_results:\n" + _literal_row(single, notes="off")
+        ),
+    }[case]
+    rc, failed_out, stderr = _run_step2_handoff(tmp_path, _fenced(broken), "inv_a1")
+    assert rc != 0 and not failed_out.exists() and "handoff failed" in stderr
+    assert failed_out != first
+
+    rc, payload = ws.adjudicate(report_path=str(failed_out), tag="a1")
+
+    assert rc == 1, payload
+    assert payload["invoke_pr_reviewer"] is False and payload["seq"] is None
+    assert payload["reason_code"] == "adjudication_missing_or_malformed"
+    assert payload["adjudication"]["errors"] == [f"input_file_not_found:{failed_out}"]
+    assert ws.binding_key() not in ws.state().get("vc_adjudication", {})
+    rc, term = ws.terminal_gate(dispatch_seq=1)
+    assert rc == 1 and term["route"] != "approved", term
