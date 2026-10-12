@@ -355,8 +355,38 @@ def test_production_path_diagnostic_survives_cleanup_in_transport_and_full_artif
     harness = _Harness(
         monkeypatch, tmp_path, _TWO_BLOCK_BODY, outcomes_by_call={2: TIMEOUT_OUTCOME}
     )
+    # Issue #3039 P3: capture the REAL scratch locations the timeout path used
+    # (pinned body file / outer scratch dir / checker attempt scratch dirs).
+    pinned_body_files: list[str] = []
+    attempt_scratch_dirs: list[str] = []
+    real_write_pinned = pipeline.write_pinned_body_tempfile
+    real_mkdtemp = pipeline.tempfile.mkdtemp
+
+    def _record_pinned(body, *, dir=None):
+        path = real_write_pinned(body, dir=dir)
+        pinned_body_files.append(path)
+        return path
+
+    def _record_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        if str(kwargs.get("prefix", "")).startswith("root_review_pipeline_attempt_"):
+            attempt_scratch_dirs.append(path)
+        return path
+
+    monkeypatch.setattr(pipeline, "write_pinned_body_tempfile", _record_pinned)
+    monkeypatch.setattr(pipeline.tempfile, "mkdtemp", _record_mkdtemp)
     code, out = harness.produce(issue_number)
     assert code == 0 and out["status"] == "ok", out
+
+    # The timeout path really used (and then removed) the outer scratch and the
+    # checker attempt scratch, all outside the checkout.
+    assert len(pinned_body_files) == 1, pinned_body_files
+    assert attempt_scratch_dirs, "checker attempt scratch was not observed"
+    outer_scratch = Path(pinned_body_files[0]).parent
+    assert outer_scratch.name.startswith("root_review_pipeline_")
+    for observed in (Path(pinned_body_files[0]), outer_scratch, *map(Path, attempt_scratch_dirs)):
+        assert not observed.resolve().is_relative_to(tmp_path.resolve()), observed
+        assert not observed.exists(), observed
 
     # Existing routing facts are unchanged: an inner readiness timeout stays
     # the operator-intervention route, not a transport failure.

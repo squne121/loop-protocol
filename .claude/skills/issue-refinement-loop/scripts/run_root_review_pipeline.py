@@ -308,6 +308,43 @@ def fetch_and_pin_live_body(
     return body, sha256_of(body), None
 
 
+class ScratchParentUnavailableError(RuntimeError):
+    """No scratch parent outside the checkout could be found (Issue #3039)."""
+
+
+def _is_outside_checkout(candidate: str | os.PathLike[str]) -> bool:
+    """True when `candidate` resolves (symlinks followed) outside `_REPO_ROOT`."""
+    try:
+        resolved = Path(candidate).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    if not resolved.is_dir():
+        return False
+    root = _REPO_ROOT.resolve()
+    return resolved != root and root not in resolved.parents
+
+
+def resolve_external_scratch_parent() -> str:
+    """Pick a scratch parent directory that is outside the checkout (Issue #3039).
+
+    `tempfile.gettempdir()` honours `TMPDIR` / `TEMP` / `TMP` (and caches the
+    answer), so it may point inside the checkout. Prefer it when its resolved
+    real path is external; otherwise fall back to OS-level temp directories
+    without touching the process-global temp configuration. Fails closed
+    (never falls back into the checkout).
+    """
+    candidates: list[str] = []
+    try:
+        candidates.append(tempfile.gettempdir())
+    except FileNotFoundError:
+        pass
+    candidates.extend(("/tmp", "/var/tmp", "/usr/tmp"))
+    for candidate in candidates:
+        if _is_outside_checkout(candidate) and os.access(candidate, os.W_OK | os.X_OK):
+            return candidate
+    raise ScratchParentUnavailableError("scratch_parent_outside_checkout_unavailable")
+
+
 def write_pinned_body_tempfile(body: str, *, dir: str | None = None) -> str:
     """Persist the pinned body to a scoped temp file (root-owned I/O).
 
@@ -1066,7 +1103,13 @@ def run_checker_pipeline_once(
     subprocess itself completed but reported that its internal
     `baseline_vc_preflight.py` execution timed out.
     """
-    scratch_dir = Path(tempfile.mkdtemp(prefix="root_review_pipeline_attempt_"))
+    # Issue #3039: same external-parent rule as the outer produce scratch, so
+    # a checkout-internal TMPDIR cannot put checker intermediates in the repo.
+    try:
+        scratch_parent = resolve_external_scratch_parent()
+    except ScratchParentUnavailableError as exc:
+        return None, str(exc), None
+    scratch_dir = Path(tempfile.mkdtemp(prefix="root_review_pipeline_attempt_", dir=scratch_parent))
     try:
         review_result, _review_rc, review_err = run_check_issue_contract(body_file)
         if review_result is None:
@@ -1489,13 +1532,27 @@ def _cmd_produce(args: argparse.Namespace) -> int:
         return 2
 
     # Issue #3039: per-invocation scratch (pinned body / history snapshot) lives
-    # in the system temporary directory (outside the repo), NOT under
+    # in a temporary directory resolved OUTSIDE the checkout (real-path checked;
+    # `TMPDIR` pointing into the repo is not trusted), NOT under
     # `_REPO_ROOT / "tmp"`. The canonical executor's before/after filesystem
     # snapshot (`skill_runtime_exec._snapshot_repo_paths`) walks the repo, so a
     # peer `produce` scratch under repo `tmp/` made a legitimate concurrent
     # `repair_action.apply` child fail with `unauthorized_write_path`. Same
     # placement precedent as the attempt scratch (`tempfile.mkdtemp` below).
-    with tempfile.TemporaryDirectory(prefix="root_review_pipeline_") as scratch_dir:
+    try:
+        scratch_parent = resolve_external_scratch_parent()
+    except ScratchParentUnavailableError as exc:
+        _emit_produce_result(
+            {
+                "schema": SCHEMA,
+                "schema_version": SCHEMA_VERSION,
+                "status": "input_or_runtime_error",
+                "error_code": str(exc),
+            }
+        )
+        return 2
+
+    with tempfile.TemporaryDirectory(prefix="root_review_pipeline_", dir=scratch_parent) as scratch_dir:
         body_file = write_pinned_body_tempfile(body, dir=scratch_dir)
 
         # Issue #2254 fix_delta P0 blocker 1: serialize the SAME

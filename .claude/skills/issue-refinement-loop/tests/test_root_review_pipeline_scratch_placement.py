@@ -143,6 +143,118 @@ def test_given_produce_when_run_then_scratch_is_not_created_under_repo_tmp(tmp_p
 
 
 # ---------------------------------------------------------------------------
+# AC1 (OWNER P2): scratch parent is verified outside the checkout, even when
+# TMPDIR / TEMP / TMP point inside it. Fresh subprocess => no tempdir cache.
+# ---------------------------------------------------------------------------
+
+_ENV_PROBE_SCRIPT = textwrap.dedent(
+    """
+    import json, sys, tempfile
+    from pathlib import Path
+
+    scripts_dir, repo_root = sys.argv[1], Path(sys.argv[2])
+    sys.path.insert(0, scripts_dir)
+    import run_root_review_pipeline as p
+
+    p._REPO_ROOT = repo_root
+    seen = {"outer": [], "attempt": []}
+    real_mkdtemp = tempfile.mkdtemp
+
+    def spy_mkdtemp(*a, **k):
+        path = real_mkdtemp(*a, **k)
+        if str(k.get("prefix", "")).startswith("root_review_pipeline_attempt_"):
+            seen["attempt"].append(path)
+        return path
+
+    tempfile.mkdtemp = spy_mkdtemp
+    p.run_check_issue_contract = lambda body_file: (None, 1, "gh_error")
+    # Attempt scratch: real run_checker_pipeline_once creates and removes it.
+    merged = p.run_checker_pipeline_once(body_file="unused", issue_number=1, body_sha256="0" * 64)
+    # Outer scratch: same parent selection + TemporaryDirectory as _cmd_produce.
+    parent = p.resolve_external_scratch_parent()
+    with tempfile.TemporaryDirectory(prefix="root_review_pipeline_", dir=parent) as outer:
+        body = p.write_pinned_body_tempfile("x", dir=outer)
+        seen["outer"].append(body)
+    print(json.dumps({"seen": seen, "parent": str(Path(parent).resolve()), "merged_none": merged[0] is None}))
+    """
+)
+
+
+@pytest.mark.parametrize("env_var", ["TMPDIR", "TEMP", "TMP"])
+def test_given_tmp_env_inside_checkout_when_scratch_resolved_then_parent_is_outside(
+    tmp_path: Path, env_var: str
+):
+    checkout = tmp_path / "fixture_checkout"
+    (checkout / "tmp").mkdir(parents=True)
+    env = {k: v for k, v in os.environ.items() if k not in {"TMPDIR", "TEMP", "TMP"}}
+    env[env_var] = str(checkout / "tmp")
+    proc = subprocess.run(
+        [sys.executable, "-c", _ENV_PROBE_SCRIPT, str(SCRIPTS_DIR), str(checkout)],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout.strip().splitlines()[-1])
+    resolved_checkout = checkout.resolve()
+    assert not Path(result["parent"]).is_relative_to(resolved_checkout), result
+    assert result["seen"]["attempt"], "checker attempt scratch not observed"
+    for observed in (*result["seen"]["outer"], *result["seen"]["attempt"]):
+        assert not Path(observed).resolve().is_relative_to(resolved_checkout), observed
+    assert list((checkout / "tmp").iterdir()) == []
+    # attempt scratch is removed by run_checker_pipeline_once's finally block.
+    for observed in result["seen"]["attempt"]:
+        assert not Path(observed).exists()
+
+
+def test_given_tmp_symlink_back_into_checkout_when_resolved_then_symlink_is_rejected(
+    tmp_path: Path, monkeypatch
+):
+    checkout = tmp_path / "fixture_checkout"
+    (checkout / "tmp").mkdir(parents=True)
+    link = tmp_path / "link_to_checkout_tmp"
+    link.symlink_to(checkout / "tmp", target_is_directory=True)
+    monkeypatch.setattr(_PIPELINE, "_REPO_ROOT", checkout)
+    monkeypatch.setattr(_PIPELINE.tempfile, "gettempdir", lambda: str(link))
+    parent = Path(_PIPELINE.resolve_external_scratch_parent()).resolve()
+    assert not parent.is_relative_to(checkout.resolve()), parent
+
+
+def test_given_no_external_parent_when_resolved_then_fails_closed(monkeypatch):
+    monkeypatch.setattr(_PIPELINE, "_REPO_ROOT", Path("/"))
+    with pytest.raises(_PIPELINE.ScratchParentUnavailableError):
+        _PIPELINE.resolve_external_scratch_parent()
+
+
+def test_given_no_external_parent_when_produce_then_input_or_runtime_error_without_repo_write(
+    tmp_path: Path, monkeypatch
+):
+    repo_root = tmp_path / "fake_repo_root"
+    repo_root.mkdir()
+    monkeypatch.setattr(_PIPELINE, "_REPO_ROOT", repo_root)
+    body_sha256 = _PIPELINE.sha256_of(_BODY)
+    monkeypatch.setattr(
+        _PIPELINE,
+        "fetch_and_pin_live_body",
+        lambda issue_number, repo, timeout_seconds=15: (_BODY, body_sha256, None),
+    )
+
+    def _boom():
+        raise _PIPELINE.ScratchParentUnavailableError("scratch_parent_outside_checkout_unavailable")
+
+    monkeypatch.setattr(_PIPELINE, "resolve_external_scratch_parent", _boom)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = _PIPELINE._cmd_produce(argparse.Namespace(issue_number=_ISSUE_NUMBER, repo=_REPO))
+    out = json.loads(buf.getvalue())
+    assert rc == 2 and out["status"] == "input_or_runtime_error", out
+    assert out["error_code"] == "scratch_parent_outside_checkout_unavailable"
+    assert list(repo_root.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
 # AC2 / AC3: hermetic executor fixture
 # ---------------------------------------------------------------------------
 
