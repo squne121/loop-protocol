@@ -83,11 +83,17 @@ scripts/claude-gpt/launch.sh -- agents --permission-mode bypassPermissions
 
 `--` は launcher と Claude Code の引数を分ける。`--permission-mode bypassPermissions` は
 launcher の既定値ではなく、その起動で Claude Code に渡す明示的な選択である。Native Claude Code の
-通常起動・グローバルな permission default は変更しない。Claude Code が求める bypass mode の初回
-警告（disclaimer）承諾と、作業対象となる **各 Git repository 固有** の workspace trust は別々に
-人間が判断する。launcher が承諾・trust を偽装したり自動化したりしない。
+通常起動・グローバルな permission default は変更しない。**bypassPermissions は permission prompt
+だけでなく Claude Code の安全確認も無効化する。** Claude Code 公式は、被害を封じ込められる隔離
+container / VM 内での利用を推奨する。ホスト上の WSL2 は、そのような隔離環境とはみなさない。
+repository の hook や policy が引き続き動作する場合もあるが、完全な安全境界にはならない。
 
-権限モードは permission prompt の扱いであり、GitHub/proxy 認証の代替ではない。Agent View が
+Claude Code が求める bypass mode の初回警告（disclaimer）承諾と workspace trust は別々に
+人間が判断する。trust は Git repository 一律ではなく workspace / directory ごとの判断であり、
+nested repository や別の linked worktree では別途承諾が必要になる場合がある。launcher が承諾・
+trust を偽装したり自動化したりしない。
+
+権限モードは GitHub/proxy 認証の代替ではない。Agent View が
 別 repository の子へバックエンド接続設定を継承・転送できるかも独立した問題であり、
 その実機検証・worktree 互換性の判断は #3052 で行う。fake Claude の argv テストや
 `claude agents --json --all` の一覧だけでは、子の実行モード・LLM 応答を実証できない。
