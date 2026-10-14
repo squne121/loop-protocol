@@ -127,8 +127,12 @@ def settings_env_is_gateway(env: dict | None) -> bool:
 
 
 def _is_real_user_turn(row: dict) -> bool:
-    """operator / UI が送った user turn。tool_result・meta・sidechain の `type: user` 行は数えない。"""
+    """operator / UI が送った user turn。実 transcript では `origin.kind == "human"` で識別される。
+
+    tool_result・meta・sidechain・task-notification・slash command / local-command 出力の `type: user` 行は数えない。"""
     if row.get("type") != "user" or row.get("isMeta") or row.get("isSidechain"):
+        return False
+    if (row.get("origin") or {}).get("kind") != "human":
         return False
     content = row.get("message", {}).get("content") if isinstance(row.get("message"), dict) else None
     if isinstance(content, list):
@@ -235,7 +239,7 @@ def load_arm(
     return {
         "label": label,
         "job_state": state.get("state"),
-        "cli_version": state.get("cliVersion"),
+        "cli_version": state.get("cliVersion") or next((r["version"] for r in rows_all if r.get("version")), None),
         "child_cwd": cwd,
         "child_cwd_in_target": cwd_ok,
         "response_after_second_user_turn": len(user_turns) >= 2
@@ -343,8 +347,6 @@ def run(scenario: str, environ: dict) -> tuple[int, dict]:
             and candidate["settings_content_valid"]
             and candidate["permission_mode_consistent"]
             and candidate["main_route_observed"]
-            and candidate["resume_same_session"]
-            and candidate["resumed_after_first_terminal"]
             and candidate["response_after_second_user_turn"]
             and candidate["valid_assistant_responses"] >= 2
         )

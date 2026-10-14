@@ -137,6 +137,7 @@ def _gateway_env() -> dict:
 
 
 _UNSET = object()
+HUMAN = {"kind": "human"}
 
 
 def _write_job(
@@ -181,10 +182,10 @@ def _write_job(
     proj = root / "projects" / enc
     proj.mkdir(parents=True, exist_ok=True)
     rows = [{"type": "permission-mode", "permissionMode": m, "sessionId": session} for m in perm_events]
-    rows.append({"type": "user", "message": {"content": "Say MARKER_OK"}})
+    rows.append({"type": "user", "origin": HUMAN, "message": {"content": "Say MARKER_OK"}})
     for n, r in enumerate(replies):
         if resumed and n == len(replies) - 1 and n > 0:
-            rows.append({"type": "user", "message": {"content": "Say MARKER_OK again"}})
+            rows.append({"type": "user", "origin": HUMAN, "message": {"content": "Say MARKER_OK again"}})
         rows.append(
             {
                 "type": "assistant",
@@ -546,7 +547,7 @@ def test_live_vc_meta_and_sidechain_user_rows_are_not_user_turns(tmp_path, flag)
         tmp_path,
         "bbbbbbbb",
         target,
-        [{"type": "user", flag: True, "message": {"content": "injected"}}, _assistant()],
+        [{"type": "user", flag: True, "origin": HUMAN, "message": {"content": "injected"}}, _assistant()],
     )
     state_path = tmp_path / "jobs" / "bbbbbbbb" / "state.json"
     state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -564,7 +565,42 @@ def test_live_vc_real_second_user_prompt_after_tool_use_is_resume_evidence(tmp_p
         tmp_path,
         "bbbbbbbb",
         target,
-        [TOOL_RESULT, {"type": "user", "message": {"content": "Say MARKER_OK again"}}, _assistant()],
+        [TOOL_RESULT, {"type": "user", "origin": HUMAN, "message": {"content": "Say MARKER_OK again"}}, _assistant()],
     )
     env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
     assert ev.run("dispatched-child-and-resume", env)[0] == 0
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {
+            "type": "user",
+            "origin": {"kind": "task-notification"},
+            "message": {"content": "<task-notification>x</task-notification>"},
+        },
+        {"type": "user", "message": {"content": "<command-name>/exit</command-name>"}},
+        {"type": "user", "message": {"content": "<local-command-stdout>ok</local-command-stdout>"}},
+    ],
+)
+def test_live_vc_non_human_user_rows_are_not_user_turns(tmp_path, row):
+    # background task 通知や slash command 出力が 2 回目の user turn に数えられて resume 証拠にならない。
+    target = tmp_path / "repo"
+    target.mkdir()
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD], resumed=True)
+    _append_rows(tmp_path, "bbbbbbbb", target, [row, _assistant()])
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    code, receipt = ev.run("dispatched-child-and-resume", env)
+    assert code == 1 and receipt["candidate"]["response_after_second_user_turn"] is False
+
+
+def test_live_vc_cli_version_falls_back_to_transcript_version(tmp_path):
+    # 実 job state の control は cliVersion を持たないことがある。transcript の version を使う。
+    target = tmp_path / "repo"
+    target.mkdir()
+    _write_job(tmp_path, "aaaaaaaa", target, settings=False, replies=[ERR], cli=None)
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD], cli=None)
+    for jid in ("aaaaaaaa", "bbbbbbbb"):
+        _append_rows(tmp_path, jid, target, [{"type": "system", "version": "2.1.299"}])
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CONTROL_ID="aaaaaaaa", CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    assert ev.run("gateway-control-comparison", env)[1]["necessity"] == "needed"
