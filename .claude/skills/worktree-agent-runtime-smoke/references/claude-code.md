@@ -185,9 +185,10 @@ launcher 固有挙動を `--claude-bin` から独立させた明示入力であ�
   Issue #2925 以前は launcher が `--settings` を policy-weakening flag として拒否していたため、
   `CLAUDE_GPT_RUNTIME_SMOKE_HOOKS` 環境変数の固定値 channel を使っていたが、launcher の薄い wrapper 化に
   伴いこの channel は撤去した。観測 hook は smoke 実行側の opt-in であり、日常の launcher には常設しない。
-  launcher は permission bypass flag（`--dangerously-skip-permissions` 系と
-  `--permission-mode bypassPermissions`）だけを引き続き拒否し、その receipt
-  （`CLAUDE_GPT_LAUNCH_RESULT_V1`）は evidence の `claude_gpt_launcher_receipt` として記録される。
+  launcher は permission mode を自動注入せず、operator が `--` の後に明示した bypass flag を透過する
+  （`--dangerously-skip-permissions` 系と `--permission-mode bypassPermissions` を拒否しない）。smoke 側は
+  bypass を既定にせず、その receipt（`CLAUDE_GPT_LAUNCH_RESULT_V1`）は evidence の
+  `claude_gpt_launcher_receipt` として記録される。
   interactive lane では、forwarder script が claude-gpt adapter の場合に限り launcher 呼び出しへ
   `--` を挿入し、Herdr の `agent start ... -- --settings <JSON>` pass-through で同じ overlay を渡す。
 
