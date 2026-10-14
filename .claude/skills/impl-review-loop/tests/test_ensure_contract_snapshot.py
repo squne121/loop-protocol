@@ -16,6 +16,7 @@ B2 atomicity: body_sha256 OR updatedAt 変化 → stale_or_conflicting_snapshot
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import inspect
 import json
@@ -3406,34 +3407,87 @@ class TestPatchCommentTransportAndReconciliation:
             expected_contract_fingerprint=fingerprint,
         )
 
+    # Issue #3050: the stored comment body is unchanged; the ``gh`` CLI response
+    # sanitizer (gh 2.102.0 / go-gh v2.16.1, Sanitizer{JSON: true}) converts it
+    # on *receipt*.  This is a faithful model of the behaviour probed on live
+    # GitHub, applied to the JSON text that gh prints to stdout.
+    _GH_SANITIZER_PASSTHROUGH_CODES = frozenset({0x09, 0x0A, 0x0B, 0x0D})
+
     @staticmethod
-    def _github_storage_rewrite(body: str) -> str:
-        """Model of the live GitHub storage rewrite observed for Issue #3050.
+    def _gh_sanitizer_caret(code: int) -> str:
+        return "^" + chr((code & 0x7F) ^ 0x40)
 
-        Probed on 2026-10-12 against real GitHub comments: real C0 controls
-        (except TAB/LF/CR) become caret notation (ESC -> ``^[``), and the
-        literal text ``\\u00XX`` for the same C0 range / ``\\u0080`` becomes
-        ``\\^X``.  ``\\x1b``, ``\\^[`` and ``\\u007f`` are left untouched.
+    @classmethod
+    def _gh_response_sanitizer(cls, json_text: str) -> str:
+        """Model of gh's JSON response sanitizer.
+
+        * JSON-level ``\\u00XX`` (XX in 00-1F / 80-9F, except 09/0a/0b/0d) is
+          replaced by caret notation (``\\u001b`` -> ``^[``).  When an odd number
+          of backslashes precedes the token, one more backslash is prefixed so
+          the JSON stays valid (literal ``\\u001b`` = JSON ``\\\\u001b`` decodes to
+          ``\\^[``).
+        * Raw control characters in the same ranges (and 0x7f) become carets.
         """
-        import re as _re
+        out: list[str] = []
+        i = 0
+        while i < len(json_text):
+            ch = json_text[i]
+            if ch == "\\":
+                match = re.fullmatch(
+                    r"u00([01][0-9a-fA-F]|[89][0-9a-fA-F])", json_text[i + 1 : i + 6]
+                )
+                if match is not None:
+                    code = int(match.group(1), 16)
+                    if code not in cls._GH_SANITIZER_PASSTHROUGH_CODES:
+                        preceding = 0
+                        while preceding < i and json_text[i - preceding - 1] == "\\":
+                            preceding += 1
+                        if preceding % 2 == 1:
+                            out.append("\\")
+                        out.append(cls._gh_sanitizer_caret(code))
+                        i += 6
+                        continue
+            code = ord(ch)
+            if (
+                code < 0x20 or code == 0x7F or 0x80 <= code <= 0x9F
+            ) and code not in cls._GH_SANITIZER_PASSTHROUGH_CODES:
+                out.append(cls._gh_sanitizer_caret(code))
+            else:
+                out.append(ch)
+            i += 1
+        return "".join(out)
 
-        body = _re.sub(
-            r"\\u00([01][0-9a-fA-F]|80)",
-            lambda m: ("\\^" + chr((int(m.group(1), 16) & 0x7F) ^ 0x40))
-            if int(m.group(1), 16) not in (0x09, 0x0A, 0x0D)
-            else m.group(0),
-            body,
+    @classmethod
+    def _gh_received_body(cls, stored_body: str) -> str:
+        """The body ``gh api`` hands to the publisher for a stored body."""
+        received = cls._gh_response_sanitizer(
+            json.dumps({"body": stored_body}, ensure_ascii=False)
         )
-        return "".join(
-            "^" + chr(ord(ch) ^ 0x40)
-            if ord(ch) < 0x20 and ch not in "\t\n\r"
-            else ch
-            for ch in body
-        )
+        return json.loads(received)["body"]
 
-    def _install_remote_boundary(self, monkeypatch, remote: dict, patch_response: str, after_patch=None, rewrite=None):
+    @classmethod
+    def _gh_received_comment(cls, comment: dict) -> dict:
+        return {**comment, "body": cls._gh_received_body(comment["body"])}
+
+    def _install_remote_boundary(
+        self, monkeypatch, remote: dict, patch_response: str, after_patch=None, sanitize=False
+    ):
+        """Fake the ``gh api`` transport boundary only.
+
+        ``remote["body"]`` is the *stored* body: exactly what the producer
+        PATCHed.  With ``sanitize=True`` only the stdout handed back to the
+        publisher (the received JSON) goes through the gh response sanitizer;
+        the stored body is never rewritten.
+        """
         endpoint = f"repos/{_REPO}/issues/comments/{self._COMMENT_ID}"
-        calls = {"patch": [], "get": []}
+        calls = {"patch": [], "get": [], "stdout": []}
+
+        def emit(obj: dict):
+            text = json.dumps(obj, ensure_ascii=False)
+            if sanitize:
+                text = self._gh_response_sanitizer(text)
+            calls["stdout"].append(text)
+            return text
 
         def fake_run(command, *, input=None, **_kwargs):
             if "--method" in command:
@@ -3444,7 +3498,7 @@ class TestPatchCommentTransportAndReconciliation:
                 assert input is not None
                 payload = json.loads(input.decode("utf-8"))
                 calls["patch"].append(payload)
-                remote["body"] = rewrite(payload["body"]) if rewrite else payload["body"]
+                remote["body"] = payload["body"]
                 if after_patch is not None:
                     after_patch(remote)
                 if patch_response == "invalid_json":
@@ -3456,7 +3510,7 @@ class TestPatchCommentTransportAndReconciliation:
                     response["body"] = "stale PATCH representation"
                 return MagicMock(
                     returncode=0,
-                    stdout=json.dumps(response).encode("utf-8"),
+                    stdout=emit(response).encode("utf-8"),
                 )
 
             assert command.count(endpoint) == 1
@@ -3464,7 +3518,7 @@ class TestPatchCommentTransportAndReconciliation:
             calls["get"].append(command)
             if patch_response == "get_failure":
                 return MagicMock(returncode=1, stdout="")
-            return MagicMock(returncode=0, stdout=json.dumps(remote))
+            return MagicMock(returncode=0, stdout=emit(remote))
 
         monkeypatch.setattr(_ecs_mod.subprocess, "run", fake_run)
         monkeypatch.setattr(_ecs_mod, "patch_comment", patch_comment)
@@ -3474,6 +3528,94 @@ class TestPatchCommentTransportAndReconciliation:
             _real_verify_controlled_publisher_comment_id_binding,
         )
         return calls
+
+    def _publish_and_parse(self, monkeypatch, classifications: list) -> tuple:
+        """Production builder -> patch_comment (gh sanitizer on receipt) -> parser.
+
+        Returns ``(final_body, remote, calls, parsed)``.  ``parsed`` comes from
+        the real parser run over the comment as *received through gh*.
+        """
+        final_body = self._final_comment_body(classifications)
+        # The producer body must be a fixed point of the receive-time sanitizer.
+        assert self._gh_received_body(final_body) == final_body
+        remote = self._trusted_remote_comment("provisional")
+        calls = self._install_remote_boundary(monkeypatch, remote, "exact", sanitize=True)
+        ok, error = _ecs_mod.patch_comment(
+            _ISSUE_NUMBER, _REPO, self._COMMENT_ID, final_body
+        )
+        assert (ok, error) == (True, None)
+        assert len(calls["patch"]) == 1
+        assert len(calls["get"]) == 1
+        assert calls["patch"][0]["body"] == final_body
+        # Storage is unchanged; only receipt is converted.
+        assert remote["body"] == final_body
+        parsed = _parser_mod.parse_contract_review_results(
+            [self._gh_received_comment(remote)], _ISSUE_URL
+        )
+        return final_body, remote, calls, parsed
+
+    def _go_inner(self, parsed: list) -> dict:
+        assert len(parsed) == 1 and parsed[0]["status"] == "go"
+        assert _parser_mod.is_fingerprint_ready_go(
+            parsed[0]["inner"], self._COMMENT_ID, _ISSUE_NUMBER
+        )
+        return parsed[0]["inner"]
+
+    @staticmethod
+    def _orig_digest(classifications: list) -> str:
+        return _ecs_mod.sha256_of(
+            json.dumps(classifications, ensure_ascii=False, separators=(",", ":"))
+        )
+
+    # -- sanitizer model / fake transport ---------------------------------
+
+    def test_gh_sanitizer_model_matches_probed_gh_behaviour(self):
+        san = self._gh_response_sanitizer
+        # JSON-level escape -> caret
+        assert san(r'"\u001b[0m"') == '"^[[0m"'
+        assert san(r'"\u0007\u001B"') == '"^G^["'
+        # literal ``\u001b`` (JSON ``\\u001b``) decodes to ``\^[``
+        assert json.loads(san(json.dumps("\\u001b"))) == "\\^["
+        # odd/even preceding backslash runs keep the JSON valid
+        assert json.loads(san(json.dumps("\\\\u001b"))) == "\\\\^["
+        assert json.loads(san(json.dumps("\\\\\\u001b"))) == "\\\\\\^["
+        # excluded codes and the reversible ``\u005c`` spelling are untouched
+        for code in ("0009", "000a", "000b", "000d"):
+            assert san(f'"\\u{code}"') == f'"\\u{code}"'
+        assert san(r'"\u005cu001b"') == r'"\u005cu001b"'
+        # raw control bytes
+        assert san('"a\x7fb"') == '"a^?b"'
+
+    def test_given_stored_body_when_gh_returns_it_then_fake_separates_stored_from_received(
+        self, monkeypatch
+    ):
+        """The fake rewrites only what gh prints, never the stored body (#3050)."""
+        body = "marker \x1b[2K and \\u001b[36m"
+        remote = self._trusted_remote_comment("provisional")
+        calls = self._install_remote_boundary(monkeypatch, remote, "exact", sanitize=True)
+
+        ok, error = _ecs_mod.patch_comment(_ISSUE_NUMBER, _REPO, self._COMMENT_ID, body)
+
+        # Stored body is the PATCHed body, byte for byte.
+        assert remote["body"] == body
+        # What the publisher read differs: it hashed the sanitizer's output.
+        received = json.loads(calls["stdout"][-1])["body"]
+        assert received == "marker ^[[2K and \\^[[36m"
+        assert received != remote["body"]
+        assert ok is False
+        assert error is not None and "binding_body_hash_mismatch" in error
+        assert len(calls["patch"]) == 1
+        assert len(calls["get"]) == 1
+
+    def test_given_unsanitized_fake_when_unstable_body_then_binding_passes(self, monkeypatch):
+        """Control: without the sanitizer on stdout the same body binds."""
+        body = "marker \x1b[2K and \\u001b[36m"
+        remote = self._trusted_remote_comment("provisional")
+        self._install_remote_boundary(monkeypatch, remote, "exact", sanitize=False)
+
+        assert _ecs_mod.patch_comment(_ISSUE_NUMBER, _REPO, self._COMMENT_ID, body) == (True, None)
+
+    # -- required production-path regressions ------------------------------
 
     def test_given_small_non_compacted_escaping_values_when_patched_then_exact_body_round_trips_through_real_parser(
         self, monkeypatch
@@ -3486,54 +3628,49 @@ class TestPatchCommentTransportAndReconciliation:
                 "stderr_head": [r"\q", "runner's output", "line1\nline2\tvalue"],
             }
         ]
-        final_body = self._final_comment_body(classifications)
-        remote = self._trusted_remote_comment("provisional")
-        calls = self._install_remote_boundary(monkeypatch, remote, "exact")
-
-        ok, error = _ecs_mod.patch_comment(
-            _ISSUE_NUMBER, _REPO, self._COMMENT_ID, final_body
+        final_body, _remote, _calls, parsed = self._publish_and_parse(
+            monkeypatch, classifications
         )
 
-        assert (ok, error) == (True, None)
-        assert len(calls["patch"]) == 1
-        assert calls["patch"][0]["body"] == final_body
-        assert remote["body"] == final_body
-        assert len(calls["get"]) == 1
-        parsed = _parser_mod.parse_contract_review_results([remote], _ISSUE_URL)
-        assert len(parsed) == 1
-        assert parsed[0]["status"] == "go"
-        assert _parser_mod.is_fingerprint_ready_go(
-            parsed[0]["inner"], self._COMMENT_ID, _ISSUE_NUMBER
-        )
-        parsed_classification = parsed[0]["inner"]["checks"]["vc_preflight"]["classifications"][0]
-        # #3050: a real ESC is transported as the stable literal ``\x1b``;
-        # the literal ``\^[[2K`` stays distinct from it (#2619).
-        expected_classification = json.loads(
-            json.dumps(classifications[0]).replace("\\u001b", "\\\\x1b")
-        )
-        assert parsed_classification == expected_classification
-        assert parsed[0]["inner"]["checks"]["vc_preflight"]["classifications_transport"] == {
+        inner = self._go_inner(parsed)
+        parsed_classification = inner["checks"]["vc_preflight"]["classifications"][0]
+        # Verbose values only: a real ESC is shown as the stable literal
+        # ``\x1b``; the literal ``\^[[2K`` stays distinct from it (#2619).
+        assert parsed_classification == {
+            "ac": "AC1a",
+            "decision": "pass",
+            "stdout_head": [r"\^[[2K", r"\x1b[2K", r"path\foo\bar"],
+            "stderr_head": [r"\q", "runner's output", "line1\nline2\tvalue"],
+        }
+        assert inner["checks"]["vc_preflight"]["classifications_transport"] == {
             "schema": "vc_preflight_classifications_transport/v1",
             "classification_count": 1,
-            "original_payload_sha256": _ecs_mod.sha256_of(
-                json.dumps(classifications, ensure_ascii=False, separators=(",", ":"))
-            ),
+            "original_payload_sha256": self._orig_digest(classifications),
             "compact": False,
             "truncated": False,
         }
 
     @pytest.mark.parametrize(
-        "stdout_head",
+        ("stdout_head", "expected_stdout_head"),
         [
-            ["\x1b[36mvite v8.0.13 \x1b[32mbuilding...\x1b[39m", "\x1b[2K", "\x07bell"],
-            [r"\u001b[36mliteral json escape", r"\u0007", r"\u001B[2K", r"\u0080"],
-            ["\x7f", "\x85", "plain \U0001F600 ✓"],
+            (
+                ["\x1b[36mvite v8.0.13 \x1b[32mbuilding...\x1b[39m", "\x1b[2K", "\x07bell"],
+                [r"\x1b[36mvite v8.0.13 \x1b[32mbuilding...\x1b[39m", r"\x1b[2K", r"\x07bell"],
+            ),
+            (
+                [r"\u001b[36mliteral json escape", r"\u0007", r"\u001B[2K", r"\u0080"],
+                [r"\x1b[36mliteral json escape", r"\x07", r"\x1b[2K", r"\x80"],
+            ),
+            (
+                ["\x7f", "\x85", "plain \U0001F600 ✓"],
+                [r"\x7f", r"\x85", "plain \U0001F600 ✓"],
+            ),
         ],
     )
-    def test_given_control_output_when_github_rewrites_stored_body_then_producer_body_is_stable_and_binds(
-        self, monkeypatch, stdout_head
+    def test_given_control_output_when_gh_sanitizer_converts_on_receipt_then_producer_body_is_stable_and_binds(
+        self, monkeypatch, stdout_head, expected_stdout_head
     ):
-        """#3050 regression: modelled GitHub rewrite must not break the binding."""
+        """#3050 regression: the gh receive-time sanitizer must not break the binding."""
         classifications = [
             {
                 "ac": "AC1",
@@ -3543,41 +3680,324 @@ class TestPatchCommentTransportAndReconciliation:
                 "stderr_head": ["\x1b[0m"],
             }
         ]
-        final_body = self._final_comment_body(classifications)
-        # The producer body is a fixed point of the observed storage rewrite.
-        assert self._github_storage_rewrite(final_body) == final_body
-        remote = self._trusted_remote_comment("provisional")
-        calls = self._install_remote_boundary(
-            monkeypatch, remote, "exact", rewrite=self._github_storage_rewrite
+        final_body, _remote, _calls, parsed = self._publish_and_parse(
+            monkeypatch, classifications
         )
 
-        ok, error = _ecs_mod.patch_comment(
-            _ISSUE_NUMBER, _REPO, self._COMMENT_ID, final_body
+        inner = self._go_inner(parsed)
+        vc_preflight = inner["checks"]["vc_preflight"]
+        assert vc_preflight["classifications"] == [
+            {
+                "ac": "AC1",
+                "decision": "pass",
+                "category": "regression_gate",
+                "stdout_head": expected_stdout_head,
+                "stderr_head": [r"\x1b[0m"],
+            }
+        ]
+        assert vc_preflight["classifications_transport"]["original_payload_sha256"] == (
+            self._orig_digest(classifications)
+        )
+        # Log display safety: the published body has no real control chars
+        # (other than TAB/LF/CR) and no sanitizer-sensitive ``\u00XX`` token.
+        assert re.search("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", final_body) is None
+        assert re.search(r"\\u00(?:[01][0-9a-fA-F]|[89][0-9a-fA-F])", final_body) is None
+
+    def test_given_literal_u001b_command_and_real_esc_output_when_published_then_command_and_hash_round_trip(
+        self, monkeypatch
+    ):
+        raw_command = "python -c 'assert r\"\\u001b\" == \"\\\\\" + \"u001b\"'"
+        assert "\\u001b" in raw_command and "\x1b" not in raw_command
+        command_hash = hashlib.sha256(raw_command.encode("utf-8")).hexdigest()
+        classifications = [
+            {
+                "ac": "AC7",
+                "decision": "pass",
+                "category": "regression_gate",
+                "raw_command": raw_command,
+                "command_hash": command_hash,
+                "stdout_head": ["\x1b[2K done"],
+            }
+        ]
+        before = json.loads(json.dumps(classifications))
+
+        final_body, _remote, _calls, parsed = self._publish_and_parse(
+            monkeypatch, classifications
         )
 
-        assert (ok, error) == (True, None)
-        assert len(calls["patch"]) == 1
-        assert len(calls["get"]) == 1
-        assert remote["body"] == final_body
-        parsed = _parser_mod.parse_contract_review_results([remote], _ISSUE_URL)
-        assert len(parsed) == 1 and parsed[0]["status"] == "go"
-        assert _parser_mod.is_fingerprint_ready_go(
-            parsed[0]["inner"], self._COMMENT_ID, _ISSUE_NUMBER
-        )
-        transport = parsed[0]["inner"]["checks"]["vc_preflight"]["classifications_transport"]
-        assert transport["original_payload_sha256"] == _ecs_mod.sha256_of(
-            json.dumps(classifications, ensure_ascii=False, separators=(",", ":"))
+        assert classifications == before  # producer payload not mutated
+        inner = self._go_inner(parsed)
+        item = inner["checks"]["vc_preflight"]["classifications"][0]
+        # raw_command keeps the *literal* ``\u001b`` (not ``\x1b``), exactly.
+        assert item["raw_command"] == raw_command
+        assert hashlib.sha256(item["raw_command"].encode("utf-8")).hexdigest() == item["command_hash"]
+        # ... while the real ESC in verbose output is shown, lossily, as ``\x1b``.
+        assert item["stdout_head"] == [r"\x1b[2K done"]
+        assert item["raw_command"] != item["stdout_head"][0]
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "\\u001b",
+            "\\\\u001b",
+            "\\\\\\u001b",
+            "\\\\\\\\u001b",
+            "x\\u001b y\\\\u001B z\\u0085",
+            "\\u0007\\u0080\\u009f\\u0000",
+            "\\u0009\\u000a\\u000b\\u000d",
+            "\\u00",
+            "\\u001",
+            "\\u00zz",
+            "\\u005cu001b",
+            "tail\\",
+            "\\\\",
+        ],
+    )
+    def test_given_non_verbose_fields_with_literal_escape_text_when_published_then_every_field_round_trips_exactly(
+        self, monkeypatch, value
+    ):
+        classifications = [
+            {
+                "ac": value,
+                "decision": "pass",
+                "category": value,
+                "scope_class": value,
+                "raw_command": value,
+                "command_hash": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+                "nested": {value: [value, {"k": value}]},
+                "stdout_head": [value],
+            }
+        ]
+        before = json.loads(json.dumps(classifications))
+
+        _final_body, _remote, _calls, parsed = self._publish_and_parse(
+            monkeypatch, classifications
         )
 
-    def test_given_unstable_body_when_github_rewrites_then_binding_still_fails_closed(
+        assert classifications == before
+        inner = self._go_inner(parsed)
+        item = inner["checks"]["vc_preflight"]["classifications"][0]
+        for key in (
+            "ac", "decision", "category", "scope_class", "raw_command", "command_hash", "nested"
+        ):
+            assert item[key] == classifications[0][key], key
+        assert hashlib.sha256(item["raw_command"].encode("utf-8")).hexdigest() == item["command_hash"]
+        # Only the verbose key is allowed to differ (lossy ``\xNN`` display).
+        assert set(item) == set(classifications[0])
+
+    def test_given_boundary_band_payload_when_published_then_parser_returns_go_and_legacy_order_would_fail(
+        self, monkeypatch
+    ):
+        """Original JSON <= 16,000 but normalised size > 16,384 (#3050 P2-1).
+
+        Each ``\\b`` (BS) is 2 characters in the original JSON and 5 once the
+        verbose ``\\xNN`` display form is JSON-encoded.
+        """
+        classifications = [
+            {"ac": f"AC{index}", "decision": "pass", "stdout_head": ["\x08" * 320]}
+            for index in range(20)
+        ]
+        original_json = json.dumps(classifications, ensure_ascii=False, separators=(",", ":"))
+        normalized_json = _ecs_mod._classifications_transport_json(
+            _ecs_mod._normalize_classifications_for_transport(
+                classifications, omit_verbose=False
+            )
+        )
+        assert len(original_json) <= _ecs_mod._MAX_CLASSIFICATIONS_TRANSPORT_CHARS
+        assert len(normalized_json) > _parser_mod._MAX_JSON_FLOW_COLLECTION_CHARS
+
+        final_body, _remote, _calls, parsed = self._publish_and_parse(
+            monkeypatch, classifications
+        )
+
+        inner = self._go_inner(parsed)
+        vc_preflight = inner["checks"]["vc_preflight"]
+        assert [item["ac"] for item in vc_preflight["classifications"]] == [
+            f"AC{index}" for index in range(20)
+        ]
+        assert vc_preflight["classifications_transport"]["compact"] is True
+        assert vc_preflight["classifications_transport"]["classification_count"] == 20
+        assert vc_preflight["classifications_transport"]["original_payload_sha256"] == (
+            self._orig_digest(classifications)
+        )
+
+        # Negative control: re-create the legacy order (size judged on the
+        # original payload, normalisation applied afterwards) and show the real
+        # parser then rejects the body as json_flow_collection_too_large.
+        def legacy_compact(items):
+            metadata = {
+                "schema": "vc_preflight_classifications_transport/v1",
+                "classification_count": len(items),
+                "original_payload_sha256": self._orig_digest(items),
+                "compact": False,
+                "truncated": False,
+            }
+            assert len(json.dumps(items, ensure_ascii=False, separators=(",", ":"))) <= 16_000
+            return _ecs_mod._gh_sanitizer_stable_verbose_value(items), metadata
+
+        monkeypatch.setattr(_ecs_mod, "compact_vc_preflight_classifications", legacy_compact)
+        legacy_body = self._final_comment_body(classifications)
+        legacy_comment = self._trusted_remote_comment(legacy_body)
+        block = _parser_mod._extract_yaml_blocks(legacy_body)[0]
+        with pytest.raises(_parser_mod.SimpleYamlParseError, match="json_flow_collection_too_large"):
+            _parser_mod._parse_simple_yaml_block(block)
+        assert _parser_mod.parse_contract_review_results([legacy_comment], _ISSUE_URL) == []
+
+    @staticmethod
+    def _padded(total: int, *, verbose: bool) -> list[dict]:
+        """One classification whose final transport JSON is exactly ``total`` chars."""
+        key = "stdout_head" if verbose else "note"
+        item: dict = {"ac": "AC1", "decision": "pass", key: ""}
+        base = len(
+            _ecs_mod._classifications_transport_json(
+                _ecs_mod._normalize_classifications_for_transport([item], omit_verbose=False)
+            )
+        )
+        if verbose:
+            item[key] = ["x" * (total - base - 2)]
+        else:
+            item[key] = "x" * (total - base)
+        # stdout_head is a list: '[""]' costs 2 more than '""'; recompute exactly.
+        assert len(
+            _ecs_mod._classifications_transport_json(
+                _ecs_mod._normalize_classifications_for_transport([item], omit_verbose=False)
+            )
+        ) == total
+        return [item]
+
+    @pytest.mark.parametrize(
+        ("total", "expect_compact"),
+        [(15_999, False), (16_000, False), (16_001, True), (16_384, True), (16_385, True)],
+    )
+    def test_given_final_json_size_around_limit_when_compacting_then_decision_uses_final_representation(
+        self, total, expect_compact
+    ):
+        classifications = self._padded(total, verbose=True)
+
+        result, metadata = _ecs_mod.compact_vc_preflight_classifications(classifications)
+
+        assert metadata["compact"] is expect_compact
+        assert metadata["truncated"] is expect_compact
+        assert metadata["classification_count"] == 1
+        assert metadata["original_payload_sha256"] == self._orig_digest(classifications)
+        assert len(_ecs_mod._classifications_transport_json(result)) <= 16_000
+        assert ("stdout_head" in result[0]) is (not expect_compact)
+
+    def test_given_reversible_encoding_growth_when_original_fits_then_compaction_is_decided_on_encoded_size(self):
+        """Original JSON <= 16,000 but the reversible ``\\u005c`` form pushes past it."""
+        literal = "\\u001b" * 1_000
+        classifications = [
+            {"ac": "AC1", "decision": "pass", "note": literal, "stdout_head": ["x" * 5_000]}
+        ]
+        original_json = json.dumps(classifications, ensure_ascii=False, separators=(",", ":"))
+        assert len(original_json) <= 16_000
+
+        result, metadata = _ecs_mod.compact_vc_preflight_classifications(classifications)
+
+        assert metadata["compact"] is True
+        assert metadata["original_payload_sha256"] == self._orig_digest(classifications)
+        assert result == [{"ac": "AC1", "decision": "pass", "note": literal}]
+        assert len(_ecs_mod._classifications_transport_json(result)) <= 16_000
+
+    @pytest.mark.parametrize(("total", "fits"), [(16_000, True), (16_001, False)])
+    def test_given_non_verbose_payload_at_limit_after_compaction_when_compacting_then_boundary_is_exact(
+        self, total, fits
+    ):
+        # Verbose output is present, so the compaction path is always taken.
+        item = {"ac": "AC1", "decision": "pass", "note": "", "stdout_head": ["v" * 5_000]}
+        base = len(
+            _ecs_mod._classifications_transport_json(
+                _ecs_mod._normalize_classifications_for_transport([item], omit_verbose=True)
+            )
+        )
+        item["note"] = "n" * (total - base)
+        classifications = [item]
+
+        if fits:
+            result, metadata = _ecs_mod.compact_vc_preflight_classifications(classifications)
+            assert metadata["compact"] is True
+            assert len(_ecs_mod._classifications_transport_json(result)) == total
+        else:
+            with pytest.raises(
+                ValueError, match="vc_preflight_classifications_compact_payload_too_large"
+            ):
+                _ecs_mod.compact_vc_preflight_classifications(classifications)
+
+    def test_given_compaction_when_applied_then_count_digest_and_non_verbose_items_are_preserved(self):
+        classifications = [
+            {
+                "ac": f"AC{index}",
+                "decision": "pass",
+                "category": "regression_gate",
+                "scope_class": "in_scope",
+                "raw_command": f"echo {index} \\u001b",
+                "command_hash": hashlib.sha256(f"echo {index} \\u001b".encode()).hexdigest(),
+                "fingerprint": {"a": ["b", {"c": "\\u0085"}]},
+                "stdout_head": ["\x1b" + "o" * 1_500],
+                "stderr_head": ["e" * 1_500],
+                "runner_env_delta": {"k": "v" * 500},
+                "pnpm_gate_evidence": {"k": "p" * 500},
+            }
+            for index in range(8)
+        ]
+        before = json.loads(json.dumps(classifications))
+        verbose = _ecs_mod._CLASSIFICATIONS_TRANSPORT_OMIT_KEYS
+
+        result, metadata = _ecs_mod.compact_vc_preflight_classifications(classifications)
+
+        assert classifications == before  # input untouched
+        assert metadata["compact"] is True and metadata["truncated"] is True
+        assert metadata["original_payload_sha256"] == self._orig_digest(before)
+        assert metadata["classification_count"] == len(before) == len(result)
+        for original, kept in zip(before, result):
+            assert kept == {k: v for k, v in original.items() if k not in verbose}
+            assert hashlib.sha256(kept["raw_command"].encode()).hexdigest() == kept["command_hash"]
+
+    @pytest.mark.parametrize(
+        "classifications",
+        [
+            [{"ac": "AC\x1b1", "decision": "pass"}],
+            [{"ac": "AC1", "decision": "pass", "note": "bell \x07"}],
+            [{"ac": "AC1", "decision": "pass", "raw_command": "echo \x7f"}],
+            [{"ac": "AC1", "decision": "pass", "note": "c1 \x85"}],
+            [{"ac": "AC1", "decision": "pass", "nested": ["ok", {"deep": "\x1b[0m"}]}],
+            [{"ac": "AC1", "decision": "pass", "\x1bkey": "value"}],
+            [{"ac": "AC1", "decision": "pass", "nested": {"\x07key": "value"}}],
+            ["bare \x1b string item"],
+        ],
+    )
+    def test_given_real_control_char_in_non_verbose_field_or_key_when_built_then_fails_closed(
+        self, classifications
+    ):
+        with pytest.raises(
+            ValueError,
+            match="vc_preflight_classifications_control_char_in_non_verbose_field",
+        ):
+            self._final_comment_body(classifications)
+        with pytest.raises(ValueError):
+            _ecs_mod.compact_vc_preflight_classifications(classifications)
+
+    def test_given_real_control_char_only_in_verbose_fields_when_built_then_allowed(self):
+        classifications = [
+            {
+                "ac": "AC1",
+                "decision": "pass",
+                "stdout_head": ["\x1b[0m", "\x00\x1f\x7f\x85"],
+                "stderr_head": ["\x07"],
+                "runner_env_delta": {"\x1bk": "\x1bv"},
+                "pnpm_gate_evidence": ["\x1b"],
+            }
+        ]
+        body = self._final_comment_body(classifications)
+        assert self._gh_received_body(body) == body
+
+    def test_given_unstable_body_when_gh_sanitizes_then_binding_still_fails_closed(
         self, monkeypatch
     ):
         """Negative control: an unnormalised body keeps failing closed (#3050 AC4)."""
         unstable = "marker \x1b[2K and \\u001b[36m"
         remote = self._trusted_remote_comment("provisional")
-        calls = self._install_remote_boundary(
-            monkeypatch, remote, "exact", rewrite=self._github_storage_rewrite
-        )
+        calls = self._install_remote_boundary(monkeypatch, remote, "exact", sanitize=True)
 
         ok, error = _ecs_mod.patch_comment(_ISSUE_NUMBER, _REPO, self._COMMENT_ID, unstable)
 
@@ -3599,37 +4019,22 @@ class TestPatchCommentTransportAndReconciliation:
                 "runner_env_delta": {"large": "z" * 17_000},
             }
         ]
-        final_body = self._final_comment_body(classifications)
-        remote = self._trusted_remote_comment("provisional")
-        calls = self._install_remote_boundary(monkeypatch, remote, "exact")
-
-        ok, error = _ecs_mod.patch_comment(
-            _ISSUE_NUMBER, _REPO, self._COMMENT_ID, final_body
+        final_body, _remote, _calls, parsed = self._publish_and_parse(
+            monkeypatch, classifications
         )
 
-        assert (ok, error) == (True, None)
-        assert len(calls["patch"]) == 1
-        assert calls["patch"][0]["body"] == final_body
-        assert len(calls["get"]) == 1
-        parsed = _parser_mod.parse_contract_review_results([remote], _ISSUE_URL)
-        assert len(parsed) == 1
-        assert parsed[0]["status"] == "go"
-        vc_preflight = parsed[0]["inner"]["checks"]["vc_preflight"]
+        inner = self._go_inner(parsed)
+        vc_preflight = inner["checks"]["vc_preflight"]
         assert vc_preflight["classifications"] == [{
             "ac": "AC1b", "decision": "pass", "category": "regression_gate"
         }]
         assert vc_preflight["classifications_transport"] == {
             "schema": "vc_preflight_classifications_transport/v1",
             "classification_count": 1,
-            "original_payload_sha256": _ecs_mod.sha256_of(
-                json.dumps(classifications, ensure_ascii=False, separators=(",", ":"))
-            ),
+            "original_payload_sha256": self._orig_digest(classifications),
             "compact": True,
             "truncated": True,
         }
-        assert _parser_mod.is_fingerprint_ready_go(
-            parsed[0]["inner"], self._COMMENT_ID, _ISSUE_NUMBER
-        )
 
     @pytest.mark.parametrize(
         "patch_response", ["invalid_json", "id_mismatch", "body_mismatch"]

@@ -498,11 +498,16 @@ def compact_vc_preflight_classifications(
 ) -> tuple[list[Any], dict[str, Any]]:
     """Bound snapshot transport while retaining a strict classifications list.
 
-    The complete producer payload is bound by digest and count.  If it cannot
-    fit in the parser's bounded JSON transport, only verbose execution output
-    is omitted; classification records and every non-verbose consumer field
-    remain unchanged.  A compacted list that still exceeds the hard cap is
-    rejected rather than converted to an opaque scalar or truncated further.
+    ``original_payload_sha256`` binds the complete, unmodified producer payload
+    by digest and count.  The size decision (Issue #3050) is, however, made on
+    the *final transport representation*: the normalised list serialised by
+    ``_classifications_transport_json`` -- the exact string the parser's
+    bounded JSON reader will measure.  If that does not fit
+    ``_MAX_CLASSIFICATIONS_TRANSPORT_CHARS``, only verbose execution output is
+    omitted and the final representation is re-measured.  Classification
+    records and every non-verbose consumer field stay unchanged and
+    round-trip exactly; a list that still exceeds the hard cap is rejected
+    rather than converted to an opaque scalar or truncated further.
     """
     original_json = json.dumps(classifications, ensure_ascii=False, separators=(",", ":"))
     metadata: dict[str, Any] = {
@@ -512,18 +517,16 @@ def compact_vc_preflight_classifications(
         "compact": False,
         "truncated": False,
     }
-    if len(original_json) <= _MAX_CLASSIFICATIONS_TRANSPORT_CHARS:
-        return classifications, metadata
+    normalized = _normalize_classifications_for_transport(
+        classifications, omit_verbose=False
+    )
+    if len(_classifications_transport_json(normalized)) <= _MAX_CLASSIFICATIONS_TRANSPORT_CHARS:
+        return normalized, metadata
 
-    compacted: list[Any] = []
-    for item in classifications:
-        if not isinstance(item, dict):
-            raise ValueError("vc_preflight_classifications_non_object_cannot_compact")
-        compacted.append(
-            {key: value for key, value in item.items() if key not in _CLASSIFICATIONS_TRANSPORT_OMIT_KEYS}
-        )
-    compacted_json = json.dumps(compacted, ensure_ascii=False, separators=(",", ":"))
-    if len(compacted_json) > _MAX_CLASSIFICATIONS_TRANSPORT_CHARS:
+    compacted = _normalize_classifications_for_transport(
+        classifications, omit_verbose=True
+    )
+    if len(_classifications_transport_json(compacted)) > _MAX_CLASSIFICATIONS_TRANSPORT_CHARS:
         raise ValueError("vc_preflight_classifications_compact_payload_too_large")
     metadata["compact"] = True
     metadata["truncated"] = True
@@ -1906,21 +1909,47 @@ def ensure_contract_snapshot(
     return result
 
 
-# Issue #3050: GitHub rewrites control characters in a comment body to caret
-# notation at storage time.  Observed on live GitHub (2026-10-12): a real ESC
-# becomes ``^[``, and the *literal text* ``\u001b`` -- exactly what json.dumps
-# emits for an ESC -- becomes ``\^[`` (all C0 except TAB/LF/CR, and
-# ``\u0080``).  The readback then differs from the body the producer hashed
-# and the full binding fails with ``binding_body_hash_mismatch``.  Neither
-# ``\xNN`` nor ``\^[`` literals are rewritten, so advisory text is made
-# stable under that rewrite *before* the body is built and hashed.
+# Issue #3050: why control characters need special transport handling.
+#
+# GitHub *stores* the comment body unchanged: a literal ``\u001b`` stays
+# literal on the server.  The mutation happens on *receipt*: the ``gh`` CLI
+# (observed with gh 2.102.0 / go-gh v2.16.1) passes every response through a
+# JSON-mode response sanitizer (``Sanitizer{JSON: true}``).  It rewrites
+# ``\u00XX`` escape text in the received JSON (XX in 00-1F and 80-9F, except
+# 09/0a/0b/0d) into caret notation (``\u001b`` -> ``^[``), prefixing one extra
+# backslash when an odd number of backslashes precedes the token so the JSON
+# stays valid (a literal ``\u001b`` in the body, JSON ``\\u001b``, decodes to
+# ``\^[``), and likewise rewrites raw control characters.  The publisher
+# reads the comment back through ``gh`` and hashes what the sanitizer returned,
+# so a body containing these tokens fails ``binding_body_hash_mismatch``.
+#
+# The producer therefore builds a body that is a fixed point of the sanitizer:
+#   * verbose log fields (``_CLASSIFICATIONS_TRANSPORT_OMIT_KEYS``) are
+#     advisory output, so their control characters / literal ``\u00XX`` text
+#     are lossily shown as ``\xNN`` (a form the sanitizer does not touch);
+#   * every other field must round-trip exactly, so an escaped backslash
+#     directly before ``u00XX`` is spelled ``\u005c`` (standard JSON: the
+#     parser restores the identical value, and the sanitizer ignores ``\``
+#     escapes), while real control characters -- which JSON can only express
+#     as ``\u00XX`` -- are rejected fail-closed.
 _GITHUB_REWRITTEN_CONTROL_RE = re.compile(
     "[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]"
     r"|\\u00(?:[01][0-9a-fA-F]|[89][0-9a-fA-F])"
 )
+_REAL_CONTROL_CHAR_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+# Left-to-right, non-overlapping scan of JSON escape pairs.  Alternative 1
+# captures an escaped backslash (``\\``) that is directly followed by
+# ``u00XX`` with XX in the sanitizer's control ranges; alternative 2 consumes
+# any other escape pair so backslash parity stays aligned.
+_JSON_BACKSLASH_BEFORE_U00_RE = re.compile(
+    r"(\\\\)(?=u00(?:[01][0-9a-fA-F]|[89][0-9a-fA-F]))|\\.",
+    re.DOTALL,
+)
 
 
-def _github_stable_control_text(text: str) -> str:
+def _gh_sanitizer_stable_verbose_text(text: str) -> str:
+    """Lossy ``\\xNN`` display form; only for verbose log values."""
+
     def _repl(match: "re.Match[str]") -> str:
         token = match.group(0)
         code = ord(token) if len(token) == 1 else int(token[-2:], 16)
@@ -1931,14 +1960,85 @@ def _github_stable_control_text(text: str) -> str:
     return _GITHUB_REWRITTEN_CONTROL_RE.sub(_repl, text)
 
 
-def _github_stable_control_value(value: Any) -> Any:
+def _gh_sanitizer_stable_verbose_value(value: Any) -> Any:
     if isinstance(value, str):
-        return _github_stable_control_text(value)
+        return _gh_sanitizer_stable_verbose_text(value)
     if isinstance(value, list):
-        return [_github_stable_control_value(item) for item in value]
+        return [_gh_sanitizer_stable_verbose_value(item) for item in value]
     if isinstance(value, dict):
-        return {key: _github_stable_control_value(item) for key, item in value.items()}
+        converted: dict[Any, Any] = {}
+        for key, item in value.items():
+            new_key = _gh_sanitizer_stable_verbose_value(key)
+            if new_key in converted:
+                raise ValueError("vc_preflight_classifications_verbose_key_collision")
+            converted[new_key] = _gh_sanitizer_stable_verbose_value(item)
+        return converted
     return value
+
+
+def _reject_control_in_non_verbose(value: Any) -> None:
+    """Fail closed on real control characters in a lossless (non-verbose) field."""
+    if isinstance(value, str):
+        if _REAL_CONTROL_CHAR_RE.search(value) is not None:
+            raise ValueError("vc_preflight_classifications_control_char_in_non_verbose_field")
+    elif isinstance(value, list):
+        for item in value:
+            _reject_control_in_non_verbose(item)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _reject_control_in_non_verbose(key)
+            _reject_control_in_non_verbose(item)
+
+
+def _normalize_classifications_for_transport(
+    classifications: list[Any], *, omit_verbose: bool
+) -> list[Any]:
+    """Return a sanitizer-stable copy of ``classifications``.
+
+    Verbose keys get the lossy ``\\xNN`` form (or are dropped when
+    ``omit_verbose``); everything else is kept verbatim and validated to be
+    free of real control characters so that it round-trips exactly.
+    """
+    normalized: list[Any] = []
+    for item in classifications:
+        if not isinstance(item, dict):
+            if omit_verbose:
+                raise ValueError("vc_preflight_classifications_non_object_cannot_compact")
+            _reject_control_in_non_verbose(item)
+            normalized.append(item)
+            continue
+        record: dict[Any, Any] = {}
+        for key, value in item.items():
+            if key in _CLASSIFICATIONS_TRANSPORT_OMIT_KEYS:
+                if not omit_verbose:
+                    record[key] = _gh_sanitizer_stable_verbose_value(value)
+                continue
+            _reject_control_in_non_verbose(key)
+            _reject_control_in_non_verbose(value)
+            record[key] = value
+        normalized.append(record)
+    return normalized
+
+
+def _gh_sanitizer_safe_json_text(encoded: str) -> str:
+    """Reversibly spell ``\\\\`` before ``u00XX`` as ``\\u005c`` (identical JSON value)."""
+
+    def _repl(match: "re.Match[str]") -> str:
+        return "\\u005c" if match.group(1) is not None else match.group(0)
+
+    return _JSON_BACKSLASH_BEFORE_U00_RE.sub(_repl, encoded)
+
+
+def _classifications_transport_json(classifications: list[Any]) -> str:
+    """Final classifications JSON text (before YAML single-quoting).
+
+    This exact string is what the parser's bounded JSON reader measures, so
+    the size decision in ``compact_vc_preflight_classifications`` and the
+    serialisation in the comment builder must both use it.
+    """
+    return _gh_sanitizer_safe_json_text(
+        json.dumps(classifications, ensure_ascii=False, separators=(",", ":"))
+    )
 
 
 def _build_contract_review_comment(
@@ -2009,12 +2109,12 @@ CONTRACT_SNAPSHOT_MATERIALIZATION_PENDING_V1:
         vc_preflight_classifications,
         classifications_transport,
     ) = compact_vc_preflight_classifications(vc_preflight_classifications)
-    # Applied after compaction so original_payload_sha256 still binds the
-    # unmodified producer payload (#3050).
-    vc_preflight_classifications = _github_stable_control_value(
-        vc_preflight_classifications
+    # The transport form is normalised and measured inside
+    # compact_vc_preflight_classifications; original_payload_sha256 still binds
+    # the unmodified producer payload (#3050).
+    classifications_json = (
+        "'" + _classifications_transport_json(vc_preflight_classifications).replace("'", "''") + "'"
     )
-    classifications_json = json_yaml_scalar(vc_preflight_classifications)
     classifications_transport_json = json.dumps(
         classifications_transport, ensure_ascii=False, separators=(",", ":")
     )
