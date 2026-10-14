@@ -199,6 +199,8 @@ job が再度 `done` になってから実行する。evaluator は `timeline.js
 `lastTerminalAt` が probe より後であることを要求する。境界を観測できない（timeline 欠落・terminal 無し・後続 turn 無し）
 場合は `assertions.resume_boundary` が `unverified` となり exit 1 で、2 turn の応答（`two_turn_response`）とは別に記録する。
 resume 境界にできる terminal は `done` / `failed` / `stopped` だけで、入力待ちの `blocked` は process が生存しているため境界にしない。
+pre-boundary の有効応答は、最初の probe 以後かつ境界（T1）以前の時刻でなければならず、時刻が無い応答は
+境界へ束縛できないため `unverified` とする。
 post-boundary の有効応答は、境界後の最初の probe から次の human turn までの区間に必要である。
 process の再起動・settings 再読込そのものは観測できないため `process_restart_observed` は常に `unverified` である。
 

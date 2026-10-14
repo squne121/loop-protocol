@@ -183,6 +183,7 @@ def _write_job(
     job_state: str = "done",
     timeline=_UNSET,
     row_cwd: Path | None = None,
+    pre_ts: str | None = T_PRE_REPLY,
 ):
     session = f"{job_id}-0000-4000-8000-000000000000"
     flags = ["--model", model_flag]
@@ -233,7 +234,7 @@ def _write_job(
                     "message": {"content": f"{prompt} again"},
                 }
             )
-        rows.append(_assistant_row(r, T_POST_REPLY if post else T_PRE_REPLY))
+        rows.append(_assistant_row(r, T_POST_REPLY if post else pre_ts))
     if row_cwd is not None:
         rows = [{**x, "cwd": str(row_cwd)} for x in rows]
     (proj / f"{session}.jsonl").write_text("\n".join(json.dumps(x) for x in rows), encoding="utf-8")
@@ -1135,3 +1136,78 @@ def test_live_vc_job_cwd_in_real_subdirectory_of_target_is_in_target(tmp_path):
     env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
     code, receipt = ev.run("dispatched-child-and-resume", env)
     assert code == 0 and receipt["candidate"]["child_cwd_in_target"] is True
+
+
+# --- iteration 2: pre-boundary の成功を時刻で T1 に束縛する・等号側の境界値 --------------------------------
+
+
+def test_live_vc_resume_terminal_before_first_valid_response_is_not_resume(tmp_path):
+    # W-a: terminal(03:05) が最初の有効応答(03:10)より前。T1 より後の応答は pre-boundary の成功ではない。
+    timeline = [
+        (T_FIRST_PROBE, "working"),
+        ("2026-10-14T03:05:00.000Z", "failed"),
+        (T_SECOND_PROBE, "working"),
+        (T_LAST_TERMINAL, "done"),
+    ]
+    code, _, resume = _resume_receipt(tmp_path, timeline=timeline)
+    assert code == 1 and resume == {"status": "failed", "reason": "no_valid_response_pre_boundary"}
+
+
+def test_live_vc_resume_pre_boundary_response_without_timestamp_is_unverified(tmp_path):
+    code, receipt, resume = _resume_receipt(tmp_path, pre_ts=None)
+    assert code == 1 and resume == {"status": "unverified", "reason": "pre_boundary_response_timestamp_missing"}
+    assert receipt["assertions"]["resume_boundary"] == "unverified"
+
+
+def test_live_vc_resume_pre_boundary_response_before_first_probe_time_is_not_resume(tmp_path):
+    # 応答の時刻が P1 より前（時計の不整合）。P1 以後でなければ束縛を証明できない。
+    code, _, resume = _resume_receipt(tmp_path, pre_ts="2026-10-14T02:59:59.000Z")
+    assert code == 1 and resume["reason"] == "no_valid_response_pre_boundary"
+
+
+def test_live_vc_resume_pre_boundary_response_exactly_at_terminal_is_accepted(tmp_path):
+    # 等号側: 応答時刻 == T1 は pre-boundary（T1 以下）。
+    code, _, resume = _resume_receipt(tmp_path, pre_ts=T_FIRST_TERMINAL)
+    assert code == 0 and resume["status"] == "observed"
+
+
+def test_live_vc_resume_pre_boundary_response_just_after_terminal_is_not_resume(tmp_path):
+    code, _, resume = _resume_receipt(tmp_path, pre_ts="2026-10-14T03:30:00.001Z")
+    assert code == 1 and resume["reason"] == "no_valid_response_pre_boundary"
+
+
+def test_live_vc_resume_pre_boundary_response_exactly_at_first_probe_is_accepted(tmp_path):
+    code, _, resume = _resume_receipt(tmp_path, pre_ts=T_FIRST_PROBE)
+    assert code == 0 and resume["status"] == "observed"
+
+
+def test_live_vc_resume_terminal_at_same_instant_as_first_probe_is_the_boundary(tmp_path):
+    # 等号側: terminal が P1 と同時刻でも T1 である（`at >= p1_ts`）。その後の応答 (03:10) は pre-boundary でない。
+    timeline = [
+        (T_FIRST_PROBE, "working"),
+        (T_FIRST_PROBE, "failed"),
+        (T_SECOND_PROBE, "working"),
+        (T_LAST_TERMINAL, "done"),
+    ]
+    code, _, resume = _resume_receipt(tmp_path, timeline=timeline)
+    assert code == 1 and resume == {"status": "failed", "reason": "no_valid_response_pre_boundary"}
+
+
+def test_live_vc_resume_terminal_at_same_instant_as_second_probe_is_not_a_boundary_before_it(tmp_path):
+    # 等号側: P2 が T1 と同時刻なら T1 より後ではない（`ts > t1`）。境界後の human turn を観測できていない。
+    timeline = [(T_FIRST_PROBE, "working"), (T_SECOND_PROBE, "done"), (T_LAST_TERMINAL, "done")]
+    code, _, resume = _resume_receipt(tmp_path, timeline=timeline)
+    assert code == 1 and resume == {"status": "unverified", "reason": "no_human_turn_after_terminal"}
+
+
+def test_live_vc_resume_last_terminal_at_same_instant_as_second_probe_is_not_after_it(tmp_path):
+    target = tmp_path / "repo"
+    target.mkdir()
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD, GOOD], resumed=True)
+    state_path = tmp_path / "jobs" / "bbbbbbbb" / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["lastTerminalAt"] = T_SECOND_PROBE
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    code, receipt = ev.run("dispatched-child-and-resume", env)
+    assert code == 1 and receipt["candidate"]["resume"]["reason"] == "last_terminal_not_after_probe"

@@ -373,7 +373,13 @@ def resume_analysis(
     if not after:
         return result("unverified", "no_human_turn_after_terminal")
     p2_idx, p2_ts = after[0]
-    if not any(p1_idx < v["idx"] < p2_idx for v in valid_expected):
+    # pre-boundary の成功は P1 以後かつ T1 以前の時刻でなければならない（行 index だけでは因果を帰属できない）。
+    # timestamp が無い応答は境界への束縛を証明できないので、fail-closed で unverified に倒す。
+    pre_candidates = [v for v in valid_expected if p1_idx < v["idx"] < p2_idx]
+    pre_times = [_parse_ts(rows[v["idx"]].get("timestamp")) for v in pre_candidates]
+    if not any(ts is not None and p1_ts <= ts <= t1 for ts in pre_times):
+        if any(ts is None for ts in pre_times):
+            return result("unverified", "pre_boundary_response_timestamp_missing")
         return result("failed", "no_valid_response_pre_boundary")
     # P2 に続く応答だけを数える（P2 が失敗し、後続の P3 で成功した場合は resume の成功にしない）。
     p3_idx = next((i for i, r in enumerate(rows) if i > p2_idx and _is_real_user_turn(r)), len(rows))
