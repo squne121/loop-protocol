@@ -2800,8 +2800,11 @@ Allowed Paths 外の consumer（`.claude/agents/tests/test_issue_editor_runtime_
 follow-up で扱う。
 `permissions.deny` と `PreToolUse` hook を含む repository の canonical guard、GitHub server-side protection、
 worktree ownership、destructive-operation prohibition は弱めない。Claude Code permission bypass は
-launcher 経由で導入しない（launcher は `--dangerously-skip-permissions` 系と
-`--permission-mode bypassPermissions` を引き続き拒否する）。
+launcher が既定で導入しない（launcher は permission mode を自動注入せず、operator が `--` の後に
+明示した bypass flag を透過する。`--dangerously-skip-permissions` 系と `--permission-mode bypassPermissions` を
+拒否しない。bypassPermissions は通常の permission 確認を省略するだけで、GitHub / proxy 認証を不要にせず、
+workspace trust と初回 disclaimer の承諾も別の人間判断である。operator 向けの正規用法は
+`docs/dev/claude-gpt-runtime-prerequisites.md`）。
 
 Auto mode の実 runtime 確認は `bash scripts/claude-gpt/runtime_smoke_test.sh --scenario auto_classifier`
 で行う。permission 許可済みルールに含まれず classifier を通る無害な操作（scratch directory 内のファイル作成）が
