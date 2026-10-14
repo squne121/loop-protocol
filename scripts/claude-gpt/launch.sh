@@ -31,7 +31,7 @@
 #
 # Exit code:
 #   0   --check-only / --dry-run の成功（通常起動では claude の exit code をそのまま返す）
-#   2   launcher 自身の引数エラー（未知オプション・permission bypass flag）
+#   2   launcher 自身の引数エラー（未知オプションなど）
 #   3   claude バイナリが見つからない
 #   7   接続先 server の診断失敗（到達不能 / base URL 不正 / required model 不足）
 
@@ -100,26 +100,7 @@ while [ $# -gt 0 ]; do
 done
 
 # --- 以降 "$@" は `--` の後ろに来た claude 追加引数そのもの（文字列へ結合して再分割しない）。
-#
-# permission bypass は launcher 経由では導入しない（Claude Code permission bypass は本 Issue の
-# Out of Scope であり、guard の弱体化にもあたる）。それ以外の flag は Native と同じく
-# そのまま claude へ渡す。 ---
-prev=""
-for arg in "$@"; do
-  case "$arg" in
-    --dangerously-skip-permissions | --dangerously-skip-permissions=* | \
-      --allow-dangerously-skip-permissions | --allow-dangerously-skip-permissions=* | \
-      --permission-mode=bypassPermissions)
-      printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"permission_bypass_flag_rejected","flag":"%s"}\n' "$arg" >&2
-      exit 2
-      ;;
-  esac
-  if [ "$prev" = "--permission-mode" ] && [ "$arg" = "bypassPermissions" ]; then
-    printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"blocked","reason":"permission_bypass_flag_rejected","flag":"--permission-mode bypassPermissions"}\n' >&2
-    exit 2
-  fi
-  prev="$arg"
-done
+#     明示した permission mode も含め、launcher は判定・注入せずそのまま渡す。 ---
 
 if [ "$DRY_RUN" = "true" ]; then
   printf '{"schema":"CLAUDE_GPT_LAUNCH_RESULT_V1","status":"dry_run","base_url":%s,"launch_env":%s,"isolation":"none","generated_settings":false}\n' \
