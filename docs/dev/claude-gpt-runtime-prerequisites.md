@@ -156,10 +156,12 @@ proxy・trust 済み fixture（例: owner 所有の disposable repo `~/projects/
 permission 条件で次の 2 arm を**順に**実行する。#3052 で失敗した条件は「`launch.sh` が shell にだけ gateway を
 export した状態で別 repo へ dispatch する」ことなので、**両 arm とも `launch.sh` 経由**で開き、差を `--settings` の有無
 だけにする（gateway が全く無い shell を control にすると native fallback が自明に出て、仮説の検証にならない）。
-`~/.claude/settings.json` の `defaultMode` も 2 arm で同じにする。`<repo>` は本 repository の絶対 path である。
+`~/.claude/settings.json` の `defaultMode` も 2 arm で同じにする。シェル変数 `REPO` は本 repository の絶対 path を保持する
+（例: `REPO=/home/<user>/projects/LOOP_PROTOCOL`）。launcher は `cd ~/projects` で親ディレクトリへ移動した後でも
+絶対 path で呼び、evaluator は後述のとおり `uv run --directory "$REPO"` で repository root を基準に実行する。
 
-1. Control: `cd ~/projects && sh <repo>/scripts/claude-gpt/launch.sh -- agents --permission-mode bypassPermissions`（`--settings` なし）。
-2. Candidate: Agent View を閉じ、`cd ~/projects && sh <repo>/scripts/claude-gpt/launch.sh -- agents --settings "$HOME/.claude-gpt/agent-view-settings.json" --permission-mode bypassPermissions` で開き直す。
+1. Control: `cd ~/projects && sh "$REPO/scripts/claude-gpt/launch.sh" -- agents --permission-mode bypassPermissions`（`--settings` なし）。
+2. Candidate: Agent View を閉じ、`cd ~/projects && sh "$REPO/scripts/claude-gpt/launch.sh" -- agents --settings "$HOME/.claude-gpt/agent-view-settings.json" --permission-mode bypassPermissions` で開き直す。
 
 evaluator は両 arm の role alias（`providerEnv`）・実効 permission-mode・child cwd・Claude Code version が同一であることを
 要求し、満たさなければ `inconclusive` にする。supervisor を 2 arm 間で再起動したかは記録しておく（evaluator は検査できない）。
@@ -181,22 +183,37 @@ export CLAUDE_GPT_AV_TARGET_CWD="$HOME/projects/agentview-3052-zEnHieYt"
 export CLAUDE_GPT_AV_EXPECT_TEXT="AVGW3055 $(git -C "$CLAUDE_GPT_AV_TARGET_CWD" rev-parse --short HEAD)"
 export CLAUDE_GPT_AV_CONTROL_ID=<control の id>
 export CLAUDE_GPT_AV_CANDIDATE_ID=<candidate の id>
-uv run --locked python3 scripts/claude-gpt/tests/agent_view_gateway_live_vc.py --scenario gateway-control-comparison
-uv run --locked python3 scripts/claude-gpt/tests/agent_view_gateway_live_vc.py --scenario dispatched-child-and-resume
+REPO=<本 repository の絶対 path>
+uv run --directory "$REPO" --locked python3 scripts/claude-gpt/tests/agent_view_gateway_live_vc.py --scenario gateway-control-comparison
+uv run --directory "$REPO" --locked python3 scripts/claude-gpt/tests/agent_view_gateway_live_vc.py --scenario dispatched-child-and-resume
 ```
 
-AC3 の `dispatched-child-and-resume` は、candidate を pause または supervisor 再起動後に `Enter` で再開し、
-同じ prompt を 2 回目の user turn として送って応答させてから実行する（再開後の user turn に続く有効な gateway 応答が必要）。
+evaluator の相対 path（`scripts/...` と既定の `artifacts/...`）は `uv --directory` が切り替える repository root を基準に解決される。
+`cd ~/projects` した親ディレクトリから `--directory` 無しで実行すると `~/projects/scripts/...` を探して exit 2 になる
+（`uv --project` だけでは相対引数の基準 cwd は変わらない）。
+
+AC3 の `dispatched-child-and-resume` は、candidate が最初の prompt に応答して job が終端（`done`）した後に、
+pause または supervisor 再起動を経て `Enter` で再開し、同じ prompt を 2 回目の user turn として送って応答させ、
+job が再度 `done` になってから実行する。evaluator は `timeline.jsonl` の terminal 行を resume 境界とし、境界より前の
+有効な gateway 応答・境界より後の probe に続く有効応答・最新応答が有効・job の最終 state が `done` かつ
+`lastTerminalAt` が probe より後であることを要求する。境界を観測できない（timeline 欠落・terminal 無し・後続 turn 無し）
+場合は `assertions.resume_boundary` が `unverified` となり exit 1 で、2 turn の応答（`two_turn_response`）とは別に記録する。
+process の再起動・settings 再読込そのものは観測できないため `process_restart_observed` は常に `unverified` である。
 
 evaluator の判定は次のとおり。`assertions` の `unverified` は PASS ではない。
 
-- `needed`（exit 0）: control が model access error か gateway 外 model への fallback で失敗し、candidate が gateway model で応答した。
-- `unnecessary`（exit 0）: 両 arm が gateway model で応答した。docs の本節は不要になる。
-- `inconclusive`（exit 1）: arm の条件・version・cwd が不一致、または失敗が gateway と無関係。
+- `needed`（exit 0）: 同じ要求 model（`--model`）・同じ最初の probe prompt の初回実行区間で、control が model access error か
+  gateway 外 model への fallback で失敗し、candidate が gateway model で応答した。
+- `unnecessary`（exit 0）: 同条件の初回実行区間で両 arm が gateway model で応答した。docs の本節は不要になる。
+- `inconclusive`（exit 1）: arm の条件・version・cwd・要求 model・最初の probe prompt が不一致、初回実行区間に有効応答も
+  failure class も無い、candidate の初回が失敗し追加 turn だけ成功した、または失敗が gateway と無関係。
 - exit 77: job id・target cwd・UI 宣言が無い（SKIP）。
 
 AC3 の exit 0 は、`--settings` の**内容**（file の場合は中身）が canonical の loopback gateway と全 role alias に一致し、
 transcript に実効 `permission-mode` event があって宣言と一致し、main model の実応答があり、`--settings` に実 credential（API key や `unused` 以外の token）が無いことを意味する。
+transcript が期待 path に無く別の projects dir から一意に採用された場合は、job state の cwd だけでは成功にせず、transcript 各行の
+実 cwd を read-only の `git rev-parse --git-common-dir` で target と照合する。同一 repository（primary checkout または linked worktree）
+だけを受理し、別 clone・別 repository・cwd 欠落・候補重複・common-dir 取得不能は `child_cwd_in_target: false` として扱う。
 `--settings` の file は評価時に読むため、dispatch 後に再生成した file は区別できない。Haiku route は
 実際に `gpt-6-luna` の応答が transcript に現れた場合だけ `observed` で、alias の設定値だけでは `unverified` のままである。
 UI からの dispatch は operator の自己申告でありスクリプトは独立に観測できない。proxy request との一対一相関も取得できない

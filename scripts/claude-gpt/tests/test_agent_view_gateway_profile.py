@@ -11,7 +11,9 @@ repo 外の絶対 path settings を生成して `claude agents --settings` へ�
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -138,6 +140,28 @@ def _gateway_env() -> dict:
 
 _UNSET = object()
 HUMAN = {"kind": "human"}
+# resume 境界の合成時刻: 初回 probe -> 初回応答 -> first terminal(T1) -> 2 回目 probe(P2) -> 応答 -> last terminal。
+T_FIRST_PROBE = "2026-10-14T03:00:00.000Z"
+T_PRE_REPLY = "2026-10-14T03:10:00.000Z"
+T_FIRST_TERMINAL = "2026-10-14T03:30:00.000Z"
+T_SECOND_PROBE = "2026-10-14T04:00:00.000Z"
+T_POST_REPLY = "2026-10-14T04:10:00.000Z"
+T_LAST_TERMINAL = "2026-10-14T04:30:00.000Z"
+
+
+def _assistant_row(r: dict, ts: str | None = None) -> dict:
+    row = {
+        "type": "assistant",
+        "isApiErrorMessage": r.get("err", False),
+        "message": {
+            "model": r["model"],
+            "content": [{"type": "text", "text": r["text"]}],
+            "usage": {"output_tokens": r.get("tokens", 5)},
+        },
+    }
+    if ts:
+        row["timestamp"] = ts
+    return row
 
 
 def _write_job(
@@ -154,9 +178,14 @@ def _write_job(
     perm_declared: str | None = "bypassPermissions",
     perm_events: tuple = ("bypassPermissions",),
     provider_env=_UNSET,
+    model_flag: str = "gpt-6-sol[1m]",
+    prompt: str = "Say MARKER_OK",
+    job_state: str = "done",
+    timeline=_UNSET,
+    row_cwd: Path | None = None,
 ):
     session = f"{job_id}-0000-4000-8000-000000000000"
-    flags = ["--model", "gpt-6-sol[1m]"]
+    flags = ["--model", model_flag]
     if perm_declared:
         flags += ["--permission-mode", perm_declared]
     if settings_file is not None:
@@ -165,38 +194,48 @@ def _write_job(
         env = _gateway_env() if settings_env is _UNSET else settings_env
         flags = ["--settings", json.dumps({"env": env}), *flags]
     state = {
-        "state": "done",
+        "state": job_state,
         "sessionId": session,
         "resumeSessionId": session,
         "cwd": str(cwd),
         "cliVersion": cli,
         "respawnFlags": flags,
         "providerEnv": dict(ev.canonical_aliases()) if provider_env is _UNSET else provider_env,
-        "firstTerminalAt": "2026-10-14T03:30:00Z",
-        "lastTerminalAt": "2026-10-14T04:30:00Z" if resumed else "2026-10-14T03:30:00Z",
+        "firstTerminalAt": T_FIRST_TERMINAL,
+        "lastTerminalAt": T_LAST_TERMINAL if resumed else T_FIRST_TERMINAL,
     }
     jobs = root / "jobs" / job_id
     jobs.mkdir(parents=True)
     (jobs / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    if timeline is _UNSET:
+        # 実 job と同じ `{at, state}` 行。resumed の場合は first terminal の後に再度 working -> done になる。
+        timeline = [(T_FIRST_PROBE, "working"), (T_FIRST_TERMINAL, "done")]
+        if resumed:
+            timeline += [(T_SECOND_PROBE, "working"), (T_LAST_TERMINAL, "done")]
+    if timeline is not None:
+        (jobs / "timeline.jsonl").write_text(
+            "\n".join(json.dumps({"at": at, "state": st, "detail": "", "text": ""}) for at, st in timeline),
+            encoding="utf-8",
+        )
     enc = re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
     proj = root / "projects" / enc
     proj.mkdir(parents=True, exist_ok=True)
     rows = [{"type": "permission-mode", "permissionMode": m, "sessionId": session} for m in perm_events]
-    rows.append({"type": "user", "origin": HUMAN, "message": {"content": "Say MARKER_OK"}})
+    rows.append({"type": "user", "origin": HUMAN, "timestamp": T_FIRST_PROBE, "message": {"content": prompt}})
     for n, r in enumerate(replies):
-        if resumed and n == len(replies) - 1 and n > 0:
-            rows.append({"type": "user", "origin": HUMAN, "message": {"content": "Say MARKER_OK again"}})
-        rows.append(
-            {
-                "type": "assistant",
-                "isApiErrorMessage": r.get("err", False),
-                "message": {
-                    "model": r["model"],
-                    "content": [{"type": "text", "text": r["text"]}],
-                    "usage": {"output_tokens": r.get("tokens", 5)},
-                },
-            }
-        )
+        post = resumed and n == len(replies) - 1 and n > 0
+        if post:
+            rows.append(
+                {
+                    "type": "user",
+                    "origin": HUMAN,
+                    "timestamp": T_SECOND_PROBE,
+                    "message": {"content": f"{prompt} again"},
+                }
+            )
+        rows.append(_assistant_row(r, T_POST_REPLY if post else T_PRE_REPLY))
+    if row_cwd is not None:
+        rows = [{**x, "cwd": str(row_cwd)} for x in rows]
     (proj / f"{session}.jsonl").write_text("\n".join(json.dumps(x) for x in rows), encoding="utf-8")
 
 
@@ -511,10 +550,7 @@ def _append_rows(root: Path, job_id: str, cwd: Path, rows: list[dict]):
 
 
 def _assistant(text="MARKER_OK done", model="gpt-6-sol"):
-    return {
-        "type": "assistant",
-        "message": {"model": model, "content": [{"type": "text", "text": text}], "usage": {"output_tokens": 5}},
-    }
+    return _assistant_row({"model": model, "text": text})
 
 
 TOOL_RESULT = {
@@ -565,7 +601,16 @@ def test_live_vc_real_second_user_prompt_after_tool_use_is_resume_evidence(tmp_p
         tmp_path,
         "bbbbbbbb",
         target,
-        [TOOL_RESULT, {"type": "user", "origin": HUMAN, "message": {"content": "Say MARKER_OK again"}}, _assistant()],
+        [
+            TOOL_RESULT,
+            {
+                "type": "user",
+                "origin": HUMAN,
+                "timestamp": T_SECOND_PROBE,
+                "message": {"content": "Say MARKER_OK again"},
+            },
+            _assistant(),
+        ],
     )
     env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
     assert ev.run("dispatched-child-and-resume", env)[0] == 0
@@ -606,15 +651,89 @@ def test_live_vc_cli_version_falls_back_to_transcript_version(tmp_path):
     assert ev.run("gateway-control-comparison", env)[1]["necessity"] == "needed"
 
 
-def test_live_vc_transcript_relocated_to_worktree_project_dir_is_found(tmp_path):
+_GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY")
+
+
+def _git(cwd: Path, *args: str) -> None:
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_ENV_DROP}
+    subprocess.run(
+        ["git", "-C", str(cwd), "-c", "user.name=t", "-c", "user.email=t@t.invalid", *args],
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+
+def _git_repo(path: Path) -> Path:
+    path.mkdir(parents=True)
+    _git(path, "init", "-q")
+    _git(path, "commit", "--allow-empty", "-q", "-m", "init")
+    return path
+
+
+def _relocate(tmp_path: Path, cwd: Path, name: str = "-relocated-worktree") -> None:
+    src = tmp_path / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
+    src.rename(tmp_path / "projects" / name)
+
+
+def test_live_vc_transcript_relocated_to_linked_worktree_of_same_repository_is_accepted(tmp_path):
+    target = _git_repo(tmp_path / "repo")
+    worktree = tmp_path / "linked-wt"
+    _git(target, "worktree", "add", "-q", "-b", "wt-branch", str(worktree))
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD, GOOD], resumed=True, row_cwd=worktree)
+    _relocate(tmp_path, target)
+    code, receipt = ev.run("dispatched-child-and-resume", _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb"))
+    assert code == 0 and receipt["candidate"]["transcript_identity"] == "same_repository"
+
+
+def test_live_vc_transcript_relocated_to_primary_checkout_of_same_repository_is_accepted(tmp_path):
+    target = _git_repo(tmp_path / "repo")
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD, GOOD], resumed=True, row_cwd=target)
+    _relocate(tmp_path, target)
+    code, _ = ev.run("dispatched-child-and-resume", _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb"))
+    assert code == 0
+
+
+def test_live_vc_transcript_relocated_to_foreign_repository_is_rejected(tmp_path):
+    # job state の cwd は target 配下だが、同一 session id の transcript の実 cwd は別 Git repository。
+    target = _git_repo(tmp_path / "repo")
+    foreign = _git_repo(tmp_path / "foreign-repo")
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD, GOOD], resumed=True, row_cwd=foreign)
+    _relocate(tmp_path, target, "-foreign-repo")
+    code, receipt = ev.run("dispatched-child-and-resume", _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb"))
+    cand = receipt["candidate"]
+    assert code == 1 and cand["child_cwd_in_target"] is False
+    assert cand["transcript_identity"] == "foreign_repository"
+
+
+def test_live_vc_transcript_relocated_without_cwd_field_is_not_guessed(tmp_path):
+    target = _git_repo(tmp_path / "repo")
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD, GOOD], resumed=True)
+    _relocate(tmp_path, target)
+    code, receipt = ev.run("dispatched-child-and-resume", _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb"))
+    assert code == 1 and receipt["candidate"]["transcript_identity"] == "cwd_missing"
+    assert receipt["candidate"]["child_cwd_in_target"] is False
+
+
+@pytest.mark.parametrize("which", ["missing_dir", "not_a_git_repo"])
+def test_live_vc_transcript_relocated_with_unresolvable_git_identity_is_not_guessed(tmp_path, which):
+    target = _git_repo(tmp_path / "repo")
+    row_cwd = tmp_path / "gone" if which == "missing_dir" else tmp_path / "plain-dir"
+    if which == "not_a_git_repo":
+        row_cwd.mkdir()
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD, GOOD], resumed=True, row_cwd=row_cwd)
+    _relocate(tmp_path, target)
+    code, receipt = ev.run("dispatched-child-and-resume", _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb"))
+    assert code == 1 and receipt["candidate"]["transcript_identity"] == "git_identity_unavailable"
+
+
+def test_live_vc_transcript_relocated_with_non_git_target_is_not_guessed(tmp_path):
     target = tmp_path / "repo"
     target.mkdir()
-    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD, GOOD], resumed=True)
-    src = tmp_path / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(target))
-    dst = tmp_path / "projects" / "-relocated-worktree"
-    src.rename(dst)
-    env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
-    assert ev.run("dispatched-child-and-resume", env)[0] == 0
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD, GOOD], resumed=True, row_cwd=target)
+    _relocate(tmp_path, target)
+    code, receipt = ev.run("dispatched-child-and-resume", _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb"))
+    assert code == 1 and receipt["candidate"]["transcript_identity"] == "git_identity_unavailable"
 
 
 def test_live_vc_ambiguous_relocated_transcript_is_not_guessed(tmp_path):
@@ -631,3 +750,260 @@ def test_live_vc_ambiguous_relocated_transcript_is_not_guessed(tmp_path):
         f.unlink()
     env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
     assert ev.run("dispatched-child-and-resume", env)[0] == 1
+
+
+# --- F1: resume 境界（terminal -> その後の human probe）の観測 ------------------------------------------
+
+
+def _resume_receipt(tmp_path, **job_kwargs):
+    code, receipt = ev.run("dispatched-child-and-resume", _resume_env(tmp_path, **job_kwargs))
+    return code, receipt, receipt["candidate"]["resume"]
+
+
+def test_live_vc_resume_boundary_observed_with_pre_and_post_probe_and_latest_success(tmp_path):
+    code, receipt, resume = _resume_receipt(tmp_path)
+    assert code == 0 and resume == {"status": "observed", "reason": "boundary_and_probes_observed"}
+    a = receipt["assertions"]
+    assert a["resume_boundary"] == a["two_turn_response"] == "observed"
+    # process の再起動・settings 再読込そのものは観測できない。PASS でも常に unverified。
+    assert a["process_restart_observed"] == "unverified"
+
+
+def test_live_vc_resume_two_human_prompts_in_one_run_without_terminal_is_not_resume(tmp_path):
+    # (a) timeline に T1 terminal が無い: 同一実行中 session で human prompt を 2 回送っただけ。
+    timeline = [(T_FIRST_PROBE, "working"), (T_SECOND_PROBE, "working")]
+    code, receipt, resume = _resume_receipt(tmp_path, timeline=timeline, job_state="working")
+    assert code == 1 and resume["status"] == "unverified" and resume["reason"] == "no_terminal_in_timeline"
+    assert receipt["observed_postcondition"] is False
+
+
+def test_live_vc_resume_terminal_after_both_probes_is_not_a_boundary(tmp_path):
+    # terminal 行が両 probe より後にしか無い（途中に終端していない）。
+    timeline = [(T_FIRST_PROBE, "working"), (T_SECOND_PROBE, "working"), (T_LAST_TERMINAL, "done")]
+    code, _, resume = _resume_receipt(tmp_path, timeline=timeline)
+    assert code == 1 and resume["reason"] == "no_human_turn_after_terminal"
+
+
+def test_live_vc_resume_first_api_error_then_later_successes_is_not_resume(tmp_path):
+    # (b) 初回 API error、2 回目以降に成功応答 2 行。旧判定（有効応答 2 件 + 2 回目 turn 後の応答）は通ってしまう。
+    target = tmp_path / "repo"
+    target.mkdir()
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[ERR, GOOD], resumed=True)
+    _append_rows(tmp_path, "bbbbbbbb", target, [_assistant()])
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    code, receipt = ev.run("dispatched-child-and-resume", env)
+    cand = receipt["candidate"]
+    assert cand["valid_assistant_responses"] == 2 and cand["response_after_second_user_turn"] is True
+    assert code == 1 and cand["resume"] == {"status": "failed", "reason": "no_valid_response_pre_boundary"}
+
+
+@pytest.mark.parametrize("job_state", ["done", "failed"])
+def test_live_vc_resume_latest_probe_failure_after_earlier_success_is_not_resume(tmp_path, job_state):
+    # (c) 過去成功済みだが最新 resume probe が失敗（最新 assistant 応答が API error / job failed）。
+    target = tmp_path / "repo"
+    target.mkdir()
+    timeline = [
+        (T_FIRST_PROBE, "working"),
+        (T_FIRST_TERMINAL, "done"),
+        (T_SECOND_PROBE, "working"),
+        (T_LAST_TERMINAL, job_state),
+    ]
+    _write_job(
+        tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD, GOOD], resumed=True, job_state=job_state,
+        timeline=timeline,
+    )  # fmt: skip
+    _append_rows(tmp_path, "bbbbbbbb", target, [_assistant_row(ERR, "2026-10-14T04:20:00.000Z")])
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    code, receipt = ev.run("dispatched-child-and-resume", env)
+    assert code == 1 and receipt["candidate"]["resume"] == {"status": "failed", "reason": "latest_response_not_valid"}
+    assert receipt["assertions"]["resume_boundary"] == "failed"
+
+
+def test_live_vc_resume_job_still_working_with_only_past_responses_is_not_resume(tmp_path):
+    # (d) job がまだ working で過去の応答だけ。最新 probe の完了を観測していない。
+    timeline = [(T_FIRST_PROBE, "working"), (T_FIRST_TERMINAL, "done"), (T_SECOND_PROBE, "working")]
+    code, _, resume = _resume_receipt(tmp_path, job_state="working", timeline=timeline)
+    assert code == 1 and resume == {"status": "failed", "reason": "job_final_state_not_done"}
+
+
+def test_live_vc_resume_timeline_state_working_even_if_state_json_done_is_not_resume(tmp_path):
+    timeline = [(T_FIRST_PROBE, "working"), (T_FIRST_TERMINAL, "done"), (T_SECOND_PROBE, "working")]
+    code, _, resume = _resume_receipt(tmp_path, job_state="done", timeline=timeline)
+    assert code == 1 and resume["reason"] == "job_final_state_not_done"
+
+
+def test_live_vc_resume_last_terminal_not_after_probe_is_not_resume(tmp_path):
+    target = tmp_path / "repo"
+    target.mkdir()
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD, GOOD], resumed=True)
+    state_path = tmp_path / "jobs" / "bbbbbbbb" / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["lastTerminalAt"] = T_FIRST_TERMINAL
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    code, receipt = ev.run("dispatched-child-and-resume", env)
+    assert code == 1 and receipt["candidate"]["resume"]["reason"] == "last_terminal_not_after_probe"
+
+
+@pytest.mark.parametrize("timeline", [None, []])
+def test_live_vc_resume_boundary_unobservable_is_unverified_not_success(tmp_path, timeline):
+    # (e) timeline 欠落（または空）で resume 境界を観測できない。応答が揃っていても成功にしない。
+    code, receipt, resume = _resume_receipt(tmp_path, timeline=timeline)
+    reason = "timeline_missing" if timeline is None else "no_terminal_in_timeline"
+    assert code == 1 and resume == {"status": "unverified", "reason": reason}
+    a = receipt["assertions"]
+    assert a["resume_boundary"] == "unverified" and receipt["observed_postcondition"] is False
+    assert a["two_turn_response"] == "observed"  # 2 turn 応答と resume 境界は別 assertion
+    assert a["process_restart_observed"] == "unverified"
+
+
+def test_live_vc_resume_does_not_require_same_session_id(tmp_path):
+    # Claude Code の resume では session id が変わる場合がある。resume_same_session を AND に戻さない。
+    target = tmp_path / "repo"
+    target.mkdir()
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD, GOOD], resumed=True)
+    state_path = tmp_path / "jobs" / "bbbbbbbb" / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["resumeSessionId"] = "ffffffff-0000-4000-8000-000000000000"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    code, receipt = ev.run("dispatched-child-and-resume", _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb"))
+    assert code == 0 and receipt["candidate"]["resume_same_session"] is False
+
+
+# --- F2: 2 arm 因果比較の対応条件 -----------------------------------------------------------------------
+
+
+def _pair_job_kwargs(tmp_path, control: dict, candidate: dict):
+    target = tmp_path / "repo"
+    target.mkdir(exist_ok=True)
+    _write_job(tmp_path, "aaaaaaaa", target, settings=False, **control)
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, **candidate)
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CONTROL_ID="aaaaaaaa", CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    return ev.run("gateway-control-comparison", env)
+
+
+def test_live_vc_control_only_nonexistent_model_flag_is_not_needed(tmp_path):
+    # (1) control だけ `--model gpt-NONEXISTENT`（model access error）。2 arm の実 request model が異なる。
+    code, receipt = _pair_job_kwargs(tmp_path, {"replies": [ERR], "model_flag": "gpt-NONEXISTENT"}, {"replies": [GOOD]})
+    assert (code, receipt["necessity"]) == (1, "inconclusive")
+
+
+def test_live_vc_different_first_probe_prompt_is_inconclusive(tmp_path):
+    # (2) 最初の human probe の prompt が異なる。
+    code, receipt = _pair_job_kwargs(
+        tmp_path, {"replies": [ERR]}, {"replies": [GOOD], "prompt": "Say MARKER_OK differently"}
+    )
+    assert (code, receipt["necessity"]) == (1, "inconclusive")
+
+
+def test_live_vc_prompt_whitespace_only_difference_is_still_the_same_probe(tmp_path):
+    code, receipt = _pair_job_kwargs(tmp_path, {"replies": [ERR]}, {"replies": [GOOD], "prompt": "Say   MARKER_OK "})
+    assert (code, receipt["necessity"]) == (0, "needed")
+
+
+def test_live_vc_candidate_first_run_failure_with_later_turn_success_is_not_needed(tmp_path):
+    # (3) candidate の初回が失敗し、追加 turn だけ成功。初回区間の応答だけを比較する。
+    code, receipt = _pair_job_kwargs(tmp_path, {"replies": [ERR]}, {"replies": [ERR, GOOD], "resumed": True})
+    assert receipt["candidate"]["valid_assistant_responses"] == 1  # 全体では有効応答が 1 件ある
+    assert receipt["candidate"]["first_run_valid_responses"] == 0
+    assert (code, receipt["necessity"]) == (1, "inconclusive")
+
+
+UNRELATED_API_ERROR = {"model": "<synthetic>", "text": "API Error: 500 upstream failure", "err": True, "tokens": 0}
+
+
+@pytest.mark.parametrize("bad_control", [[ECHO], [RATE], [UNRELATED_API_ERROR]])
+def test_live_vc_unrelated_control_first_run_failures_are_not_needed_causal(tmp_path, bad_control):
+    # (4) prompt echo / rate limit / 無関係 API error は gateway 継承の failure と誤診しない。
+    code, receipt = _pair_job_kwargs(tmp_path, {"replies": bad_control}, {"replies": [GOOD]})
+    assert (code, receipt["necessity"]) == (1, "inconclusive")
+
+
+def test_live_vc_control_gateway_failure_only_after_first_run_is_not_needed(tmp_path):
+    # control の gateway failure が追加 turn にしか無く、初回区間は prompt echo。
+    code, receipt = _pair_job_kwargs(tmp_path, {"replies": [ECHO, ERR], "resumed": True}, {"replies": [GOOD]})
+    assert (code, receipt["necessity"]) == (1, "inconclusive")
+
+
+def test_live_vc_same_conditions_with_control_response_is_unnecessary(tmp_path):
+    # (5) 同一条件で control も応答。
+    code, receipt = _pair_job_kwargs(tmp_path, {"replies": [GOOD]}, {"replies": [GOOD]})
+    assert (code, receipt["necessity"]) == (0, "unnecessary")
+
+
+@pytest.mark.parametrize("failure", [ERR, NATIVE])
+def test_live_vc_valid_control_gateway_failure_with_candidate_first_run_success_is_needed(tmp_path, failure):
+    # (6) 同一 model / prompt で control の初回が gateway 未適用の failure、candidate の初回が成功。
+    code, receipt = _pair_job_kwargs(tmp_path, {"replies": [failure]}, {"replies": [GOOD]})
+    assert (code, receipt["necessity"]) == (0, "needed")
+    assert receipt["proxy_correlation"] == "unverified" and receipt["provider_route_claim"] == "none"
+
+
+def test_live_vc_arm_without_first_run_evidence_is_inconclusive(tmp_path):
+    # 初回区間に有効応答も failure class も無い（assistant 応答が無い）arm は比較できない。
+    code, receipt = _pair_job_kwargs(tmp_path, {"replies": []}, {"replies": [GOOD]})
+    assert (code, receipt["necessity"]) == (1, "inconclusive")
+
+
+# --- F4: operator 文書の evaluator 実行 cwd --------------------------------------------------------------
+
+
+def _doc_section() -> str:
+    text = DOC.read_text(encoding="utf-8")
+    return text[text.index("実機 2 arm 対照の operator 手順") : text.index("### 接続先 server の診断")]
+
+
+def _doc_evaluator_commands() -> list[str]:
+    return [
+        line.strip()
+        for line in _doc_section().splitlines()
+        if "agent_view_gateway_live_vc.py" in line and line.strip().startswith("uv run")
+    ]
+
+
+def test_doc_evaluator_commands_run_from_absolute_repo_directory():
+    commands = _doc_evaluator_commands()
+    assert len(commands) == 2
+    assert {re.search(r"--scenario (\S+)", c).group(1) for c in commands} == set(ev.SCENARIOS)
+    for command in commands:
+        assert re.search(r'uv run --directory "\$REPO" --locked python3 scripts/claude-gpt/tests/', command), command
+    section = _doc_section()
+    assert re.search(r"^REPO=\S", section, re.M)  # REPO を絶対 path の変数として保持する
+    assert "<repo>" not in section  # 未定義 placeholder で launcher を指さない
+    assert 'sh "$REPO/scripts/claude-gpt/launch.sh"' in section
+
+
+def _run_doc_command(command: str, cwd: Path, tmp_path: Path) -> subprocess.CompletedProcess:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_GPT_AV_")}
+    env["REPO"] = str(h.REPO_ROOT)
+    return subprocess.run(
+        ["sh", "-c", f'{command} --artifact-dir "{tmp_path / "art"}"'],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv is required to run the documented command")
+@pytest.mark.parametrize("scenario", ev.SCENARIOS)
+def test_doc_evaluator_command_from_parent_directory_skips_77_not_exit_2(tmp_path, scenario):
+    # operator が `cd ~/projects`（本 repository の親）へ移動した後でも evaluator が起動し、env 未設定で SKIP 77。
+    parent = tmp_path / "projects"
+    parent.mkdir()
+    command = next(c for c in _doc_evaluator_commands() if f"--scenario {scenario}" in c)
+    proc = _run_doc_command(command, parent, tmp_path)
+    assert proc.returncode == 77, proc.stderr
+    assert proc.stderr.startswith("SKIP: ")
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv is required to run the documented command")
+def test_doc_evaluator_command_without_directory_fails_from_parent_directory(tmp_path):
+    # 負例: `--directory "$REPO"` が無いと相対 path を親から探して exit 2 になる（誤った文書の再発を固定する）。
+    parent = tmp_path / "projects"
+    parent.mkdir()
+    command = _doc_evaluator_commands()[0].replace('--directory "$REPO" ', "")
+    assert "--directory" not in command
+    proc = _run_doc_command(command, parent, tmp_path)
+    assert proc.returncode == 2, (proc.returncode, proc.stderr)
