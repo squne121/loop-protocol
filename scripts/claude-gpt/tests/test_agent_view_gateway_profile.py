@@ -1007,3 +1007,131 @@ def test_doc_evaluator_command_without_directory_fails_from_parent_directory(tmp
     assert "--directory" not in command
     proc = _run_doc_command(command, parent, tmp_path)
     assert proc.returncode == 2, (proc.returncode, proc.stderr)
+
+
+# --- iteration 1: blocked は resume 境界でない / P2 束縛 / 初回区間 / 非 dict 行 / cwd 正規化 ---------------
+
+
+def test_live_vc_resume_blocked_state_is_not_a_terminal_boundary(tmp_path):
+    # B1: `blocked` は入力待ちで process が生存している。人間の返信が resume 成功になってはならない。
+    timeline = [
+        (T_FIRST_PROBE, "working"),
+        (T_FIRST_TERMINAL, "blocked"),
+        (T_SECOND_PROBE, "working"),
+        (T_LAST_TERMINAL, "done"),
+    ]
+    code, receipt, resume = _resume_receipt(tmp_path, timeline=timeline)
+    assert code == 1 and resume["status"] == "unverified"
+    assert receipt["assertions"]["resume_boundary"] == "unverified"
+    assert receipt["observed_postcondition"] is False
+
+
+@pytest.mark.parametrize("terminal", ["done", "failed", "stopped"])
+def test_live_vc_resume_done_failed_stopped_are_boundary_terminals(tmp_path, terminal):
+    timeline = [
+        (T_FIRST_PROBE, "working"),
+        (T_FIRST_TERMINAL, terminal),
+        (T_SECOND_PROBE, "working"),
+        (T_LAST_TERMINAL, "done"),
+    ]
+    code, _, resume = _resume_receipt(tmp_path, timeline=timeline)
+    assert code == 0 and resume["status"] == "observed"
+
+
+def test_live_vc_resume_failed_second_probe_then_successful_third_probe_is_not_resume(tmp_path):
+    # W1: P2 に対する応答が失敗し、後続の P3 で成功した場合は post-boundary の成功にしない。
+    target = tmp_path / "repo"
+    target.mkdir()
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD, ERR], resumed=True)
+    third_probe = {
+        "type": "user",
+        "origin": HUMAN,
+        "timestamp": "2026-10-14T04:20:00.000Z",
+        "message": {"content": "retry"},
+    }
+    _append_rows(tmp_path, "bbbbbbbb", target, [third_probe, _assistant_row(GOOD, "2026-10-14T04:25:00.000Z")])
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    code, receipt = ev.run("dispatched-child-and-resume", env)
+    assert code == 1
+    assert receipt["candidate"]["resume"] == {"status": "failed", "reason": "no_valid_response_post_boundary"}
+
+
+def test_live_vc_first_run_is_cut_at_the_next_human_turn(tmp_path):
+    # W2: candidate の初回が失敗し追加 turn だけ成功。terminal の時刻情報が無くても、次の human turn で初回区間を切る。
+    code, receipt = _pair_job_kwargs(
+        tmp_path, {"replies": [ERR]}, {"replies": [ERR, GOOD], "resumed": True, "timeline": None}
+    )
+    assert receipt["candidate"]["first_run_valid_responses"] == 0
+    assert (code, receipt["necessity"]) == (1, "inconclusive")
+
+
+def test_live_vc_first_run_is_cut_at_the_first_terminal(tmp_path):
+    # W2: 次の human turn が無くても、最初の terminal より後の応答は初回区間に混入させない。
+    late_success = _assistant_row(GOOD, "2026-10-14T03:40:00.000Z")
+    target = tmp_path / "repo"
+    target.mkdir()
+    _write_job(tmp_path, "aaaaaaaa", target, settings=False, replies=[ERR])
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[ERR])
+    _append_rows(tmp_path, "bbbbbbbb", target, [late_success])
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CONTROL_ID="aaaaaaaa", CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    code, receipt = ev.run("gateway-control-comparison", env)
+    assert receipt["candidate"]["first_run_valid_responses"] == 0
+    assert (code, receipt["necessity"]) == (1, "inconclusive")
+
+
+def test_live_vc_first_run_continues_across_blocked_state_without_a_human_turn(tmp_path):
+    # `blocked` は承認待ち等で human turn 無しに継続し得るため、初回区間の終端にしない。
+    target = tmp_path / "repo"
+    target.mkdir()
+    timeline = [
+        (T_FIRST_PROBE, "working"),
+        ("2026-10-14T03:20:00.000Z", "blocked"),
+        ("2026-10-14T03:21:00.000Z", "working"),
+        (T_FIRST_TERMINAL, "done"),
+    ]
+    _write_job(tmp_path, "aaaaaaaa", target, settings=False, replies=[ERR])
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[ERR], timeline=timeline)
+    _append_rows(tmp_path, "bbbbbbbb", target, [_assistant_row(GOOD, "2026-10-14T03:25:00.000Z")])
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CONTROL_ID="aaaaaaaa", CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    code, receipt = ev.run("gateway-control-comparison", env)
+    assert (code, receipt["necessity"]) == (0, "needed")
+
+
+def test_live_vc_non_dict_json_transcript_lines_are_ignored(tmp_path):
+    # W3: `123` や `[1]` のような dict 以外の JSON 行で AttributeError にならず、無視される。
+    target = tmp_path / "repo"
+    target.mkdir()
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD, GOOD], resumed=True)
+    _append_rows(tmp_path, "bbbbbbbb", target, [123, [1], "text", None])
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    code, receipt = ev.run("dispatched-child-and-resume", env)
+    assert code == 0 and receipt["candidate"]["resume"]["status"] == "observed"
+
+
+@pytest.mark.parametrize("kind", ["dotdot", "symlink"])
+def test_live_vc_job_cwd_escaping_target_via_dotdot_or_symlink_is_not_in_target(tmp_path, kind):
+    # W4: 文字列 prefix が target 配下でも、`..` / symlink を正規化すると別 directory を指す cwd は受理しない。
+    target = tmp_path / "repo"
+    foreign = tmp_path / "foreign"
+    target.mkdir()
+    foreign.mkdir()
+    if kind == "dotdot":
+        cwd = target / ".." / "foreign"
+    else:
+        cwd = target / "link"
+        cwd.symlink_to(foreign, target_is_directory=True)
+    assert str(cwd).startswith(str(target) + "/")
+    _write_job(tmp_path, "bbbbbbbb", cwd, settings=True, replies=[GOOD, GOOD], resumed=True)
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    code, receipt = ev.run("dispatched-child-and-resume", env)
+    assert code == 1 and receipt["candidate"]["child_cwd_in_target"] is False
+
+
+def test_live_vc_job_cwd_in_real_subdirectory_of_target_is_in_target(tmp_path):
+    target = tmp_path / "repo"
+    sub = target / "sub"
+    sub.mkdir(parents=True)
+    _write_job(tmp_path, "bbbbbbbb", sub, settings=True, replies=[GOOD, GOOD], resumed=True)
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    code, receipt = ev.run("dispatched-child-and-resume", env)
+    assert code == 0 and receipt["candidate"]["child_cwd_in_target"] is True

@@ -55,7 +55,8 @@ ROLE_ENV_KEYS = (
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
 )
-_TERMINAL_STATES = ("done", "blocked", "failed")
+# `blocked` は入力待ちで process が生存しており、承認などで human turn 無しに継続し得る。終端（resume 境界）にしない。
+_TERMINAL_STATES = ("done", "failed", "stopped")
 _GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY")
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 _LIB_SH = Path(__file__).resolve().parent.parent / "lib.sh"
@@ -235,9 +236,11 @@ def _transcript(projects_dir: Path, cwd: str, session_id: str) -> tuple[list[dic
     try:
         for line in path.read_text(encoding="utf-8").splitlines():
             try:
-                rows.append(json.loads(line))
+                row = json.loads(line)
             except ValueError:
                 continue
+            if isinstance(row, dict):
+                rows.append(row)
     except OSError:
         return [], "transcript_not_found"
     return rows, resolution
@@ -372,7 +375,9 @@ def resume_analysis(
     p2_idx, p2_ts = after[0]
     if not any(p1_idx < v["idx"] < p2_idx for v in valid_expected):
         return result("failed", "no_valid_response_pre_boundary")
-    if not any(v["idx"] > p2_idx for v in valid_expected):
+    # P2 に続く応答だけを数える（P2 が失敗し、後続の P3 で成功した場合は resume の成功にしない）。
+    p3_idx = next((i for i, r in enumerate(rows) if i > p2_idx and _is_real_user_turn(r)), len(rows))
+    if not any(p2_idx < v["idx"] < p3_idx for v in valid_expected):
         return result("failed", "no_valid_response_post_boundary")
     latest = max((x["idx"] for x in [*valid_expected, *failed] if x["idx"] > p2_idx), default=None)
     if latest is None or latest not in {v["idx"] for v in valid_expected}:
@@ -383,6 +388,14 @@ def resume_analysis(
     if last_terminal is None or last_terminal <= p2_ts:
         return result("failed", "last_terminal_not_after_probe")
     return result("observed", "boundary_and_probes_observed")
+
+
+def _cwd_in_target(cwd: str, target_cwd: str | None) -> bool:
+    """`..` と symlink を正規化（realpath）した後の包含判定。文字列 prefix だけで target 配下と見なさない。"""
+    if target_cwd is None:
+        return True
+    real_cwd, real_target = os.path.realpath(cwd), os.path.realpath(target_cwd)
+    return real_cwd == real_target or real_cwd.startswith(real_target.rstrip("/") + "/")
 
 
 def load_arm(
@@ -406,7 +419,7 @@ def load_arm(
         valid_expected = [v for v in valid if expect in v["text"]]
     else:
         valid_expected = valid
-    cwd_ok = bool(cwd) and (target_cwd is None or cwd == target_cwd or cwd.startswith(target_cwd.rstrip("/") + "/"))
+    cwd_ok = bool(cwd) and _cwd_in_target(cwd, target_cwd)
     # relocated transcript は job state の cwd だけで成功と推測せず、transcript の実 cwd の identity も要求する。
     if resolution in ("relocated_unique", "relocated_ambiguous") and identity != "same_repository":
         cwd_ok = False
