@@ -751,15 +751,21 @@ def test_bvp_root_resolution_ignores_nested_claude_cwd_is_resolved_root(tmp_path
     assert root_side["results"][0]["category"] != "missing_baseline_expect_for_new_allowed_path", root_side
 
 
-def test_bvp_root_resolution_ignores_nested_claude_unresolvable_start_is_diagnosed(tmp_path):
+def test_bvp_root_resolution_ignores_nested_claude_unresolvable_start_is_diagnosed(tmp_path, monkeypatch):
     """AC4: no ancestor holds the producer script -> diagnosable failure naming the start path."""
+    # tmp_path may live inside the real repo (repo-local --basetemp), whose ancestors hold the
+    # real producer. Swap the sentinel for this test only so the negative fixture is
+    # independent of the pytest basetemp location (module-global lookup; restored by pytest).
+    sentinel = ".claude/__issue3023_nonexistent_sentinel__/baseline_vc_preflight.py"
+    monkeypatch.setitem(globals(), "_BVP_SCRIPT_REL", sentinel)
     lonely = tmp_path / "lonely" / "file.py"
     lonely.parent.mkdir()
     lonely.write_text("", encoding="utf-8")
+    assert all(not (p / sentinel).exists() for p in (lonely.resolve(), *lonely.resolve().parents))
     with pytest.raises(BvpHelperError) as ei:
         _run_bvp_899("x", start=lonely)
     msg = str(ei.value)
-    assert str(lonely.resolve()) in msg and _BVP_SCRIPT_REL in msg, msg
+    assert str(lonely.resolve()) in msg and sentinel in msg, msg
 
 
 def test_bvp_root_resolution_ignores_nested_claude_missing_script_is_diagnosed(tmp_path):
