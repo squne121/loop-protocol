@@ -132,13 +132,36 @@ def test_secret_or_settings_default_launcher_does_not_write_settings(tmp_path):
 # --- read-only evaluator: false-green 防止 ---------------------------------------------------------
 
 
+def _gateway_env() -> dict:
+    return {"ANTHROPIC_BASE_URL": "http://127.0.0.1:18765", **ev.canonical_aliases()}
+
+
+_UNSET = object()
+
+
 def _write_job(
-    root: Path, job_id: str, cwd: Path, *, settings: bool, replies: list[dict], resumed: bool = False, cli: str = "test"
+    root: Path,
+    job_id: str,
+    cwd: Path,
+    *,
+    settings: bool,
+    replies: list[dict],
+    resumed: bool = False,
+    cli: str = "test",
+    settings_env=_UNSET,
+    settings_file: Path | None = None,
+    perm_declared: str | None = "bypassPermissions",
+    perm_events: tuple = ("bypassPermissions",),
 ):
     session = f"{job_id}-0000-4000-8000-000000000000"
-    flags = ["--model", "gpt-6-sol[1m]", "--permission-mode", "bypassPermissions"]
-    if settings:
-        flags = ["--settings", json.dumps({"env": {"ANTHROPIC_MODEL": "gpt-6-sol[1m]"}}), *flags]
+    flags = ["--model", "gpt-6-sol[1m]"]
+    if perm_declared:
+        flags += ["--permission-mode", perm_declared]
+    if settings_file is not None:
+        flags = ["--settings", str(settings_file), *flags]
+    elif settings:
+        env = _gateway_env() if settings_env is _UNSET else settings_env
+        flags = ["--settings", json.dumps({"env": env}), *flags]
     state = {
         "state": "done",
         "sessionId": session,
@@ -156,7 +179,8 @@ def _write_job(
     enc = re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
     proj = root / "projects" / enc
     proj.mkdir(parents=True, exist_ok=True)
-    rows = [{"type": "user", "message": {"content": "Say MARKER_OK"}}]
+    rows = [{"type": "permission-mode", "permissionMode": m, "sessionId": session} for m in perm_events]
+    rows.append({"type": "user", "message": {"content": "Say MARKER_OK"}})
     for r in replies:
         rows.append(
             {
@@ -344,3 +368,79 @@ def test_live_vc_missing_provider_env_is_not_canonical_match(tmp_path):
     state_path.write_text(json.dumps(state), encoding="utf-8")
     env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
     assert ev.run("dispatched-child-and-resume", env)[0] == 1
+
+
+def _resume_env(tmp_path, **job_kwargs):
+    target = tmp_path / "repo"
+    target.mkdir(exist_ok=True)
+    kwargs = {"settings": True, "replies": [GOOD, GOOD], "resumed": True, **job_kwargs}
+    _write_job(tmp_path, "bbbbbbbb", target, **kwargs)
+    return _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+
+
+def test_live_vc_ac3_green_reports_unverified_assertions_explicitly(tmp_path):
+    code, receipt = ev.run("dispatched-child-and-resume", _resume_env(tmp_path))
+    assert code == 0
+    a = receipt["assertions"]
+    assert a["settings_content_inherited"] == a["permission_mode_effective"] == a["main_route_called"] == "observed"
+    # 未実行の Haiku route・operator 自己申告の UI provenance・proxy 相関は PASS 扱いしない。
+    assert a["haiku_route_called"] == a["ui_dispatch_provenance"] == a["proxy_request_correlation"] == "unverified"
+    assert receipt["ui_dispatch_provenance"] == "operator_attested_only"
+    assert receipt["candidate"]["settings_role_aliases_configured"]  # 設定値は設定値として別項目
+
+
+def test_live_vc_haiku_route_observed_only_with_actual_luna_response(tmp_path):
+    luna = {"model": "gpt-6-luna", "text": "MARKER_OK haiku"}
+    _, receipt = ev.run("dispatched-child-and-resume", _resume_env(tmp_path, replies=[GOOD, luna]))
+    assert receipt["assertions"]["haiku_route_called"] == "observed"
+
+
+def test_live_vc_main_route_not_observed_when_only_haiku_responds(tmp_path):
+    luna = {"model": "gpt-6-luna", "text": "MARKER_OK haiku"}
+    assert ev.run("dispatched-child-and-resume", _resume_env(tmp_path, replies=[luna, luna]))[0] == 1
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"perm_events": ()},  # 宣言だけで実効 permission-mode event が無い
+        {"perm_events": ("default",)},  # 宣言 bypassPermissions と実効が不一致
+        {"perm_declared": None, "perm_events": ()},  # 宣言も観測も無い
+    ],
+)
+def test_live_vc_declared_permission_mode_is_not_effective_mode(tmp_path, kwargs):
+    assert ev.run("dispatched-child-and-resume", _resume_env(tmp_path, **kwargs))[0] == 1
+
+
+def test_live_vc_settings_file_path_content_is_read_not_just_flag_presence(tmp_path):
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps({"env": _gateway_env()}), encoding="utf-8")
+    code, receipt = ev.run("dispatched-child-and-resume", _resume_env(tmp_path, settings_file=good))
+    assert code == 0 and receipt["candidate"]["settings_source"] == "file"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        {"env": {}},  # gateway env を持たない file
+        {"env": {**_gateway_env(), "ANTHROPIC_BASE_URL": "https://api.example.com"}},  # non-loopback
+        {"env": {**_gateway_env(), "ANTHROPIC_MODEL": "claude-sonnet-4-5"}},  # alias が canonical と不一致
+        None,  # file が存在しない
+    ],
+)
+def test_live_vc_settings_file_without_valid_gateway_content_is_not_inherited(tmp_path, content):
+    path = tmp_path / "bad.json"
+    if content is not None:
+        path.write_text(json.dumps(content), encoding="utf-8")
+    code, receipt = ev.run("dispatched-child-and-resume", _resume_env(tmp_path, settings_file=path))
+    assert code == 1 and receipt["assertions"]["settings_content_inherited"] == "failed"
+
+
+def test_live_vc_candidate_inline_settings_with_native_aliases_is_inconclusive(tmp_path):
+    bad_env = {**_gateway_env(), "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-4-5"}
+    target = tmp_path / "repo"
+    target.mkdir()
+    _write_job(tmp_path, "aaaaaaaa", target, settings=False, replies=[ERR])
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD], settings_env=bad_env)
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CONTROL_ID="aaaaaaaa", CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    assert ev.run("gateway-control-comparison", env)[1]["necessity"] == "inconclusive"

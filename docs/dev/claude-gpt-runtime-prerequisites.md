@@ -149,6 +149,53 @@ cd ~/projects && claude agents --settings "$HOME/.claude-gpt/agent-view-settings
   control / candidate の 2 job を read-only で比較し `needed | unnecessary | inconclusive` を判定する。
   `unnecessary` なら本節は不要になり、削除してよい。
 
+#### 実機 2 arm 対照の operator 手順（AC1 / AC3）
+
+`claude --bg` や合成 fixture は代用にならない。operator が実際の Agent View UI で、同じ Claude Code version・
+proxy・trust 済み fixture（例: owner 所有の disposable repo `~/projects/agentview-3052-zEnHieYt`、clean を確認）・
+permission 条件で次の 2 arm を**順に**実行する。親 shell には gateway 変数を export しない（`launch.sh` 経由で
+開かない）。`~/.claude/settings.json` の `defaultMode` も 2 arm で同じにする。
+
+1. Control: `cd ~/projects && claude agents --permission-mode bypassPermissions`（`--settings` なし）。
+2. Candidate: 一度 Agent View を閉じ、`claude agents --settings "$HOME/.claude-gpt/agent-view-settings.json" --permission-mode bypassPermissions` で開き直す。
+
+各 arm で fixture を `@<repo名>` で指定し、次の同一 prompt を dispatch する。prompt に答えを含めないため、応答の echo と
+区別できる。
+
+```text
+@agentview-3052-zEnHieYt cwd の `git rev-parse --short HEAD` を実行し、`AVGW3055 <出力>` の 1 行だけで答えてください。
+```
+
+dispatch 後、子が完了（または失敗）してから job id を取得して evaluator を実行する。job id は 8 桁 hex である。
+
+```bash
+claude agents --json --all | jq -r '.[] | select(.cwd | contains("agentview-3052")) | [.id, .state, .startedAt] | @tsv'
+
+export CLAUDE_GPT_AV_UI_DISPATCHED=1   # 上記を UI から実際に dispatch した場合のみ operator が宣言する
+export CLAUDE_GPT_AV_TARGET_CWD="$HOME/projects/agentview-3052-zEnHieYt"
+export CLAUDE_GPT_AV_EXPECT_TEXT="AVGW3055 $(git -C "$CLAUDE_GPT_AV_TARGET_CWD" rev-parse --short HEAD)"
+export CLAUDE_GPT_AV_CONTROL_ID=<control の id>
+export CLAUDE_GPT_AV_CANDIDATE_ID=<candidate の id>
+uv run --locked python3 scripts/claude-gpt/tests/agent_view_gateway_live_vc.py --scenario gateway-control-comparison
+uv run --locked python3 scripts/claude-gpt/tests/agent_view_gateway_live_vc.py --scenario dispatched-child-and-resume
+```
+
+AC3 の `dispatched-child-and-resume` は、candidate を pause または supervisor 再起動後に `Enter` で再開し、
+同じ prompt でもう一度応答させてから実行する（有効な gateway 応答 2 件以上と、同一 session id での再開が必要）。
+
+evaluator の判定は次のとおり。`assertions` の `unverified` は PASS ではない。
+
+- `needed`（exit 0）: control が model access error か gateway 外 model への fallback で失敗し、candidate が gateway model で応答した。
+- `unnecessary`（exit 0）: 両 arm が gateway model で応答した。docs の本節は不要になる。
+- `inconclusive`（exit 1）: arm の条件・version・cwd が不一致、または失敗が gateway と無関係。
+- exit 77: job id・target cwd・UI 宣言が無い（SKIP）。
+
+AC3 の exit 0 は、`--settings` の**内容**（file の場合は中身）が canonical の loopback gateway と全 role alias に一致し、
+transcript に実効 `permission-mode` event があって宣言と一致し、main model の実応答があることを意味する。Haiku route は
+実際に `gpt-6-luna` の応答が transcript に現れた場合だけ `observed` で、alias の設定値だけでは `unverified` のままである。
+UI からの dispatch は operator の自己申告でありスクリプトは独立に観測できない。proxy request との一対一相関も取得できない
+場合は `unverified` とし、provider route は主張しない。
+
 ### 接続先 server の診断
 
 診断の authority は、`ANTHROPIC_BASE_URL` が実際に接続する running server である。

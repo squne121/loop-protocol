@@ -36,6 +36,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 SKIP_EXIT = 77
 SCENARIOS = ("gateway-control-comparison", "dispatched-child-and-resume")
@@ -93,17 +94,39 @@ def _flag_value(flags: list, name: str):
     return None
 
 
-def _settings_env(flags: list) -> dict | None:
-    """`--settings` が inline JSON の場合の env object。file path / 欠落は None。"""
+def _settings_env(flags: list) -> tuple[dict | None, str]:
+    """`--settings` の (env object, source)。source = inline | file | unreadable | absent。
+
+    file path の存在だけでは有効な設定の継承とは言えないため、file の中身を読む。"""
     raw = _flag_value(flags, "--settings")
     if not isinstance(raw, str):
-        return None
+        return None, "absent"
+    source = "inline"
     try:
         doc = json.loads(raw)
     except ValueError:
-        return None
+        source = "file"
+        doc = _read_json(Path(raw)) if raw.startswith("/") else None
+        if doc is None:
+            return None, "unreadable"
     env = doc.get("env") if isinstance(doc, dict) else None
-    return env if isinstance(env, dict) else None
+    return (env if isinstance(env, dict) else None), source
+
+
+def settings_env_is_gateway(env: dict | None) -> bool:
+    """env が canonical の loopback gateway + 全 role alias を持つ（値が canonical と一致する）こと。"""
+    if not env:
+        return False
+    url = env.get("ANTHROPIC_BASE_URL")
+    parsed = urlsplit(url) if isinstance(url, str) else None
+    if not parsed or parsed.hostname not in ("127.0.0.1", "localhost", "::1") or parsed.username or parsed.password:
+        return False
+    return all(env.get(k) == v for k, v in canonical_aliases().items()) and bool(canonical_aliases())
+
+
+def _permission_modes(rows: list[dict]) -> list[str]:
+    """transcript に記録された実効 permission-mode event（CLI 引数の宣言とは別の観測）。"""
+    return [str(r["permissionMode"]) for r in rows if r.get("type") == "permission-mode" and r.get("permissionMode")]
 
 
 def _text_of(content) -> str:
@@ -178,15 +201,23 @@ def load_arm(
         raise _skip(f"{label}: job state not found under jobs dir")
     cwd = str(state.get("cwd", ""))
     flags = state.get("respawnFlags") if isinstance(state.get("respawnFlags"), list) else []
-    settings_env = _settings_env(flags)
+    settings_env, settings_source = _settings_env(flags)
+    rows_all = _transcript(projects_dir, cwd, str(state.get("sessionId", "")))
+    perm_observed = _permission_modes(rows_all)
     has_settings = _flag_value(flags, "--settings") is not None
-    rows = _transcript(projects_dir, cwd, str(state.get("sessionId", "")))
-    valid, failed = assistant_responses(rows)
+    valid, failed = assistant_responses(rows_all)
     if expect:
         valid_expected = [v for v in valid if expect in v["text"]]
     else:
         valid_expected = valid
     cwd_ok = bool(cwd) and (target_cwd is None or cwd == target_cwd or cwd.startswith(target_cwd.rstrip("/") + "/"))
+    aliases = canonical_aliases()
+    strip = lambda a: re.sub(r"\[[^]]*\]$", "", a or "")  # noqa: E731
+    main_bases = {
+        strip(aliases.get(k))
+        for k in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL")
+    }
+    haiku_bases = {strip(aliases.get(k)) for k in ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_SMALL_FAST_MODEL")}
     provider_env = state.get("providerEnv") if isinstance(state.get("providerEnv"), dict) else {}
     return {
         "label": label,
@@ -195,14 +226,20 @@ def load_arm(
         "child_cwd_in_target": cwd_ok,
         "child_cwd_is_git_root": (Path(cwd) / ".git").exists() if cwd else False,
         "settings_flag_present": has_settings,
-        "settings_env_inline": settings_env is not None,
-        "settings_env_role_aliases": (
+        "settings_source": settings_source,
+        "settings_content_valid": settings_env_is_gateway(settings_env),
+        "settings_role_aliases_configured": (
             {k: settings_env.get(k) for k in ROLE_ENV_KEYS if k in settings_env} if settings_env else {}
         ),
         "provider_env_role_aliases": {k: provider_env.get(k) for k in ROLE_ENV_KEYS if k in provider_env},
         "provider_env_matches_canonical": any(k in provider_env for k in ROLE_ENV_KEYS)
         and all(v == canonical_aliases().get(k) for k, v in provider_env.items() if k in ROLE_ENV_KEYS),
-        "permission_mode_flag": _flag_value(flags, "--permission-mode"),
+        "permission_mode_declared": _flag_value(flags, "--permission-mode"),
+        "permission_modes_observed": perm_observed,
+        "permission_mode_consistent": bool(perm_observed)
+        and (_flag_value(flags, "--permission-mode") in (None, perm_observed[-1])),
+        "main_route_observed": bool(main_bases & {m for m in (v["model"] for v in valid_expected)}),
+        "haiku_route_observed": bool(haiku_bases & {v["model"] for v in valid_expected}),
         "model_flag": _flag_value(flags, "--model"),
         "valid_assistant_responses": len(valid_expected),
         "valid_assistant_models": sorted({v["model"] for v in valid_expected}),
@@ -224,7 +261,7 @@ def classify(control: dict, candidate: dict) -> str:
         return "inconclusive"
     if control["cli_version"] != candidate["cli_version"] or not candidate["cli_version"]:
         return "inconclusive"  # 同一 Claude Code version 条件が成立しない
-    if not candidate["provider_env_matches_canonical"]:
+    if not (candidate["provider_env_matches_canonical"] and candidate["settings_content_valid"]):
         return "inconclusive"
     cand_ok = candidate["valid_assistant_responses"] > 0
     ctrl_ok = control["valid_assistant_responses"] > 0
@@ -249,6 +286,8 @@ def run(scenario: str, environ: dict) -> tuple[int, dict]:
         "scenario": scenario,
         "proxy_correlation": "unverified",
         "provider_route_claim": "none",
+        # operator の自己申告のみ。本 script は UI 操作を独立に観測できない。
+        "ui_dispatch_provenance": "operator_attested_only",
     }
     try:
         if environ.get("CLAUDE_GPT_AV_UI_DISPATCHED") != "1":
@@ -272,11 +311,25 @@ def run(scenario: str, environ: dict) -> tuple[int, dict]:
             and candidate["child_cwd_in_target"]
             and candidate["valid_assistant_responses"] >= 1
             and candidate["provider_env_matches_canonical"]
+            and candidate["settings_content_valid"]
+            and candidate["permission_mode_consistent"]
+            and candidate["main_route_observed"]
             and candidate["resume_same_session"]
             and candidate["resumed_after_first_terminal"]
             and candidate["valid_assistant_responses"] >= 2
         )
-        receipt.update(candidate=candidate, observed_postcondition=ok)
+        receipt.update(
+            candidate=candidate,
+            observed_postcondition=ok,
+            assertions={
+                "settings_content_inherited": "observed" if candidate["settings_content_valid"] else "failed",
+                "permission_mode_effective": "observed" if candidate["permission_mode_consistent"] else "failed",
+                "main_route_called": "observed" if candidate["main_route_observed"] else "failed",
+                "haiku_route_called": "observed" if candidate["haiku_route_observed"] else "unverified",
+                "ui_dispatch_provenance": "unverified",
+                "proxy_request_correlation": "unverified",
+            },
+        )
         return (0 if ok else 1), receipt
     except Skip as exc:
         receipt.update(status="skip", reason=str(exc))
