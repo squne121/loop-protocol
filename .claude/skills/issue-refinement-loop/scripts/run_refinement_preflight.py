@@ -5593,18 +5593,189 @@ def _invoke_planner(
 # ---------------------------------------------------------------------------
 
 
-def _has_unknown_confidence(plan: dict) -> bool:
-    """
-    Return True if any decision in plan.decisions.*.confidence == "unknown".
+def _canonical_no_web_policy(policy: Any) -> bool:
+    return (
+        isinstance(policy, dict)
+        and policy.get("required") is False
+        and policy.get("reason_code") == "no_critical_external_claim"
+        and policy.get("critical_external_claims") == []
+        and policy.get("evidence_spans") == []
+        and policy.get("confidence") == "unknown"
+    )
 
-    This determines the warn condition:
-    planner exit 0 + fail_closed.required == false + >=1 unknown confidence → warn/1.
-    """
+
+def _has_unknown_confidence(plan: dict, *, resolved_no_web: bool = False) -> bool:
+    """Keep unrelated uncertainty visible even when a no-Web decision is verified."""
     decisions = plan.get("decisions", {})
-    for _key, policy in decisions.items():
+    if not isinstance(decisions, dict):
+        return True
+    for key, policy in decisions.items():
         if isinstance(policy, dict) and policy.get("confidence") == "unknown":
-            return True
+            if key != "web_research_policy" or not resolved_no_web or not _canonical_no_web_policy(policy):
+                return True
     return False
+
+
+def _verified_repo_local_no_web_handoff(
+    plan: dict,
+    *,
+    planner_input: dict,
+    raw_snapshot: dict,
+    anchor_comment_state: Optional[dict],
+    known_context: Optional[dict],
+    repo: str,
+    issue_number: int,
+) -> bool:
+    """Resolve only the negative Web confidence of a fully bound repo-local anchor."""
+    decisions = plan.get("decisions")
+    fail_closed = plan.get("fail_closed")
+    if (
+        plan.get("schema_version") != "refinement_loop_plan/v1"
+        or not isinstance(decisions, dict)
+        or not isinstance(fail_closed, dict)
+        or fail_closed.get("required") is not False
+        or fail_closed.get("reason_codes") != []
+    ):
+        return False
+    web = decisions.get("web_research_policy")
+    investigation = decisions.get("investigation_policy")
+    if not _canonical_no_web_policy(web) or not isinstance(investigation, dict):
+        return False
+    if (
+        investigation.get("required") is not True
+        or investigation.get("confidence") != "deterministic"
+        or not (investigation.get("repo_claims") or investigation.get("target_paths"))
+        or not isinstance(investigation.get("repo_claims"), list)
+        or not isinstance(investigation.get("target_paths"), list)
+        or _has_unknown_confidence(plan, resolved_no_web=True)
+    ):
+        return False
+
+    if not isinstance(anchor_comment_state, dict) or not isinstance(known_context, dict):
+        return False
+    body = anchor_comment_state.get("snapshot")
+    if (
+        not isinstance(body, str)
+        or not body.strip()
+        or re.search(r"\[(?:redacted|truncated):|\[\.\.\.\]|<truncated>", body, re.I)
+        or raw_snapshot.get("anchor_comment") != anchor_comment_state
+        or raw_snapshot.get("repo") != repo
+        or raw_snapshot.get("issue_number") != issue_number
+        or known_context.get("source_fetch_complete") is not True
+        or known_context.get("source_hash_verified") is not True
+        or known_context.get("source_ranges_covered") is not True
+        or known_context.get("anchor_comment_hash") != _sha256(body)
+    ):
+        return False
+
+    comments = raw_snapshot.get("comments")
+    planner_comments = planner_input.get("comments")
+    issue = raw_snapshot.get("issue")
+    planner_issue = planner_input.get("issue")
+    if (
+        not isinstance(comments, list)
+        or not isinstance(planner_comments, list)
+        or len(comments) != len(planner_comments)
+        or not isinstance(issue, dict)
+        or not isinstance(planner_issue, dict)
+        or not isinstance(issue.get("body"), str)
+        or not isinstance(planner_input.get("known_context"), dict)
+        or issue.get("number") != issue_number
+        or planner_issue.get("number") != issue_number
+        or issue.get("body") != planner_issue.get("body")
+    ):
+        return False
+    source = plan.get("source")
+    if (
+        not isinstance(source, dict)
+        or source.get("issue_number") != issue_number
+        or source.get("issue_body_sha256") != _sha256(issue["body"])
+        or source.get("comments_sha256") != _sha256(_canonical_json(planner_comments))
+        or source.get("known_context_sha256") != _sha256(_canonical_json(planner_input.get("known_context")))
+    ):
+        return False
+    anchor_url = anchor_comment_state.get("url")
+    parsed = _parse_anchor_comment_url(anchor_url) if isinstance(anchor_url, str) else {}
+    if (
+        not parsed.get("valid")
+        or parsed.get("issue_number") != issue_number
+        or f"{parsed.get('owner')}/{parsed.get('repo')}".lower() != repo.lower()
+        or anchor_comment_state.get("id") != parsed.get("comment_id")
+        or anchor_comment_state.get("issue_number") != issue_number
+    ):
+        return False
+    matches = [
+        comment for comment in comments
+        if isinstance(comment, dict) and comment.get("id") == parsed["comment_id"]
+    ]
+    if (
+        len(matches) != 1
+        or matches[0].get("body") != body
+        or anchor_comment_state.get("html_url") != anchor_url
+        or (matches[0].get("html_url") is not None and matches[0]["html_url"] != anchor_url)
+    ):
+        return False
+    # The anchor was structurally validated before the planner ran. Bind its
+    # issue URL without resolving the comment again; GitHub paths preserve
+    # repository identity across harmless owner/repo casing differences.
+    issue_url = matches[0].get("issue_url")
+    parsed_issue_url = urlparse(issue_url) if isinstance(issue_url, str) else None
+    if (
+        parsed_issue_url is None
+        or parsed_issue_url.scheme != "https"
+        or parsed_issue_url.netloc.lower() not in ("api.github.com", "github.com")
+        or parsed_issue_url.params
+        or parsed_issue_url.query
+        or parsed_issue_url.fragment
+    ):
+        return False
+    expected_path = (
+        f"/repos/{repo}/issues/{issue_number}"
+        if parsed_issue_url.netloc.lower() == "api.github.com"
+        else f"/{repo}/issues/{issue_number}"
+    )
+    if parsed_issue_url.path.rstrip("/").casefold() != expected_path.casefold():
+        return False
+    for raw, sanitized in zip(comments, planner_comments):
+        if not isinstance(raw, dict) or not isinstance(sanitized, dict):
+            return False
+        expected = dict(raw)
+        if raw is matches[0]:
+            expected["body"] = "[redacted: anchor comment snapshot stored in artifact]"
+        if sanitized != expected:
+            return False
+
+    # The ordinary planner intentionally sees a redacted anchor. Run its same
+    # claim classifier over the complete fetched snapshot before suppressing
+    # the warning; a genuine external dependency hidden in the anchor wins.
+    full_input = dict(planner_input)
+    full_input["comments"] = comments
+    full_plan, full_exit, _, _ = _invoke_planner(full_input)
+    if full_exit != 0 or not isinstance(full_plan, dict):
+        return False
+    full_decisions = full_plan.get("decisions")
+    full_fail_closed = full_plan.get("fail_closed")
+    full_source = full_plan.get("source")
+    if (
+        full_plan.get("schema_version") != plan["schema_version"]
+        or not isinstance(full_decisions, dict)
+        or not isinstance(full_fail_closed, dict)
+        or full_fail_closed.get("required") is not False
+        or full_fail_closed.get("reason_codes") != []
+        or not isinstance(full_source, dict)
+        or full_source.get("issue_number") != issue_number
+        or full_source.get("issue_body_sha256") != source["issue_body_sha256"]
+        or full_source.get("comments_sha256") != _sha256(_canonical_json(comments))
+        or full_source.get("known_context_sha256") != source["known_context_sha256"]
+    ):
+        return False
+    full_web = full_decisions.get("web_research_policy")
+    full_investigation = full_decisions.get("investigation_policy")
+    return (
+        _canonical_no_web_policy(full_web)
+        and full_investigation == investigation
+        and not _has_unknown_confidence(full_plan, resolved_no_web=True)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -5619,6 +5790,7 @@ def _apply_exit_code_mapping(
     plan: Optional[dict] = None,
     scope_delta_decision: Optional[dict] = None,
     repair_needs_fix: bool = False,
+    verified_repo_local_no_web: bool = False,
 ) -> tuple[str, int]:
     """
     Apply the Planner ↔ Wrapper Exit Code Mapping table.
@@ -5694,8 +5866,8 @@ def _apply_exit_code_mapping(
             return "blocked", EXIT_BLOCKED
         if repair_needs_fix:
             return "needs_fix", EXIT_NEEDS_FIX
-        # Check warn condition: >=1 decision has confidence: unknown
-        if plan is not None and _has_unknown_confidence(plan):
+        # Keep unknown decisions warning unless the no-Web anchor was checked.
+        if plan is not None and _has_unknown_confidence(plan, resolved_no_web=verified_repo_local_no_web):
             return "warn", EXIT_WARN
         # Check warn condition: multi-turn trusted-owner advisory route
         if scope_delta_decision is not None and scope_delta_decision.get("status") == "warn":
@@ -9653,6 +9825,20 @@ def run_preflight(
     _scope_delta_decision_for_exit_mapping = (
         known_context.get("scope_delta_decision") if isinstance(known_context, dict) else None
     )
+    verified_repo_local_no_web = (
+        planner_exit_code == 0
+        and not blockers
+        and isinstance(plan, dict)
+        and _verified_repo_local_no_web_handoff(
+            plan,
+            planner_input=planner_input_dict,
+            raw_snapshot=raw_snapshot,
+            anchor_comment_state=anchor_comment_state,
+            known_context=known_context,
+            repo=repo,
+            issue_number=issue_number,
+        )
+    )
     status, exit_code = _apply_exit_code_mapping(
         planner_exit_code,
         planner_fail_closed,
@@ -9660,6 +9846,7 @@ def run_preflight(
         plan=plan,
         scope_delta_decision=_scope_delta_decision_for_exit_mapping,
         repair_needs_fix=repair_needs_fix,
+        verified_repo_local_no_web=verified_repo_local_no_web,
     )
 
     # A verified OWNER close-only decision is a termination disposition, not

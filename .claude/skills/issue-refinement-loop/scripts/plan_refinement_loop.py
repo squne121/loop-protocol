@@ -22,6 +22,7 @@ Exit codes:
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import re
 import sys
@@ -579,24 +580,351 @@ UNMATERIALIZED_MARKER_PATTERN = re.compile(
     r"(?:（未起票）|（未起票）|\(未起票\)|unmaterialized|TBD)"
 )
 
-# Keywords indicating critical external claims (B7: more specific keywords to reduce false positives)
-CRITICAL_EXTERNAL_KEYWORDS = {
-    "official",
-    "api",
-    "cli",
-    "auth",
-    "migration",
-}
+# Evidence classification is about a *decision dependency*, not the presence
+# of a keyword. Word boundaries prevent `cli` in client and `auth` in authority
+# from turning repository facts into external specifications (#2857).
+CRITICAL_EXTERNAL_KEYWORDS = frozenset({
+    "official", "api", "cli", "auth", "migration", "graphql",
+})
+_EXTERNAL_TOPIC_RE = re.compile(
+    r"(?<![a-z0-9_])(?:graphql|api|cli|auth|authentication|oauth|migration)"
+    r"(?![a-z0-9_])", re.I,
+)
+_EXTERNAL_AUTHORITY_RE = re.compile(
+    r"\b(?:official|published)\b|公式(?:の)?\s*(?:仕様|ドキュメント|docs?)|"
+    r"外部(?:の)?\s*(?:仕様|ドキュメント|docs?)", re.I,
+)
+_EXTERNAL_INTENT_RE = re.compile(
+    r"\b(?:verify|verification|validate|validation|check|checked|compare|"
+    r"analysis|analyze|must|require[ds]?|depends?|matches|against|specification|"
+    r"docs?|documentation|behavior|current)\b|"
+    r"検証|確認|照合|依存|必要|仕様|根拠|準拠|判断|参照", re.I,
+)
+_EXPLICIT_WEB_REQUEST_RE = re.compile(
+    r"web\s*(?:で)?確認|verify\s+externally|external\s+verification|"
+    r"(?:verify|check|validate)\b.{0,100}\bofficial\s+(?:docs?|documentation)|"
+    r"公式(?:の)?\s*(?:仕様|ドキュメント|docs?).{0,30}(?:確認|検証|照合|参照)", re.I,
+)
+_REPO_TOPIC_RE = re.compile(
+    r"(?<![a-z0-9_])(?:rg|current-main|repo(?:sitory)?|fixtures?|"
+    r"tests?|symbols?|call[- ]chain)(?![a-z0-9_])|リポジトリ|実装|直接実行", re.I,
+)
+_NON_EVIDENCE_MODIFIER_RE = re.compile(
+    r"^(?:editing|changing|modifying|altering|touching|writing|running|"
+    r"executing|rebuilding|replacing|adding|removing|deleting|updating)\b", re.I,
+)
+_EVIDENCE_ACTION_RE = re.compile(
+    r"^(?:verifying|checking|validating|comparing|consulting|reading|"
+    r"referencing|using|reviewing)\b", re.I,
+)
+_EXTERNAL_SOURCE_REF_RE = re.compile(
+    r"\b(?:docs?|documentation|spec(?:ification)?|web|external)\b|公式|外部", re.I,
+)
+_EXTERNAL_ASSERTION_RE = re.compile(
+    r"\b(?:must|shall|should|require[ds]?|depends?|specified|defined|"
+    r"documented|mandated|prohibits?)\b|必要|禁止|定義|規定", re.I,
+)
+_EXTERNAL_SOURCE_BEFORE_FIXTURE_RE = re.compile(
+    r"\b(?:docs?|documentation|spec(?:ification)?|protocol|standard|policy|web)\b|"
+    r"仕様|ドキュメント", re.I,
+)
+_REPO_SPEC_FIXTURE_RE = re.compile(
+    r"\b(?:repo(?:sitory)?|local|tests?)\b.{0,80}"
+    r"\b(?:spec(?:ification)?|rate[- ]limit|data/errors)\b.{0,50}\bfixtures?\b|"
+    r"\b(?:spec(?:ification)?|rate[- ]limit|data/errors)\s+fixtures?\b"
+    r".{0,50}\b(?:repo(?:sitory)?|local|tests?)\b", re.I,
+)
+_REPO_CHECK_RE = re.compile(
+    r"\b(?:verify|inspect|check|find|run|execute|test|establish|confirm|"
+    r"search|trace|must)\b|検証|確認|調査|探[すし]|照合|直接実行|必要", re.I,
+)
+_NEGATED_REQUEST_RE = re.compile(
+    r"\b(?:do\s+not|does\s+not|don't|won't|not|no(?!\s+later\s+than\b)|never|without|unrelated|"
+    r"out\s+of\s+scope)\b|不要|参照しない|確認しない|検証しない|対象外|"
+    r"非ゴール|変更しない|禁止|単なる|言及のみ", re.I,
+)
+_NEGATED_EVIDENCE_ACTION_RE = re.compile(
+    r"\b(?:do(?:es)?\s+not|don't|never|no)\s+(?:\w+\s+){0,3}"
+    r"(?:verify|check|validate|compare|consult|reference|refer)\b|"
+    r"\b(?:will|is|are|must|should|have\s+to)\s+(?:not|never)\s+"
+    r"(?:(?:be|to|have)\s+){0,2}(?:checked|verified|validated|compared|match)\b|"
+    r"\bwon't\s+(?:be\s+)?(?:checked|verified|validated|compared)\b|"
+    r"\bwithout\s+(?:\w+\s+){0,3}(?:official|published|external|web|仕様|ドキュメント)|"
+    r"\bwithout\s+(?:consulting|using|checking)\s+.{0,60}"
+    r"(?:official|published|external|web|specification|documentation|docs?)\b|"
+    r"(?:検証|確認|照合|参照)(?:を|は|が)?(?:しない|せず|不要|は禁止)|"
+    r"(?:検証|確認|照合|参照).{0,8}禁止",
+    re.I,
+)
+_NEGATIVE_SCOPE_RE = re.compile(
+    r"\b(?:unrelated|out\s+of\s+scope)\b|対象外|非ゴール|単なる|言及のみ", re.I,
+)
+_NEGATED_EXTERNAL_MATCH_RE = re.compile(
+    r"\b(?:must|should|will|is|are|has|have)\s+(?:to\s+)?not\s+"
+    r"(?:match|agree|follow|conform|align)\b", re.I,
+)
+# A quote cue must introduce quoted content; words describing local fixtures
+# ("example fixtures", "historical tests") do not quote a later claim.
+_QUOTED_CONTEXT_RE = re.compile(
+    r"(?<![/.])\b(?:previously(?:\s+quoted)?|historical(?:\s+context)?|"
+    r"past(?:\s+quote)?|quoted|quote|literal(?:\s+example)?|noise|example)\s*[:：]|"
+    r"\b(?:previously\s+quoted|literal\s+example)\s*[\"'“‘«「『`]|"
+    r"(?:過去(?:の)?引用|引用|貼付|例示)\s*[:：]|過去の引用|例示のみ|"
+    r"\breference\s+only\s*[:：]|"
+    r"\b(?:earlier|previous)\s+(?:reviewer\s+)?(?:wrote|said|noted)\s*[:：]", re.I,
+)
+_QUOTED_ASIDE_RE = re.compile(r"\([^()]*\)")
+_FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
+_COMMENT_BLOCK_START_RE = re.compile(
+    r"^\s{0,3}(?:#{1,6}\s|[-+*]\s|\d+[.)]\s|`{3,}|~{3,}|"
+    r"<(?:p|div|h[1-6]|ul|ol|li)\b)", re.I,
+)
+# A noun-start RHS needs its own predicate; "fixtures and API errors against docs"
+# is still one negated request, not a second affirmative dependency.
+_NOUN_CLAUSE_PREDICATE_RE = re.compile(
+    r"\b(?:must|should|shall|needs?|require[ds]?|depends?|"
+    r"(?:has|have)\s+to|"
+    r"will\s+be\s+(?:checked|verified|validated|compared)|"
+    r"(?:is|are)\s+(?:(?:to\s+be\s+)?(?:checked|verified|validated|compared)|"
+    r"specified|defined|documented|described|covered|"
+    r"outlined|listed|explained|required|expected|stated|published)|"
+    r"match(?:es)?|agree(?:s)?|follow(?:s)?|conform(?:s)?|align(?:s)?)\b", re.I,
+)
 
-# Keywords for human-requested web verification in comments
-HUMAN_WEB_VERIFICATION_KEYWORDS = {
-    "webで確認",
-    "web確認",
-    "verify externally",
-    "external verification",
-    "公式 docs",
-    "official docs",
-}
+
+def _claim_prose_lines(text: str, *, vc: bool = False) -> list[str]:
+    """Ignore fenced literals; allow explicit shell-comment VC instructions.
+
+    This does not parse trusted HTML/list directives or execute content. The
+    existing section and path extractors remain unchanged.
+    """
+    lines: list[str] = []
+    fence: str | None = None
+    for line in text.splitlines():
+        marker = _FENCE_RE.match(line)
+        if marker:
+            token = marker.group(1)
+            if fence is None:
+                fence = token
+            elif token[0] == fence[0] and len(token) >= len(fence) and not line[marker.end():].strip():
+                fence = None
+            continue
+        if fence is None or (
+            vc and line.lstrip().startswith("#")
+            and re.search(r"^\s*#\s*(?:verify|check|validate)\b", line, re.I)
+        ):
+            lines.append(line)
+    return lines
+
+
+def _visible_comment_lines(body: str) -> list[str]:
+    """Keep current prose while excluding quote continuations and code literals."""
+    body = re.sub(r"<blockquote\b[^>]*>.*?</blockquote>", "\n", body, flags=re.I | re.S)
+    body = re.sub(r"<pre\b[^>]*>.*?(?:</pre\s*>|\Z)", "\n", body, flags=re.I | re.S)
+    body = re.sub(r"<code\b[^>]*>.*?(?:</code\s*>|\Z)", " ", body, flags=re.I | re.S)
+    body = re.sub(r"<!--.*?-->", "\n", body, flags=re.S)
+    visible = []
+    quoted_paragraph = False
+    for line in body.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith(">"):
+            quoted_paragraph = bool(stripped[1:].strip())
+            continue
+        if not stripped:
+            quoted_paragraph = False
+        elif quoted_paragraph and not _COMMENT_BLOCK_START_RE.match(line):
+            continue
+        else:
+            quoted_paragraph = False
+        visible.append(line)
+    prose = "\n".join(visible)
+    prose = re.sub(r"</(?:p|div|li|br|h[1-6])\s*>", "\n", prose, flags=re.I)
+    prose = html.unescape(re.sub(r"<[^>]*>", " ", prose))
+    return _claim_prose_lines(prose)
+
+
+def _split_repo_local_without(sentence: str) -> list[str]:
+    """Keep an external request apart from a trailing local-only restriction."""
+    for boundary in re.finditer(r"\s+without\s+", sentence, flags=re.I):
+        restriction = sentence[boundary.end():].strip()
+        # API/GraphQL may name local fixtures; only a source or authority in
+        # the restriction can negate the external evidence request itself.
+        source_refs = (
+            _EXTERNAL_AUTHORITY_RE.search(restriction),
+            _EXTERNAL_SOURCE_REF_RE.search(restriction),
+        )
+        source_offsets = [match.start() for match in source_refs if match]
+        local_object = _REPO_TOPIC_RE.search(restriction)
+        if (
+            _NON_EVIDENCE_MODIFIER_RE.match(restriction)
+            or (local_object and (not source_offsets or local_object.start() < min(source_offsets)))
+            or (not source_offsets and not _EVIDENCE_ACTION_RE.match(restriction))
+        ):
+            return [sentence[:boundary.start()].strip(), f"without {restriction}"]
+    return [sentence]
+
+
+def _past_quote_span(sentence: str) -> tuple[int, int | None] | None:
+    cue = _QUOTED_CONTEXT_RE.search(sentence)
+    if not cue:
+        return None
+    if cue.group()[-1] in "`\"'“‘«「『":
+        opener = cue.group()[-1]
+        quote_start = cue.end()
+    else:
+        opening = re.match(r"\s*([`\"'“‘«「『])", sentence[cue.end():])
+        if not opening:
+            return None
+        opener = opening.group(1)
+        quote_start = cue.end() + opening.end()
+    closer = {"“": "”", "‘": "’", "«": "»", "「": "」", "『": "』"}.get(opener, opener)
+    closing = re.search(r"(?<!\\)" + re.escape(closer), sentence[quote_start:])
+    return quote_start, quote_start + closing.end() if closing else None
+
+
+def _closed_quoted_current_suffix(sentence: str) -> str | None:
+    """Return an independent current clause after a closed historical quote."""
+    span = _past_quote_span(sentence)
+    if span is None or span[1] is None:
+        return None
+    remainder = sentence[span[1]:]
+    semicolon = re.match(r"\s*[;；]\s*(?:Current\s+requirement\s*:\s*)?", remainder, re.I)
+    if semicolon:
+        # The delimiter ends the historical quote; classify each following
+        # clause normally so a negative local clause cannot hide a later one.
+        return remainder[semicolon.end():].strip()
+    transition = re.match(
+        r"(?:\s+Now\s+(?=(?:verify|check|validate|compare|confirm)\b)|"
+        r"\s*,\s*and\s+now\s+(?=(?:verify|check|validate|compare|confirm)\b)|"
+        r"\s*,?\s*(?:but|however|yet)\s+now\s+"
+        r"(?=(?:verify|check|validate|compare|confirm)\b)|"
+        r"\s*,?\s*(?:but|however|yet)\s+(?=current\b))",
+        remainder, re.I,
+    )
+    return remainder[transition.end():].strip() if transition else None
+
+
+def _claim_sentences(line: str) -> list[str]:
+    """Split independent requests without losing quoted sentence context.
+
+    A negated local clause must not suppress a later external dependency in
+    the same sentence ("do not check fixtures, but verify official docs").
+    """
+    # A quoted aside describes only its parenthesized content, not a separate
+    # affirmative claim later in the sentence.
+    line = _QUOTED_ASIDE_RE.sub(
+        lambda match: " " if _QUOTED_CONTEXT_RE.search(match.group()) else match.group(),
+        line,
+    )
+    span = _past_quote_span(line)
+    if span is not None and span[1] is None:
+        sentences = [line]
+    else:
+        sentences = []
+        start = 0
+        for boundary in re.finditer(r"(?<=[。！？])|(?<=[.!?])\s+(?=[A-Z])", line, re.I):
+            if span is not None and span[0] <= boundary.start() < span[1]:
+                continue
+            part = line[start:boundary.start()].strip()
+            if part:
+                sentences.append(part)
+            start = boundary.end()
+        part = line[start:].strip()
+        if part:
+            sentences.append(part)
+    split_sentences = []
+    for sentence in sentences:
+        # Only a closed quotation followed by an explicit current transition
+        # can release the suffix from the historical-quote exclusion.
+        current_suffix = _closed_quoted_current_suffix(sentence)
+        if current_suffix is not None:
+            sentence = current_suffix
+        if _QUOTED_CONTEXT_RE.search(sentence):
+            split_sentences.append(sentence)
+            continue
+        units = re.split(
+            r"[;；]|(?:,\s*|\s+)(?:but|however|yet)\s+|"
+            r"(?:、|，)\s*(?:しかし|一方で?)\s*",
+            sentence, flags=re.I,
+        )
+        for unit in units:
+            for part in _split_repo_local_without(unit):
+                if not part.strip():
+                    continue
+                clauses = re.split(
+                    r"\s+and\s+(?=(?:(?:do|does)\s+not|don't|never|no|without|"
+                    r"verify|check|validate|compare|confirm)\b)|[、，]",
+                    part, flags=re.I,
+                )
+                expanded = []
+                for clause in clauses:
+                    for boundary in re.finditer(r"\s+and\s+", clause, flags=re.I):
+                        local = clause[:boundary.start()].strip()
+                        external = clause[boundary.end():].strip()
+                        if (
+                            _NEGATED_REQUEST_RE.search(local)
+                            and _REPO_TOPIC_RE.search(local)
+                            and _NOUN_CLAUSE_PREDICATE_RE.search(external)
+                            and _is_external_dependency(external)
+                        ):
+                            expanded.extend((local, external))
+                            break
+                    else:
+                        expanded.append(clause)
+                if (
+                    len(expanded) > 1
+                    and any(_NEGATED_REQUEST_RE.search(c) and _REPO_TOPIC_RE.search(c) for c in expanded)
+                    and any(_is_external_dependency(c) for c in expanded)
+                ):
+                    split_sentences.extend(clause.strip() for clause in expanded if clause.strip())
+                else:
+                    split_sentences.append(part.strip())
+    return split_sentences
+
+
+def _is_external_dependency(text: str, *, comment: bool = False) -> bool:
+    """Conservatively require an affirmative external authority/dependency.
+
+    Unknown genuinely external assertions should remain dispositive, but bare
+    topic tokens, negative scope, past quotes and repo-local checks do not
+    acquire external authority from accidental substrings.
+    """
+    if (_NEGATIVE_SCOPE_RE.search(text) or _NEGATED_EVIDENCE_ACTION_RE.search(text)
+        or _NEGATED_EXTERNAL_MATCH_RE.search(text) or _QUOTED_CONTEXT_RE.search(text)):
+        return False
+    topic = bool(_EXTERNAL_TOPIC_RE.search(text))
+    authority = bool(_EXTERNAL_AUTHORITY_RE.search(text))
+    intent = bool(_EXTERNAL_INTENT_RE.search(text))
+    local_fixture = _REPO_SPEC_FIXTURE_RE.search(text)
+    if local_fixture:
+        before = text[:local_fixture.start()]
+        after = text[local_fixture.end():]
+        independent_source = (
+            _EXTERNAL_AUTHORITY_RE.search(before)
+            and _EXTERNAL_SOURCE_BEFORE_FIXTURE_RE.search(before)
+        )
+        if not independent_source and not _EXTERNAL_AUTHORITY_RE.search(after):
+            return False
+    if topic and authority and intent:
+        return True
+    if topic and intent and re.search(r"\b(?:spec(?:ification)?|rate[- ]limit|data/errors)\b|仕様", text, re.I):
+        # GraphQL-only specifications need not say "API" or "official".
+        return True
+    if (authority and _EXTERNAL_ASSERTION_RE.search(text)
+        and re.search(r"\b(?:docs?|documentation|spec(?:ification)?|protocol|standard|policy)\b|仕様", text, re.I)):
+        # A published specification can be dispositive without naming a known
+        # service or explicitly asking the reader to verify it.
+        return True
+    if comment and _EXPLICIT_WEB_REQUEST_RE.search(text):
+        return True
+    # Existing official-web requests in VC may be expressed without a named
+    # service (e.g. "Verify against official docs"). Generic body mentions
+    # of web/API do not acquire dispositive status from this branch.
+    if authority and intent and re.search(r"\b(?:verify|check|validation|against)\b|照合|検証", text, re.I):
+        return True
+    if topic and re.search(r"\bvalidation\s+of\s+auth\s+migration\s+behavior\b", text, re.I):
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1106,98 +1434,100 @@ def _extract_paths_from_outcome_ac_vc(issue_body: str) -> frozenset[str]:
 
 
 def _extract_repo_claims(issue_body: str) -> list[str]:
-    """Extract claims about repo facts (commands, skills, schemas, paths)."""
+    """Pass actionable local facts to investigation, including pathless symbols.
+
+    Paths keep their established behavior. Pathless `rg`, direct execution and
+    repository tests/call-chain requests require an actual investigation verb;
+    incidental words such as `client` or `local` alone are not evidence tasks.
+    """
     claims = []
     sections = _extract_sections(issue_body)
-
-    # Include Allowed Paths section as per B6
-    for section_name in ["Outcome", "In Scope", "Acceptance Criteria", "Verification Commands", "Allowed Paths"]:
+    for section_name in [
+        "Outcome", "In Scope", "Acceptance Criteria", "Verification Commands",
+        "Allowed Paths", "Background",
+    ]:
         content = sections.get(section_name, "")
-        # B6: Also exclude fenced code for repo_claims
+        # Preserve the existing fenced-code exclusion for repository claims.
         content = _remove_fenced_code(content)
-
         for line in content.splitlines():
-            # Only extract lines that mention concrete repo elements (paths, scripts)
-            # NOT generic section headers like "## Verification Commands"
-            if any(
+            stripped = line.strip()
+            if not stripped or stripped.startswith("# "):
+                continue
+            has_concrete_path = any(
                 keyword in line.lower()
-                for keyword in [
-                    ".claude/",
-                    "src/",
-                    "docs/",
-                    "tests/",
-                    "scripts/",
-                    ".github/",
-                    "$ ",  # Shell commands
-                ]
-            ):
-                stripped = line.strip()
-                if stripped and not stripped.startswith("# "):  # Exclude headers
-                    claims.append(stripped)
-
+                for keyword in [".claude/", "src/", "docs/", "tests/", "scripts/", ".github/", "$ "]
+            )
+            pathless_check = bool(_REPO_TOPIC_RE.search(line) and _REPO_CHECK_RE.search(line))
+            if (has_concrete_path and section_name != "Background") or pathless_check:
+                claims.append(stripped)
     return claims
 
 
 def _extract_critical_external_claims(
     issue_body: str, comments: Optional[list[dict[str, Any]]] = None
 ) -> list[dict[str, Any]]:
-    """Extract critical external claims from issue body and comments."""
-    claims = []
+    """Extract affirmative external dependencies, not keyword occurrences."""
+    claims: list[dict[str, Any]] = []
     sections = _extract_sections(issue_body)
 
-    # Check each section for external claims in issue body
-    for section_name in ["Outcome", "In Scope", "Acceptance Criteria", "Verification Commands", "Out of Scope"]:
-        content = sections.get(section_name, "")
-        for line in content.splitlines():
-            line_lower = line.lower()
-            if any(keyword in line_lower for keyword in CRITICAL_EXTERNAL_KEYWORDS):
-                claim = line.strip()
-                if claim:
-                    claims.append(
-                        {
-                            "claim": claim,
-                            "affects": _infer_affects_section(section_name),
-                            "source_hint": None,
-                            "role": EXTERNAL_CLAIM_ROLE_DISPOSITIVE,
-                        }
-                    )
+    for section_name in [
+        "Outcome", "In Scope", "Acceptance Criteria", "Verification Commands",
+        "Background", "Stop Conditions",
+    ]:
+        for line in _claim_prose_lines(sections.get(section_name, ""), vc=section_name == "Verification Commands"):
+            for sentence in _claim_sentences(line):
+                if _is_external_dependency(sentence):
+                    # Keep the full source line for existing plain-text body
+                    # claims; independent mixed/negated clauses use their own
+                    # sentence so only the affirmative dependency is routed.
+                    claim = sentence.strip()
+                    claims.append({
+                        "claim": claim,
+                        "affects": _infer_affects_section(section_name),
+                        "source_hint": None,
+                        "role": EXTERNAL_CLAIM_ROLE_DISPOSITIVE,
+                    })
 
-    # B4: Check comments for human-requested web verification
-    if comments and isinstance(comments, list):
+    if isinstance(comments, list):
         for comment in comments:
-            if isinstance(comment, dict):
-                comment_body = comment.get("body", "")
-                comment_id = comment.get("id", comment.get("comment_id"))
+            if not isinstance(comment, dict) or not isinstance(comment.get("body"), str):
+                continue
+            comment_id = comment.get("id", comment.get("comment_id"))
+            hint = f"comment_{comment_id}" if comment_id else "comment"
+            for line in _visible_comment_lines(comment["body"]):
+                sentences = _claim_sentences(line)
+                # A short generic request followed by its official-source
+                # elaboration is one request (legacy fixture). Do not apply
+                # this to long prefixes: independent late claims must survive.
+                if (len(line.strip()) <= 100 and len(sentences) == 2
+                    and re.search(r"web\s*(?:で)?確認", sentences[0], re.I)
+                    and _is_external_dependency(sentences[0], comment=True)
+                    and _is_external_dependency(sentences[1], comment=True)):
+                    sentences = [line.strip()]
+                for sentence in sentences:
+                    if not _is_external_dependency(sentence, comment=True):
+                        continue
+                    claim_text = sentence.strip()
+                    if len(claim_text) > 100:
+                        for match in re.finditer(
+                            r"\b(?:verify|check|validate)\b|web\s*(?:で)?確認",
+                            claim_text, re.I,
+                        ):
+                            actionable = claim_text[match.start():].strip()
+                            if _is_external_dependency(actionable, comment=True):
+                                claim_text = actionable
+                                break
+                    claims.append({
+                        "claim": claim_text,
+                        "affects": "VC",
+                        "source_hint": hint,
+                        "role": EXTERNAL_CLAIM_ROLE_DISPOSITIVE,
+                    })
 
-                for keyword in HUMAN_WEB_VERIFICATION_KEYWORDS:
-                    if keyword in comment_body.lower():
-                        # Found human request for web verification in comments
-                        claim_text = (
-                            comment_body[:100].strip()
-                            if comment_body
-                            else "Human requested web verification"
-                        )
-                        claims.append(
-                            {
-                                "claim": claim_text,
-                                "affects": "VC",
-                                "source_hint": (
-                                    f"comment_{comment_id}" if comment_id else "comment"
-                                ),
-                                "role": EXTERNAL_CLAIM_ROLE_DISPOSITIVE,
-                            }
-                        )
-                        break  # Only add once per comment
-
-    # B7: Stable sort and dedupe by claim text
-    claims_by_text = {}
-    for claim in claims:
-        key = claim["claim"]
-        if key not in claims_by_text:
-            claims_by_text[key] = claim
-
-    # Return sorted deduped claims
-    return sorted(claims_by_text.values(), key=lambda c: c["claim"])
+    # Distinguish the same assertion sourced from two comments: evidence
+    # provenance must not be silently replaced by the first comment.
+    deduped = {(c["claim"], c["source_hint"]): c for c in claims}
+    return sorted(deduped.values(), key=lambda c: (c["claim"], c["source_hint"] or ""))
 
 
 def _infer_affects_section(section_name: str) -> str:
@@ -1207,6 +1537,8 @@ def _infer_affects_section(section_name: str) -> str:
         "In Scope": "InScope",
         "Acceptance Criteria": "AC",
         "Verification Commands": "VC",
+        "Background": "AC",
+        "Stop Conditions": "StopCondition",
         "Out of Scope": "StopCondition",
     }
     return mapping.get(section_name, "AC")
