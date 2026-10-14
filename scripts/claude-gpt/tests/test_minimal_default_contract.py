@@ -132,11 +132,36 @@ def test_default_env_contract_passes_caller_flags_through_unchanged(tmp_path, se
         ("--permission-mode=bypassPermissions",),
     ],
 )
-def test_default_env_contract_never_enables_permission_bypass(tmp_path, server, flag):
-    proc, observed, _env = H.run_launcher_with_fake_claude(tmp_path, server.url, flag)
+def test_permission_bypass_explicit_flags_reach_claude_unchanged(tmp_path, server, flag):
+    args = ("agents", *flag, "--json", "--all")
+    _proc, observed, env = _launch(tmp_path, server, args)
+    assert observed["argv"] == list(args)
+    for key in ("HOME", "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "GH_CONFIG_DIR"):
+        assert observed["env"].get(key) == env.get(key)
+
+
+@pytest.mark.parametrize("option", ["--permission-mode", "--dangerously-skip-permissions"])
+def test_permission_bypass_launcher_options_before_separator_still_rejected(tmp_path, server, option):
+    fake = H.write_fake_claude(tmp_path / "fake-claude")
+    out = tmp_path / "out.json"
+    env = H.base_env(tmp_path, ANTHROPIC_BASE_URL=server.url, FAKE_CLAUDE_OUT=str(out))
+    proc = H.run_launcher(["--claude-bin", str(fake), option], env)
     assert proc.returncode == 2, (proc.stdout, proc.stderr)
-    assert observed is None, "claude must not be reached when a bypass flag is requested"
-    assert "permission_bypass_flag_rejected" in proc.stderr
+    assert not out.exists()
+    assert "unknown_launcher_option" in proc.stderr
+
+
+@pytest.mark.parametrize("mode", ["--check-only", "--dry-run"])
+def test_permission_bypass_diagnostics_do_not_launch_claude(tmp_path, server, mode):
+    fake = H.write_fake_claude(tmp_path / "fake-claude")
+    out = tmp_path / "out.json"
+    env = H.base_env(tmp_path, ANTHROPIC_BASE_URL=server.url, FAKE_CLAUDE_OUT=str(out))
+    proc = H.run_launcher(
+        [mode, "--claude-bin", str(fake), "--", "agents", "--permission-mode", "bypassPermissions"], env
+    )
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert json.loads(proc.stdout)["status"] == ("ok" if mode == "--check-only" else "dry_run")
+    assert not out.exists(), "diagnostics must not launch Claude even with caller-supplied permission flags"
 
 
 def test_default_env_contract_dry_run_has_no_side_effects(tmp_path, server):
@@ -214,8 +239,6 @@ def test_compensating_layers_removed_from_production_sources():
     for name in ("launch.sh", "preflight.sh"):
         code = _active_code(H.SCRIPT_DIR / name)
         for token in forbidden:
-            if token == "--permission-mode":
-                continue  # launch.sh は bypass 値の拒否判定にだけ使う（注入はしない）。argv 観測で検証済み。
             assert token not in code, f"{name} still contains active code for removed layer: {token}"
     lib_code = _active_code(H.LIB_SH)
     for token in ("CLAUDE_ISOLATED", "settings.local.json", "mcp-empty.json", "AGY_OAUTH_TOKEN_HANDOFF",
