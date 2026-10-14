@@ -14,7 +14,7 @@ Issue #3055: Agent View の別 repo `@repo` dispatch で `--settings env` が必
   CLAUDE_GPT_AV_CONTROL_ID       control arm の job id（gateway-control-comparison で必須）
   CLAUDE_GPT_AV_CANDIDATE_ID     candidate arm の job id（必須）
   CLAUDE_GPT_AV_UI_DISPATCHED    "1" = 両 arm を Agent View UI の @repo で dispatch した
-  CLAUDE_GPT_AV_TARGET_CWD       dispatch 先 repo の絶対 path（child cwd が配下であること）
+  CLAUDE_GPT_AV_TARGET_CWD       dispatch 先 repo の絶対 path（必須。未設定は SKIP。child cwd が配下であること）
   CLAUDE_GPT_AV_EXPECT_TEXT      child の assistant 応答に含まれるべき文字列
   CLAUDE_GPT_AV_JOBS_DIR         既定 ~/.claude/jobs
   CLAUDE_GPT_AV_PROJECTS_DIR     既定 ~/.claude/projects
@@ -47,6 +47,26 @@ ROLE_ENV_KEYS = (
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
 )
 _JOB_ID_RE = re.compile(r"^[0-9a-f]{8}$")
+_LIB_SH = Path(__file__).resolve().parent.parent / "lib.sh"
+_MODEL_ACCESS_RE = re.compile(r"issue with the selected model|model.{0,40}(not found|not available|access)", re.I)
+
+
+def canonical_aliases() -> dict:
+    """lib.sh の `CLAUDE_GPT_MODEL_*` 定義から role alias を導出する（別 model 定義をハードコードしない）。"""
+    text = _LIB_SH.read_text(encoding="utf-8")
+    found = dict(re.findall(r'^(CLAUDE_GPT_MODEL_[A-Z_]+)="([^"]+)"', text, re.M))
+    mapping = {
+        "ANTHROPIC_MODEL": "CLAUDE_GPT_MODEL_MAIN",
+        "ANTHROPIC_SMALL_FAST_MODEL": "CLAUDE_GPT_MODEL_SMALL_FAST",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "CLAUDE_GPT_MODEL_OPUS",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "CLAUDE_GPT_MODEL_SONNET",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "CLAUDE_GPT_MODEL_HAIKU",
+    }
+    return {k: found[v] for k, v in mapping.items() if v in found}
+
+
+def gateway_bases() -> set:
+    return {re.sub(r"\[[^]]*\]$", "", v) for v in canonical_aliases().values()}
 
 
 class Skip(Exception):
@@ -134,10 +154,15 @@ def assistant_responses(rows: list[dict]) -> tuple[list[dict], list[dict]]:
         model = str(msg.get("model", ""))
         usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
         if r.get("isApiErrorMessage") or model in ("", "<synthetic>") or not usage.get("output_tokens"):
-            failed.append({"model": model or "unknown", "failure_class": "api_error_or_synthetic"})
+            fc = "model_access_error" if _MODEL_ACCESS_RE.search(text) else "other_api_error"
+            failed.append({"model": model or "unknown", "failure_class": fc})
             continue
         if any(text == p or (len(text) > 20 and text in p) for p in prompts):
             failed.append({"model": model, "failure_class": "prompt_echo"})
+            continue
+        if model not in gateway_bases():
+            # Native / Claude Max 等の gateway 外 model の応答は gateway 経由の成功ではない。
+            failed.append({"model": model, "failure_class": "non_gateway_model_response"})
             continue
         valid.append({"model": model, "text": text})
     return valid, failed
@@ -175,6 +200,9 @@ def load_arm(
             {k: settings_env.get(k) for k in ROLE_ENV_KEYS if k in settings_env} if settings_env else {}
         ),
         "provider_env_role_aliases": {k: provider_env.get(k) for k in ROLE_ENV_KEYS if k in provider_env},
+        "provider_env_matches_canonical": all(
+            v == canonical_aliases().get(k) for k, v in provider_env.items() if k in ROLE_ENV_KEYS
+        ),
         "permission_mode_flag": _flag_value(flags, "--permission-mode"),
         "model_flag": _flag_value(flags, "--model"),
         "valid_assistant_responses": len(valid_expected),
@@ -195,11 +223,18 @@ def classify(control: dict, candidate: dict) -> str:
         return "inconclusive"  # arm の条件が逆/欠落
     if not (candidate["child_cwd_in_target"] and control["child_cwd_in_target"]):
         return "inconclusive"
+    if control["cli_version"] != candidate["cli_version"] or not candidate["cli_version"]:
+        return "inconclusive"  # 同一 Claude Code version 条件が成立しない
+    if not candidate["provider_env_matches_canonical"]:
+        return "inconclusive"
     cand_ok = candidate["valid_assistant_responses"] > 0
     ctrl_ok = control["valid_assistant_responses"] > 0
     if cand_ok and ctrl_ok:
         return "unnecessary"
-    if cand_ok and control["failed_responses"]:
+    # control の失敗が gateway 未適用を示す class（model access error / gateway 外 model への fallback）の
+    # ときだけ needed。prompt echo・rate limit 等の無関係な失敗は根拠にしない。
+    gateway_failure = {"model_access_error", "non_gateway_model_response"}
+    if cand_ok and any(f["failure_class"] in gateway_failure for f in control["failed_responses"]):
         return "needed"
     return "inconclusive"
 
@@ -219,6 +254,8 @@ def run(scenario: str, environ: dict) -> tuple[int, dict]:
     try:
         if environ.get("CLAUDE_GPT_AV_UI_DISPATCHED") != "1":
             raise _skip("operator did not attest an Agent View UI @repo dispatch (CLAUDE_GPT_AV_UI_DISPATCHED=1)")
+        if not target:
+            raise _skip("CLAUDE_GPT_AV_TARGET_CWD is not set (cross-repo target identity cannot be checked)")
         cand_id = environ.get("CLAUDE_GPT_AV_CANDIDATE_ID", "")
         if not cand_id:
             raise _skip("CLAUDE_GPT_AV_CANDIDATE_ID is not set")
@@ -235,6 +272,7 @@ def run(scenario: str, environ: dict) -> tuple[int, dict]:
             candidate["settings_flag_present"]
             and candidate["child_cwd_in_target"]
             and candidate["valid_assistant_responses"] >= 1
+            and candidate["provider_env_matches_canonical"]
             and candidate["resume_same_session"]
             and candidate["resumed_after_first_terminal"]
             and candidate["valid_assistant_responses"] >= 2

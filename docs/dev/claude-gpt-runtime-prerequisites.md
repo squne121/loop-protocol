@@ -113,9 +113,11 @@ settings file を一度生成し、その path を `--settings` で渡すだけ�
 canonical 定義（`lib.sh`）を `--dry-run` で取り出して使うため、model alias を二重管理しない。
 
 ```bash
-# 1. canonical env から repo 外の operator-local settings を生成する（値は非 secret。token は "unused" の placeholder）
+# 1. 接続先が loopback の claude-code-proxy であることを --check-only で確認してから、canonical env を
+#    repo 外の operator-local settings へ生成する（token は "unused" の placeholder。--check-only が失敗した場合は生成しない）
 mkdir -p "$HOME/.claude-gpt"
-sh scripts/claude-gpt/launch.sh --dry-run 2>/dev/null \
+sh scripts/claude-gpt/launch.sh --check-only >/dev/null 2>&1 \
+  && sh scripts/claude-gpt/launch.sh --dry-run 2>/dev/null \
   | uv run --locked python3 -I -c 'import json,sys; print(json.dumps({"env": json.load(sys.stdin)["launch_env"]}, indent=2))' \
   > "$HOME/.claude-gpt/agent-view-settings.json"
 
@@ -125,6 +127,10 @@ cd ~/projects && claude agents --settings "$HOME/.claude-gpt/agent-view-settings
 
 - `--settings` には inline JSON ではなく**絶対 path** を使う。inline JSON は process 引数と保存済み job state
   （`respawnFlags`）に残るため避ける。path が存在しない場合 Claude Code は `Settings file not found` で終了する。
+- 生成する `env` は launcher が通常起動で export する全 key（gateway・role alias・`CLAUDE_CODE_*` 互換設定・
+  `LOOP_TASK_CONTEXT_RUNTIME_VARIANT`・`CLAUDE_GPT_CLAUDE_BIN` の local path）であり、gateway 以外の値も含む。
+  `--dry-run` は診断せず ambient の `ANTHROPIC_BASE_URL` をそのまま出力するため、必ず手順 1 のとおり
+  `--check-only`（loopback host・userinfo / path なしの URL のみ受理、不正なら exit 7）を先に通す。
 - 生成する file の `ANTHROPIC_AUTH_TOKEN` は現行 loopback proxy 用の dummy 値 `unused` だけである。
   実 credential をこの file・Git・Issue/PR に書かない。一般の gateway credential へ流用しない。
 - 適用範囲は、その `claude agents` から dispatch した session に限る。`~/.claude/settings.json`・Native Claude Code の

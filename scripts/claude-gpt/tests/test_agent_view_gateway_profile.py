@@ -94,14 +94,22 @@ def test_secret_or_settings_ambient_credentials_never_reach_derived_settings(tmp
     assert "ANTHROPIC_CUSTOM_HEADERS" not in settings["env"]
 
 
-def test_secret_or_settings_base_url_must_stay_loopback(tmp_path):
-    proc = h.run_launcher(
-        ["--dry-run"], h.base_env(tmp_path, ANTHROPIC_BASE_URL="http://user:pw@gateway.example.com:443")
-    )
-    # dry-run は診断しないが、通常診断は non-loopback を exit 7 で拒否する（settings 化前の gate）。
-    check = h.run_launcher(["--check-only"], h.base_env(tmp_path, ANTHROPIC_BASE_URL="http://gateway.example.com:443"))
-    assert proc.returncode == 0
-    assert check.returncode == 7
+def test_secret_or_settings_generation_gate_rejects_userinfo_and_non_loopback_urls(tmp_path):
+    # docs 手順 1 は dry-run の前に `--check-only` を必須にする。dry-run 単体は診断しないため
+    # credential 入り URL をそのまま出力する。gate（--check-only）が生成前に拒否することを固定する。
+    for url in ("http://u:x@127.0.0.1:18765", "http://gateway.example.com:443", "http://127.0.0.1:1/v1"):
+        dry = h.run_launcher(["--dry-run"], h.base_env(tmp_path, ANTHROPIC_BASE_URL=url))
+        assert dry.returncode == 0  # dry-run は gate ではない
+        check = h.run_launcher(["--check-only"], h.base_env(tmp_path, ANTHROPIC_BASE_URL=url))
+        assert check.returncode == 7, url
+
+
+def test_secret_or_settings_doc_requires_check_only_before_generation():
+    text = DOC.read_text(encoding="utf-8")
+    section = text[text.index("Agent View cross-repo gateway") : text.index("### 接続先 server の診断")]
+    block = re.search(r"```bash\n(.*?)```", section, re.S).group(1)
+    assert "--check-only" in block and "--dry-run" in block
+    assert re.search(r"--check-only[^\n]*\n\s*&&\s*sh [^\n]*--dry-run", block)
 
 
 def test_secret_or_settings_doc_uses_absolute_path_not_inline_json():
@@ -124,7 +132,9 @@ def test_secret_or_settings_default_launcher_does_not_write_settings(tmp_path):
 # --- read-only evaluator: false-green 防止 ---------------------------------------------------------
 
 
-def _write_job(root: Path, job_id: str, cwd: Path, *, settings: bool, replies: list[dict], resumed: bool = False):
+def _write_job(
+    root: Path, job_id: str, cwd: Path, *, settings: bool, replies: list[dict], resumed: bool = False, cli: str = "test"
+):
     session = f"{job_id}-0000-4000-8000-000000000000"
     flags = ["--model", "gpt-6-sol[1m]", "--permission-mode", "bypassPermissions"]
     if settings:
@@ -134,7 +144,7 @@ def _write_job(root: Path, job_id: str, cwd: Path, *, settings: bool, replies: l
         "sessionId": session,
         "resumeSessionId": session,
         "cwd": str(cwd),
-        "cliVersion": "test",
+        "cliVersion": cli,
         "respawnFlags": flags,
         "providerEnv": {"ANTHROPIC_MODEL": "gpt-6-sol[1m]"},
         "firstTerminalAt": "2026-10-14T03:30:00Z",
@@ -270,3 +280,55 @@ def test_live_vc_cli_exits_77_without_runtime(tmp_path, scenario):
         text=True,
     )
     assert proc.returncode == 77 and proc.stderr.startswith("SKIP: ")
+
+
+def _pair(tmp_path, control_replies, cand_replies, *, control_cli="test", cand_cli="test", **extra):
+    target = tmp_path / "repo"
+    target.mkdir(exist_ok=True)
+    _write_job(tmp_path, "aaaaaaaa", target, settings=False, replies=control_replies, cli=control_cli)
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=cand_replies, cli=cand_cli)
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CONTROL_ID="aaaaaaaa", CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb", **extra)
+    return ev.run("gateway-control-comparison", env)
+
+
+NATIVE = {"model": "claude-sonnet-4-5", "text": "MARKER_OK from Claude Max"}
+RATE = {"model": "<synthetic>", "text": "API Error: 429 rate limit exceeded", "err": True, "tokens": 0}
+
+
+def test_live_vc_native_model_responses_are_not_gateway_success(tmp_path):
+    # 両 arm が Claude Max で応答しても `unnecessary` にしない。
+    assert _pair(tmp_path, [NATIVE], [NATIVE])[1]["necessity"] == "inconclusive"
+
+
+def test_live_vc_candidate_native_fallback_is_not_needed(tmp_path):
+    assert _pair(tmp_path, [ERR], [NATIVE])[1]["necessity"] == "inconclusive"
+
+
+def test_live_vc_control_native_fallback_with_gateway_candidate_is_needed(tmp_path):
+    assert _pair(tmp_path, [NATIVE], [GOOD])[1]["necessity"] == "needed"
+
+
+@pytest.mark.parametrize("bad_control", [[ECHO], [RATE]])
+def test_live_vc_unrelated_control_failures_are_not_needed(tmp_path, bad_control):
+    assert _pair(tmp_path, bad_control, [GOOD])[1]["necessity"] == "inconclusive"
+
+
+def test_live_vc_cli_version_mismatch_is_inconclusive(tmp_path):
+    assert _pair(tmp_path, [ERR], [GOOD], control_cli="1.0.0", cand_cli="2.0.0")[1]["necessity"] == "inconclusive"
+
+
+def test_live_vc_missing_target_cwd_skips_77(tmp_path):
+    target = tmp_path / "repo"
+    target.mkdir()
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD, GOOD], resumed=True)
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    env.pop("CLAUDE_GPT_AV_TARGET_CWD")
+    assert ev.run("dispatched-child-and-resume", env)[0] == 77
+
+
+def test_live_vc_resume_with_native_model_is_not_green(tmp_path):
+    target = tmp_path / "repo"
+    target.mkdir()
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[NATIVE, NATIVE], resumed=True)
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    assert ev.run("dispatched-child-and-resume", env)[0] == 1
