@@ -332,3 +332,15 @@ def test_live_vc_resume_with_native_model_is_not_green(tmp_path):
     _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[NATIVE, NATIVE], resumed=True)
     env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
     assert ev.run("dispatched-child-and-resume", env)[0] == 1
+
+
+def test_live_vc_missing_provider_env_is_not_canonical_match(tmp_path):
+    target = tmp_path / "repo"
+    target.mkdir()
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD, GOOD], resumed=True)
+    state_path = tmp_path / "jobs" / "bbbbbbbb" / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["providerEnv"] = {}
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    assert ev.run("dispatched-child-and-resume", env)[0] == 1

@@ -125,6 +125,7 @@ sh scripts/claude-gpt/launch.sh --check-only >/dev/null 2>&1 \
 cd ~/projects && claude agents --settings "$HOME/.claude-gpt/agent-view-settings.json"
 ```
 
+- 生成後は `test -s "$HOME/.claude-gpt/agent-view-settings.json"` で空でないことを確認する（`--check-only` 失敗時は file を作らない）。
 - `--settings` には inline JSON ではなく**絶対 path** を使う。inline JSON は process 引数と保存済み job state
   （`respawnFlags`）に残るため避ける。path が存在しない場合 Claude Code は `Settings file not found` で終了する。
 - 生成する `env` は launcher が通常起動で export する全 key（gateway・role alias・`CLAUDE_CODE_*` 互換設定・

@@ -200,9 +200,8 @@ def load_arm(
             {k: settings_env.get(k) for k in ROLE_ENV_KEYS if k in settings_env} if settings_env else {}
         ),
         "provider_env_role_aliases": {k: provider_env.get(k) for k in ROLE_ENV_KEYS if k in provider_env},
-        "provider_env_matches_canonical": all(
-            v == canonical_aliases().get(k) for k, v in provider_env.items() if k in ROLE_ENV_KEYS
-        ),
+        "provider_env_matches_canonical": any(k in provider_env for k in ROLE_ENV_KEYS)
+        and all(v == canonical_aliases().get(k) for k, v in provider_env.items() if k in ROLE_ENV_KEYS),
         "permission_mode_flag": _flag_value(flags, "--permission-mode"),
         "model_flag": _flag_value(flags, "--model"),
         "valid_assistant_responses": len(valid_expected),
