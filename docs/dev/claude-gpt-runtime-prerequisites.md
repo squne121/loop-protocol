@@ -70,9 +70,33 @@ Minimal client contract（upstream の案内どおり）:
 通常の child process への環境継承（`GH_CONFIG_DIR` 等の GitHub 認証 env、`SSH_AUTH_SOCK` 等）は
 撤去対象ではなく、Native Claude Code と同じく ambient な値がそのまま届く。smoke 用の観測 hook と
 `--append-system-prompt-file` は smoke 実行側（`worktree-agent-runtime-smoke`）の opt-in であり、
-日常の launcher には常設しない。permission bypass（`--dangerously-skip-permissions`、
-`--allow-dangerously-skip-permissions`、`--permission-mode bypassPermissions`）は launcher 経由では
-引き続き拒否する。
+日常の launcher には常設しない。permission mode も launcher は自動設定しない。operator が `--` の
+後に明示した引数だけをそのまま Claude Code に渡す。
+
+### Claude-GPT Agent View の明示起動
+
+Claude-GPT に限り、対象 Git repository で次のように operator が権限モードを明示して起動する。
+
+```bash
+scripts/claude-gpt/launch.sh -- agents --permission-mode bypassPermissions
+```
+
+`--` は launcher と Claude Code の引数を分ける。`--permission-mode bypassPermissions` は
+launcher の既定値ではなく、その起動で Claude Code に渡す明示的な選択である。Native Claude Code の
+通常起動・グローバルな permission default は変更しない。**bypassPermissions は permission prompt
+だけでなく Claude Code の安全確認も無効化する。** Claude Code 公式は、被害を封じ込められる隔離
+container / VM 内での利用を推奨する。ホスト上の WSL2 は、そのような隔離環境とはみなさない。
+repository の hook や policy が引き続き動作する場合もあるが、完全な安全境界にはならない。
+
+Claude Code が求める bypass mode の初回警告（disclaimer）承諾と workspace trust は別々に
+人間が判断する。trust は Git repository 一律ではなく workspace / directory ごとの判断であり、
+nested repository や別の linked worktree では別途承諾が必要になる場合がある。launcher が承諾・
+trust を偽装したり自動化したりしない。
+
+権限モードは GitHub/proxy 認証の代替ではない。Agent View が
+別 repository の子へバックエンド接続設定を継承・転送できるかも独立した問題であり、
+その実機検証・worktree 互換性の判断は #3052 で行う。fake Claude の argv テストや
+`claude agents --json --all` の一覧だけでは、子の実行モード・LLM 応答を実証できない。
 
 ### 接続先 server の診断
 
