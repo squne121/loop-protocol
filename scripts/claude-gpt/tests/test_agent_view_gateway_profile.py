@@ -499,3 +499,72 @@ def test_live_vc_settings_carrying_real_credentials_are_rejected(tmp_path, extra
     env = _resume_env(tmp_path, settings_env={**_gateway_env(), **extra})
     code, receipt = ev.run("dispatched-child-and-resume", env)
     assert code == 1 and "real-looking-value" not in json.dumps(receipt)
+
+
+def _append_rows(root: Path, job_id: str, cwd: Path, rows: list[dict]):
+    session = f"{job_id}-0000-4000-8000-000000000000"
+    path = root / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(cwd)) / f"{session}.jsonl"
+    with path.open("a", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write("\n" + json.dumps(r))
+
+
+def _assistant(text="MARKER_OK done", model="gpt-6-sol"):
+    return {
+        "type": "assistant",
+        "message": {"model": model, "content": [{"type": "text", "text": text}], "usage": {"output_tokens": 5}},
+    }
+
+
+TOOL_RESULT = {
+    "type": "user",
+    "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "d87d667"}]},
+}
+
+
+def test_live_vc_tool_result_rows_are_not_a_second_user_turn(tmp_path):
+    # 1 回の user prompt の中で tool_use -> tool_result -> 応答しても、resume 後の応答ではない。
+    target = tmp_path / "repo"
+    target.mkdir()
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD], resumed=False)
+    _append_rows(tmp_path, "bbbbbbbb", target, [TOOL_RESULT, _assistant()])
+    state_path = tmp_path / "jobs" / "bbbbbbbb" / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["lastTerminalAt"] = "2026-10-14T04:30:00Z"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    code, receipt = ev.run("dispatched-child-and-resume", env)
+    assert code == 1 and receipt["candidate"]["response_after_second_user_turn"] is False
+
+
+@pytest.mark.parametrize("flag", ["isMeta", "isSidechain"])
+def test_live_vc_meta_and_sidechain_user_rows_are_not_user_turns(tmp_path, flag):
+    target = tmp_path / "repo"
+    target.mkdir()
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD], resumed=False)
+    _append_rows(
+        tmp_path,
+        "bbbbbbbb",
+        target,
+        [{"type": "user", flag: True, "message": {"content": "injected"}}, _assistant()],
+    )
+    state_path = tmp_path / "jobs" / "bbbbbbbb" / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["lastTerminalAt"] = "2026-10-14T04:30:00Z"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    assert ev.run("dispatched-child-and-resume", env)[0] == 1
+
+
+def test_live_vc_real_second_user_prompt_after_tool_use_is_resume_evidence(tmp_path):
+    target = tmp_path / "repo"
+    target.mkdir()
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD], resumed=True)
+    _append_rows(
+        tmp_path,
+        "bbbbbbbb",
+        target,
+        [TOOL_RESULT, {"type": "user", "message": {"content": "Say MARKER_OK again"}}, _assistant()],
+    )
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    assert ev.run("dispatched-child-and-resume", env)[0] == 0

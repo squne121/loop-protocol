@@ -126,6 +126,16 @@ def settings_env_is_gateway(env: dict | None) -> bool:
     return all(env.get(k) == v for k, v in canonical_aliases().items()) and bool(canonical_aliases())
 
 
+def _is_real_user_turn(row: dict) -> bool:
+    """operator / UI が送った user turn。tool_result・meta・sidechain の `type: user` 行は数えない。"""
+    if row.get("type") != "user" or row.get("isMeta") or row.get("isSidechain"):
+        return False
+    content = row.get("message", {}).get("content") if isinstance(row.get("message"), dict) else None
+    if isinstance(content, list):
+        return not any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+    return isinstance(content, str) and bool(content.strip())
+
+
 def _permission_modes(rows: list[dict]) -> list[str]:
     """transcript に記録された実効 permission-mode event（CLI 引数の宣言とは別の観測）。"""
     return [str(r["permissionMode"]) for r in rows if r.get("type") == "permission-mode" and r.get("permissionMode")]
@@ -214,7 +224,7 @@ def load_arm(
         valid_expected = valid
     cwd_ok = bool(cwd) and (target_cwd is None or cwd == target_cwd or cwd.startswith(target_cwd.rstrip("/") + "/"))
     aliases = canonical_aliases()
-    user_turns = [i for i, r in enumerate(rows_all) if r.get("type") == "user"]
+    user_turns = [i for i, r in enumerate(rows_all) if _is_real_user_turn(r)]
     strip = lambda a: re.sub(r"\[[^]]*\]$", "", a or "")  # noqa: E731
     main_bases = {
         strip(aliases.get(k))
