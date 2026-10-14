@@ -98,6 +98,50 @@ trust を偽装したり自動化したりしない。
 その実機検証・worktree 互換性の判断は #3052 で行う。fake Claude の argv テストや
 `claude agents --json --all` の一覧だけでは、子の実行モード・LLM 応答を実証できない。
 
+### Agent View cross-repo gateway（別 repo の子へ gateway を渡す opt-in 手順、Issue #3055）
+
+親ディレクトリ（`~/projects`）の Agent View から `@repo` で別 Git repository へ dispatch する子は、
+**その子の cwd の settings** から gateway を読む。launcher が `exec` 前に export した shell env は、
+Claude Code 公式仕様では supervisor が同じ gateway を export した shell から起動され、かつ同一
+directory への dispatch / 背景化に限って転送される。別 repo への dispatch では届かないため、
+子が `Claude Max` 表示や model access error になり得る（#3052 の実機観測）。公式は gateway 変数を
+settings file の `env` block に置き、Agent View に渡した `--settings` が dispatch 先へ引き継がれると
+説明している（https://code.claude.com/docs/en/agent-view の「LLM gateway」）。
+
+default launcher は変更しない。新しい wrapper も追加しない。operator が repo 外の絶対 path に
+settings file を一度生成し、その path を `--settings` で渡すだけである。env 値は launcher の
+canonical 定義（`lib.sh`）を `--dry-run` で取り出して使うため、model alias を二重管理しない。
+
+```bash
+# 1. canonical env から repo 外の operator-local settings を生成する（値は非 secret。token は "unused" の placeholder）
+mkdir -p "$HOME/.claude-gpt"
+sh scripts/claude-gpt/launch.sh --dry-run 2>/dev/null \
+  | uv run --locked python3 -I -c 'import json,sys; print(json.dumps({"env": json.load(sys.stdin)["launch_env"]}, indent=2))' \
+  > "$HOME/.claude-gpt/agent-view-settings.json"
+
+# 2. 親ディレクトリで Agent View を開く（--settings は dispatch 先の子へ引き継がれる）
+cd ~/projects && claude agents --settings "$HOME/.claude-gpt/agent-view-settings.json"
+```
+
+- `--settings` には inline JSON ではなく**絶対 path** を使う。inline JSON は process 引数と保存済み job state
+  （`respawnFlags`）に残るため避ける。path が存在しない場合 Claude Code は `Settings file not found` で終了する。
+- 生成する file の `ANTHROPIC_AUTH_TOKEN` は現行 loopback proxy 用の dummy 値 `unused` だけである。
+  実 credential をこの file・Git・Issue/PR に書かない。一般の gateway credential へ流用しない。
+- 適用範囲は、その `claude agents` から dispatch した session に限る。`~/.claude/settings.json`・Native Claude Code の
+  通常起動・`scripts/claude-gpt/launch.sh` の通常起動は変えない。`--settings` は ambient の user/project 設定より
+  優先されるため、proxy の port や role alias を変えたら file を再生成する（古い file は古い route を指す）。
+- `--permission-mode bypassPermissions` が必要な場合は、上の「Claude-GPT Agent View の明示起動」の注意と
+  承諾（bypass disclaimer・workspace trust）に従い、operator が `claude agents` へ明示的に追加する。
+  この手順は permission mode を注入しない。dispatch 先の repo ごとの workspace trust も別途必要である。
+- 確認: 子の UI が `Claude Max` ではなく `gpt-6-sol[1m]` を示し、子が実際に応答すること。proxy log との
+  一対一対応は取れない場合があり、その場合は provider route を未確認として扱う。
+- 戻し方: `claude agents` を `--settings` なしで開き直し、`rm "$HOME/.claude-gpt/agent-view-settings.json"` する。
+  Native Claude Code へ戻す場合は `claude` を直接起動する（global 設定は一切変更していない）。
+- **必要性は実機で未確定**: `--settings` ありの成功は #3052 で観測済みだが、同一条件の `--settings` なし対照が
+  無い。`scripts/claude-gpt/tests/agent_view_gateway_live_vc.py` が、operator が UI から dispatch した
+  control / candidate の 2 job を read-only で比較し `needed | unnecessary | inconclusive` を判定する。
+  `unnecessary` なら本節は不要になり、削除してよい。
+
 ### 接続先 server の診断
 
 診断の authority は、`ANTHROPIC_BASE_URL` が実際に接続する running server である。
