@@ -128,6 +128,172 @@ baseline の contract snapshot に `# preflight-scope: pr_review_only` の VC（
 
 `.claude/agents/test-runner.md` は「`TEST_VERDICT_MACHINE/v2` の全フィールドは必ず含める（routing 必須フィールド）」と記述している。Step 2 の委譲契約と食い違う場合、Step 2（本節）が **適用条件の分離について優先する**: 通常 VC / runtime_only / `pr_review_only` の独立経路では GitHub 由来情報を report に捏造して埋めず、trust marker のキーごと省略する（上表と上記「`pr_review_only` AC の current-head 証跡の取得と経路判定」節の適用条件に従う）。`test-runner.md` 本体の報告例・規約の追従（例の `generated_at` 追記等）は agent 定義変更として別 Issue が所有し、本 Issue では変更しない。実 SubAgent がこの契約どおりに出力するかどうかの検証は follow-up の責務である。
 
+## test-runner report の lossless な受渡し手順（handoff、Issue #3033）
+
+root が test-runner の full `TEST_VERDICT_MACHINE/v2` を Step 4 の `step4-adjudicate` へ渡すときは、child が観測した per-command の実行事実を一切変えずに伝達する。新しい schema・gate・ledger・汎用 wrapper は導入せず、既存の `step4-adjudicate` / `step5-terminal-gate` の authority をそのまま使う。
+
+### 受渡し経路
+
+経路は `child の full final result（生テキスト）→ 本節の抽出・型保持変換 → 試行ごとに新しい --test-verdict-file → 既存 step4-adjudicate` に固定する。
+
+- root は child の final result 全文を Write で `tmp/s4/test_runner_final_i{iteration}_a{attempt}.txt` のように **無加工のまま** 保存する（要約・整形・一部抜粋をしない）。
+- 変換の出力先は試行ごとに新しいパス（例: `tmp/s4/test_verdict_i{iteration}_a{attempt}.json`）にする。旧 report のパスを今回の入力として渡さない。
+- 変換後のファイルを `step4-adjudicate --test-verdict-file` へ渡す。それ以外の経路（要約値からの組立て等）で作った report を渡してはならない。
+
+### 許可される変換と禁止される再構成
+
+許可するのは Markdown / YAML から JSON への構文・型保持変換だけである。次を禁止する。
+
+- `passed[]`、VC metadata（`extract-vc-metadata` の `commands[]`）、ログ断片、過去 report の成功値などの要約値から `runtime_ac_results[]` を再構成しない（`zip` による行の組立てを含む）。
+- `runtime_ac_results[]`・`exit_code`・`status`・`fallback_detected`・`generated_at`・最終 `result` を新規に作らない・補完しない・書き換えない。
+- `default=str`、`bool(...)`、欠落値の既定値補充など、「通る形」に直す処理を入れない。
+- `generated_at` は `test-runner.md` の既存契約どおり引用付き文字列である。無引用の timestamp など JSON 化できない値は補正せず、変換失敗（次節の handoff 失敗）として扱う。
+
+変換は生 YAML の時点で情報消失を検出して失敗させる（parse 後の object と JSON の比較だけでは、parse 時の消失は検出できないため）。次はすべて handoff 失敗である: mapping の重複 key（後続の PASS が先行の FAIL を上書きするため）、JSON で型が変わる非文字列 key、`on` / `off` / `yes` / `no` のような無引用の boolean 風 scalar や `010` のような YAML 1.1 固有の数値表記（文字列は引用する）、fence の未終端、既知 field の型不一致、JSON 往復で値・型・順序が変わる入力。fence の開始・終了は独立した行として認識し、`command` / `notes` に含まれる 3 連バッククォートは終端として扱わない。
+
+### 実行可能な変換例
+
+次の code block が変換の正本であり、`uv run --locked python3 - "$RAW_FINAL_RESULT_FILE" "$ATTEMPT_VERDICT_FILE"` の stdin にこの code block を **変更せず** 渡して実行する。回帰テストは同じ code block を文書から抽出して実行する。
+<!-- step2-handoff-conversion-example -->
+```python
+import json
+import re
+import sys
+from pathlib import Path
+import yaml
+fence = chr(96) * 3  # Markdown の fence 記号（この code block 自体の fence と衝突させないため直書きしない）
+
+
+class StrictLoader(yaml.SafeLoader):
+    """この変換専用の loader。global の SafeLoader / 他 consumer の semantics は変えない。"""
+
+
+def _mapping(loader, node, deep=False):
+    # 重複 key は後勝ちで先行事実（FAIL 等）を消すため fail-closed。key は JSON で型が変わらない str のみ。
+    loader.flatten_mapping(node)
+    result = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if type(key) is not str:
+            raise ValueError(f"non-string mapping key {key!r} is not preserved by JSON")
+        if key in result:
+            raise ValueError(f"duplicate mapping key {key!r}")
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
+
+
+def _bool(loader, node):
+    # YAML 1.1 の on/off/yes/no は意図を保持できない。true / false 以外の無引用 scalar は拒否する。
+    if node.value not in ("true", "false"):
+        raise ValueError(f"ambiguous unquoted boolean-like scalar {node.value!r}; quote it as a string")
+    return node.value == "true"
+
+
+def _number(construct):
+    def build(loader, node):
+        # 8 進・60 進・桁区切りなど YAML 1.1 固有表記は JSON 数値として読めないので拒否する。
+        try:
+            json.loads(node.value)
+        except ValueError:
+            raise ValueError(f"ambiguous unquoted numeric scalar {node.value!r}; quote it as a string") from None
+        return construct(loader, node)
+
+    return build
+
+
+StrictLoader.add_constructor("tag:yaml.org,2002:map", _mapping)
+StrictLoader.add_constructor("tag:yaml.org,2002:bool", _bool)
+StrictLoader.add_constructor("tag:yaml.org,2002:int", _number(yaml.SafeLoader.construct_yaml_int))
+StrictLoader.add_constructor("tag:yaml.org,2002:float", _number(yaml.SafeLoader.construct_yaml_float))
+
+
+def yaml_blocks(text):
+    # fence は独立した行として認識する。closing は opening と同種で opening 以上の長さの fence のみ。
+    blocks, lines, index = [], text.splitlines(), 0
+    while index < len(lines):
+        opening = re.fullmatch(r"(`{3,})[ \t]*([^`\s]*)[ \t]*", lines[index])
+        index += 1
+        if opening is None:
+            continue
+        body = []
+        while index < len(lines) and not re.fullmatch(r" {0,3}`{%d,}[ \t]*" % len(opening.group(1)), lines[index]):
+            body.append(lines[index])
+            index += 1
+        if index >= len(lines):
+            raise ValueError("unterminated markdown fence")
+        index += 1
+        if opening.group(2) in ("yaml", "yml") and any(line.startswith("TEST_VERDICT:") for line in body):
+            blocks.append("\n".join(body) + "\n")
+    return blocks
+
+
+def same(left, right):
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return list(left) == list(right) and all(same(left[key], right[key]) for key in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(same(a, b) for a, b in zip(left, right))
+    return left == right
+
+
+raw_path, out_path = Path(sys.argv[1]), Path(sys.argv[2])
+try:
+    out_path.unlink(missing_ok=True)  # 失敗時に古い有効 report を残さない
+    blocks = yaml_blocks(raw_path.read_text(encoding="utf-8"))
+    if len(blocks) != 1:
+        raise ValueError(f"expected exactly one TEST_VERDICT yaml block, found {len(blocks)}")
+    report = yaml.load(blocks[0], Loader=StrictLoader)["TEST_VERDICT"]
+    if not isinstance(report, dict):
+        raise ValueError("TEST_VERDICT is not a mapping")
+    rows = report.get("runtime_ac_results")
+    if type(report.get("result")) is not str or type(rows) is not list or not all(isinstance(row, dict) for row in rows):
+        raise ValueError("result must be a string and runtime_ac_results a list of mappings")
+    for owner, expected in [(report, {"generated_at": str, "schema": str}), *[(row, {"command": str, "command_hash": str, "status": str, "exit_code": int, "fallback_detected": bool, "notes": str}) for row in rows]]:
+        for key, kind in expected.items():
+            if key in owner and type(owner[key]) is not kind:
+                raise ValueError(f"{key} must be {kind.__name__}, got {type(owner[key]).__name__}")
+    # default= を渡さない・NaN を許さない: JSON 非対応型は TypeError / ValueError で失敗させる
+    payload = json.dumps(report, ensure_ascii=False, allow_nan=False)
+    if not same(json.loads(payload), report):
+        raise ValueError("JSON round trip changed a value, type, or order")
+    out_path.write_text(payload, encoding="utf-8")
+    if not same(json.loads(out_path.read_text(encoding="utf-8")), report):
+        raise ValueError("saved handoff file differs from the parsed report")
+except Exception as exc:
+    out_path.unlink(missing_ok=True)
+    print(f"handoff failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+    sys.exit(1)
+```
+
+### handoff 失敗の分岐
+
+次のいずれかを handoff 失敗として扱う。
+
+- (a) child が full report を返さない。
+- (b) full report を受領したが、抽出・YAML parse・型保持変換・JSON 化・保存のいずれかに失敗する（上記変換例は失敗時に出力先を残さず exit 1 で終わる）。
+
+回復は次の順で行う。
+
+1. raw report の再取得（SubAgent の既存 final result があれば優先する）。再取得できたら新しい試行として、新しい raw 保存先と新しい `--test-verdict-file` パスで変換をやり直す。
+2. 再取得が不可能なら、同一 binding（head / body sha / command triplet）で test-runner を再実行する。
+
+handoff 失敗が解消できない間は、**未作成または不正な当該試行の入力パス**を通常の `step4-adjudicate`（`--reuse-stored` なし）に渡し、`step-4-pr-review.md` 既存の失効経路（exit 1、同一 binding の旧 PASS 失効）へ到達させる。失効と再 adjudication が完了するまで、`--reuse-stored` と旧 `step4-gate` の PASS を根拠にしない。LOOP_STATE の手編集はしない。手組みの PASS・stale HEAD・別 body の証跡転用を許さない。
+
+### #2916 との関係
+
+root は実行済みの non-pass（FAIL / SKIP / fallback）を PASS に変えない。`pr_review_only` の実行済み non-pass の既定は fail-closed（`step4-adjudicate` が拒否する）である。`--delegate-pr-review-only-nonpass` の既存条件（`step-4-pr-review.md` 参照）を満たす場合に限り、失敗事実を保持したまま reviewer dispatch を許可できる。dispatch 許可（`invoke_pr_reviewer: true`）は AC 達成でも terminal approval でもなく、最終承認は既存の `step5-terminal-gate` だけが確定する。不正・欠落・矛盾・binding 不一致の report は委譲の対象外で、fail-closed のままである。
+
+### 実セッションでの最小確認手順
+
+1. SubAgent の terminal `completed` を確認し、final result 全文を取得する。
+2. 全文を無加工で raw 保存する。
+3. 上記の変換を実行し、試行ごとに新しい `--test-verdict-file` を作る。
+4. child の full report と handoff file を readback 比較する（schema、`generated_at`、`result`、全 `runtime_ac_results[]` の順序と値、任意 field、HEAD・body・command binding）。
+5. 比較が一致した場合だけ `step4-adjudicate` へ渡す。
+
+静的テストの PASS を、実セッションでの handoff の保証と混同しない。実セッションでの readback 比較を実施していない間は「未確認」と報告する。
+
 ## 独立検証（証拠権限の切替、Issue #1856 Phase 1）
 
 Step 2 の routing 正本は、TEST_VERDICT comment/artifact の有無に依存しない。orchestrator（呼び出し元）が以下をその場で照合するだけで判定する。materializer・dedicated publisher・producer側の署名情報・PR 上の TEST_VERDICT コメントは、この照合の routing input として要求しない（それらの実装ファイル自体は Phase 3 の別 Issue まで物理削除しないが、Step 2 の判定ロジックはこれらに依存しない）。
