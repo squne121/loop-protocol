@@ -61,8 +61,8 @@ skills:
 - `readiness_forwarding_payload` は `READINESS_FORWARDING_PAYLOAD_V1` として渡す
 - `READINESS_FORWARDING_PAYLOAD_V1.readiness_result.status` の許可値は
   `status: go | needs_fix | human_judgment | input_or_runtime_error`
-- `status: go` の場合は pre-edit static readiness blocker がない candidate body として扱う
-- `status: needs_fix` の場合は `errors[]` と `readiness_result_ref` を source of truth にして candidate body を作り直す
+- `status: go` は root が確認した **既存本文** の preflight-static readiness に blocker がないことを示す。生成後の candidate body が edit-ready という判定ではない
+- `status: needs_fix` の場合は `errors[]` と `readiness_result_ref` を参照して candidate body を作る。候補生成後の検証・局所修復は `edit-issue/SKILL.md` に従う
 - `status: human_judgment` または `status: input_or_runtime_error` の場合は helper 実行を急がず fail-closed で owner 判断へ送る
 
 ## context_bundle_path 入力契約（Issue #1909 由来、forward-compat）
@@ -71,11 +71,7 @@ Issue #1909（`context_bundle_path` 追加）マージ後、本 SubAgent は入�
 
 ## 既存 Issue 更新フロー (Existing Issue Flow)
 
-1. current issue body と reviewer feedback を読み、candidate body を repo-relative file に保存する
-2. `READINESS_FORWARDING_PAYLOAD_V1` を組み立てる
-3. `ISSUE_EDIT_TXN_INPUT_V1` を repo-relative file に保存する
-4. `uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py --input-file <file>` を起動する
-5. `ISSUE_EDIT_TXN_RESULT_V1.status` を確認する
+候補生成、本文変更時だけの full guard、LP017 の局所修復と再検証、検証済み候補の無変更 handoff、transaction の起動と結果確認は **preload された `.claude/skills/edit-issue/SKILL.md` の「手順」** に従う。この agent 定義に独立した編集順序を設けない。
 
 ## 結果ルーティング (Result Routing)
 
