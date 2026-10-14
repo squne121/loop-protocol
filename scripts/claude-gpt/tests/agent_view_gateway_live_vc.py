@@ -121,6 +121,8 @@ def settings_env_is_gateway(env: dict | None) -> bool:
     parsed = urlsplit(url) if isinstance(url, str) else None
     if not parsed or parsed.hostname not in ("127.0.0.1", "localhost", "::1") or parsed.username or parsed.password:
         return False
+    if "ANTHROPIC_API_KEY" in env or env.get("ANTHROPIC_AUTH_TOKEN", "unused") != "unused":
+        return False  # 実 credential を持つ settings は AC4 の posture に反する（値は receipt に出さない）
     return all(env.get(k) == v for k, v in canonical_aliases().items()) and bool(canonical_aliases())
 
 
@@ -167,7 +169,7 @@ def assistant_responses(rows: list[dict]) -> tuple[list[dict], list[dict]]:
     ]
     prompts = [p for p in prompts if p]
     valid, failed = [], []
-    for r in rows:
+    for i, r in enumerate(rows):
         if r.get("type") != "assistant" or not isinstance(r.get("message"), dict):
             continue
         msg = r["message"]
@@ -187,7 +189,7 @@ def assistant_responses(rows: list[dict]) -> tuple[list[dict], list[dict]]:
             # Native / Claude Max 等の gateway 外 model の応答は gateway 経由の成功ではない。
             failed.append({"model": model, "failure_class": "non_gateway_model_response"})
             continue
-        valid.append({"model": model, "text": text})
+        valid.append({"model": model, "text": text, "idx": i})
     return valid, failed
 
 
@@ -212,6 +214,7 @@ def load_arm(
         valid_expected = valid
     cwd_ok = bool(cwd) and (target_cwd is None or cwd == target_cwd or cwd.startswith(target_cwd.rstrip("/") + "/"))
     aliases = canonical_aliases()
+    user_turns = [i for i, r in enumerate(rows_all) if r.get("type") == "user"]
     strip = lambda a: re.sub(r"\[[^]]*\]$", "", a or "")  # noqa: E731
     main_bases = {
         strip(aliases.get(k))
@@ -223,7 +226,10 @@ def load_arm(
         "label": label,
         "job_state": state.get("state"),
         "cli_version": state.get("cliVersion"),
+        "child_cwd": cwd,
         "child_cwd_in_target": cwd_ok,
+        "response_after_second_user_turn": len(user_turns) >= 2
+        and any(v["idx"] > user_turns[1] for v in valid_expected),
         "child_cwd_is_git_root": (Path(cwd) / ".git").exists() if cwd else False,
         "settings_flag_present": has_settings,
         "settings_source": settings_source,
@@ -232,8 +238,7 @@ def load_arm(
             {k: settings_env.get(k) for k in ROLE_ENV_KEYS if k in settings_env} if settings_env else {}
         ),
         "provider_env_role_aliases": {k: provider_env.get(k) for k in ROLE_ENV_KEYS if k in provider_env},
-        "provider_env_matches_canonical": any(k in provider_env for k in ROLE_ENV_KEYS)
-        and all(v == canonical_aliases().get(k) for k, v in provider_env.items() if k in ROLE_ENV_KEYS),
+        "provider_env_matches_canonical": all(provider_env.get(k) == v for k, v in aliases.items()) and bool(aliases),
         "permission_mode_declared": _flag_value(flags, "--permission-mode"),
         "permission_modes_observed": perm_observed,
         "permission_mode_consistent": bool(perm_observed)
@@ -261,7 +266,19 @@ def classify(control: dict, candidate: dict) -> str:
         return "inconclusive"
     if control["cli_version"] != candidate["cli_version"] or not candidate["cli_version"]:
         return "inconclusive"  # 同一 Claude Code version 条件が成立しない
-    if not (candidate["provider_env_matches_canonical"] and candidate["settings_content_valid"]):
+    # control は candidate と同じ supervisor env（launcher 由来の gateway を shell に持つ）で、差は --settings のみ。
+    # gateway 環境が全く無い control は H1 を検証しない（native fallback が自明に出る）。
+    if not (control["provider_env_matches_canonical"] and candidate["provider_env_matches_canonical"]):
+        return "inconclusive"
+    if control["provider_env_role_aliases"] != candidate["provider_env_role_aliases"]:
+        return "inconclusive"
+    if not candidate["settings_content_valid"]:
+        return "inconclusive"
+    if control["child_cwd"] != candidate["child_cwd"]:
+        return "inconclusive"  # 同一 fixture repo への dispatch ではない
+    if not (control["permission_modes_observed"] and candidate["permission_modes_observed"]):
+        return "inconclusive"
+    if control["permission_modes_observed"][-1] != candidate["permission_modes_observed"][-1]:
         return "inconclusive"
     cand_ok = candidate["valid_assistant_responses"] > 0
     ctrl_ok = control["valid_assistant_responses"] > 0
@@ -294,6 +311,8 @@ def run(scenario: str, environ: dict) -> tuple[int, dict]:
             raise _skip("operator did not attest an Agent View UI @repo dispatch (CLAUDE_GPT_AV_UI_DISPATCHED=1)")
         if not target:
             raise _skip("CLAUDE_GPT_AV_TARGET_CWD is not set (cross-repo target identity cannot be checked)")
+        if not expect:
+            raise _skip("CLAUDE_GPT_AV_EXPECT_TEXT is not set (a paraphrased echo cannot be told from a real answer)")
         cand_id = environ.get("CLAUDE_GPT_AV_CANDIDATE_ID", "")
         if not cand_id:
             raise _skip("CLAUDE_GPT_AV_CANDIDATE_ID is not set")
@@ -316,6 +335,7 @@ def run(scenario: str, environ: dict) -> tuple[int, dict]:
             and candidate["main_route_observed"]
             and candidate["resume_same_session"]
             and candidate["resumed_after_first_terminal"]
+            and candidate["response_after_second_user_turn"]
             and candidate["valid_assistant_responses"] >= 2
         )
         receipt.update(

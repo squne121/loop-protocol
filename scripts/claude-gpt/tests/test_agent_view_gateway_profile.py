@@ -152,6 +152,7 @@ def _write_job(
     settings_file: Path | None = None,
     perm_declared: str | None = "bypassPermissions",
     perm_events: tuple = ("bypassPermissions",),
+    provider_env=_UNSET,
 ):
     session = f"{job_id}-0000-4000-8000-000000000000"
     flags = ["--model", "gpt-6-sol[1m]"]
@@ -169,7 +170,7 @@ def _write_job(
         "cwd": str(cwd),
         "cliVersion": cli,
         "respawnFlags": flags,
-        "providerEnv": {"ANTHROPIC_MODEL": "gpt-6-sol[1m]"},
+        "providerEnv": dict(ev.canonical_aliases()) if provider_env is _UNSET else provider_env,
         "firstTerminalAt": "2026-10-14T03:30:00Z",
         "lastTerminalAt": "2026-10-14T04:30:00Z" if resumed else "2026-10-14T03:30:00Z",
     }
@@ -181,7 +182,9 @@ def _write_job(
     proj.mkdir(parents=True, exist_ok=True)
     rows = [{"type": "permission-mode", "permissionMode": m, "sessionId": session} for m in perm_events]
     rows.append({"type": "user", "message": {"content": "Say MARKER_OK"}})
-    for r in replies:
+    for n, r in enumerate(replies):
+        if resumed and n == len(replies) - 1 and n > 0:
+            rows.append({"type": "user", "message": {"content": "Say MARKER_OK again"}})
         rows.append(
             {
                 "type": "assistant",
@@ -444,3 +447,55 @@ def test_live_vc_candidate_inline_settings_with_native_aliases_is_inconclusive(t
     _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD], settings_env=bad_env)
     env = _env(tmp_path, target, CLAUDE_GPT_AV_CONTROL_ID="aaaaaaaa", CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
     assert ev.run("gateway-control-comparison", env)[1]["necessity"] == "inconclusive"
+
+
+def test_live_vc_control_without_gateway_env_is_not_a_valid_h1_control(tmp_path):
+    # supervisor に gateway が全く無い control は native fallback が自明に出る。needed の根拠にしない。
+    target = tmp_path / "repo"
+    target.mkdir()
+    _write_job(tmp_path, "aaaaaaaa", target, settings=False, replies=[NATIVE], provider_env={})
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD])
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CONTROL_ID="aaaaaaaa", CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    assert ev.run("gateway-control-comparison", env)[1]["necessity"] == "inconclusive"
+
+
+def test_live_vc_arms_must_share_permission_mode_and_child_cwd(tmp_path):
+    target = tmp_path / "repo"
+    other = target / "sub-b"
+    other.mkdir(parents=True)
+    (target / "sub-a").mkdir()
+    base = {"replies": [GOOD]}
+    _write_job(tmp_path, "aaaaaaaa", target, settings=False, replies=[ERR], perm_events=("default",))
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, **base)
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CONTROL_ID="aaaaaaaa", CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    assert ev.run("gateway-control-comparison", env)[1]["necessity"] == "inconclusive"
+    _write_job(tmp_path, "cccccccc", target / "sub-a", settings=False, replies=[ERR])
+    _write_job(tmp_path, "dddddddd", other, settings=True, replies=[GOOD])
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CONTROL_ID="cccccccc", CLAUDE_GPT_AV_CANDIDATE_ID="dddddddd")
+    assert ev.run("gateway-control-comparison", env)[1]["necessity"] == "inconclusive"
+
+
+def test_live_vc_expect_text_is_required(tmp_path):
+    env = _resume_env(tmp_path)
+    env.pop("CLAUDE_GPT_AV_EXPECT_TEXT")
+    assert ev.run("dispatched-child-and-resume", env)[0] == 77
+
+
+def test_live_vc_resume_needs_a_response_after_a_second_user_turn(tmp_path):
+    # terminal 時刻だけが進み、再開後の user turn / 応答が無い transcript は resume の証拠にならない。
+    target = tmp_path / "repo"
+    target.mkdir()
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD, GOOD], resumed=False)
+    state_path = tmp_path / "jobs" / "bbbbbbbb" / "state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["lastTerminalAt"] = "2026-10-14T04:30:00Z"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    assert ev.run("dispatched-child-and-resume", env)[0] == 1
+
+
+@pytest.mark.parametrize("extra", [{"ANTHROPIC_API_KEY": "k"}, {"ANTHROPIC_AUTH_TOKEN": "real-looking-value"}])
+def test_live_vc_settings_carrying_real_credentials_are_rejected(tmp_path, extra):
+    env = _resume_env(tmp_path, settings_env={**_gateway_env(), **extra})
+    code, receipt = ev.run("dispatched-child-and-resume", env)
+    assert code == 1 and "real-looking-value" not in json.dumps(receipt)
