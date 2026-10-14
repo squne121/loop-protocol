@@ -604,3 +604,30 @@ def test_live_vc_cli_version_falls_back_to_transcript_version(tmp_path):
         _append_rows(tmp_path, jid, target, [{"type": "system", "version": "2.1.299"}])
     env = _env(tmp_path, target, CLAUDE_GPT_AV_CONTROL_ID="aaaaaaaa", CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
     assert ev.run("gateway-control-comparison", env)[1]["necessity"] == "needed"
+
+
+def test_live_vc_transcript_relocated_to_worktree_project_dir_is_found(tmp_path):
+    target = tmp_path / "repo"
+    target.mkdir()
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD, GOOD], resumed=True)
+    src = tmp_path / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(target))
+    dst = tmp_path / "projects" / "-relocated-worktree"
+    src.rename(dst)
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    assert ev.run("dispatched-child-and-resume", env)[0] == 0
+
+
+def test_live_vc_ambiguous_relocated_transcript_is_not_guessed(tmp_path):
+    target = tmp_path / "repo"
+    target.mkdir()
+    _write_job(tmp_path, "bbbbbbbb", target, settings=True, replies=[GOOD, GOOD], resumed=True)
+    src = tmp_path / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(target))
+    for name in ("-copy-a", "-copy-b"):
+        (tmp_path / "projects" / name).mkdir()
+        for f in src.iterdir():
+            (tmp_path / "projects" / name / f.name).write_bytes(f.read_bytes())
+
+    for f in list(src.iterdir()):
+        f.unlink()
+    env = _env(tmp_path, target, CLAUDE_GPT_AV_CANDIDATE_ID="bbbbbbbb")
+    assert ev.run("dispatched-child-and-resume", env)[0] == 1

@@ -159,6 +159,11 @@ def _text_of(content) -> str:
 def _transcript(projects_dir: Path, cwd: str, session_id: str) -> list[dict]:
     enc = re.sub(r"[^A-Za-z0-9]", "-", cwd)
     path = projects_dir / enc / f"{session_id}.jsonl"
+    if not path.exists() and re.fullmatch(r"[0-9a-f-]{36}", session_id):
+        # worktree へ再配置された session は別の projects dir に transcript を持つ。一意に定まる場合だけ使う。
+        found = list(projects_dir.glob(f"*/{session_id}.jsonl"))
+        if len(found) == 1:
+            path = found[0]
     rows = []
     try:
         for line in path.read_text(encoding="utf-8").splitlines():
