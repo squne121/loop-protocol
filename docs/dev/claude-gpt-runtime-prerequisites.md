@@ -144,10 +144,16 @@ cd ~/projects && claude agents --settings "$HOME/.claude-gpt/agent-view-settings
   一対一対応は取れない場合があり、その場合は provider route を未確認として扱う。
 - 戻し方: `claude agents` を `--settings` なしで開き直し、`rm "$HOME/.claude-gpt/agent-view-settings.json"` する。
   Native Claude Code へ戻す場合は `claude` を直接起動する（global 設定は一切変更していない）。
-- **必要性は実機で未確定**: `--settings` ありの成功は #3052 で観測済みだが、同一条件の `--settings` なし対照が
-  無い。`scripts/claude-gpt/tests/agent_view_gateway_live_vc.py` が、operator が UI から dispatch した
-  control / candidate の 2 job を read-only で比較し `needed | unnecessary | inconclusive` を判定する。
-  `unnecessary` なら本節は不要になり、削除してよい。
+- **必要性は実機の 2 arm 対照で `needed` と判定された（限定つき）**: Issue #3055 の AC1 では、同じ trust 済み fixture・cwd・
+  permission mode・最初の prompt で、control（`--settings` なし）が model access error で失敗し、candidate（`--settings env` あり）は
+  実 LLM（`gpt-6-sol`）が応答して、evaluator が `needed`（exit 0）を返した（Claude Code 2.1.299。証跡:
+  https://github.com/squne121/loop-protocol/issues/3055#issuecomment-6171360693 ）。AC3 では、candidate を再開した後の 2 回目の probe に対する
+  実 LLM 応答と、resume 境界が evaluator で観測され、`observed_postcondition: true`（exit 0）となった（再開後は 2.1.300。証跡:
+  https://github.com/squne121/loop-protocol/issues/3055#issuecomment-6190229095 ）。ただし制約として、各 arm は 1 試行である。
+  UI 操作（dispatch・attach）は OWNER の自己申告で、evaluator は独立に観測できない。proxy request との一対一相関は未確認で、
+  provider 固有の route 成功は主張しない。Haiku route と process 再起動・settings 再読込は未検証である。この結果から一般的な必要性までは
+  主張しない。`scripts/claude-gpt/tests/agent_view_gateway_live_vc.py` は、条件が変わった環境で同じ判定を再現するために引き続き使える
+  （`needed | unnecessary | inconclusive`）。
 
 #### 実機 2 arm 対照の operator 手順（AC1 / AC3）
 
