@@ -450,3 +450,471 @@ def test_lane_selector_enum_rejects_invalid_multi_lane_combination():
         "must be rejected fail-closed"
     )
     assert "LOOP_E2E_LANE" in responsive_with_preview_namespace_flag.stderr
+
+
+# ---------------------------------------------------------------------------
+# Issue #2969: component-vrt-report negative-control artifact must be bound to
+# `github.run_attempt` (no stale-artifact false-green on re-run), its download
+# round trip must be bounded, and the real hidden-file upload proof must stay.
+# ---------------------------------------------------------------------------
+_NC_STATIC_NAME = "component-vrt-negative-control-attachments"
+_NC_NAME_RE = re.compile(
+    rf"^{re.escape(_NC_STATIC_NAME)}-\$\{{\{{\s*github\.run_attempt\s*\}}\}}$"
+)
+_NC_UPLOAD_ID = "upload-negative-control-attachments"
+_NC_VERIFY_ID = "verify-negative-control-attachments"
+_NC_MAX_DOWNLOADS = 4
+_NC_MAX_SLEEP_TOTAL_SECONDS = 30
+_NC_LITERAL_SLEEP_RE = re.compile(r"^\s*sleep\s+(\d+)\s*$")
+
+
+def _nc_job(workflow: dict) -> dict:
+    return workflow["jobs"]["component-vrt-report"]
+
+
+def _nc_uses(step: dict, action: str) -> bool:
+    return str(step.get("uses", "")).split("@", 1)[0] == action
+
+
+def _nc_normalize_if(value: object) -> str:
+    text = str(value if value is not None else "").strip()
+    match = re.fullmatch(r"\$\{\{\s*(.*?)\s*\}\}", text, flags=re.DOTALL)
+    return match.group(1) if match else text
+
+
+def _nc_targets_static_name(step: dict) -> bool:
+    """True when the step's artifact `with.name` starts with the negative-control name."""
+    name = str((step.get("with") or {}).get("name", ""))
+    return name.startswith(_NC_STATIC_NAME)
+
+
+def _nc_locate(job: dict) -> dict:
+    steps = [s for s in job.get("steps", []) if isinstance(s, dict)]
+    upload_idx = [i for i, s in enumerate(steps) if s.get("id") == _NC_UPLOAD_ID]
+    verify_idx = [i for i, s in enumerate(steps) if s.get("id") == _NC_VERIFY_ID]
+    # Only downloads of the negative-control artifact (name-prefix match) are
+    # targets; unrelated artifact downloads in the job are out of scope. A
+    # static-name download still matches by prefix and is rejected by
+    # `_NC_NAME_RE` in the checkers.
+    download_idx = [
+        i
+        for i, s in enumerate(steps)
+        if _nc_uses(s, "actions/download-artifact") and _nc_targets_static_name(s)
+    ]
+    # Any upload of the negative-control name from a step other than the
+    # canonical upload id is rogue (e.g. a static-name upload under a new id).
+    rogue_upload_idx = [
+        i
+        for i, s in enumerate(steps)
+        if _nc_uses(s, "actions/upload-artifact")
+        and s.get("id") != _NC_UPLOAD_ID
+        and _nc_targets_static_name(s)
+    ]
+    return {
+        "steps": steps,
+        "upload": upload_idx,
+        "verify": verify_idx,
+        "downloads": download_idx,
+        "rogue_uploads": rogue_upload_idx,
+    }
+
+
+def _nc_path_parts(raw: str) -> list[str]:
+    cleaned = raw.strip().strip("/")
+    if cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    parts = [p for p in cleaned.split("/") if p and p != "."]
+    while parts and re.fullmatch(r"\*+", parts[-1]):
+        parts.pop()
+    return parts
+
+
+def _nc_paths_overlap(a: str, b: str) -> bool:
+    pa, pb = _nc_path_parts(a), _nc_path_parts(b)
+    if not pa or not pb:
+        return True
+    n = min(len(pa), len(pb))
+    return pa[:n] == pb[:n]
+
+
+def _nc_check_artifact_name_is_attempt_scoped(job: dict) -> list[str]:
+    """Return violations for AC1 (empty list == compliant)."""
+    loc = _nc_locate(job)
+    steps = loc["steps"]
+    violations: list[str] = []
+    if len(loc["upload"]) != 1:
+        return [f"expected exactly one upload step id={_NC_UPLOAD_ID}, found {len(loc['upload'])}"]
+    upload = steps[loc["upload"][0]]
+    if not _nc_uses(upload, "actions/upload-artifact"):
+        violations.append("negative-control upload step is not actions/upload-artifact")
+    upload_name = str((upload.get("with") or {}).get("name", ""))
+    if not _NC_NAME_RE.fullmatch(upload_name):
+        violations.append(f"upload name is not attempt-scoped: {upload_name!r}")
+    for idx in loc["rogue_uploads"]:
+        rogue_name = str((steps[idx].get("with") or {}).get("name", ""))
+        violations.append(f"rogue upload step {idx} (id={steps[idx].get('id')!r}) uploads {rogue_name!r}")
+    if not loc["downloads"]:
+        violations.append("no download-artifact step found")
+    for idx in loc["downloads"]:
+        name = str((steps[idx].get("with") or {}).get("name", ""))
+        if not _NC_NAME_RE.fullmatch(name):
+            violations.append(f"download step {idx} name is not attempt-scoped: {name!r}")
+        elif name != upload_name and re.sub(r"\s+", "", name) != re.sub(r"\s+", "", upload_name):
+            violations.append(f"download step {idx} name differs from upload name: {name!r}")
+    return violations
+
+
+def _nc_check_roundtrip_is_bounded(job: dict) -> list[str]:
+    """Return violations for AC2 (empty list == compliant)."""
+    loc = _nc_locate(job)
+    steps = loc["steps"]
+    if len(loc["upload"]) != 1 or len(loc["verify"]) != 1:
+        return ["upload/verify steps must each be present exactly once"]
+    upload_idx, verify_idx = loc["upload"][0], loc["verify"][0]
+    downloads = loc["downloads"]
+    violations: list[str] = []
+    if not 1 <= len(downloads) <= _NC_MAX_DOWNLOADS:
+        violations.append(f"download step count {len(downloads)} not in 1..{_NC_MAX_DOWNLOADS}")
+    ids = [steps[i].get("id") for i in downloads]
+    if any(not i for i in ids):
+        violations.append("every download step needs an id")
+
+    # Retry gating: every non-first download is gated on the previous
+    # download's `outcome == 'failure'` (never `conclusion`, which is
+    # 'success' under continue-on-error).
+    for pos, idx in enumerate(downloads):
+        step = steps[idx]
+        cond = _nc_normalize_if(step.get("if"))
+        if step.get("continue-on-error") is not True:
+            violations.append(f"download step {idx} must set continue-on-error: true")
+        if "conclusion" in cond:
+            violations.append(f"download step {idx} gates on conclusion (use outcome)")
+        if pos > 0:
+            prev_id = steps[downloads[pos - 1]].get("id")
+            if f"steps.{prev_id}.outcome == 'failure'" not in cond:
+                violations.append(f"download step {idx} is not gated on previous failure outcome")
+        elif "failure" in cond:
+            violations.append("first download must not be failure-gated")
+
+    # Everything between upload and assert: only upload/download/literal sleep.
+    sleep_total = 0
+    for idx in range(upload_idx + 1, verify_idx):
+        step = steps[idx]
+        run = step.get("run")
+        if idx in downloads:
+            if idx < upload_idx:
+                violations.append("download before upload")
+            continue
+        if run is None:
+            violations.append(f"unexpected non-run step {idx} between upload and assert")
+            continue
+        if re.search(r"\b(while|until|for)\b", str(run)):
+            violations.append(f"loop construct in step {idx}")
+        match = _NC_LITERAL_SLEEP_RE.fullmatch(str(run))
+        if not match:
+            violations.append(f"step {idx} is not a literal `sleep N` step: {str(run)!r}")
+            continue
+        sleep_total += int(match.group(1))
+        cond = _nc_normalize_if(step.get("if"))
+        if ".outcome == 'failure'" not in cond or "conclusion" in cond:
+            violations.append(f"sleep step {idx} is not gated on a failure outcome")
+    if sleep_total > _NC_MAX_SLEEP_TOTAL_SECONDS:
+        violations.append(f"total sleep {sleep_total}s exceeds {_NC_MAX_SLEEP_TOTAL_SECONDS}s")
+    if any(i < upload_idx or i > verify_idx for i in downloads):
+        violations.append("download step outside upload..assert window")
+
+    # The assert step must fail closed (and also scan loops/sleeps).
+    verify = steps[verify_idx]
+    script = str(verify.get("run", ""))
+    if re.search(r"\b(while|until|sleep)\b", script):
+        violations.append("assert step contains loop/sleep")
+    if re.search(r"\|\|\s*true|\bset\s+\+e\b|\bexit\s+0\b|\|\|\s*:", script):
+        violations.append("assert step contains a fail-open construct")
+    if not re.search(r"\bexit\s+1\b", script):
+        violations.append("assert step has no `exit 1` failure path")
+    if '-eq 0' not in script:
+        violations.append("assert step does not check for an empty file set")
+    return violations
+
+
+def _nc_check_hidden_file_proof(job: dict) -> list[str]:
+    """Return violations for AC3 (empty list == compliant)."""
+    loc = _nc_locate(job)
+    steps = loc["steps"]
+    if len(loc["upload"]) != 1 or len(loc["verify"]) != 1 or not loc["downloads"]:
+        return ["upload/verify/download steps missing"]
+    upload_idx, verify_idx = loc["upload"][0], loc["verify"][0]
+    violations: list[str] = []
+    upload_with = steps[upload_idx].get("with") or {}
+    if str(upload_with.get("include-hidden-files")).lower() != "true":
+        violations.append("upload lost include-hidden-files: true")
+    if str(upload_with.get("if-no-files-found")) != "error":
+        violations.append("upload lost if-no-files-found: error")
+    upload_path = str(upload_with.get("path", ""))
+    verify = steps[verify_idx]
+    if _nc_normalize_if(verify.get("if")) != "always()":
+        violations.append("assert step must have `if: ${{ always() }}`")
+    if verify_idx < upload_idx or any(i > verify_idx for i in loc["downloads"]):
+        violations.append("assert step must come after upload and every download")
+    script = str(verify.get("run", ""))
+    if ".vitest-attachments" in script:
+        violations.append("assert step reads the local .vitest-attachments dir")
+    download_paths = {str((steps[i].get("with") or {}).get("path", "")).strip() for i in loc["downloads"]}
+    if len(download_paths) != 1 or "" in download_paths:
+        violations.append(f"all downloads must share one non-empty path, got {sorted(download_paths)}")
+        return violations
+    (download_path,) = download_paths
+    if ".vitest-attachments" in _nc_path_parts(download_path):
+        violations.append("download path is under .vitest-attachments")
+    for raw in upload_path.splitlines():
+        if raw.strip() and _nc_paths_overlap(download_path, raw):
+            violations.append(f"download path {download_path!r} overlaps upload path {raw.strip()!r}")
+    base = download_path.rstrip("/")
+    for kind in ("actual", "diff"):
+        if f"{base}/**/*-{kind}-*.png" not in script:
+            violations.append(f"assert step does not scan the download dir for *-{kind}-*.png")
+    return violations
+
+
+def test_component_vrt_negative_control_artifact_name_is_attempt_scoped():
+    job = _nc_job(_load_workflow())
+    assert _nc_check_artifact_name_is_attempt_scoped(job) == []
+
+    def _step(j: dict, kind: str) -> list[dict]:
+        if kind == "upload":
+            return [s for s in j["steps"] if isinstance(s, dict) and s.get("id") == _NC_UPLOAD_ID]
+        return [s for s in j["steps"] if isinstance(s, dict) and _nc_uses(s, f"actions/{kind}-artifact")]
+
+    # mutated copy 1: static upload name
+    m = copy.deepcopy(job)
+    _step(m, "upload")[-1]["with"]["name"] = _NC_STATIC_NAME
+    assert _nc_check_artifact_name_is_attempt_scoped(m)
+    # mutated copy 2: static name on a single (retry) download
+    m = copy.deepcopy(job)
+    _step(m, "download")[-1]["with"]["name"] = _NC_STATIC_NAME
+    assert _nc_check_artifact_name_is_attempt_scoped(m)
+    # mutated copy 3: the first download uses a static name
+    m = copy.deepcopy(job)
+    _step(m, "download")[0]["with"]["name"] = _NC_STATIC_NAME
+    assert _nc_check_artifact_name_is_attempt_scoped(m)
+    # mutated copy 4: attempt id replaced by a non run_attempt expression
+    m = copy.deepcopy(job)
+    _step(m, "upload")[0]["with"]["name"] = f"{_NC_STATIC_NAME}-${{{{ github.run_id }}}}"
+    assert _nc_check_artifact_name_is_attempt_scoped(m)
+    # mutated copy 5: upload / download names diverge
+    m = copy.deepcopy(job)
+    _step(m, "download")[0]["with"]["name"] = f"{_NC_STATIC_NAME}-${{{{ github.run_attempt }}}}-x"
+    assert _nc_check_artifact_name_is_attempt_scoped(m)
+    # mutated copy 6: rogue static-name upload under a different step id
+    m = copy.deepcopy(job)
+    m["steps"].append(
+        {
+            "name": "rogue static upload",
+            "id": "upload-rogue-static",
+            "uses": "actions/upload-artifact@v6",
+            "with": {"name": _NC_STATIC_NAME, "path": "rogue-dir"},
+        }
+    )
+    assert any("rogue upload" in v for v in _nc_check_artifact_name_is_attempt_scoped(m))
+    # allowed: an unrelated download (other name/path) outside the negative-control
+    # block must not make any of the three checkers false-fail.
+    m = copy.deepcopy(job)
+    m["steps"].append(
+        {
+            "name": "unrelated download",
+            "id": "download-some-unrelated-artifact",
+            "uses": "actions/download-artifact@v6",
+            "with": {"name": "some-unrelated-artifact", "path": "unrelated-dir"},
+        }
+    )
+    assert _nc_check_artifact_name_is_attempt_scoped(m) == []
+    assert _nc_check_roundtrip_is_bounded(m) == []
+    assert _nc_check_hidden_file_proof(m) == []
+    # a static-name download is still a target (prefix match) and is rejected
+    m = copy.deepcopy(job)
+    m["steps"].append(
+        {
+            "name": "static download",
+            "id": "download-static",
+            "uses": "actions/download-artifact@v6",
+            "with": {"name": _NC_STATIC_NAME, "path": "negative-control-download"},
+        }
+    )
+    assert _nc_check_artifact_name_is_attempt_scoped(m)
+
+
+def test_component_vrt_negative_control_roundtrip_is_bounded():
+    job = _nc_job(_load_workflow())
+    assert _nc_check_roundtrip_is_bounded(job) == []
+
+    steps_of = lambda j: j["steps"]  # noqa: E731
+    sleeps = [s for s in steps_of(job) if isinstance(s, dict) and str(s.get("run", "")).startswith("sleep ")]
+    downloads = [s for s in steps_of(job) if isinstance(s, dict) and _nc_uses(s, "actions/download-artifact")]
+    verify = next(s for s in steps_of(job) if isinstance(s, dict) and s.get("id") == _NC_VERIFY_ID)
+
+    def mutate(fn) -> list[str]:
+        m = copy.deepcopy(job)
+        fn(m)
+        return _nc_check_roundtrip_is_bounded(m)
+
+    def _dl(m: dict) -> list[dict]:
+        return [s for s in m["steps"] if isinstance(s, dict) and _nc_uses(s, "actions/download-artifact")]
+
+    def _sl(m: dict) -> list[dict]:
+        return [s for s in m["steps"] if isinstance(s, dict) and str(s.get("run", "")).startswith("sleep ")]
+
+    def _vf(m: dict) -> dict:
+        return next(s for s in m["steps"] if isinstance(s, dict) and s.get("id") == _NC_VERIFY_ID)
+
+    assert sleeps and downloads and verify
+
+    # unbounded retry shapes
+    assert mutate(lambda m: _sl(m)[0].__setitem__("run", "while true; do sleep 1; done"))
+    assert mutate(lambda m: _sl(m)[0].__setitem__("run", "until [ -d negative-control-download ]; do sleep 1; done"))
+    # non-literal / unparseable sleeps
+    assert mutate(lambda m: _sl(m)[0].__setitem__("run", "sleep $((2 * 3))"))
+    assert mutate(lambda m: _sl(m)[0].__setitem__("run", "sleep ${RETRY_SLEEP}"))
+    assert mutate(lambda m: _sl(m)[0].__setitem__("run", "sleep 5 && true"))
+    assert mutate(lambda m: _sl(m)[0].__setitem__("run", "sleep 5.5"))
+    # total sleep above 30s
+    assert mutate(lambda m: _sl(m)[0].__setitem__("run", "sleep 31"))
+    # too many downloads (> 4)
+    def add_download(m: dict) -> None:
+        idx = max(
+            i
+            for i, s in enumerate(m["steps"])
+            if isinstance(s, dict) and _nc_uses(s, "actions/download-artifact")
+        )
+        extra = copy.deepcopy(m["steps"][idx])
+        extra["id"] = "download-negative-control-attachments-extra"
+        extra["if"] = "${{ always() && steps.%s.outcome == 'failure' }}" % m["steps"][idx]["id"]
+        for k in range(3):
+            m["steps"].insert(idx + 1, copy.deepcopy(extra))
+            m["steps"][idx + 1]["id"] = f"download-extra-{k}"
+    assert mutate(add_download)
+    # retry not gated on previous failure / gated on conclusion
+    assert mutate(lambda m: _dl(m)[1].__setitem__("if", "${{ always() }}"))
+    assert mutate(
+        lambda m: _dl(m)[1].__setitem__(
+            "if", "${{ always() && steps.%s.conclusion == 'failure' }}" % _dl(m)[0]["id"]
+        )
+    )
+    # download without continue-on-error
+    assert mutate(lambda m: _dl(m)[0].__delitem__("continue-on-error"))
+    # assert step that tolerates an empty download directory
+    assert mutate(lambda m: _vf(m).__setitem__("run", _vf(m)["run"].replace("exit 1", "exit 0")))
+    assert mutate(lambda m: _vf(m).__setitem__("run", _vf(m)["run"] + "\ntrue || true\n"))
+    assert mutate(lambda m: _vf(m).__setitem__("run", "set +e\n" + _vf(m)["run"]))
+    assert mutate(lambda m: _vf(m).__setitem__("run", "exit 0\n" + _vf(m)["run"]))
+    assert mutate(lambda m: _vf(m).__setitem__("run", "echo skipped"))
+    # a loop in the assert step
+    assert mutate(lambda m: _vf(m).__setitem__("run", "while true; do sleep 1; done\nexit 1"))
+
+
+def test_component_vrt_negative_control_keeps_hidden_file_proof():
+    job = _nc_job(_load_workflow())
+    assert _nc_check_hidden_file_proof(job) == []
+
+    def mutate(fn) -> list[str]:
+        m = copy.deepcopy(job)
+        fn(m)
+        return _nc_check_hidden_file_proof(m)
+
+    def _up(m: dict) -> dict:
+        return next(s for s in m["steps"] if isinstance(s, dict) and s.get("id") == _NC_UPLOAD_ID)
+
+    def _dl(m: dict) -> list[dict]:
+        return [s for s in m["steps"] if isinstance(s, dict) and _nc_uses(s, "actions/download-artifact")]
+
+    def _vf(m: dict) -> dict:
+        return next(s for s in m["steps"] if isinstance(s, dict) and s.get("id") == _NC_VERIFY_ID)
+
+    # hidden-file proof knobs
+    assert mutate(lambda m: _up(m)["with"].__setitem__("include-hidden-files", False))
+    assert mutate(lambda m: _up(m)["with"].__delitem__("include-hidden-files"))
+    assert mutate(lambda m: _up(m)["with"].__setitem__("if-no-files-found", "warn"))
+    assert mutate(lambda m: _vf(m).__setitem__("if", "${{ success() }}"))
+    assert mutate(lambda m: _vf(m).__delitem__("if"))
+    # local-dir-only assert (no download dir scan; reads .vitest-attachments)
+    local_only = (
+        "shopt -s globstar nullglob\n"
+        "actual_files=(.vitest-attachments/**/*-actual-*.png)\n"
+        "diff_files=(.vitest-attachments/**/*-diff-*.png)\n"
+        '[ "${#actual_files[@]}" -eq 0 ] && exit 1\n'
+        '[ "${#diff_files[@]}" -eq 0 ] && exit 1\n'
+    )
+    assert mutate(lambda m: _vf(m).__setitem__("run", local_only))
+    # download path overlaps local attachments dir / upload path
+    for bad in (
+        ".vitest-attachments",
+        ".vitest-attachments/download",
+        ".vitest-attachments/tests/component/__negative_control__",
+        ".vitest-attachments/tests/component/__negative_control__/sub",
+        ".",
+        "./",
+    ):
+        assert mutate(lambda m, bad=bad: [d["with"].__setitem__("path", bad) for d in _dl(m)]), bad
+    # assert step before the downloads
+    def move_assert_first(m: dict) -> None:
+        verify = _vf(m)
+        m["steps"].remove(verify)
+        m["steps"].insert(next(i for i, s in enumerate(m["steps"]) if _nc_uses(s, "actions/download-artifact")), verify)
+    assert mutate(move_assert_first)
+    # a download path that differs from the scanned directory
+    assert mutate(lambda m: [d["with"].__setitem__("path", "other-dir") for d in _dl(m)])
+
+
+def _nc_run_assert_script(script: str, workdir: pathlib.Path) -> subprocess.CompletedProcess:
+    # GitHub expressions are not evaluated locally; none are expected in this
+    # script, but neutralise any so bash can run it. `shell: bash` in GitHub
+    # Actions is `bash --noprofile --norc -e -o pipefail {0}`.
+    script = re.sub(r"\$\{\{.*?\}\}", "EXPR", script)
+    return subprocess.run(
+        ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script],
+        cwd=str(workdir),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def test_component_vrt_negative_control_assert_script_behaviour(tmp_path):
+    job = _nc_job(_load_workflow())
+    verify = next(s for s in job["steps"] if isinstance(s, dict) and s.get("id") == _NC_VERIFY_ID)
+    script = str(verify["run"])
+    download = next(
+        s for s in job["steps"] if isinstance(s, dict) and _nc_uses(s, "actions/download-artifact")
+    )["with"]["path"]
+
+    # missing download dir -> fail closed
+    missing = tmp_path / "missing"
+    missing.mkdir()
+    assert _nc_run_assert_script(script, missing).returncode != 0
+
+    # empty download dir -> fail closed
+    empty = tmp_path / "empty"
+    (empty / download).mkdir(parents=True)
+    assert _nc_run_assert_script(script, empty).returncode != 0
+
+    # only actual (no diff) -> fail closed
+    partial = tmp_path / "partial"
+    (partial / download / "sub").mkdir(parents=True)
+    (partial / download / "sub" / "x-actual-1.png").write_bytes(b"png")
+    assert _nc_run_assert_script(script, partial).returncode != 0
+
+    # local .vitest-attachments populated but download dir empty -> still fail
+    local_only = tmp_path / "local_only"
+    (local_only / download).mkdir(parents=True)
+    (local_only / ".vitest-attachments" / "t").mkdir(parents=True)
+    (local_only / ".vitest-attachments" / "t" / "x-actual-1.png").write_bytes(b"png")
+    (local_only / ".vitest-attachments" / "t" / "x-diff-1.png").write_bytes(b"png")
+    assert _nc_run_assert_script(script, local_only).returncode != 0
+
+    # valid download dir -> pass
+    ok = tmp_path / "ok"
+    (ok / download / "sub").mkdir(parents=True)
+    (ok / download / "sub" / "x-actual-1.png").write_bytes(b"png")
+    (ok / download / "sub" / "x-diff-1.png").write_bytes(b"png")
+    result = _nc_run_assert_script(script, ok)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "hidden_attachment_upload_proof=ok" in result.stdout
