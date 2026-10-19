@@ -16,13 +16,33 @@ description: ユーザーの要求を Terminal AI Agent が再現可能に作業
 - 対応するテンプレートファイル `.github/ISSUE_TEMPLATE/{種別}.yml` を読み、Issue Forms の各 `textarea` の `label` を必須セクション一覧として取得する（テンプレ更新時に自動追従）
 - 以降の本文生成はこの必須セクション一覧を基準にする
 
+### 0.5. invocation-owned scratch workspace を確立する（run-scoped scratch）
+
+本文 draft・anchor list・post-create readback・guard result は ad hoc scratch であり、予測可能な固定 `/tmp/<name>`（同名の既存 file を truncate / overwrite しうる path）や cwd 直下の裸のファイル名へ書かない。起票ごとに実際に作成した invocation-owned 一意 directory（以下 workspace）の具体 path に揃える。
+
+確立は次の順序で行う（リポジトリ root で実行。fresh checkout では ignored `tmp/` 自体が存在しないため、先に root を materialize する）:
+
+```bash
+mkdir -p tmp
+WORKSPACE=$(mktemp -d tmp/create-issue.XXXXXX)
+echo "$WORKSPACE"
+```
+
+1. canonical repo `tmp/` root を idempotent に materialize する（`mkdir -p tmp`。既存でも失敗しない）。
+2. その配下に `mktemp -d` で invocation-owned directory を atomic に実作成する。`mktemp -u` のような name-only allocation は禁止（名前だけ確保して後から作る経路は競合し、unique を保証しない）。OS-temp が必要な既存経路でも `mktemp -d` で実際に directory を作る。
+3. 生成した具体 path（`echo` の出力）を以降の Bash call・SubAgent・background consumer へ明示的に引き渡す。Bash の環境変数は call をまたいで持続しないため、後続 call では具体 path をリテラルで再指定する（以降の例の `$WORKSPACE` はその具体 path を指す）。
+4. workspace は全 consumer（validator / guard / `--body-file` / `--readback-json` / `verify-anchors.sh`）と background / SubAgent の terminal join が完了するまで削除しない。他 invocation・他 session の `tmp/` 配下は片付けない（foreign cleanup 禁止）。自分の workspace の cleanup が不確実なら残置理由を記録し、本来の成果を無関係に失敗扱いしない。
+5. model が生成する scratch（本文 draft・anchor list）は、workspace 確立後は Write / Edit（in-project file operation）を優先して `WORKSPACE` 配下の `body.md` / `anchors.txt` に書く。`gh ... > readback.json` のように shell の stdout capture が実質必要な部分だけ Bash を使う（推奨手順であり、permissions / allow / hook / launcher の緩和は伴わない）。
+
+workspace 内の通常名（`body.md` / `anchors.txt` / `readback.json` / `guard_result.json`）は許容する。`--body-file` / `--readback-json` は読み取り引数であって破壊操作ではないが、読み取る path は producer が書いた同じ workspace の具体 path に揃える。
+
 ### 1. 要求を分析する
 
 - ユーザーの要求から Outcome（達成したい状態）を抽出する
 - **anchor 主張を含む Issue**: Issue 本文で「既存ファイルの行番号・セクション見出し・関数名」を anchor として主張する場合は、起票前に [`references/body-authoring.md`](references/body-authoring.md) の Anchor Verification Preflight を参照し、以下のスクリプトで一括検証してから起票する:
   ```bash
-  # anchor_list.txt に 1 行 1 anchor を記載（# コメント行は無視される）
-  .claude/skills/create-issue/scripts/verify-anchors.sh anchor_list.txt
+  # "$WORKSPACE/anchors.txt" に 1 行 1 anchor を記載（# コメント行は無視される）
+  .claude/skills/create-issue/scripts/verify-anchors.sh "$WORKSPACE/anchors.txt"
   ```
   スクリプトは `git grep -lF -- <anchor>` を配列形式で実行し、PASS/FAIL を出力する。exit 1 が返った場合は起票しない
 - **follow-up Issue の場合（post-merge-cleanup / issue-refinement-loop から委譲）**: [`references/body-authoring.md`](references/body-authoring.md) の「ワークフロー不具合検出時の修正方針起案ガイダンス」セクションを参照し、決定論的修正と workaround を明示比較してから Outcome を起案する
@@ -216,13 +236,13 @@ scope 重複チェックの結果にかかわらず、以下を強く推奨す�
 
 ### 4. 起票を実行する
 
-Issue Template Guard / Outcome Quality Guard / Scope 重複チェックを全て通過したら、Issue 本文を一時ファイルに書き出し、**書き込み前 validator** を実行する（fail-closed）:
+Issue Template Guard / Outcome Quality Guard / Scope 重複チェックを全て通過したら、Issue 本文を workspace の `body.md`（上記 Step 0.5。Write で具体 path に書く）に書き出し、**書き込み前 validator** を実行する（fail-closed）:
 
 ```bash
 # 書き込み前 validator — exit 1 なら起票しない
 # --kind を指定すると ISSUE_TEMPLATE/<kind>.yml から必須セクション・Stop Conditions を動的取得する（LP001/LP017）
 # --title を指定すると LP031 で implementation kind の title prefix を検証する
-uv run --locked python3 .claude/skills/create-issue/scripts/validate_issue_body.py --body-file /tmp/issue_body.md --kind implementation --title "$TITLE"
+uv run --locked python3 .claude/skills/create-issue/scripts/validate_issue_body.py --body-file "$WORKSPACE/body.md" --kind implementation --title "$TITLE"
 ```
 
 `validate_issue_body.py` が exit 1 を返した場合は **起票を中止**し、JSON 出力の `errors` を人間に提示して修正を求める。
@@ -240,26 +260,26 @@ helper は `--title` / `--body-file` / `--label` / `--parent-issue` / `--blocked
 1. GitHub から title/labels を read-back する:
 
 ```bash
-gh issue view "$CREATED_ISSUE_NUMBER" --repo "$REPO" --json title,labels > /tmp/readback.json
+gh issue view "$CREATED_ISSUE_NUMBER" --repo "$REPO" --json title,labels > "$WORKSPACE/readback.json"
 ```
 
 2. `guard-issue-body.py` に `--readback-json` を渡して ready tuple を検証する:
 
 ```bash
-uv run --locked python3 .claude/skills/edit-issue/scripts/guard-issue-body.py /tmp/issue_body.md \
+uv run --locked python3 .claude/skills/edit-issue/scripts/guard-issue-body.py "$WORKSPACE/body.md" \
   --issue-kind implementation \
   --check-ready-tuple \
-  --readback-json /tmp/readback.json
+  --readback-json "$WORKSPACE/readback.json"
 ```
 
 3. guard の exit code を変数に保存する:
 
 ```bash
-uv run --locked python3 .claude/skills/edit-issue/scripts/guard-issue-body.py /tmp/issue_body.md \
+uv run --locked python3 .claude/skills/edit-issue/scripts/guard-issue-body.py "$WORKSPACE/body.md" \
   --issue-kind implementation \
   --check-ready-tuple \
-  --readback-json /tmp/readback.json \
-  --format json > /tmp/guard_result.json
+  --readback-json "$WORKSPACE/readback.json" \
+  --format json > "$WORKSPACE/guard_result.json"
 GUARD_EXIT=$?
 ```
 
