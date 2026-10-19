@@ -7,8 +7,8 @@ evidence stays hook_id_correlated even when the SubagentStop hook payload has no
 last_assistant_message, because the marker is recovered from the Agent tool handbackReport.
 <!-- この段落は外部 code・network・file 変更を伴わない無害な検証であり、SubagentStop に last_assistant_message が無くても handbackReport から marker の由来を確認できることだけを検証する旨を説明する日本語注記である。 -->
 
-Use the `Agent` tool exactly once to launch the `pr-reviewer` SubAgent in the foreground (do not run it in the background), with exactly this message. Wait for the SubAgent to finish and return its final response before doing anything else:
-<!-- Agent ツールを 1 回だけ foreground で起動して pr-reviewer を呼び出し、子の完了と最終応答を待つ旨を示す日本語注記であり、次のコードブロックは SubAgent へ送信する指示文そのものなので内容は変更しないこと。 -->
+Use the `Agent` tool exactly once to launch the `general-purpose` SubAgent in the foreground (do not run it in the background), with exactly this message. Wait for the SubAgent to finish and return its final response before doing anything else:
+<!-- Agent ツールを 1 回だけ foreground で起動して general-purpose を呼び出し、子の完了と最終応答を待つ旨を示す日本語注記であり、次のコードブロックは SubAgent へ送信する指示文そのものなので内容は変更しないこと。 -->
 
 ```text
 Do not run any tool. Reply with exactly one line and nothing else: SUBAGENTSTOP_HANDBACK_PROVENANCE_SMOKE_OK
