@@ -1648,6 +1648,475 @@ class TestB3WarnReachable:
         assert code == wrapper.EXIT_ENVIRONMENT_FAILURE
 
 
+def _ac8_repo_local_anchor_fixture(anchor_body: str) -> tuple[dict, str]:
+    issue_number = 2857
+    anchor_url = f"https://github.com/testowner/testrepo/issues/{issue_number}#issuecomment-7"
+    fixture = make_minimal_fixture(
+        issue_number=issue_number,
+        body=VALID_ISSUE_BODY,
+        comments=[
+            {
+                "id": 7,
+                "body": anchor_body,
+                "issue_url": f"https://api.github.com/repos/testowner/testrepo/issues/{issue_number}",
+            }
+        ],
+    )
+    fixture["anchor_comments"] = [
+        {
+            **fixture["comments"][0],
+            "html_url": anchor_url,
+            "url": "https://api.github.com/repos/testowner/testrepo/issues/comments/7",
+            "author_association": "OWNER",
+            "user": {"login": "owner", "type": "User"},
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+        }
+    ]
+    return fixture, anchor_url
+
+
+def test_repo_local_no_web_preflight_handoff_preserves_unverified_anchor_warning(tmp_path):
+    fixture, anchor_url = _ac8_repo_local_anchor_fixture("## Revised AC\n- AC2: trusted fixture directive\n")
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+
+    with (
+        mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path),
+        mock.patch.object(wrapper, "_invoke_planner", wraps=wrapper._invoke_planner) as invoke,
+    ):
+        result, exit_code = wrapper.run_preflight(
+            issue_number=2857,
+            repo="testowner/testrepo",
+            anchor_comment_urls=[anchor_url],
+            fixture_path=fixture_path,
+        )
+
+    assert (result["status"], exit_code) == ("pass", wrapper.EXIT_PASS)
+    assert result["next_action"] == "proceed"
+    assert len(invoke.call_args_list) == 2
+    sanitized = invoke.call_args_list[0].args[0]
+    full = invoke.call_args_list[1].args[0]
+    assert sanitized["comments"][0]["body"] == "[redacted: anchor comment snapshot stored in artifact]"
+    assert full["comments"][0]["body"] == fixture["comments"][0]["body"]
+    assert result["planner_fail_closed"] is False
+    assert result["must_read"] == ["scripts/example.py"]
+
+
+@pytest.mark.parametrize("continuation", [
+    " Now verify current GitHub GraphQL errors against official docs before approval.",
+    "; Current requirement: verify current GitHub GraphQL errors against official docs before approval.",
+    ", and now verify current GitHub GraphQL errors against official docs before approval.",
+    "; Verify current GitHub GraphQL errors against official docs before approval.",
+    "; GitHub GraphQL errors must match official docs before approval.",
+    "; Do not verify local fixtures; GitHub GraphQL errors must match official docs before approval.",
+    ", but now verify current GitHub GraphQL errors against official docs before approval.",
+])
+def test_closed_past_quote_and_current_anchor_keep_web_warning(tmp_path, continuation):
+    anchor = ("## Revised AC\n- AC2: Earlier reviewer wrote: "
+              "`Verify GitHub GraphQL errors against official docs.`" + continuation + "\n")
+    fixture, anchor_url = _ac8_repo_local_anchor_fixture(anchor)
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+    invoke = wrapper._invoke_planner
+    observed = []
+
+    def observe_planner(planner_input, **kwargs):
+        result = invoke(planner_input, **kwargs)
+        observed.append((planner_input, result[0]))
+        return result
+
+    with (
+        mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path),
+        mock.patch.object(wrapper, "_invoke_planner", side_effect=observe_planner),
+    ):
+        result, exit_code = wrapper.run_preflight(
+            issue_number=2857, repo="testowner/testrepo",
+            anchor_comment_urls=[anchor_url], fixture_path=fixture_path,
+        )
+
+    assert len(observed) == 2
+    sanitized, sanitized_plan = observed[0]
+    full, full_plan = observed[1]
+    assert sanitized["comments"][0]["body"] == "[redacted: anchor comment snapshot stored in artifact]"
+    assert full["comments"][0]["body"] == anchor
+    assert sanitized_plan["decisions"]["web_research_policy"]["required"] is False
+    policy = full_plan["decisions"]["web_research_policy"]
+    assert policy["required"] is True
+    assert len(policy["critical_external_claims"]) == 1
+    claim = policy["critical_external_claims"][0]
+    assert "GitHub GraphQL errors" in claim["claim"]
+    assert "Earlier reviewer wrote" not in claim["claim"]
+    assert claim["source_hint"] == "comment_7" and claim["role"] == "dispositive"
+    assert (result["status"], exit_code) == ("warn", wrapper.EXIT_WARN)
+    assert result["next_action"] == "proceed_with_notes"
+
+
+@pytest.mark.parametrize(
+    "phrase,expected",
+    [
+        (
+            "Official OAuth 2.0 documentation requires an exact registered redirect URI match before approval.",
+            "registered redirect URI match",
+        ),
+        (
+            "Verify against the official GraphQL specification that request error "
+            "responses must not contain data.",
+            "request error responses must not contain data",
+        ),
+        (
+            "GraphQL の公式仕様で request error 時の data の返却は禁止されるため、この制約を検証する。",
+            "data の返却は禁止",
+        ),
+        (
+            "Verify GitHub GraphQL errors against official docs using the repository "
+            "GraphQL specification fixture in tests before approval.",
+            "official docs using the repository",
+        ),
+        (
+            "Official OAuth documentation requires a registered redirect URI match "
+            "using the repository GraphQL specification fixture in tests.",
+            "registered redirect URI match",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors must match "
+            "official docs before approval.",
+            "GitHub GraphQL errors must match official docs before approval",
+        ),
+        (
+            "Do not verify local example fixtures and GitHub GraphQL errors must match "
+            "official docs before approval.",
+            "GitHub GraphQL errors must match official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures (example: repository API fixtures) and "
+            "GitHub GraphQL errors must match official docs before approval.",
+            "GitHub GraphQL errors must match official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures (historical context: repository API fixtures) "
+            "and GitHub GraphQL errors must match official docs before approval.",
+            "GitHub GraphQL errors must match official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures (過去の引用) and GitHub GraphQL errors "
+            "must match official docs before approval.",
+            "GitHub GraphQL errors must match official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors have to match "
+            "official docs before approval.",
+            "GitHub GraphQL errors have to match official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors are described "
+            "in official docs before approval.",
+            "GitHub GraphQL errors are described in official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors are covered "
+            "in official docs before approval.",
+            "GitHub GraphQL errors are covered in official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors are to be checked "
+            "against official docs before approval.",
+            "GitHub GraphQL errors are to be checked against official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors will be checked "
+            "against official docs before approval.",
+            "GitHub GraphQL errors will be checked against official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors will be verified "
+            "against official docs before approval.",
+            "GitHub GraphQL errors will be verified against official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors are checked "
+            "against official docs before approval.",
+            "GitHub GraphQL errors are checked against official docs before approval",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors will be checked "
+            "against official docs without editing tests.",
+            "GitHub GraphQL errors will be checked against official docs",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors will be checked "
+            "against official docs without changing code before approval.",
+            "GitHub GraphQL errors will be checked against official docs",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors will be checked "
+            "against official docs without adding source files before approval.",
+            "GitHub GraphQL errors will be checked against official docs",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors must match "
+            "official docs without checking repository API fixtures.",
+            "GitHub GraphQL errors must match official docs",
+        ),
+        (
+            "Do not verify local fixtures and GitHub GraphQL errors must match "
+            "official docs no later than release.",
+            "GitHub GraphQL errors must match official docs no later than release",
+        ),
+        (
+            "GitHub GraphQL errors must match official docs no later than release.",
+            "GitHub GraphQL errors must match official docs no later than release",
+        ),
+        (
+            "Do not inspect repository call chain and GitHub GraphQL data/errors "
+            "require validation against the official specification before approval.",
+            "GitHub GraphQL data/errors require validation against the official specification",
+        ),
+        (
+            "GitHub GraphQL errors must match official docs before approval "
+            "and do not verify repository fixtures.",
+            "GitHub GraphQL errors must match official docs before approval",
+        ),
+    ],
+)
+def test_noun_start_external_anchor_cannot_clear_no_web_warning(tmp_path, phrase, expected):
+    fixture, anchor_url = _ac8_repo_local_anchor_fixture(f"## Revised AC\n- AC2: {phrase}\n")
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+    invoke = wrapper._invoke_planner
+    observed = []
+
+    def observe_planner(planner_input, **kwargs):
+        result = invoke(planner_input, **kwargs)
+        observed.append((planner_input, result[0]))
+        return result
+
+    with (
+        mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path),
+        mock.patch.object(wrapper, "_invoke_planner", side_effect=observe_planner),
+    ):
+        result, exit_code = wrapper.run_preflight(
+            issue_number=2857,
+            repo="testowner/testrepo",
+            anchor_comment_urls=[anchor_url],
+            fixture_path=fixture_path,
+        )
+
+    assert len(observed) == 2
+    sanitized, sanitized_plan = observed[0]
+    full, full_plan = observed[1]
+    assert sanitized["comments"][0]["body"] == "[redacted: anchor comment snapshot stored in artifact]"
+    assert full["comments"][0]["body"] == fixture["comments"][0]["body"]
+    assert sanitized_plan["decisions"]["web_research_policy"]["required"] is False
+    assert sanitized_plan["decisions"]["web_research_policy"]["critical_external_claims"] == []
+    assert sanitized_plan["decisions"]["web_research_policy"]["confidence"] == "unknown"
+    full_policy = full_plan["decisions"]["web_research_policy"]
+    assert full_policy["required"] is True
+    assert len(full_policy["critical_external_claims"]) == 1
+    claim = full_policy["critical_external_claims"][0]
+    assert expected in claim["claim"]
+    assert claim["source_hint"] == "comment_7"
+    assert claim["role"] == "dispositive"
+    assert (result["status"], exit_code) == ("warn", wrapper.EXIT_WARN)
+    assert result["next_action"] == "proceed_with_notes"
+
+
+@pytest.mark.parametrize("phrase", [
+    "Do not verify local fixtures and GitHub GraphQL errors will not be checked "
+    "against official docs before approval.",
+    "Do not verify local fixtures and GitHub GraphQL errors won't be checked "
+    "against official docs before approval.",
+    "Previously quoted: Do not verify local fixtures, but verify GitHub GraphQL "
+    "errors against official docs before approval.",
+    "Earlier reviewer wrote: `Verify GitHub GraphQL errors against official docs. "
+    "Now verify current GitHub GraphQL errors against official docs before approval.`",
+    "Earlier reviewer wrote: `Verify GitHub GraphQL errors against official docs.` "
+    "This is a historical quote, not a current request.",
+    "Check the official GraphQL specification fixture in repository tests.",
+    "Do not verify local fixtures and check repository tests instead.",
+    "Previously quoted: Do not verify local example fixtures and GitHub GraphQL errors "
+    "must match official docs before approval.",
+    "Previously quoted “GitHub GraphQL errors must match official docs before approval.”",
+    "(Example: GitHub GraphQL errors must match official docs before approval.)",
+    "Previously quoted: Do not verify local fixtures and GitHub GraphQL errors must match "
+    "official docs without checking repository API fixtures.",
+    "Do not verify local fixtures and GitHub GraphQL errors must match official docs "
+    "without consulting official API documentation.",
+])
+def test_negated_future_anchor_keeps_repo_local_no_web_handoff(tmp_path, phrase):
+    fixture, anchor_url = _ac8_repo_local_anchor_fixture(f"## Revised AC\n- AC2: {phrase}\n")
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+
+    with mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path):
+        result, exit_code = wrapper.run_preflight(
+            issue_number=2857,
+            repo="testowner/testrepo",
+            anchor_comment_urls=[anchor_url],
+            fixture_path=fixture_path,
+        )
+
+    assert (result["status"], exit_code) == ("pass", wrapper.EXIT_PASS)
+    assert result["next_action"] == "proceed"
+
+
+@pytest.mark.parametrize("api_url", [True, False])
+def test_repo_local_no_web_handoff_accepts_case_variant_issue_url(tmp_path, api_url):
+    fixture, anchor_url = _ac8_repo_local_anchor_fixture("## Revised AC\n- AC2: trusted fixture directive\n")
+    fixture["repo"] = "TestOwner/TestRepo"
+    issue_url = (
+        "https://api.github.com/repos/testowner/testrepo/issues/2857"
+        if api_url else "https://github.com/testowner/testrepo/issues/2857"
+    )
+    fixture["comments"][0]["issue_url"] = issue_url
+    fixture["anchor_comments"][0]["issue_url"] = issue_url
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+
+    with mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path):
+        result, exit_code = wrapper.run_preflight(
+            issue_number=2857,
+            repo="TestOwner/TestRepo",
+            anchor_comment_urls=[anchor_url],
+            fixture_path=fixture_path,
+        )
+    assert (result["status"], exit_code) == ("pass", wrapper.EXIT_PASS)
+
+
+def test_repo_local_no_web_handoff_rejects_foreign_issue_url_host(tmp_path):
+    fixture, anchor_url = _ac8_repo_local_anchor_fixture("## Revised AC\n- AC2: trusted fixture directive\n")
+    foreign_url = "https://example.com/repos/testowner/testrepo/issues/2857"
+    fixture["comments"][0]["issue_url"] = foreign_url
+    fixture["anchor_comments"][0]["issue_url"] = foreign_url
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+    with mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path):
+        result, exit_code = wrapper.run_preflight(
+            issue_number=2857,
+            repo="testowner/testrepo",
+            anchor_comment_urls=[anchor_url],
+            fixture_path=fixture_path,
+        )
+    assert (result["status"], exit_code) == ("warn", wrapper.EXIT_WARN)
+
+
+@pytest.mark.parametrize(
+    "anchor_body",
+    [
+        "[redacted: anchor comment snapshot stored in artifact]",
+        "## Revised AC\n- AC2: trusted fixture directive [truncated: remaining text]\n",
+        "## Revised AC\n- AC2: Do not verify local fixtures and GitHub GraphQL "
+        "errors must match official docs [truncated: remaining text]\n",
+        "## Revised AC\n- AC2: Do not verify local fixtures and GitHub GraphQL "
+        "errors have to match official docs [truncated: remaining text]\n",
+        "## Revised AC\n- AC2: 公式ドキュメントで外部 API の仕様を検証する必要がある\n",
+        "## Revised AC\n- AC2: Do not verify local fixtures and verify GitHub GraphQL "
+        "errors against official docs before approval.\n",
+        "## Revised AC\n- AC2: Do not verify local fixtures and verify GitHub GraphQL "
+        "errors against official docs before approval and do not change tests.\n",
+        "## Revised AC\n- AC2: リポジトリ fixtures の検証は不要、GitHub GraphQL の "
+        "data/errors を公式仕様と照合する必要がある。\n",
+    ],
+)
+def test_repo_local_no_web_handoff_rejects_unverified_anchor(tmp_path, anchor_body):
+    fixture, anchor_url = _ac8_repo_local_anchor_fixture(anchor_body)
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+    with mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path):
+        result, exit_code = wrapper.run_preflight(
+            issue_number=2857,
+            repo="testowner/testrepo",
+            anchor_comment_urls=[anchor_url],
+            fixture_path=fixture_path,
+        )
+    assert result["status"] != "pass"
+    assert exit_code != wrapper.EXIT_PASS
+
+
+def test_repo_local_no_web_handoff_rejects_unbound_crosscheck(tmp_path):
+    fixture, anchor_url = _ac8_repo_local_anchor_fixture("## Revised AC\n- AC2: trusted fixture directive\n")
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+    invoke = wrapper._invoke_planner
+
+    def corrupt_full_anchor_source(planner_input, **kwargs):
+        plan, exit_code, stderr, stdout = invoke(planner_input, **kwargs)
+        if not kwargs and plan is not None:
+            plan["source"]["comments_sha256"] = "unverified"
+        return plan, exit_code, stderr, stdout
+
+    with (
+        mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path),
+        mock.patch.object(wrapper, "_invoke_planner", side_effect=corrupt_full_anchor_source),
+    ):
+        result, exit_code = wrapper.run_preflight(
+            issue_number=2857,
+            repo="testowner/testrepo",
+            anchor_comment_urls=[anchor_url],
+            fixture_path=fixture_path,
+        )
+    assert (result["status"], exit_code) == ("warn", wrapper.EXIT_WARN)
+
+
+def test_repo_local_no_web_handoff_requires_complete_anchor_ranges(tmp_path):
+    fixture, anchor_url = _ac8_repo_local_anchor_fixture("## Revised AC\n- AC2: trusted fixture directive\n")
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+    with (
+        mock.patch.object(wrapper, "_find_repo_root", return_value=tmp_path),
+        mock.patch.object(wrapper.anchor_context, "compute_source_ranges_covered", return_value=False),
+    ):
+        result, exit_code = wrapper.run_preflight(
+            issue_number=2857,
+            repo="testowner/testrepo",
+            anchor_comment_urls=[anchor_url],
+            fixture_path=fixture_path,
+        )
+    assert (result["status"], exit_code) == ("warn", wrapper.EXIT_WARN)
+
+
+@pytest.mark.parametrize(
+    "required,reason,claims",
+    [
+        (True, "external_claim", [{"claim": "official API"}]),
+        (False, "unknown", []),
+        (False, "no_critical_external_claim", ["unverified"]),
+    ],
+)
+def test_repo_local_no_web_handoff_rejects_conflicting_policy(required, reason, claims):
+    plan = {
+        "decisions": {
+            "web_research_policy": {
+                "required": required,
+                "reason_code": reason,
+                "critical_external_claims": claims,
+                "evidence_spans": [],
+                "confidence": "unknown",
+            },
+            "investigation_policy": {"required": True, "repo_claims": ["local"], "confidence": "deterministic"},
+        }
+    }
+    assert wrapper._has_unknown_confidence(plan, resolved_no_web=True) is True
+    assert wrapper._apply_exit_code_mapping(0, False, [], plan=plan)[0] == "warn"
+
+
+def test_repo_local_no_web_handoff_keeps_other_unknown_decisions():
+    plan = {
+        "decisions": {
+            "web_research_policy": {
+                "required": False,
+                "reason_code": "no_critical_external_claim",
+                "critical_external_claims": [],
+                "evidence_spans": [],
+                "confidence": "unknown",
+            },
+            "investigation_policy": {"required": False, "repo_claims": [], "confidence": "unknown"},
+        }
+    }
+    assert wrapper._has_unknown_confidence(plan, resolved_no_web=True) is True
+    assert wrapper._apply_exit_code_mapping(0, False, [], plan=plan, verified_repo_local_no_web=True)[0] == "warn"
+
+
 # ---------------------------------------------------------------------------
 # B4: planner_input artifact saved
 # ---------------------------------------------------------------------------
