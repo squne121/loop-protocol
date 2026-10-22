@@ -118,12 +118,25 @@ native `parent`／`blockedBy`／`blocking` を同期する場合は `native_rela
 
 ### 1. candidate body と readiness context を準備する
 
-- `reviewer_feedback_url` / `reviewer_feedback_text` と `readiness_forwarding_payload` を使って candidate body を生成する
-- candidate body は repo-relative file に保存する
+- `issue-editor` は current issue body と `reviewer_feedback_url` / `reviewer_feedback_text`、root Step 4 から受け取った `readiness_forwarding_payload` を読み、**同一 invocation 内で**変更候補を生成して repo-relative file に保存する。root の既存本文に対する `preflight-static` の `go` は候補の edit-ready 判定ではない。
 - `title_update.required == true` のときは current title、current body hash、current updatedAt を同一 pre-readback に束縛する。title-only は candidate body に current body を渡す。
-- body authoring rule は [`../create-issue/references/body-authoring.md`](../create-issue/references/body-authoring.md) を参照する
+- body authoring rule は [`../create-issue/references/body-authoring.md`](../create-issue/references/body-authoring.md) を参照する。
 
-### 2. helper を起動する
+### 2. 本文を変更する候補だけを transaction 前に full guard で検証する
+
+- current body と保存した候補の実際の内容を比較する。`new_body == current_body` の no-change / title-only / comment-only は本ステップの kind-aware guard と LP017 補充を**実行しない**。変更する候補を no-change として扱ってはならない。
+- `new_body != current_body` の場合は保存した候補ファイルに、transaction が使う既存の **full guard** をこの invocation 内で実行する（kind は body の Machine-Readable Contract から guard 自身が解決する）。`--orig-file` と `--check-ready-tuple` は渡さない。
+
+```bash
+uv run --locked python3 .claude/skills/edit-issue/scripts/guard-issue-body.py <candidate_body_file> --format json
+```
+
+- full guard は成功 exit 0 / validation exit 2、JSON の `all_passed` と `guards[]` を返す。exit 0 かつ `all_passed: true` の場合だけ次へ進む。exit 2 のとき `guards[]` の `name: issue_body_validation` にある `errors[].rule_id: LP017` を確認する（単体 `validate_issue_body.py` の exit 0 / validation exit 1、`status` / `errors[].rule_id` は body validator 部分だけの結果であり、full guard の代わりにはならない）。
+- LP017 がある場合だけ、`.github/ISSUE_TEMPLATE/implementation.yml` 等の**該当 kind の current template** にある `Stop Conditions` 標準項目を読み、候補の `## Stop Conditions` から不足している項目だけを補う。Issue 固有の追加条件と他の本文は保持する。LP017 のメッセージは先頭 3 件しか表示しないため、それだけを使って標準 6 件を再構成しない。修復候補を同じファイルに保存し、上記と同じ flags で full guard を再実行する。
+- 再検証が exit 0 / `all_passed: true` にならない場合、または LP017 以外の guard failure / runtime error が残る場合は**transaction に渡さず**既存の `failed` / `human_judgment_required` ルーティングで扱う。LP017 修復後でも全 guard を通す。最後の検証後に候補を変更した場合は、再び full guard を実行する。
+- **最後に検証した候補**ファイルを、その内容を変更せず `ISSUE_EDIT_TXN_INPUT_V1.new_body_file` に指定して controlled transaction へ渡す。別の候補を再生成して差し替えない。transaction 自身の guard → hygiene → static readiness → readback は省略しない。
+
+### 3. helper を起動する
 
 ```bash
 uv run --locked python3 .claude/skills/edit-issue/scripts/edit_issue_txn.py \

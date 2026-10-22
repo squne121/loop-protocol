@@ -614,6 +614,64 @@ def test_comment_publish_success_propagates_comment_id_url_body_sha(
     assert result["comment_publish"]["comment_body_sha256"] == "sha256:comment"
 
 
+@pytest.mark.parametrize("mode", ["no_change", "title_only", "comment_only"])
+def test_3006_legacy_unchanged_body_never_triggers_preedit_validation(
+    repo_tmp: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """GIVEN a legacy body missing template conditions WHEN unchanged THEN no guard/body rewrite."""
+    legacy_body = (
+        "## Machine-Readable Contract\n\n```yaml\nissue_kind: implementation\n```\n"
+        "\n## Stop Conditions\n\n- Local-only condition.\n"
+    )
+    payload = _minimal_input(repo_tmp, title_required=mode == "title_only")
+    (repo_tmp / "tmp" / "new_body.md").write_text(legacy_body, encoding="utf-8")
+    payload["expected_previous_body_sha256"] = txn._sha256_text(legacy_body)
+    if mode == "comment_only":
+        (repo_tmp / "tmp" / "comment.md").write_text("local marker", encoding="utf-8")
+        payload["comment_mode"] = {
+            "mode": "publish", "comment_body_file": "tmp/comment.md", "marker": "local marker"
+        }
+
+    calls: list[str] = []
+
+    def _fetch(*_args: object, **_kwargs: object) -> tuple[dict, str]:
+        return {
+            "title": "x" if mode == "title_only" and calls else "old",
+            "body": legacy_body,
+            "updatedAt": "2026-07-03T10:41:51Z" if mode == "title_only" and calls else "2026-07-03T10:40:51Z",
+        }, ""
+
+    def _invoke(command_id: str, *_args: object, **_kwargs: object) -> tuple[_CP, dict]:
+        calls.append(command_id)
+        if command_id == "issue_comment.publish":
+            result = {
+                "comment_id": "c-3006",
+                "comment_url": "https://example.com/c3006",
+                "body_sha256": "sha256:comment",
+            }
+        elif command_id == "issue_content.update" and mode == "title_only":
+            result = {"new_body_sha256": txn._sha256_text(legacy_body)}
+        else:
+            pytest.fail(f"unexpected mutation: {command_id}")
+        return _CP(0, stdout=json.dumps(result)), result
+
+    monkeypatch.setattr(txn, "_fetch_issue", _fetch)
+    monkeypatch.setattr(txn, "_invoke_controlled_exec", _invoke)
+    monkeypatch.setattr(
+        txn, "_run_command", lambda _args: pytest.fail("unchanged body must not run guard/hygiene/readiness")
+    )
+
+    result = txn.run_transaction(payload)
+    assert result["status"] == ("no_change" if mode == "no_change" else "ok")
+    assert result["body_update"]["new_body_sha256"] == txn._sha256_text(legacy_body)
+    expected_calls = {
+        "no_change": [],
+        "title_only": ["issue_content.update"],
+        "comment_only": ["issue_comment.publish"],
+    }
+    assert calls == expected_calls[mode]
+
+
 def test_body_unchanged_comment_publish_skips_body_update(
     repo_tmp: Path,
     monkeypatch: pytest.MonkeyPatch,
