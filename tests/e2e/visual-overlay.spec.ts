@@ -15,8 +15,9 @@
  * and the Issue #1386 contract): adding a `frozen` baseline for any final
  * overlay surface, and implementing the `final-no-command-rail` overlay UI
  * (#1377). `running-hud-paused` and `result-timeout` were promoted to
- * `active-fixture-only` / `legacy-current` by Issue #1376 (AC12) and are
- * captured below; `final-no-command-rail` remains `pending-fixture`
+ * `active-fixture-only` / `legacy-current` by Issue #1376 (AC12), then to
+ * registry `frozen` by Issue #1392, and are captured below;
+ * `final-no-command-rail` remains `pending-fixture`
  * (`VISUAL_SCENARIO_STATUS`) / `pending-baseline` (registry `maturity`)
  * and is only exercised as an explicit-pending / fail-closed proof (AC4) —
  * never captured.
@@ -66,6 +67,16 @@ const RUNNING_HUD_PAUSED_FIXTURE: VisualScenarioFixture = {
 }
 
 /**
+ * Issue #1392 AC2: the result screen's Duration is authoritative only as
+ * `elapsedTicks * fixedDeltaMs` (`src/systems/SortieSystem.ts`), so the
+ * fixture derives `durationMs` from the same two values instead of carrying
+ * an independently invented number.
+ */
+const RESULT_TIMEOUT_ELAPSED_TICKS = 900
+const RESULT_TIMEOUT_FIXED_DELTA_MS = 16
+const RESULT_TIMEOUT_DURATION_MS = RESULT_TIMEOUT_ELAPSED_TICKS * RESULT_TIMEOUT_FIXED_DELTA_MS
+
+/**
  * `active-fixture-only` (Scenario Support Matrix, Issue #1376 AC12 promotion)
  * — the result screen (`[data-phase-screen="result"]`) after a timeout-
  * terminal sortie, reward summary built from `RewardSystem.calculate()`.
@@ -74,7 +85,13 @@ const RESULT_TIMEOUT_FIXTURE: VisualScenarioFixture = {
   name: 'result-timeout',
   loopPhase: 'result',
   paused: false,
-  sortie: { status: 'timeout', elapsedTicks: 900, fixedDeltaMs: 16, durationMs: 14400, kills: 5 },
+  sortie: {
+    status: 'timeout',
+    elapsedTicks: RESULT_TIMEOUT_ELAPSED_TICKS,
+    fixedDeltaMs: RESULT_TIMEOUT_FIXED_DELTA_MS,
+    durationMs: RESULT_TIMEOUT_DURATION_MS,
+    kills: 5,
+  },
   player: { hp: 42, maxHp: 100 },
   progress: { resources: 30, weaponPower: 2 },
   telemetry: { status: '', summary: '' },
@@ -314,12 +331,13 @@ test.describe('AC8 boundary cell: 375x667 (minimum supported viewport)', () => {
 // #1376 built the pause dialog / result screen controller
 // (`src/ui/phaseScreens.ts`) that these captures now exercise. Both target
 // the same `[data-battle-ui-root]` DOM overlay root as the running-hud
-// capture above (registry `legacy-current`, not `frozen` — `frozen`
-// requires a merged PR SHA per docs/dev/visual-baseline-registry.md's
-// transition rules, deferred until after #1377 per the established
-// precedent for the other overlay rows).
+// capture above. Issue #1392 promoted both registry rows to `frozen` after
+// #1376/#1377 merged (docs/dev/visual-baseline-registry.md "#1392 frozen
+// 昇格"). These screenshots supplement, and never replace, the focus /
+// inert / dialog behavior tests in `tests/e2e/product-pause.spec.ts` and
+// `tests/e2e/m3-loop-mvp.spec.ts` (Issue #1392 AC3).
 
-test('GIVEN the running-hud-paused active-fixture-only scenario WHEN the DOM overlay root is captured THEN it matches the legacy-current pause dialog baseline (AC12)', async ({
+test('GIVEN the running-hud-paused active-fixture-only scenario WHEN the DOM overlay root is captured THEN it matches the frozen pause dialog baseline (AC12, #1392)', async ({
   page,
 }) => {
   await installVisualScenario(page, RUNNING_HUD_PAUSED_FIXTURE)
@@ -342,11 +360,18 @@ test('GIVEN the running-hud-paused active-fixture-only scenario WHEN the DOM ove
   })
 })
 
-test('GIVEN the result-timeout active-fixture-only scenario WHEN the DOM overlay root is captured THEN it matches the legacy-current result screen baseline (AC12)', async ({
+test('GIVEN the result-timeout active-fixture-only scenario WHEN the DOM overlay root is captured THEN it matches the frozen result screen baseline (AC12, #1392)', async ({
   page,
 }) => {
   await installVisualScenario(page, RESULT_TIMEOUT_FIXTURE)
   await page.goto('/')
+
+  // Issue #1392 AC2: the Duration cell is not masked in this frozen
+  // baseline, so assert its text is exactly elapsedTicks * fixedDeltaMs
+  // (formatted as src/ui/phaseScreens.ts does) before comparing pixels.
+  await expect(page.locator('[data-phase-screen="result"] [data-field="result-duration"]')).toHaveText(
+    `${(RESULT_TIMEOUT_DURATION_MS / 1000).toFixed(1)}s`,
+  )
 
   const overlayRoot = page.locator('[data-battle-ui-root]')
   // registryId + explicit maxDiffPixels: `result-overlay-timeout` is the
