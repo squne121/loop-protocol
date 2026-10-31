@@ -435,6 +435,7 @@ downstream skill（impl-review-loop・implement-issue・issue-contract-review・
 - raw anchor comment snapshot を reviewer feedback や title rewrite 入力へ直接流さない
 - `WEB_RESEARCH_RESULT_V1` の retry/fallback/attempt log は link-only とし、`#394` の責務へ越境しない
 - `max_iterations` 超過時は fail-close する
+- ad hoc scratch（本文 draft・anchor list・readback 等。canonical artifact は対象外で移動しない）は予測可能な固定 `/tmp/<name>` や cwd 直下の裸のファイル名へ書かず、invocation ごとに実作成した owned workspace の具体 path に置く。確立の順序は固定: (1) リポジトリ root で canonical `tmp/` root を idempotent に materialize（`mkdir -p tmp`）→ (2) その配下に atomic に実 directory を作成（`WORKSPACE=$(mktemp -d tmp/refinement-<N>.XXXXXX)`。`mktemp -u` のような name-only allocation は禁止。OS-temp が必要な場合も `mktemp -d` で実作成）。生成した具体 path は Bash call・agent・background consumer へ明示 handoff し（環境変数の暗黙持続に頼らない）、全 consumer と SubAgent の terminal join が完了するまで保持する。他 invocation の directory は片付けず（foreign cleanup 禁止）、自分の cleanup が不確実なら残置理由を記録して成果を失敗扱いしない。model 生成 scratch は確立後 Write / Edit を優先し、`gh ... > readback.json` のように stdout capture が必要な部分だけ Bash を使う。
 
 ## スコープ変更時の停止条件 (Scope Change Stop Conditions)
 
