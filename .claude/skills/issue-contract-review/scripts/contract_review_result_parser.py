@@ -461,6 +461,13 @@ TRUSTED_CONTRACT_PUBLISHERS: dict[int, dict[str, Any]] = {
         "expected_type": "User",
         "allowed_associations": frozenset({"OWNER"}),
     },
+    # #3062: repo-specific, immutable GitHub User ID from the bot's PR #3060.
+    # CONTRIBUTOR alone is never trusted; the entire identity tuple must match.
+    345302307: {
+        "expected_login": "squne-chatgpt-to-claudecode",
+        "expected_type": "User",
+        "allowed_associations": frozenset({"CONTRIBUTOR"}),
+    },
 }
 
 
