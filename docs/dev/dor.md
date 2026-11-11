@@ -181,6 +181,20 @@ $ test -f nonexistent_file.py
 
 exit 5（no tests collected）を「baseline で fail した」と解釈してはならない。テストが収集されていないだけであり、実装後もテストが収集されなければ exit 5 のまま変化しない（偽陽性）。
 
+### 複数入力の合流結果と独立 fixture
+
+複数の独立した入力レーン（例: HTML と Markdown の collector、HOME と XDG の設定探索）から同一値へ合流・重複排除・fallback する parser / collector / config 解決を扱う Issue では、合流後の aggregate result の PASS だけを全レーンが機能している証拠にしない。
+
+例（#3016）: HTML と Markdown の両方に同じ `P2` を含む合成 fixture では、Markdown collector だけが実装され HTML collector が欠落していても、重複排除後の aggregate result は `["P2"]` となり PASS する。この fixture では HTML lane の欠陥（mutant）を検出できない。#2966 の HOME / XDG 設定入力でも、両レーンを同時に満たす単一 regression が片側の欠陥を覆い隠す同系の false-green が起きた。
+
+Issue contract の AC / VC を書くときは、可能な範囲で次をそれぞれ直接 assert することを推奨する（全 Issue に対する mandatory gate ではない）。
+
+- **source-isolated positive**: 1 レーンだけに値を置いた fixture で、そのレーン単独で値が得られる（例: HTML-only → `["P2"]`、Markdown-only → `["P2"]`、HOME-only / XDG-only でそれぞれ設定が解決される）
+- **source-isolated negative**: 対象レーンに値が無い・不正な fixture で、そのレーン由来の値が得られない
+- **aggregation / dedup**: mixed duplicate（例: HTML と Markdown の両方に `P2`）で重複排除・優先順位・fallback の挙動が期待どおりになる
+
+実装時の test-first behavioral RED は、上記テストが収集・実行されたうえで assertion failure（pytest exit 1）になることを指す。テスト未作成・未収集による exit 5 は RED の証拠にならない（[pytest exit code semantics](#pytest-exit-code-semantics終了コードの意味論) 参照）。
+
 ## Allowed Paths
 
 ### 機械判定可能な条件
