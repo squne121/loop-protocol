@@ -9,6 +9,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 _SCRIPT = _SCRIPTS_DIR / "repair_issue_contract.py"
@@ -496,27 +497,81 @@ def _run_ric_899(body):
         _os.unlink(p)
 
 
-def _run_bvp_899(body, strict=False):
+# Producer script path relative to the repository root. Its *existence* is the
+# deterministic root sentinel (Issue #3023): a stray/nested `.claude` directory
+# (e.g. `<root>/.claude/.claude/` or `<root>/.claude/skills/.../scripts/.claude/`)
+# never contains this file, and unlike `.git` it also exists in a clean
+# `git archive` export.
+_BVP_SCRIPT_REL = ".claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py"
+
+
+class BvpHelperError(AssertionError):
+    """Diagnosable failure of the baseline_vc_preflight.py test helper (Issue #3023)."""
+
+
+def _resolve_bvp_root(start=None):
+    """Return the nearest ancestor of ``start`` that contains the real producer script.
+
+    ``start`` is the search *starting point* (default: this test file); it is injectable
+    so fixtures can point it at a real file inside a synthetic tree. This is deliberately
+    a small test-local function, not a generic repository-root resolver.
+    """
+    origin = Path(start if start is not None else __file__).resolve()
+    for candidate in (origin, *origin.parents):
+        if (candidate / _BVP_SCRIPT_REL).is_file():
+            return candidate
+    raise BvpHelperError(
+        f"baseline_vc_preflight.py root not found: no ancestor of {origin} contains "
+        f"{_BVP_SCRIPT_REL}"
+    )
+
+
+def _invoke_bvp_899(root, body, strict=False):
+    """Run the real producer found under ``root`` with ``cwd=root`` and return its JSON.
+
+    The producer's own non-zero exit with a valid JSON document (e.g. strict-mode
+    ``status: blocked`` exit 1) is an expected response and is returned as-is. A missing
+    script, empty outer stdout, or non-JSON / corrupt / non-object output raises
+    ``BvpHelperError`` carrying script path, returncode, stderr (and stdout when useful).
+    """
     import subprocess as _sp
     import json as _json
     import tempfile as _tf
     import os as _os
     import sys as _sys
-    root = Path(__file__).resolve()
-    while root != root.parent and not (root / ".claude").is_dir():
-        root = root.parent
-    script = str(root / ".claude/skills/issue-contract-review/scripts/baseline_vc_preflight.py")
+    root = Path(root)
+    script = root / _BVP_SCRIPT_REL
+    if not script.is_file():
+        raise BvpHelperError(f"baseline_vc_preflight.py script not found: {script} (root={root})")
     with _tf.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
         f.write(body)
         p = f.name
     try:
-        argv = [_sys.executable, script, "--body-file", p]
+        argv = [_sys.executable, str(script), "--body-file", p]
         if strict:
             argv.append("--strict")
-        r = _sp.run(argv, capture_output=True, text=True)
-        return _json.loads(r.stdout)
+        r = _sp.run(argv, capture_output=True, text=True, cwd=str(root))
+        diag = f"script={script} returncode={r.returncode} stderr={r.stderr!r}"
+        if not r.stdout.strip():
+            raise BvpHelperError(f"baseline_vc_preflight.py produced empty stdout: {diag}")
+        try:
+            data = _json.loads(r.stdout)
+        except ValueError as exc:
+            raise BvpHelperError(
+                f"baseline_vc_preflight.py stdout is not valid JSON ({exc}): {diag} stdout={r.stdout!r}"
+            ) from exc
+        if not isinstance(data, dict):
+            raise BvpHelperError(
+                f"baseline_vc_preflight.py stdout is not a JSON object: {diag} stdout={r.stdout!r}"
+            )
+        return data
     finally:
         _os.unlink(p)
+
+
+def _run_bvp_899(body, strict=False, start=None):
+    """Resolve the repository root once, then run the real producer with that same root as cwd."""
+    return _invoke_bvp_899(_resolve_bvp_root(start), body, strict=strict)
 
 
 def _result_for_899(data, needle):
@@ -571,6 +626,192 @@ def test_rg_exit2_new_file():
     it = _result_for_899(data, "rg-exit2-ac18-899.md")
     assert it is not None, data
     assert it["category"] == "missing_baseline_expect_for_new_allowed_path", it
+
+
+# ---------------------------------------------------------------------------
+# Issue #3023: _run_bvp_899() must not mistake a stray/nested `.claude` directory
+# for the repository root, and must evaluate VCs in the same root it resolved.
+# ---------------------------------------------------------------------------
+
+_BVP_SYNTH_START_REL = ".claude/skills/issue-refinement-loop/scripts/tests/test_repair_issue_contract.py"
+
+# The two known stray `.claude` placements (see #2071 and #3020).
+_BVP_NESTED_CLAUDE_PLACEMENTS = {
+    "root_claude_claude": ".claude/.claude",
+    "scripts_nested_claude": ".claude/skills/issue-refinement-loop/scripts/.claude",
+}
+
+_BVP_NEW_PATH_BODY = (
+    "## Verification Commands\n\n```bash\n$ test -f docs/dev/new-path-3023.md\n```\n\n"
+    "## Allowed Paths\n\n- `docs/dev/new-path-3023.md`\n"
+)
+_BVP_RG_NEW_PATH_BODY = (
+    "## Verification Commands\n\n```bash\n$ rg somepattern docs/dev/rg-new-3023.md\n```\n\n"
+    "## Allowed Paths\n\n- `docs/dev/rg-new-3023.md`\n"
+)
+
+
+def _make_synthetic_bvp_tree(tmp_path, nested_rel):
+    """Build `<tmp>/synth` holding real producer + its real import dependencies, plus a stray
+    nested `.claude` directory at ``nested_rel``. Everything stays inside ``tmp_path``.
+
+    Returns (synthetic_root, search_start) where ``search_start`` is a real file inside the
+    synthetic tree (not a chdir, not a symlink to the real test file).
+    """
+    import shutil as _sh
+
+    real = _resolve_bvp_root()
+    synth = tmp_path / "synth"
+    bvp_dir = synth / Path(_BVP_SCRIPT_REL).parent
+    bvp_dir.mkdir(parents=True)
+    for src in (real / Path(_BVP_SCRIPT_REL).parent).glob("*.py"):
+        _sh.copy2(src, bvp_dir / src.name)
+    agent_ops = synth / "scripts" / "agent-ops"
+    agent_ops.mkdir(parents=True)
+    _sh.copy2(real / "scripts/agent-ops/allowed_paths_policy.py", agent_ops / "allowed_paths_policy.py")
+    create_issue = synth / ".claude/skills/create-issue/scripts"
+    create_issue.mkdir(parents=True)
+    _sh.copy2(
+        real / ".claude/skills/create-issue/scripts/prose_boundary_policy.py",
+        create_issue / "prose_boundary_policy.py",
+    )
+    start = synth / _BVP_SYNTH_START_REL
+    start.parent.mkdir(parents=True)
+    _sh.copy2(Path(__file__).resolve(), start)  # a real regular file, not a symlink
+    stray = synth / nested_rel
+    stray.mkdir(parents=True)
+    (stray / "stray-artifact.txt").write_text("stray\n", encoding="utf-8")
+    return synth, start
+
+
+def _legacy_first_dot_claude_ancestor(start):
+    """Re-implementation of the pre-#3023 heuristic, used only to prove the fixture is polluting."""
+    root = Path(start).resolve()
+    while root != root.parent and not (root / ".claude").is_dir():
+        root = root.parent
+    return root
+
+
+@pytest.mark.parametrize("placement", sorted(_BVP_NESTED_CLAUDE_PLACEMENTS))
+def test_bvp_root_resolution_ignores_nested_claude_resolves_real_producer(tmp_path, placement):
+    """AC1: with either nested `.claude` placement, root resolution picks the synthetic repo
+    root (not an intermediate ancestor) and a real, existing producer script inside it."""
+    synth, start = _make_synthetic_bvp_tree(tmp_path, _BVP_NESTED_CLAUDE_PLACEMENTS[placement])
+
+    # Fixture self-check: the legacy `.claude`-only heuristic would stop at a wrong ancestor.
+    legacy = _legacy_first_dot_claude_ancestor(start)
+    assert legacy != synth and not (legacy / _BVP_SCRIPT_REL).exists(), (legacy, synth)
+
+    root = _resolve_bvp_root(start)
+    assert root == synth.resolve()
+    assert (root / _BVP_SCRIPT_REL).is_file()
+    assert tmp_path.resolve() in root.parents
+
+
+@pytest.mark.parametrize("placement", sorted(_BVP_NESTED_CLAUDE_PLACEMENTS))
+@pytest.mark.parametrize(
+    "body",
+    [_BVP_NEW_PATH_BODY, _BVP_RG_NEW_PATH_BODY],
+    ids=["test_f_new_path", "rg_new_path"],
+)
+def test_bvp_root_resolution_ignores_nested_claude_runs_real_producer(tmp_path, placement, body):
+    """AC3: _run_bvp_899() (root resolution -> real producer subprocess) yields the strict
+    new-Allowed-Path classification regardless of nested `.claude` pollution. The real
+    producer's exit 1 + blocked JSON is inspected as JSON, not raised."""
+    synth, start = _make_synthetic_bvp_tree(tmp_path, _BVP_NESTED_CLAUDE_PLACEMENTS[placement])
+    data = _run_bvp_899(body, strict=True, start=start)
+    assert data.get("status") == "blocked", data
+    results = data.get("results", [])
+    assert results, data
+    assert results[0].get("decision") == "blocked", results[0]
+    assert results[0].get("classification") == "blocked", results[0]
+    assert results[0].get("category") == "missing_baseline_expect_for_new_allowed_path", results[0]
+
+
+def test_bvp_root_resolution_ignores_nested_claude_cwd_is_resolved_root(tmp_path, monkeypatch):
+    """AC2: the VC evaluation cwd is the resolved root, not the caller cwd. A same-named file
+    that exists only under the caller cwd must not change the classification, and a file that
+    exists only under the resolved root must."""
+    synth, start = _make_synthetic_bvp_tree(tmp_path, _BVP_NESTED_CLAUDE_PLACEMENTS["scripts_nested_claude"])
+    rel = "docs/dev/new-path-3023.md"
+
+    caller = tmp_path / "caller_cwd"
+    (caller / "docs/dev").mkdir(parents=True)
+    (caller / rel).write_text("caller-only\n", encoding="utf-8")
+    monkeypatch.chdir(caller)
+    assert (Path.cwd() / rel).exists() and not (synth / rel).exists()
+
+    caller_only = _run_bvp_899(_BVP_NEW_PATH_BODY, strict=True, start=start)
+    assert caller_only["results"][0]["category"] == "missing_baseline_expect_for_new_allowed_path", caller_only
+
+    (synth / "docs/dev").mkdir(parents=True)
+    (synth / rel).write_text("root-side\n", encoding="utf-8")
+    (caller / rel).unlink()
+    root_side = _run_bvp_899(_BVP_NEW_PATH_BODY, strict=True, start=start)
+    assert root_side["results"][0]["category"] != "missing_baseline_expect_for_new_allowed_path", root_side
+
+
+def test_bvp_root_resolution_ignores_nested_claude_unresolvable_start_is_diagnosed(tmp_path, monkeypatch):
+    """AC4: no ancestor holds the producer script -> diagnosable failure naming the start path."""
+    # tmp_path may live inside the real repo (repo-local --basetemp), whose ancestors hold the
+    # real producer. Swap the sentinel for this test only so the negative fixture is
+    # independent of the pytest basetemp location (module-global lookup; restored by pytest).
+    sentinel = ".claude/__issue3023_nonexistent_sentinel__/baseline_vc_preflight.py"
+    monkeypatch.setitem(globals(), "_BVP_SCRIPT_REL", sentinel)
+    lonely = tmp_path / "lonely" / "file.py"
+    lonely.parent.mkdir()
+    lonely.write_text("", encoding="utf-8")
+    assert all(not (p / sentinel).exists() for p in (lonely.resolve(), *lonely.resolve().parents))
+    with pytest.raises(BvpHelperError) as ei:
+        _run_bvp_899("x", start=lonely)
+    msg = str(ei.value)
+    assert str(lonely.resolve()) in msg and sentinel in msg, msg
+
+
+def test_bvp_root_resolution_ignores_nested_claude_missing_script_is_diagnosed(tmp_path):
+    """AC4: invoking against a root whose producer script is absent fails with the script path."""
+    with pytest.raises(BvpHelperError) as ei:
+        _invoke_bvp_899(tmp_path, "x")
+    assert str(tmp_path / _BVP_SCRIPT_REL) in str(ei.value), str(ei.value)
+
+
+def _make_stub_bvp_root(tmp_path, stub_source):
+    root = tmp_path / "stub_root"
+    script = root / _BVP_SCRIPT_REL
+    script.parent.mkdir(parents=True)
+    script.write_text(stub_source, encoding="utf-8")
+    return root, script
+
+
+@pytest.mark.parametrize(
+    "stub_source, expected_returncode, expected_fragment",
+    [
+        ("import sys\nsys.stderr.write('boom-stderr')\nsys.exit(2)\n", "returncode=2", "boom-stderr"),
+        ("print('not json at all')\n", "returncode=0", "not json at all"),
+        ("print('{\"status\": \"blo')\n", "returncode=0", '"status": "blo'),
+        ("print('[1, 2]')\n", "returncode=0", "[1, 2]"),
+    ],
+    ids=["empty_stdout_exit2", "non_json", "corrupt_json", "non_object_json"],
+)
+def test_bvp_root_resolution_ignores_nested_claude_abnormal_outputs_are_diagnosed(
+    tmp_path, stub_source, expected_returncode, expected_fragment
+):
+    """AC4: empty outer stdout / non-JSON / corrupt JSON / non-object JSON raise a diagnosed
+    failure (script path, returncode, stderr, stdout) instead of returning {} or a success."""
+    root, script = _make_stub_bvp_root(tmp_path, stub_source)
+    with pytest.raises(BvpHelperError) as ei:
+        _invoke_bvp_899(root, "x")
+    msg = str(ei.value)
+    assert str(script) in msg, msg
+    assert expected_returncode in msg, msg
+    assert expected_fragment in msg, msg
+
+
+def test_bvp_root_resolution_ignores_nested_claude_expected_exit1_json_is_not_raised(tmp_path):
+    """AC4: a producer exit 1 with valid blocked JSON is an expected response, not an error."""
+    stub = "import json, sys\nprint(json.dumps({'status': 'blocked', 'results': []}))\nsys.exit(1)\n"
+    root, _script = _make_stub_bvp_root(tmp_path, stub)
+    assert _invoke_bvp_899(root, "x") == {"status": "blocked", "results": []}
 
 
 def test_insert_baseline_expect_fail_for_new_allowed_path():
