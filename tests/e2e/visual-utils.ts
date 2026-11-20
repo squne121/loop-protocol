@@ -189,12 +189,12 @@ export const VISUAL_BASELINE_REGISTRY_MATURITY: Readonly<
 > = {
   'timeout-overlay': 'frozen',
   'running-hud': 'legacy-current',
-  // Issue #1376 AC12: promoted 'pending-baseline' -> 'legacy-current' (not
-  // 'frozen' -- frozen requires a merged PR SHA per
-  // docs/dev/visual-baseline-registry.md's transition rules, deferred to
-  // after #1377 per established precedent for the other overlay rows).
-  'running-hud-paused': 'legacy-current',
-  'result-overlay-timeout': 'legacy-current',
+  // Issue #1376 AC12: promoted 'pending-baseline' -> 'legacy-current'.
+  // Issue #1392: promoted 'legacy-current' -> 'frozen' after #1376/#1377
+  // merged (baseline PNGs last written by merged commit f9c7a42 / PR #2006;
+  // see docs/dev/visual-baseline-registry.md "#1392 frozen 昇格").
+  'running-hud-paused': 'frozen',
+  'result-overlay-timeout': 'frozen',
   'final-no-command-rail': 'pending-baseline',
   'running-hud-overlay-legacy-current': 'legacy-current',
   // Issue #1958 AC8: boundary-cell captures share the SAME maturity as the

@@ -112,8 +112,8 @@ registry は推測ではなく現行テスト実体に基づいて分類する�
 | running-hud-overlay-legacy-current-375x667 | screenshot-baseline | legacy-current | `tests/e2e/__screenshots__/visual-overlay.spec.ts/vrt-running-hud-overlay-375x667.png`（`tests/e2e/visual-overlay.spec.ts` の `AC8 boundary cell: 375x667` describe block） | #1958 | `running-hud-overlay-legacy-current` と同一の capture root / fixture を、`Supported minimum viewport`（375x667、AC7/AC8 の最小サポート境界）で描画すること | 色味 / 詳細配置は再設計まで可変。将来の overlay 再設計で `frozen` 化するまでは legacy-current のまま | `maxDiffPixels: 100`（同上） | §4 の `maturity transition` を満たした時点で `legacy-current -> frozen`（`running-hud-overlay-legacy-current` と同時遷移） | #1375 / #1376 / #1377 / #1380 |
 | defeat-overlay | pixel-contract | predicate-only | `getImageData` smoke（`m2-combat-mvp.spec.ts` の defeat overlay 赤支配ピクセル検証 / AC8） | #681 / #732 | defeat overlay が赤系・終端状態として識別可能であること | exact pixels は未固定。最終 layout / 色味は未確定 | N/A（screenshot baseline ではない） | predicate（赤支配）が壊れた場合のみテスト側を調整 | #727 |
 | hp-label | predicate-only | predicate-only | HP label bounds smoke（`m2-combat-mvp.spec.ts` の HP label bounding box 検証 / AC5） | #726 / #727 | HP label が viewport 外 / NaN 表示にならない・bounds 内・可読であること | 最終 UI 表現 / 配置は未固定 | N/A（screenshot baseline ではない） | predicate（bounds / 可読）が壊れた場合のみテスト側を調整 | #727 |
-| running-hud-paused | screenshot-baseline | legacy-current | `tests/e2e/__screenshots__/visual-overlay.spec.ts/vrt-running-hud-paused-overlay.png`（`tests/e2e/visual-overlay.spec.ts` の `[data-battle-ui-root]` DOM overlay baseline test。Issue #1376 AC12 で active 昇格） | #1380 / #1375 / #1376 / #1377 / #1391 | running HUD の停止状態でも command-rail / right rail / two-column shell / `.battle-stage` 外 controls への依存がないことを明示し、pause dialog（`role="dialog"`、Resume 初期 focus、Canvas/combat HUD inert 化）が描画されること | 色味 / 詳細配置は再設計まで可変。将来の overlay 再設計で `frozen` 化するまでは legacy-current のまま | `maxDiffPixels: 100`（絶対ピクセル数。`running-hud-overlay-legacy-current` と同じ capture root・同じ理由で採用。ローカル環境で複数回実測し PASS した） | §4 の `maturity transition` を満たした時点で `legacy-current -> frozen`（#1377 マージ後） | #1370 / #1375 / #1376 / #1377 / #1380 |
-| result-overlay-timeout | screenshot-baseline | legacy-current | `tests/e2e/__screenshots__/visual-overlay.spec.ts/vrt-result-timeout-overlay.png`（`tests/e2e/visual-overlay.spec.ts` の `[data-battle-ui-root]` DOM overlay baseline test。Issue #1376 AC12 で active 昇格） | #1380 / #1376 / #1377 / #1392 | result overlay timeout の timeout 時間表現を `durationMs` / `fixedDeltaMs`（`RewardSystem.calculate()` の戻り値経由）から構築し、result dialog（`role="dialog"`、`tabindex="-1"` heading 初期 focus、Return to hangar 厳密1件）が描画されること | 色味 / 詳細配置は再設計まで可変。将来の overlay 再設計で `frozen` 化するまでは legacy-current のまま | `maxDiffPixels: 100`（絶対ピクセル数。`running-hud-overlay-legacy-current` と同じ capture root・同じ理由で採用。ローカル環境で複数回実測し PASS した） | §4 の `maturity transition` を満たした時点で `legacy-current -> frozen`（#1377 マージ後） | #1380 / #1376 / #1377 |
+| running-hud-paused | screenshot-baseline | frozen | `tests/e2e/__screenshots__/visual-overlay.spec.ts/vrt-running-hud-paused-overlay.png`（`tests/e2e/visual-overlay.spec.ts` の `[data-battle-ui-root]` DOM overlay baseline test。Issue #1376 AC12 で active 昇格、Issue #1392 で frozen 昇格） | #1380 / #1375 / #1376 / #1377 / #1391 / #1392 | pause dialog（`role="dialog"`、Resume 初期 focus、Canvas/combat HUD inert 化）が battle-ui overlay 内に描画されること。旧レール / 2カラム shell 依存の除外は #1377 マージで確認済み（下記「#1392 frozen 昇格」参照）。HUD の Elapsed 表示は `elapsedTicks * fixedDeltaMs` 由来で、mask しない | 意図した視覚仕様変更（§4 checklist 経由の人間レビュー）以外は固定 | `maxDiffPixels: 100`（絶対ピクセル数。`running-hud-overlay-legacy-current` と同じ capture root・同じ理由で採用。ローカル環境で複数回実測し PASS した） | 意図した視覚仕様変更を人間がレビューし承認した場合のみ（§4 checklist 経由） | #1380 |
+| result-overlay-timeout | screenshot-baseline | frozen | `tests/e2e/__screenshots__/visual-overlay.spec.ts/vrt-result-timeout-overlay.png`（`tests/e2e/visual-overlay.spec.ts` の `[data-battle-ui-root]` DOM overlay baseline test。Issue #1376 AC12 で active 昇格、Issue #1392 で frozen 昇格） | #1380 / #1376 / #1377 / #1392 | result overlay timeout の Duration 表示が `elapsedTicks * fixedDeltaMs`（`durationMs`、`SortieSystem` と同じ導出）から構築され mask されないこと（spec が screenshot 前に Duration テキストを明示検証する）。result dialog（`role="dialog"`、`tabindex="-1"` heading 初期 focus、Return to hangar 厳密1件）が描画されること | 意図した視覚仕様変更（§4 checklist 経由の人間レビュー）以外は固定 | `maxDiffPixels: 100`（絶対ピクセル数。`running-hud-overlay-legacy-current` と同じ capture root・同じ理由で採用。ローカル環境で複数回実測し PASS した） | 意図した視覚仕様変更を人間がレビューし承認した場合のみ（§4 checklist 経由） | #1380 |
 | final-no-command-rail | screenshot-baseline | pending-baseline | pending: no PNG/test | #1380 / #1370 / #1377 | 最終結果画面が `command rail` 未依存でも意図読取できること。right rail / battle-stage 外依存は frozen 禁止条件 | #1370 / #1377 の影響条件を満たすまで固定化しない | pending: no PNG/test（active PASS claim 保留） | `merged PR SHA` と `artifact URL` / `artifact digest` / `environment fingerprint` が確定した時点で `legacy-current -> frozen` | #1380 / #1370 / #1377 |
 | combat-hud-running (component VRT) | screenshot-baseline | provisional | `tests/component/__screenshots__/combat-hud-running.vrt.test.ts/`（`tests/component/combat-hud-running.vrt.test.ts`。Vitest Browser Mode、Playwright E2E VRT とは別の baseline root） | #1389 / #1380 / #1370 | `createHudController()` の production DOM を `src/style.css` 適用済みで mount し、`[data-combat-hud]` のみを撮影すること（full page / Canvas / legacy result surface / command rail は撮影しない） | 色味 / 詳細配置は UI 再設計まで可変。`combat-hud-running` 以外のシナリオは本 Issue の Out of Scope | `allowedMismatchedPixelRatio: 0.02` + `allowedMismatchedPixels: 48`（Issue #2014、Vitest Browser Mode `toMatchScreenshot()` は両者を併記した場合、厳しい方を採用する。理由: PR #2024 OWNER REQUEST_CHANGES で、比率単独（1280x212 capture で実効 ~5,427px）は HULL/Pause/elapsed の欠落を 許容してしまうと指摘された。CI ピン留め canonical environment 内で 3 回連続の fresh-run vs 既存 baseline diff を `allowedMismatchedPixels: 0` で実測した結果は 0px（真のノイズ床）。48px は その 0px 床に対する安全マージンであり、同一環境で実測した最小の critical subregion （elapsed ~1,240px²）よりも一桁以上小さい。env-gated mutation negative-control lane が HULL / Pause / elapsed を個別に隠して同じ baseline に対する `toMatchScreenshot()` が実際に mismatch する ことを証明する） | component VRT は non-required/report-only（`component-vrt-report` CI job）のままである限り maturity 遷移条件は適用しない。required gate 化する場合は別 Issue で本行を frozen 遷移条件つきに更新する | #1380（VRT rollout tracker） |
 
@@ -145,7 +145,7 @@ frozen 昇格レビューでは、表の行とは別に以下の補助情報を 
 AC 補助行（確認シグナル）:
 台帳の分類確認として、`predicate-only` と `frozen` / `provisional` / `legacy-current` / `pending-baseline` は全行で定義する。
 右 rail 依存の確認として、`command-rail` / `right rail` / `two-column` / `battle-stage` の依存は frozen 前提で許容しない。
-予約行の確認として、`final-no-command-rail` は `pending-baseline` で `pending: no PNG/test` と明記する（`running-hud-paused` / `result-overlay-timeout` は Issue #1376 AC12 で `legacy-current` へ昇格済み。下記「running-hud-paused / result-overlay-timeout の #1376 baseline 更新（明示）」参照）。
+予約行の確認として、`final-no-command-rail` は `pending-baseline` で `pending: no PNG/test` と明記する（`running-hud-paused` / `result-overlay-timeout` は Issue #1376 AC12 で `legacy-current` へ昇格し、Issue #1392 で `frozen` へ昇格済み。下記「running-hud-paused / result-overlay-timeout の #1392 frozen 昇格（明示）」参照）。
 既存 predicate の確認として、`defeat-overlay` と `hp-label` は `predicate-only` のまま維持し、`screenshot-baseline` へ再分類しない。
 既存行維持の確認として、`timeout-overlay` / `running-hud` / `defeat-overlay` / `hp-label` は既存列挙を維持し、判定行を分割更新しない。
 親子 Issue 連鎖の確認として、`#1370` / `#1375` / `#1377` / `#1380` の影響を `spec` / `invalidated_by` に保持する。
@@ -174,6 +174,8 @@ rows = [
 # promoted pending-baseline -> legacy-current (real committed PNG + active
 # test). final-no-command-rail remains the sole pending-baseline reservation
 # row (#1377, Out of Scope for #1376).
+# Issue #1392: running-hud-paused / result-overlay-timeout promoted
+# legacy-current -> frozen after #1376/#1377 merged.
 required_pending = {
     "final-no-command-rail",
 }
@@ -201,7 +203,7 @@ for rid in required_pending:
 for rid in required_promoted_active:
     assert rid in by_id, f"missing promoted row: {rid}"
     row = by_id[rid]
-    assert row[2] == "legacy-current", f"{rid}: maturity must be legacy-current after AC12 promotion"
+    assert row[2] == "frozen", f"{rid}: maturity must be frozen after #1392 promotion"
     assert "__screenshots__" in row[3] and ".png" in row[3], f"{rid}: must point to a committed PNG"
     assert "pending: no PNG/test" not in row[3], f"{rid}: must not still claim pending"
 
@@ -471,6 +473,58 @@ controller（`src/ui/phaseScreens.ts`）を実装した。この実装により�
   発生した場合は、#1374/#1375 の前例（本ファイル上記セクション）と同様に CI
   `test-results` artifact の `*-actual.png` を最終 baseline として採用する運用を
   適用する。
+
+### running-hud-paused / result-overlay-timeout の #1392 frozen 昇格（明示）
+
+Issue #1392 は、#1376（PR #1984, `c9f074e`）と #1377（PR #1998, `1c4f938`）のマージ後に、
+pause overlay（`running-hud-paused`）と result overlay timeout（`result-overlay-timeout`）
+の 2 行を `frozen` に昇格する。baseline PNG は新規生成・再生成していない（既存 committed
+PNG をそのまま正本として採用する）。
+
+- **old maturity**: `legacy-current`（両行とも）
+- **new maturity**: `frozen`（両行とも）。`tests/e2e/visual-utils.ts` の
+  `VISUAL_BASELINE_REGISTRY_MATURITY` も同時に `frozen` へ更新した。
+- **transition reason**: 上記「#1376 baseline 更新」が `frozen` 昇格の据え置き条件とした
+  #1377 がマージ済みであり、両 overlay とも最終 battle-ui overlay として実装済み。
+- **merged PR SHA**（baseline PNG を最後に書き込んだマージ済みコミット）: `f9c7a42`
+  （#1958 / PR #2006）。それ以前の書込み: `10925fb`（PR #1996）、`c9f074e`（PR #1984）。
+  `f9c7a42` 以降の UI 関連変更は `01b8633`（#2023、VRT fixture 適用の attestation
+  marker 追加）のみ。
+- **committed PNG sha256**:
+  - `vrt-running-hud-paused-overlay.png`: `4522b2416771cb67e32c866e5ab7b3be45c8ead431254ab39d5afad77d579f91`
+  - `vrt-result-timeout-overlay.png`: `f8c7d621b32e0b56d6e6468ac6a6a415e9ba9c53234977b7443d6c7817a2327d`
+- **visual content review**: 両 PNG を目視確認した。いずれも約 1230x693 の
+  `[data-battle-ui-root]` capture であり、#1376 時点の known limitation（canvas mask に
+  よる全面 magenta 塗り）は #1980 の `canvasVisibility: 'hidden'` 化で解消済み。
+  pause: `PAUSED` dialog・Resume（focus ring 付き）・inert 化された背面 combat HUD
+  （HULL 80/100、Elapsed `14.4 s`）。result: `戦闘終了` heading（focus 枠付き）・
+  KILLS 5・DURATION `14.4s`・BASE 30・KILL BONUS 25・HP BONUS 0・TOTAL 55・
+  Return to hangar 1 件。
+- **right-rail dependency**: なし。両 dialog は battle-ui overlay 内の `role="dialog"`
+  panel であり、旧 command rail は #1377 で削除済み。
+- **capture root**: `[data-battle-ui-root]`。
+- **determinism controls**: `installVisualScenario()` fixture、
+  `assertVisualScenarioAttested()`（receipt / state / pause 時の Canvas `inert` 検証）、
+  `tests/e2e/visual.freeze.css`、`canvasVisibility: 'hidden'`、`maxDiffPixels: 100`。
+- **duration / timer source**（`elapsedTicks` / `durationMs` / `fixedDeltaMs`）:
+  result の Duration は production と同じく `durationMs = elapsedTicks * fixedDeltaMs`
+  （`src/systems/SortieSystem.ts`）。`tests/e2e/visual-overlay.spec.ts` の
+  `RESULT_TIMEOUT_FIXTURE` は `durationMs` を独立した値ではなく
+  `RESULT_TIMEOUT_ELAPSED_TICKS * RESULT_TIMEOUT_FIXED_DELTA_MS`（900 * 16 = 14400ms）
+  から導出し、screenshot 比較の前に `[data-field="result-duration"]` が `14.4s` である
+  ことを明示検証する。pause 背面の HUD Elapsed も `elapsedTicks * fixedDeltaMs` 由来
+  （fixture の `fixedDeltaMs` が timer authority）。いずれも mask しない。
+- **behavior tests are not replaced**: `focus` / `inert` / `keyboard` / `dialog` の
+  振る舞いは screenshot で代替しない。pause は `tests/e2e/product-pause.spec.ts`
+  （`role="dialog"`・Canvas/combat HUD inert・Resume への focus 移動・invoker への
+  focus 復帰）、result は `tests/e2e/m3-loop-mvp.spec.ts`（result heading の
+  `toBeFocused()`）が引き続き正本の振る舞い検証である。
+- **evidence status**: `pending`。このセッションの環境では `node_modules` / `dist` が
+  なく、`pnpm install` も実行できなかったため、`pnpm test:vrt:e2e` を実行していない。
+  `artifact URL` / `artifact digest` / `environment fingerprint`（CI e2e job の
+  summary）は、§「pending-baseline / legacy-current の遷移規則」どおり、この昇格 PR の
+  CI 実行から PR 本文へ添付し、マージ前にレビューで確認すること。CI で mismatch が
+  出た場合は本昇格を保留し、§4 checklist に従って baseline を扱う。
 
 ### running-hud-overlay-legacy-current の canvas mask capture defect 修正（Issue #1980、明示）
 
