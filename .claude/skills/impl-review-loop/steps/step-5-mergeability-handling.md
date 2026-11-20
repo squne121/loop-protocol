@@ -161,6 +161,26 @@ Issue #1870（#1856）: `route_loop_verdict_v2()` は `test_verdict` を一切�
 | `conflict_hard_stop` | `mergeable == CONFLICTING` または `merge_state_status == DIRTY`（**verdict に関係なく最優先で評価**） | CONFLICTING PR Escalation Runbook 発動（actual conflict のみ hard stop。#1860 Owner Decision） |
 | `fail_closed` | schema 不正、`APPROVE` かつ `blockers` 非空、`mergeability_unknown`、`BLOCKED`/`UNSTABLE`/`DRAFT` | `decision.reason_code` を warning として記録。`mergeability_unknown` は bounded retry（最大 3 回、5 秒間隔）後も `fail_closed` のままなら warning に格下げして継続。`BLOCKED`/`UNSTABLE`/`DRAFT` は current-head required-CI / branch-protection evaluator の判定に委ね、human escalation にはしない |
 
+### `UNSTABLE` + `MERGEABLE` の限定 opt-in 経路（`--verify-required-ci-live`、#3074）
+
+既定では `UNSTABLE` は上記のとおり `fail_closed`（defer to CI evaluator）のままである。
+current-head の required CI が完全 PASS でも GitHub が `UNSTABLE` を返し続ける場合
+（例: 旧 run の失敗・キャンセルや非必須 check の失敗が同一 HEAD に残る場合）に限り、
+`adjudicate_vc_result.py step5-terminal-gate` へ明示的に `--verify-required-ci-live`
+（`--expected-pr-number` 必須）を付けた場合だけ例外経路を使える。
+
+- CLI 自身が固定引数で `wait_ci_checks.py --required`（repo `squne121/loop-protocol`、同一 PR・同一 HEAD、bounded）を
+  その場で読み取り専用実行する。実 exit 0 かつ整合した `CI_WAIT_RESULT_V1`（`status: passed`、
+  `required_only: true`、全 check が `SUCCESS`、PR・HEAD 一致）のときだけ `UNSTABLE`+`MERGEABLE` が `approved` になる。
+- 外部の「PASS」JSON ファイルや boolean は approval source にならない。`live_mergeability` 内に
+  `required_ci_proof` を埋め込んでも gate が破棄する。`merge_state_status` 等の live 値は書き換えない。
+- required context の未 materialize・失敗・pending・権限/API/timeout による取得不能・別 PR/別 HEAD・壊れた JSON は
+  従来どおり `fail_closed`。この場合は停止し、CI を成功へ読み替えない。
+- `DIRTY`/`CONFLICTING`、`BLOCKED`/`DRAFT`/`UNKNOWN`、stale review・HEAD、dispatch seq、Issue body/command hashes、
+  VC gate は従来どおり。`CLEAN`/`HAS_HOOKS` は opt-in なしで `approved` のまま。
+- reviewer の `APPROVE` は terminal approval ではない。terminal approval は `step5-terminal-gate` の exit 0 のみ。
+  `route_loop_verdict_v2()` 単体の結果（埋め込み proof を含む）は terminal approval ではない。
+
 `UNKNOWN`、`BLOCKED`、`BEHIND`、`UNSTABLE`、`DRAFT`、`HAS_HOOKS` は Git conflict として扱わない
 （Safety Invariants）。actual Git conflict として hard stop するのは `mergeable == CONFLICTING` または
 `merge_state_status == DIRTY` の場合のみであり、この判定は reviewer verdict（`REQUEST_CHANGES` /

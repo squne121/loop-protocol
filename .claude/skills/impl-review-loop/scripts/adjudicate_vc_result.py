@@ -2677,8 +2677,13 @@ def step5_terminal_gate(
     expected_command_hashes: list[str],
     dispatch_seq: int,
     cwd: Any = None,
+    _root_live_ci_proof: dict[str, Any] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Terminal approval composition point (Issue #2837).
+
+    ``_root_live_ci_proof`` is INTERNAL: only the step5-terminal-gate CLI may
+    supply it, from its own live wait_ci_checks run. A ``required_ci_proof``
+    key inside ``live_mergeability`` is always dropped here.
 
     Returns ``(exit_code, route_decision_json)``: 0 = approved, 1 = anything
     else (the route is output as-is, or ``continue_loop`` with one of the
@@ -2691,9 +2696,14 @@ def step5_terminal_gate(
     VC is never re-run here.
     """
     route_module = _load_route_module()
+    route_live = live_mergeability
+    if isinstance(live_mergeability, dict):
+        route_live = {k: v for k, v in live_mergeability.items() if k != route_module.REQUIRED_CI_PROOF_KEY}
+        if _root_live_ci_proof is not None:
+            route_live[route_module.REQUIRED_CI_PROOF_KEY] = _root_live_ci_proof
     decision = route_module.route_loop_verdict_v2_resolve_semantic_ambiguity(
         reviewer_verdict,
-        live_mergeability,
+        route_live,
         cwd=cwd if cwd is not None else _REPO_ROOT,
     )
     plain = _plain_route_decision(decision)
@@ -3048,6 +3058,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="step5-terminal-gate: JSON live_mergeability (second input of route_loop_verdict_v2()).",
     )
     parser.add_argument(
+        "--verify-required-ci-live",
+        action="store_true",
+        help=(
+            "step5-terminal-gate (opt-in): this CLI itself runs the canonical read-only "
+            "wait_ci_checks.py --required for squne121/loop-protocol, --expected-pr-number and "
+            "--expected-head-sha (bounded), and only a live exit-0 passed result lets an "
+            "UNSTABLE/MERGEABLE PR reach approved. No caller-supplied CI result is ever read. "
+            "Requires --expected-pr-number."
+        ),
+    )
+    parser.add_argument(
         "--dispatch-seq",
         type=int,
         help=(
@@ -3056,6 +3077,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     args = parser.parse_args(argv)
+    if args.verify_required_ci_live and args.command != "step5-terminal-gate":
+        parser.error("--verify-required-ci-live is only accepted by step5-terminal-gate")
     if args.command != "step4-adjudicate" and (
         args.producer_exit_code is not None or args.repo is not None
     ):
@@ -3107,6 +3130,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ]
         if args.dispatch_seq is None:
             missing.append("--dispatch-seq")
+        if args.verify_required_ci_live and args.expected_pr_number is None:
+            missing.append("--expected-pr-number (with --verify-required-ci-live)")
         if missing:
             parser.error(f"step5-terminal-gate requires: {', '.join(missing)}")
     else:
@@ -3421,6 +3446,51 @@ def _run_step4_adjudicate(args: argparse.Namespace) -> int:
     return exit_code
 
 
+_LIVE_CI_REPO = "squne121/loop-protocol"
+_LIVE_CI_CHECKER = Path(__file__).resolve().parent / "wait_ci_checks.py"
+_LIVE_CI_WAIT_SECONDS = 30
+_LIVE_CI_PROCESS_TIMEOUT = 55
+_LIVE_CI_PREFIX = "CI_WAIT_RESULT_V1_JSON="
+
+
+def _live_required_ci_proof(pr_number: int, head_sha: str, *, run: Any = None) -> dict[str, Any] | None:
+    """Run the canonical read-only checker and return the INTERNAL proof, or None.
+
+    Fixed command, bounded, inherited PATH (native gh bridge). Any failure,
+    non-zero exit, unparsable/ambiguous output or non-passed status yields
+    None, so the ordinary (fail_closed) route is unchanged. Strict validation
+    of the payload itself is done by the router on the returned proof.
+    """
+    import subprocess
+
+    runner = run if run is not None else subprocess.run
+    argv = [
+        sys.executable, str(_LIVE_CI_CHECKER),
+        "--repo", _LIVE_CI_REPO,
+        "--pr", str(pr_number),
+        "--head-sha", head_sha,
+        "--required",
+        "--interval", "5",
+        "--timeout-seconds", str(_LIVE_CI_WAIT_SECONDS),
+    ]
+    try:
+        proc = runner(argv, capture_output=True, text=True, timeout=_LIVE_CI_PROCESS_TIMEOUT, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0 or not isinstance(proc.stdout, str):
+        return None
+    lines = [ln for ln in proc.stdout.splitlines() if ln.startswith(_LIVE_CI_PREFIX)]
+    if len(lines) != 1:
+        return None
+    try:
+        payload = json.loads(lines[0][len(_LIVE_CI_PREFIX):])
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return {"ci_wait_result": payload, "expected_pr_number": pr_number}
+
+
 def _run_step5_terminal_gate(args: argparse.Namespace) -> int:
     """CLI entrypoint for `step5-terminal-gate` (Issue #2837). Exit codes:
     0 = approved, 1 = not approved (route JSON on stdout), 2 = malformed
@@ -3442,6 +3512,13 @@ def _run_step5_terminal_gate(args: argparse.Namespace) -> int:
             "expected_command_hashes_malformed", hashes_errors or ["expected_command_hashes_not_string_list"]
         )
 
+    # Opt-in UNSTABLE proof: computed here from a live canonical checker run,
+    # never from a user-provided file. The gate drops any proof key inside the
+    # live file, so only this root-supplied value can reach the router.
+    live_ci_proof = None
+    if args.verify_required_ci_live:
+        live_ci_proof = _live_required_ci_proof(args.expected_pr_number, args.expected_head_sha)
+
     exit_code, decision = step5_terminal_gate(
         loop_state,
         reviewer_verdict,
@@ -3450,6 +3527,7 @@ def _run_step5_terminal_gate(args: argparse.Namespace) -> int:
         expected_contract_body_sha256=args.expected_contract_body_sha256,
         expected_command_hashes=expected_hashes,
         dispatch_seq=args.dispatch_seq,
+        _root_live_ci_proof=live_ci_proof,
     )
     sys.stdout.write(_canonical_json(decision) + "\n")
     return exit_code

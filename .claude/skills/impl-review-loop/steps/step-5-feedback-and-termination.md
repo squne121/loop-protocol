@@ -378,7 +378,7 @@ PUBLISH_LANE_DECISION_V1:
 | `CLEAN` | `approved` | |
 | `HAS_HOOKS` | `approved` | merge hooks があるが merge 可能。conflict ではない |
 | `DRAFT` | `fail_closed`（defer to CI evaluator） | Draft PR は人間が ready にする。単独では human escalation にしない（#1860 Owner Decision / #1873 Delivery Rule） |
-| `UNSTABLE` | `fail_closed`（defer to CI evaluator） | branch protection テスト失敗の可能性。conflict でも自動 human escalation でもない |
+| `UNSTABLE` | `fail_closed`（defer to CI evaluator） | branch protection テスト失敗の可能性。conflict でも自動 human escalation でもない。例外: `step5-terminal-gate --verify-required-ci-live`（#3074）で同一 PR・HEAD の live `wait_ci_checks.py --required` が全 PASS のときのみ `approved`（`step-5-mergeability-handling.md` 参照）。未解決なら停止し `fail_closed` のまま |
 | `BLOCKED` | `fail_closed`（defer to CI evaluator） | branch protection 設定待ち。conflict でも自動 human escalation でもない |
 | `BEHIND` | `route_to_update_branch` | `step-5-mergeability-handling.md` の BEHIND 分岐参照 |
 | `DIRTY`（または `mergeable: CONFLICTING`） | `conflict_hard_stop` | CONFLICTING PR Escalation Runbook 発動。verdict に関係なく最優先 |

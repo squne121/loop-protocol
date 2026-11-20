@@ -915,6 +915,86 @@ def _reconciliation_decision(drift: MainDriftDecision) -> RouteDecision:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Opt-in Step 5 UNSTABLE reconciliation proof (candidate).
+#
+# ``live_mergeability["required_ci_proof"]`` is a strictly INTERNAL optional
+# key. It is supplied only by the step5-terminal-gate CLI root, from its own
+# live wait_ci_checks.py --required run (the live execution is the source
+# authenticity); it is never user-provided evidence and step5_terminal_gate
+# drops any such key found in caller input. A pure route decision, including
+# one produced from a hand-embedded key, is NOT Step 5 terminal approval:
+# only the CLI exit code is. Only a valid, current-head, required-only
+# CI_WAIT_RESULT_V1 payload lets UNSTABLE + MERGEABLE route to ``approved``;
+# absent or invalid -> the ordinary defer-to-CI fail_closed route. It never
+# rewrites any mergeability field.
+# ---------------------------------------------------------------------------
+
+REQUIRED_CI_PROOF_KEY = "required_ci_proof"
+_REQUIRED_CI_PROOF_REPO = "squne121/loop-protocol"
+_CI_WAIT_RESULT_KEYS = frozenset(
+    {
+        "schema",
+        "status",
+        "repo",
+        "pr_number",
+        "head_sha",
+        "current_head_sha",
+        "required_only",
+        "checks",
+        "elapsed_seconds",
+        "interval_seconds",
+        "timeout_seconds",
+        "error_code",
+        "message",
+    }
+)
+
+
+def _is_positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _required_ci_proof_valid(proof: Any, live_head_sha: str) -> bool:
+    """True only for a complete, current-head, all-SUCCESS required-CI proof."""
+    if not isinstance(proof, Mapping) or set(proof) != {"ci_wait_result", "expected_pr_number"}:
+        return False
+    expected_pr = proof["expected_pr_number"]
+    result = proof["ci_wait_result"]
+    if not _is_positive_int(expected_pr) or not isinstance(result, Mapping):
+        return False
+    if set(result) != _CI_WAIT_RESULT_KEYS:
+        return False
+    if result["schema"] != "CI_WAIT_RESULT_V1" or result["status"] != "passed":
+        return False
+    if result["error_code"] is not None or result["required_only"] is not True:
+        return False
+    if result["repo"] != _REQUIRED_CI_PROOF_REPO:
+        return False
+    pr_number = result["pr_number"]
+    if not _is_positive_int(pr_number) or pr_number != expected_pr:
+        return False
+    head_sha = result["head_sha"]
+    if not isinstance(head_sha, str) or not head_sha:
+        return False
+    if head_sha != result["current_head_sha"] or head_sha != live_head_sha:
+        return False
+    checks = result["checks"]
+    if not isinstance(checks, list) or not checks:
+        return False
+    names: set[str] = set()
+    for check in checks:
+        if not isinstance(check, Mapping):
+            return False
+        name = check.get("name")
+        if not isinstance(name, str) or not name.strip() or name in names:
+            return False
+        names.add(name)
+        if check.get("bucket") != "pass" or check.get("state") != "SUCCESS":
+            return False
+    return True
+
+
 def route_loop_verdict_v2(
     reviewer_verdict: Mapping[str, Any],
     live_mergeability: Mapping[str, Any],
@@ -1093,6 +1173,13 @@ def route_loop_verdict_v2(
     # never trigger human escalation on its own: Issue #1873's Delivery
     # Rule requires the PR to stay Draft pending human final merge.
     # ------------------------------------------------------------------
+    if (
+        merge_state_status == "UNSTABLE"
+        and mergeable == "MERGEABLE"
+        and _required_ci_proof_valid(live_mergeability.get(REQUIRED_CI_PROOF_KEY), live_head_sha)
+    ):
+        return _decision(ROUTE_APPROVED)
+
     if merge_state_status in _DEFER_TO_CI_EVALUATOR_STATUSES:
         return _fail(
             f"merge_state_status_{merge_state_status.lower()}_not_conflict_defer_to_ci_evaluator",
