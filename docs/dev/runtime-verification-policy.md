@@ -564,6 +564,17 @@ failure は fail-closed で非 0 exit になり、PASS へ昇格しない。
 - fixture skill の live 証跡は対照実行の分類が成立することの検証であり、`worktree-agent-runtime-smoke/SKILL.md` 自身の手順文が
   挙動を駆動したことの因果的証明ではない。
 
+### Runtime smoke live-test fixture authoring（pytest live test から runner を呼ぶ際の指針、Issue #2999）
+
+runner（`scripts/agent-ops/run_worktree_agent_runtime_smoke.py`）は `--output-dir` を exclusive-create で扱い、既に存在する path（symlink を含む）は fail-closed で拒否する。pytest の live test でこの runner を呼ぶ著者は、固定 `OUTPUT_DIR` + `shutil.rmtree(ROOT / OUTPUT_DIR, ignore_errors=True)` の形で出力先を使い回してはならない（#2971 の live test 3 ファイルにあった同型パターン）。本節は Python live test を新規作成・修正する開発者／agent 向けの指針であり、新しい validator・gate・runner の挙動変更は含まない。
+
+- **未存在の run 固有 output path**: `--output-dir` は run ごとに未存在の一意な worktree-local 相対 path を生成して渡す（例: UTC timestamp + UUID）。`mkdtemp` / `mkdir` で runner 起動前にその出力先を作らない。作成は runner の exclusive-create に任せる。
+- **過去 evidence の保全**: 古い output directory を `rmtree` で削除して再利用しない。失敗 run の evidence も含め、過去の evidence は保持する。
+- **同一 invocation の output path**: 1 invocation で生成した path を、runner に渡す `--output-dir` の実 argv、`summary.md` の読み出し、必要な `evidence.json` の保存・検証に一貫して使う。path が一意であることだけでなく、この配線（argv・summary・structured evidence が同一 run を指すこと）を、runner を起動しない hermetic regression test（生成した argv と読み出し先を直接 assert する）で固定することを推奨する。 相対`--output-dir`は runner 側では指定した対象 worktree を基準に解決されるため、pytest 側の`summary.md`や`evidence.json`の読出し先も同じ worktree 基準で組み立て、テストを起動した別ディレクトリの cwd に依存させない。
+- **一時入力と runtime evidence の区別**: `tempfile.mkdtemp` で作る prompt file 等の一時入力は `finally` 等で cleanup を維持してよい。これは runner 証跡の削除とは別であり、証跡は worktree-local に残るだけで、worktree cleanup 後も永久保存されるとは主張しない（retention の設計は本節の範囲外）。
+
+責任範囲の区別: 既存 live test の実装修正は、body-only lane の 1 ファイルを #2986、残り 2 ファイルを #2997 が所有する。VC の記述契約は #2918、VC 内の prompt-file と output-dir の衝突は #2915 が扱う。本節はこれらを重複して所有せず、新規 live test の著者向け指針のみを定める。
+
 ## 11. Claude extension surface risk-trigger policy（拡張サーフェスの risk-trigger 判定）
 
 > 関連 Issue: #2259（OWNER レビュー P0-7 で明示）、#2283（本セクション新設）、#2290（enforcement 配線 follow-up）
