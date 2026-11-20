@@ -1,4 +1,5 @@
 ---
+title: プレイテスト実施・記録・レビューのための手順書
 status: draft
 issue: "#284"
 parent_issue: "#254"
@@ -74,6 +75,23 @@ trace_links:
 ## Decision Meeting
 - プレイテスト終了後、開発チームでログを振り返り、各項目の `classification` と `decision`（対応方針）を確定する。
 - 決定事項は `docs/product/playtest-log.md` の `decision` フィールドに記録する。
+
+## Deferred / Partial Waiver Resolution
+playtest evidence 文書（例: `docs/playtest/<milestone>.md`）の `acceptance_verdict.partial_or_deferred` 配下にある deferred / partial waiver を解消するときの手順を定義する。本節は手順と終端状態 schema のみを定め、個別 waiver entry の書き換えは各対象 Issue（例: #689 / #690）の PR が担う。
+
+- **前提**: 解消は新しい evidence block の追加で行い、既存 evidence を後から書き換えて（backfill して）解消扱いにしない。
+- **解消方式の 2 経路**:
+
+| 方式 | 適用条件 | 手順 |
+|---|---|---|
+| entry 削除 | 当該 AC が `acceptance_verdict.passed` の判定基準を追加注記なしで満たし、waiver を残す監査上の理由がない | `partial_or_deferred` から entry を削除し、AC を `passed` に移す |
+| `status` 変更で残置 | 証跡が複数 session に分かれる、元の期待値（viewport 等）をそのまま主張しない、人間承認が必要だった等、解消の経緯・制約を後から参照する必要がある | entry を `partial_or_deferred` に残し、`status` を終端値へ変更し、解消根拠を同 entry に記録する |
+
+- **判断基準**: 迷う場合は `status` 変更で残置を選ぶ（解消経緯を失わない側に倒す）。entry 削除は、解消後の AC が他の `passed` AC と区別する必要がない場合に限る。
+- **終端 `status` 値**: 解消済み entry に許容する `status` は `accepted` のみとする。`deferred` / `partial` など未解消を示す値を残したまま解消扱いにしない。
+- **残置時の必須記録**: `reason`（解消内容）、`resolved_by_evidence`（証跡 URL）、`approved_by` / `approved_at`（人間承認が必要な場合）を記録する。解消を担った Issue は `resolved_issue` に記録してよい。
+- **`expiry_issue` の扱い**: 解消時は、当該 entry から `expiry_issue`（waiver の期限・解消担当 Issue を示す参照）を除去する。解消を担った Issue の参照が必要な場合は `resolved_issue` へ移し、`expiry_issue` を解消済み entry に残さない。
+- **整合確認**: 解消後、文書 frontmatter の `status` / `acceptance_verdict.overall` と本文の Resolution note が、変更後の `partial_or_deferred` と矛盾しないことを確認する。
 
 ## Privacy / PII Handling
 - **基本原則**: 公開リポジトリには個人名、連絡先、顔・声の録画 URL、識別可能な発話全文を保存しない。
