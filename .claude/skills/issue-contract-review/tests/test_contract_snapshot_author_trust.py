@@ -53,6 +53,12 @@ _TRUSTED_LOGIN = "squne121"
 _TRUSTED_TYPE = "User"
 _TRUSTED_ASSOCIATION = "OWNER"
 
+# Observed GitHub PR #3060 author identity and author_association in this repo.
+_BOT_ID = 345302307
+_BOT_LOGIN = "squne-chatgpt-to-claudecode"
+_BOT_TYPE = "User"
+_BOT_ASSOCIATION = "CONTRIBUTOR"
+
 assert _TRUSTED_ID in TRUSTED_CONTRACT_PUBLISHERS
 
 
@@ -216,6 +222,62 @@ class TestFetchPreservesProvenance:
 
 
 class TestIdentityTupleAllowlist:
+    def test_repo_bot_exact_identity_tuple_is_trusted(self):
+        assert is_trusted_snapshot_author(
+            _BOT_LOGIN,
+            _BOT_ASSOCIATION,
+            author_id=_BOT_ID,
+            author_type=_BOT_TYPE,
+        ) is True
+
+    @pytest.mark.parametrize(
+        "author, association, author_id, author_type",
+        [
+            (_BOT_LOGIN, "OWNER", _BOT_ID, _BOT_TYPE),
+            (_BOT_LOGIN, "COLLABORATOR", _BOT_ID, _BOT_TYPE),
+            (_BOT_LOGIN, "NONE", _BOT_ID, _BOT_TYPE),
+            ("squne121", _BOT_ASSOCIATION, _BOT_ID, _BOT_TYPE),
+            (_BOT_LOGIN, _BOT_ASSOCIATION, _BOT_ID + 1, _BOT_TYPE),
+            (_BOT_LOGIN, _BOT_ASSOCIATION, _BOT_ID, "Bot"),
+            (_BOT_LOGIN, _BOT_ASSOCIATION, None, _BOT_TYPE),
+        ],
+    )
+    def test_repo_bot_mismatched_identity_fields_are_untrusted(
+        self, author, association, author_id, author_type
+    ):
+        assert is_trusted_snapshot_author(
+            author,
+            association,
+            author_id=author_id,
+            author_type=author_type,
+        ) is False
+
+    def test_repo_bot_schema_valid_go_is_authoritative(self):
+        bot_comment = _comment(
+            3062,
+            _go_body(),
+            author=_BOT_LOGIN,
+            author_association=_BOT_ASSOCIATION,
+            author_id=_BOT_ID,
+            author_type=_BOT_TYPE,
+        )
+        parsed = parse_contract_review_results(
+            [bot_comment], expected_issue_url=_ISSUE_URL
+        )
+        assert len(parsed) == 1
+        assert parsed[0]["is_trusted_author"] is True
+        result = find_latest_go(parsed, trusted_only=True)
+        assert result is not None
+        assert result["html_url"] == bot_comment["html_url"]
+
+    def test_nonallowlisted_contributor_is_untrusted(self):
+        assert is_trusted_snapshot_author(
+            "other-contributor",
+            "CONTRIBUTOR",
+            author_id=_BOT_ID + 1,
+            author_type="User",
+        ) is False
+
     def test_trusted_identity_tuple_is_trusted(self):
         assert (
             is_trusted_snapshot_author(
