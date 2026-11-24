@@ -215,13 +215,14 @@ def is_exact_ordinary_pr_dispatch_only_skip(
 
     A matching tuple is not enough: the CheckRun must be an exact,
     addressable current-head row from the current workflow run and the
-    ordinary PR route must have completed it as skipped. Every incomplete or
-    divergent case is deliberately classified as unknown and therefore blocks
-    fail-closed.
+    ordinary push / pull_request route must have completed it as skipped
+    (these jobs are workflow_dispatch-only). Every incomplete or divergent
+    case, including workflow_dispatch and unknown events, is deliberately
+    classified as unknown and therefore blocks fail-closed.
     """
     check_run_id = check.get("check_run_id")
     return (
-        event_name == "pull_request"
+        event_name in {"push", "pull_request"}
         and (check.get("workflow"), check.get("name")) in CONDITIONAL_EXCLUDED_TUPLES
         and check.get("status") == "completed"
         and check.get("conclusion") == "skipped"
